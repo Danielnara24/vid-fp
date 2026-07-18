@@ -50,10 +50,15 @@ fn bron_kerbosch(
 }
 
 fn main() {
-    let folder_path = env::args().nth(1).expect("Please provide a folder path! (e.g., cargo run --release -- /path/to/folder)");
+    ffmpeg_next::init().expect("Failed to initialize FFmpeg bindings.");
+
+    let folder_path = env::args().nth(1).expect("Please provide a folder path!");
     
-    let max_hamming = 5;
-    let min_match_pct = 0.15;
+    // Initialize embedded Sled Database Cache 
+    let db = sled::open("video_hashes.db").expect("Failed to open cache database");
+    
+    let max_hamming = 6;
+    let min_match_pct = 0.10;
 
     let extensions = ["mp4", "mkv", "avi", "mov", "flv", "webm"];
     let mut video_files = Vec::new();
@@ -71,24 +76,47 @@ fn main() {
         }
     }
 
-    if video_files.is_empty() {
-        println!("No video files found.");
-        return;
-    }
+    if video_files.is_empty() { return; }
     
     let total_videos = video_files.len();
     println!("Found {} video files. Starting parallel fingerprinting...", total_videos);
 
     let processed_count = AtomicUsize::new(0);
+    
+    // Process with File Size + Modification Time cache logic
     let fingerprints: Vec<VideoFingerprint> = video_files
         .par_iter()
         .filter_map(|vf| {
-            let fp = fingerprint_video(vf);
+            let metadata = std::fs::metadata(vf).ok()?;
+            let mtime = metadata.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+                .duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap().as_secs();
+            let size = metadata.len();
+            
+            let cache_key = format!("{}_{}_{}", vf, mtime, size);
+
+            // Fetch from Cache
+            if let Ok(Some(data)) = db.get(&cache_key) {
+                if let Ok(fp) = bincode::deserialize::<VideoFingerprint>(&data) {
+                    let done = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    println!("[Cached] {}/{} - {}", done, total_videos, Path::new(vf).file_name().unwrap().to_string_lossy());
+                    return Some(fp);
+                }
+            }
+
+            // Fingerprint natively and save to Sled Database Cache
+            let fp = fingerprint_video(vf)?;
+            
+            if let Ok(encoded) = bincode::serialize(&fp) {
+                let _ = db.insert(&cache_key, encoded);
+            }
+
             let done = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
-            println!("Processed {}/{} - {}", done, total_videos, Path::new(vf).file_name().unwrap().to_string_lossy());
-            fp
+            println!("[Processed] {}/{} - {}", done, total_videos, Path::new(vf).file_name().unwrap().to_string_lossy());
+            Some(fp)
         })
         .collect();
+
+    let _ = db.flush();
 
     let n = fingerprints.len();
     if n < 2 {

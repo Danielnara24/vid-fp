@@ -1,5 +1,6 @@
-use std::process::Command;
+use serde::{Deserialize, Serialize};
 
+#[derive(Serialize, Deserialize, Clone)]
 pub struct VideoFingerprint {
     pub path: String,
     pub valid_hashes: Vec<u64>,
@@ -9,67 +10,99 @@ pub struct VideoFingerprint {
 }
 
 pub fn fingerprint_video(filepath: &str) -> Option<VideoFingerprint> {
-    // 1. FFmpeg Subprocess Extraction (Subprocess halved: We completely removed the redundant ffprobe)
-    let output = Command::new("ffmpeg")
-        .args([
-            "-y", "-loglevel", "error",
-            "-skip_frame", "nokey",
-            "-threads", "1",
-            "-i", filepath,
-            "-map", "0:v:0",
-            "-an", "-sn",
-            "-vf", "scale=64:64:flags=fast_bilinear",
-            "-avoid_negative_ts", "make_zero",
-            "-f", "rawvideo", "-pix_fmt", "gray", "-"
-        ])
-        .output()
-        .ok()?;
+    // 1. Native Zero-Copy Extraction (No Subprocess Overhead)
+    let mut ictx = ffmpeg_next::format::input(&filepath).ok()?;
+    let input = ictx.streams().best(ffmpeg_next::media::Type::Video)?;
+    let video_stream_index = input.index();
 
-    let raw_bytes = output.stdout;
-    let frame_size = 64 * 64;
-    let total_frames = raw_bytes.len() / frame_size;
-    
-    if total_frames == 0 { return None; }
+    let context_decoder = ffmpeg_next::codec::context::Context::from_parameters(input.parameters()).ok()?;
+    let mut decoder = context_decoder.decoder().video().ok()?;
 
-    // 2. Filter duplicate adjacent frames 
+    let mut scaler = ffmpeg_next::software::scaling::context::Context::get(
+        decoder.format(),
+        decoder.width(),
+        decoder.height(),
+        ffmpeg_next::format::Pixel::GRAY8,
+        64,
+        64,
+        ffmpeg_next::software::scaling::flag::Flags::FAST_BILINEAR,
+    ).ok()?;
+
     let mut u_frames = Vec::new();
     let mut unique_frame_indices = Vec::new();
-    
-    let chunks: Vec<&[u8]> = raw_bytes.chunks_exact(frame_size).collect();
-    u_frames.push(chunks[0]);
-    unique_frame_indices.push(0);
 
-    for i in 1..total_frames {
-        if chunks[i] != chunks[i - 1] {
-            u_frames.push(chunks[i]);
-            unique_frame_indices.push(i as u32);
-        }
-    }
-    
-    let n_unique = u_frames.len();
-
-    // 3. Calculate Variance for Auto-Cropping algebraically in a single fast pass
     let mut sum = vec![0u64; 64 * 64];
     let mut sum_sq = vec![0u64; 64 * 64];
 
-    for &frame in &u_frames {
-        for i in 0..(64 * 64) {
-            let val = frame[i] as u64;
-            sum[i] += val;
-            sum_sq[i] += val * val;
+    let mut frame_idx = 0;
+    let mut prev_frame = vec![0u8; 4096];
+    let mut is_first = true;
+
+    let mut process_frame = |decoded: &ffmpeg_next::frame::Video| -> Result<(), ffmpeg_next::Error> {
+        let mut scaled = ffmpeg_next::frame::Video::empty();
+        scaler.run(decoded, &mut scaled)?;
+
+        let data = scaled.data(0);
+        let stride = scaled.stride(0);
+
+        let mut current_frame = vec![0u8; 4096];
+        for y in 0..64 {
+            let src_idx = y * stride;
+            let dst_idx = y * 64;
+            current_frame[dst_idx..dst_idx + 64].copy_from_slice(&data[src_idx..src_idx + 64]);
+        }
+
+        if is_first || current_frame != prev_frame {
+            u_frames.push(current_frame.clone());
+            unique_frame_indices.push(frame_idx);
+
+            for (i, &val) in current_frame.iter().enumerate() {
+                let v = val as u64;
+                sum[i] += v;
+                sum_sq[i] += v * v;
+            }
+
+            prev_frame = current_frame;
+            is_first = false;
+        }
+        frame_idx += 1;
+        Ok(())
+    };
+
+    // Rapid Demuxing: Only push Key-frames (I-Frames) into decoder 
+    for (stream, packet) in ictx.packets() {
+        if stream.index() == video_stream_index && packet.is_key() {
+            if decoder.send_packet(&packet).is_ok() {
+                let mut decoded = ffmpeg_next::frame::Video::empty();
+                while decoder.receive_frame(&mut decoded).is_ok() {
+                    let _ = process_frame(&decoded);
+                }
+            }
         }
     }
 
+    let _ = decoder.send_eof();
+    let mut decoded = ffmpeg_next::frame::Video::empty();
+    while decoder.receive_frame(&mut decoded).is_ok() {
+        let _ = process_frame(&decoded);
+    }
+
+    let total_frames = frame_idx;
+    if total_frames == 0 { return None; }
+
+    let n_unique = u_frames.len();
+    let n_f32 = n_unique as f32;
+
+    // 2. Variance & Auto-Crop Algebra (Untouched - accurate)
     let mut row_max_var = [0.0f32; 64];
     let mut col_max_var = [0.0f32; 64];
-    let n_f32 = n_unique as f32;
 
     for y in 0..64 {
         for x in 0..64 {
             let i = y * 64 + x;
             let mean = sum[i] as f32 / n_f32;
             let mean_sq = sum_sq[i] as f32 / n_f32;
-            let variance = mean_sq - (mean * mean); 
+            let variance = mean_sq - (mean * mean);
 
             if variance > row_max_var[y] { row_max_var[y] = variance; }
             if variance > col_max_var[x] { col_max_var[x] = variance; }
@@ -96,7 +129,7 @@ pub fn fingerprint_video(filepath: &str) -> Option<VideoFingerprint> {
             x2 = if temp_x2 < 63 { temp_x2 - 1 } else { temp_x2 };
         }
     }
-    
+
     let crop_h = y2 - y1 + 1;
     let crop_w = x2 - x1 + 1;
 
@@ -116,7 +149,7 @@ pub fn fingerprint_video(filepath: &str) -> Option<VideoFingerprint> {
 
                 let y_idx = y_f.floor() as usize;
                 let x_idx = x_f.floor() as usize;
-                
+
                 let yw = y_f - y_idx as f32;
                 let xw = x_f - x_idx as f32;
 
@@ -134,12 +167,10 @@ pub fn fingerprint_video(filepath: &str) -> Option<VideoFingerprint> {
         }
     }
 
-    // 4. Generate Grids & Pack into Hashes immediately
     let mut hashes = Vec::with_capacity(n_unique);
-    
-    for &frame in &u_frames {
-        let mut frame_8x9 = [0u8; 72]; 
-        
+    for frame in &u_frames {
+        let mut frame_8x9 = [0u8; 72];
+
         if crop_h != 8 || crop_w != 9 {
             for (i, w) in weights.iter().enumerate() {
                 let p11 = frame[w.y_idx * 64 + w.x_idx] as f32;
@@ -173,22 +204,19 @@ pub fn fingerprint_video(filepath: &str) -> Option<VideoFingerprint> {
         hashes.push(hash);
     }
 
-    // 5. Integer-based Timestamp Mapping
     let mut changes_hashes = Vec::new();
     let mut changes_t_start = Vec::new();
     let mut changes_valid = Vec::new();
 
     for i in 0..hashes.len() {
         let h = hashes[i];
-        let bits = h.count_ones(); 
-        let valid = bits > 2 && bits < 62;
+        let valid = h.count_ones() > 2 && h.count_ones() < 62;
 
         let should_push = if i == 0 {
             true
         } else {
-            let prev_h = hashes[i-1];
-            let prev_bits = prev_h.count_ones();
-            let prev_valid = prev_bits > 2 && prev_bits < 62;
+            let prev_h = hashes[i - 1];
+            let prev_valid = prev_h.count_ones() > 2 && prev_h.count_ones() < 62;
             h != prev_h || valid != prev_valid
         };
 
@@ -199,9 +227,9 @@ pub fn fingerprint_video(filepath: &str) -> Option<VideoFingerprint> {
         }
     }
 
-    let mut final_hashes = Vec::new();
-    let mut final_t_start = Vec::new();
-    let mut final_t_end = Vec::new();
+    let mut final_hashes = Vec::with_capacity(changes_hashes.len());
+    let mut final_t_start = Vec::with_capacity(changes_hashes.len());
+    let mut final_t_end = Vec::with_capacity(changes_hashes.len());
 
     for i in 0..changes_hashes.len() {
         if changes_valid[i] {
