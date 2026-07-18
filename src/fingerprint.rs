@@ -1,39 +1,15 @@
 use std::process::Command;
-use std::str;
-use std::time::Instant;
 
 pub struct VideoFingerprint {
     pub path: String,
-    pub duration: f32,
     pub valid_hashes: Vec<u64>,
-    pub valid_t_start: Vec<f32>,
-    pub valid_t_end: Vec<f32>,
-}
-
-fn get_exact_duration(filepath: &str) -> f32 {
-    let output = Command::new("ffprobe")
-        .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", filepath])
-        .output();
-
-    if let Ok(out) = output {
-        if let Ok(s) = str::from_utf8(&out.stdout) {
-            if let Ok(duration) = s.trim().parse::<f32>() {
-                return duration;
-            }
-        }
-    }
-    0.0
+    pub valid_t_start: Vec<u32>,
+    pub valid_t_end: Vec<u32>,
+    pub total_frames: u32,
 }
 
 pub fn fingerprint_video(filepath: &str) -> Option<VideoFingerprint> {
-    let start_time = Instant::now();
-    let exact_duration = get_exact_duration(filepath);
-    if exact_duration <= 0.0 {
-        println!("Could not get duration for {}", filepath);
-        return None;
-    }
-
-    // 1. FFmpeg Subprocess Extraction
+    // 1. FFmpeg Subprocess Extraction (Subprocess halved: We completely removed the redundant ffprobe)
     let output = Command::new("ffmpeg")
         .args([
             "-y", "-loglevel", "error",
@@ -54,44 +30,46 @@ pub fn fingerprint_video(filepath: &str) -> Option<VideoFingerprint> {
     let total_frames = raw_bytes.len() / frame_size;
     
     if total_frames == 0 { return None; }
-    println!("[{}] Extracted {} keyframes.", filepath, total_frames);
 
-    // 2. Filter duplicate adjacent frames (np.where(change_mask))
+    // 2. Filter duplicate adjacent frames 
     let mut u_frames = Vec::new();
     let mut unique_frame_indices = Vec::new();
     
-    u_frames.push(raw_bytes[0..frame_size].to_vec());
+    let chunks: Vec<&[u8]> = raw_bytes.chunks_exact(frame_size).collect();
+    u_frames.push(chunks[0]);
     unique_frame_indices.push(0);
 
     for i in 1..total_frames {
-        let prev = &raw_bytes[(i - 1) * frame_size .. i * frame_size];
-        let curr = &raw_bytes[i * frame_size .. (i + 1) * frame_size];
-        if curr != prev {
-            u_frames.push(curr.to_vec());
-            unique_frame_indices.push(i);
+        if chunks[i] != chunks[i - 1] {
+            u_frames.push(chunks[i]);
+            unique_frame_indices.push(i as u32);
         }
     }
+    
     let n_unique = u_frames.len();
-    println!("[{}] Filtered to {} unique dynamic frames.", filepath, n_unique);
 
-    // 3. Calculate Variance for Auto-Cropping
-    let mut row_max_var = vec![0.0f32; 64];
-    let mut col_max_var = vec![0.0f32; 64];
+    // 3. Calculate Variance for Auto-Cropping algebraically in a single fast pass
+    let mut sum = vec![0u64; 64 * 64];
+    let mut sum_sq = vec![0u64; 64 * 64];
+
+    for &frame in &u_frames {
+        for i in 0..(64 * 64) {
+            let val = frame[i] as u64;
+            sum[i] += val;
+            sum_sq[i] += val * val;
+        }
+    }
+
+    let mut row_max_var = [0.0f32; 64];
+    let mut col_max_var = [0.0f32; 64];
+    let n_f32 = n_unique as f32;
 
     for y in 0..64 {
         for x in 0..64 {
-            let mut sum = 0.0;
-            for f in 0..n_unique {
-                sum += u_frames[f][y * 64 + x] as f32;
-            }
-            let mean = sum / n_unique as f32;
-            
-            let mut var_sum = 0.0;
-            for f in 0..n_unique {
-                let diff = u_frames[f][y * 64 + x] as f32 - mean;
-                var_sum += diff * diff;
-            }
-            let variance = var_sum / n_unique as f32;
+            let i = y * 64 + x;
+            let mean = sum[i] as f32 / n_f32;
+            let mean_sq = sum_sq[i] as f32 / n_f32;
+            let variance = mean_sq - (mean * mean); 
 
             if variance > row_max_var[y] { row_max_var[y] = variance; }
             if variance > col_max_var[x] { col_max_var[x] = variance; }
@@ -121,76 +99,88 @@ pub fn fingerprint_video(filepath: &str) -> Option<VideoFingerprint> {
     
     let crop_h = y2 - y1 + 1;
     let crop_w = x2 - x1 + 1;
-    println!("[{}] Autocropped to {}x{} (y:{}-{}, x:{}-{})", filepath, crop_w, crop_h, y1, y2, x1, x2);
 
-    // 4. Generate 8x9 Grids via Bilinear Interpolation & Pack into Hashes
-    let mut hashes = Vec::new();
+    struct InterpWeight {
+        y_idx: usize, x_idx: usize,
+        y_idx_next: usize, x_idx_next: usize,
+        w11: f32, w12: f32,
+        w21: f32, w22: f32,
+    }
+
+    let mut weights = Vec::with_capacity(8 * 9);
+    if crop_h != 8 || crop_w != 9 {
+        for out_y in 0..8 {
+            for out_x in 0..9 {
+                let y_f = (out_y as f32) * (crop_h as f32 - 1.0) / 7.0;
+                let x_f = (out_x as f32) * (crop_w as f32 - 1.0) / 8.0;
+
+                let y_idx = y_f.floor() as usize;
+                let x_idx = x_f.floor() as usize;
+                
+                let yw = y_f - y_idx as f32;
+                let xw = x_f - x_idx as f32;
+
+                weights.push(InterpWeight {
+                    y_idx: y1 + y_idx,
+                    x_idx: x1 + x_idx,
+                    y_idx_next: y1 + (y_idx + 1).min(crop_h - 1),
+                    x_idx_next: x1 + (x_idx + 1).min(crop_w - 1),
+                    w11: (1.0 - yw) * (1.0 - xw),
+                    w12: (1.0 - yw) * xw,
+                    w21: yw * (1.0 - xw),
+                    w22: yw * xw,
+                });
+            }
+        }
+    }
+
+    // 4. Generate Grids & Pack into Hashes immediately
+    let mut hashes = Vec::with_capacity(n_unique);
     
-    for f in 0..n_unique {
-        let frame = &u_frames[f];
-        let mut frame_8x9 = vec![vec![0u8; 9]; 8];
-
+    for &frame in &u_frames {
+        let mut frame_8x9 = [0u8; 72]; 
+        
         if crop_h != 8 || crop_w != 9 {
-            for out_y in 0..8 {
-                for out_x in 0..9 {
-                    let y_f = (out_y as f32) * (crop_h as f32 - 1.0) / 7.0;
-                    let x_f = (out_x as f32) * (crop_w as f32 - 1.0) / 8.0;
+            for (i, w) in weights.iter().enumerate() {
+                let p11 = frame[w.y_idx * 64 + w.x_idx] as f32;
+                let p12 = frame[w.y_idx * 64 + w.x_idx_next] as f32;
+                let p21 = frame[w.y_idx_next * 64 + w.x_idx] as f32;
+                let p22 = frame[w.y_idx_next * 64 + w.x_idx_next] as f32;
 
-                    let y_idx = y_f.floor() as usize;
-                    let x_idx = x_f.floor() as usize;
-                    
-                    let yw = y_f - y_idx as f32;
-                    let xw = x_f - x_idx as f32;
-
-                    let y_idx_next = (y_idx + 1).min(crop_h - 1);
-                    let x_idx_next = (x_idx + 1).min(crop_w - 1);
-
-                    let p11 = frame[(y1 + y_idx) * 64 + (x1 + x_idx)] as f32;
-                    let p12 = frame[(y1 + y_idx) * 64 + (x1 + x_idx_next)] as f32;
-                    let p21 = frame[(y1 + y_idx_next) * 64 + (x1 + x_idx)] as f32;
-                    let p22 = frame[(y1 + y_idx_next) * 64 + (x1 + x_idx_next)] as f32;
-
-                    let val = p11 * (1.0 - yw) * (1.0 - xw)
-                            + p12 * (1.0 - yw) * xw
-                            + p21 * yw * (1.0 - xw)
-                            + p22 * yw * xw;
-                            
-                    frame_8x9[out_y][out_x] = val as u8;
-                }
+                frame_8x9[i] = (p11 * w.w11 + p12 * w.w12 + p21 * w.w21 + p22 * w.w22) as u8;
             }
         } else {
-            // Already 8x9 (Rare case but handled)
+            let mut i = 0;
             for out_y in 0..8 {
                 for out_x in 0..9 {
-                    frame_8x9[out_y][out_x] = frame[(y1 + out_y) * 64 + (x1 + out_x)];
+                    frame_8x9[i] = frame[(y1 + out_y) * 64 + (x1 + out_x)];
+                    i += 1;
                 }
             }
         }
 
-        // Horizontal Difference to 64-bit Hash
         let mut hash: u64 = 0;
+        let mut bit_idx = 0;
         for r in 0..8 {
+            let row_offset = r * 9;
             for c in 0..8 {
-                if frame_8x9[r][c + 1] > frame_8x9[r][c] {
-                    // Python np.packbits MSB first mapping
-                    let bit_idx = r * 8 + c;
+                if frame_8x9[row_offset + c + 1] > frame_8x9[row_offset + c] {
                     hash |= 1 << (63 - bit_idx);
                 }
+                bit_idx += 1;
             }
         }
         hashes.push(hash);
     }
 
-    // 5. Final Filter (Bit count bounds and contiguous duplicates)
-    let timestamps: Vec<f32> = (0..total_frames).map(|i| (i as f32 / total_frames as f32) * exact_duration).collect();
-    
-    let mut final_hashes = Vec::new();
-    let mut final_t_start = Vec::new();
-    let mut final_idx_tracker = Vec::new();
+    // 5. Integer-based Timestamp Mapping
+    let mut changes_hashes = Vec::new();
+    let mut changes_t_start = Vec::new();
+    let mut changes_valid = Vec::new();
 
     for i in 0..hashes.len() {
         let h = hashes[i];
-        let bits = h.count_ones(); // HARDWARE POPCNT! SO FAST!
+        let bits = h.count_ones(); 
         let valid = bits > 2 && bits < 62;
 
         let should_push = if i == 0 {
@@ -202,33 +192,35 @@ pub fn fingerprint_video(filepath: &str) -> Option<VideoFingerprint> {
             h != prev_h || valid != prev_valid
         };
 
-        if should_push && valid {
-            final_hashes.push(h);
-            final_t_start.push(timestamps[unique_frame_indices[i]]);
-            final_idx_tracker.push(unique_frame_indices[i]);
+        if should_push {
+            changes_hashes.push(h);
+            changes_t_start.push(unique_frame_indices[i]);
+            changes_valid.push(valid);
         }
     }
 
-    // Calculate end times
-    let mut final_t_end = Vec::with_capacity(final_t_start.len());
-    for i in 0..final_t_start.len() {
-        if i + 1 < final_t_start.len() {
-            // Use the timestamp of the NEXT valid change as the end time
-            // Wait, Python script uses `timestamps[idx[final_idx[1:]]]`
-            // Actually Python pulls from `timestamps[idx[final_idx[i+1]]]`. We tracked this!
-            final_t_end.push(timestamps[final_idx_tracker[i+1]]);
-        } else {
-            final_t_end.push(exact_duration);
+    let mut final_hashes = Vec::new();
+    let mut final_t_start = Vec::new();
+    let mut final_t_end = Vec::new();
+
+    for i in 0..changes_hashes.len() {
+        if changes_valid[i] {
+            final_hashes.push(changes_hashes[i]);
+            final_t_start.push(changes_t_start[i]);
+
+            if i + 1 < changes_hashes.len() {
+                final_t_end.push(changes_t_start[i + 1]);
+            } else {
+                final_t_end.push(total_frames as u32);
+            }
         }
     }
-
-    println!("[{}] Final valid hashes to compare: {} (Completed in {:.2}s)", filepath, final_hashes.len(), start_time.elapsed().as_secs_f32());
 
     Some(VideoFingerprint {
         path: filepath.to_string(),
-        duration: exact_duration,
         valid_hashes: final_hashes,
         valid_t_start: final_t_start,
         valid_t_end: final_t_end,
+        total_frames: total_frames as u32,
     })
 }

@@ -1,14 +1,16 @@
 mod compare;
 mod fingerprint;
 
-use compare::compare_videos;
+use compare::find_all_matches;
 use fingerprint::{fingerprint_video, VideoFingerprint};
+use rayon::prelude::*;
 use std::collections::HashSet;
 use std::env;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use walkdir::WalkDir;
 
-// Exact translation of the Python bron_kerbosch function
+// Graph Traversal with Pivoting logic to handle aggressive densifying cliques flawlessly
 fn bron_kerbosch(
     r: HashSet<usize>,
     mut p: HashSet<usize>,
@@ -23,8 +25,16 @@ fn bron_kerbosch(
         return;
     }
 
-    let p_clone = p.clone();
-    for v in p_clone {
+    // Heuristic: Use Pivot methodology choosing largest neighbor intersection maximizing node exclusion
+    let pivot = p.union(&x).max_by_key(|&&v| adjacency[v].intersection(&p).count()).cloned();
+    
+    let p_explore: Vec<usize> = if let Some(u) = pivot {
+        p.difference(&adjacency[u]).cloned().collect()
+    } else {
+        p.iter().cloned().collect()
+    };
+
+    for v in p_explore {
         let mut new_r = r.clone();
         new_r.insert(v);
 
@@ -40,7 +50,6 @@ fn bron_kerbosch(
 }
 
 fn main() {
-    // Get folder from command line argument, or use a default if not provided
     let folder_path = env::args().nth(1).expect("Please provide a folder path! (e.g., cargo run --release -- /path/to/folder)");
     
     let max_hamming = 5;
@@ -51,7 +60,6 @@ fn main() {
 
     println!("Scanning folder recursively: {}", folder_path);
 
-    // 1. Find all videos recursively
     for entry in WalkDir::new(&folder_path).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
         if path.is_file() {
@@ -67,15 +75,20 @@ fn main() {
         println!("No video files found.");
         return;
     }
-    println!("Found {} video files. Starting fingerprinting...", video_files.len());
+    
+    let total_videos = video_files.len();
+    println!("Found {} video files. Starting parallel fingerprinting...", total_videos);
 
-    // 2. Fingerprint all videos
-    let mut fingerprints: Vec<VideoFingerprint> = Vec::new();
-    for vf in &video_files {
-        if let Some(fp) = fingerprint_video(vf) {
-            fingerprints.push(fp);
-        }
-    }
+    let processed_count = AtomicUsize::new(0);
+    let fingerprints: Vec<VideoFingerprint> = video_files
+        .par_iter()
+        .filter_map(|vf| {
+            let fp = fingerprint_video(vf);
+            let done = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
+            println!("Processed {}/{} - {}", done, total_videos, Path::new(vf).file_name().unwrap().to_string_lossy());
+            fp
+        })
+        .collect();
 
     let n = fingerprints.len();
     if n < 2 {
@@ -85,26 +98,21 @@ fn main() {
 
     println!("\nFingerprinting complete. Cross-analyzing {} videos...", n);
 
-    // 3. Compare all pairs (N * (N-1) / 2) and build adjacency list
+    // 2. Global Multi-Index Pair Analysis mapped in Parallel completely bypassing nested loop O(N*N) traps
     let mut adjacency = vec![HashSet::new(); n];
-    
-    for i in 0..n {
-        for j in (i + 1)..n {
-            if compare_videos(&fingerprints[i], &fingerprints[j], max_hamming, min_match_pct).is_some() {
-                adjacency[i].insert(j);
-                adjacency[j].insert(i);
-            }
-        }
+    let edges = find_all_matches(&fingerprints, max_hamming, min_match_pct);
+
+    for (i, j) in edges {
+        adjacency[i].insert(j);
+        adjacency[j].insert(i);
     }
 
-    // 4. Find Duplicate Clusters (Bron-Kerbosch)
     println!("Grouping duplicate clusters...");
     let mut base_cliques = Vec::new();
     let all_nodes: HashSet<usize> = (0..n).collect();
     
     bron_kerbosch(HashSet::new(), all_nodes.clone(), HashSet::new(), &adjacency, &mut base_cliques);
 
-    // 5. Expand Groups (same as python while changed loop)
     let mut expanded_groups = Vec::new();
     for clique in base_cliques {
         let mut group = clique.clone();
@@ -113,8 +121,7 @@ fn main() {
             changed = false;
             for v in 0..n {
                 if !group.contains(&v) {
-                    let intersect_count = adjacency[v].intersection(&group).count();
-                    if intersect_count >= 2 {
+                    if adjacency[v].intersection(&group).count() >= 2 {
                         group.insert(v);
                         changed = true;
                     }
@@ -124,10 +131,8 @@ fn main() {
         expanded_groups.push(group);
     }
 
-    // Sort by length descending to make subset filtering work like Python
     expanded_groups.sort_by(|a, b| b.len().cmp(&a.len()));
 
-    // 6. Filter Subsets
     let mut final_groups_sets: Vec<HashSet<usize>> = Vec::new();
     for g in expanded_groups {
         let mut is_subset = false;
@@ -142,20 +147,15 @@ fn main() {
         }
     }
 
-    // Convert sets to sorted vectors of strings (full paths)
     let mut final_groups: Vec<Vec<String>> = Vec::new();
     for g in final_groups_sets {
         let mut group_paths: Vec<String> = g.into_iter().map(|idx| fingerprints[idx].path.clone()).collect();
-        group_paths.sort(); // Sort alphabetically within the group
+        group_paths.sort();
         final_groups.push(group_paths);
     }
 
-    // Sort all groups: highest length first, then alphabetically by the first item
-    final_groups.sort_by(|a, b| {
-        b.len().cmp(&a.len()).then_with(|| a[0].cmp(&b[0]))
-    });
+    final_groups.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a[0].cmp(&b[0])));
 
-    // 7. Print Results in Requested Format
     println!("\n========================================");
     println!("             RESULTS");
     println!("========================================\n");
@@ -167,14 +167,9 @@ fn main() {
         total_files_linked += group.len();
         
         for path_str in group {
-            // Extract just the filename to match your requested print layout
-            let filename = Path::new(path_str)
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy();
-            println!("{}", filename);
+            println!("{}", Path::new(path_str).file_name().unwrap_or_default().to_string_lossy());
         }
-        println!(); // Blank line between groups
+        println!();
     }
 
     println!("Total groups found: {}", final_groups.len());
