@@ -8,6 +8,8 @@ use std::collections::HashSet;
 use std::env;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::io::Write;
+use std::time::Instant;
 use walkdir::WalkDir;
 
 // Graph Traversal with Pivoting logic to handle aggressive densifying cliques flawlessly
@@ -50,6 +52,9 @@ fn bron_kerbosch(
 }
 
 fn main() {
+    // Start tracking time immediately upon execution
+    let start_time = Instant::now();
+
     ffmpeg_next::init().expect("Failed to initialize FFmpeg bindings.");
     ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Quiet);
 
@@ -77,12 +82,33 @@ fn main() {
         }
     }
 
-    if video_files.is_empty() { return; }
+    if video_files.is_empty() { 
+        println!("No videos found.");
+        return; 
+    }
     
     let total_videos = video_files.len();
     println!("Found {} video files. Starting parallel fingerprinting...", total_videos);
 
     let processed_count = AtomicUsize::new(0);
+
+    // Helper closure to format and cleanly overwrite the single line progress bar output
+    let print_progress = |status: &str, done: usize, total: usize, start: Instant, vf: &str| {
+        let pct = (done as f64 / total as f64) * 100.0;
+        let elapsed = start.elapsed().as_secs();
+        let hours = elapsed / 3600;
+        let mins = (elapsed % 3600) / 60;
+        let secs = elapsed % 60;
+        let filename = Path::new(vf).file_name().unwrap_or_default().to_string_lossy();
+
+        let mut stdout = std::io::stdout().lock();
+        let _ = write!(
+            stdout,
+            "\x1B[2K\r[{}] {}/{} [{:.1}%] - Time elapsed: {:02}:{:02}:{:02} - {}",
+            status, done, total, pct, hours, mins, secs, filename
+        );
+        let _ = stdout.flush();
+    };
     
     // Process with File Size + Modification Time cache logic
     let fingerprints: Vec<VideoFingerprint> = video_files
@@ -99,7 +125,7 @@ fn main() {
             if let Ok(Some(data)) = db.get(&cache_key) {
                 if let Ok(fp) = bincode::deserialize::<VideoFingerprint>(&data) {
                     let done = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
-                    println!("[Cached] {}/{} - {}", done, total_videos, Path::new(vf).file_name().unwrap().to_string_lossy());
+                    print_progress("Cached", done, total_videos, start_time, vf);
                     return Some(fp);
                 }
             }
@@ -112,11 +138,12 @@ fn main() {
             }
 
             let done = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
-            println!("[Processed] {}/{} - {}", done, total_videos, Path::new(vf).file_name().unwrap().to_string_lossy());
+            print_progress("Processing", done, total_videos, start_time, vf);
             Some(fp)
         })
         .collect();
 
+    println!(); // Move to a new line once the single-line progress iteration is complete
     let _ = db.flush();
 
     let n = fingerprints.len();
@@ -201,6 +228,12 @@ fn main() {
         println!();
     }
 
+    let total_elapsed = start_time.elapsed().as_secs();
+    let total_hours = total_elapsed / 3600;
+    let total_mins = (total_elapsed % 3600) / 60;
+    let total_secs = total_elapsed % 60;
+
     println!("Total groups found: {}", final_groups.len());
     println!("Total files linked: {}", total_files_linked);
+    println!("Total time elapsed: {:02}:{:02}:{:02}", total_hours, total_mins, total_secs);
 }
