@@ -18,8 +18,15 @@ pub fn output_results(
     let mut total_files_linked = 0;
 
     let mut txt_out = String::new();
-    let mut csv_out = String::from("group;resolution;size;length;full_path\n");
     let mut json_out_groups = Vec::new();
+
+    // Use csv crate for robust and RFC-compliant CSV generation
+    let mut csv_wtr = csv::WriterBuilder::new()
+        .delimiter(b';')
+        .from_writer(Vec::new());
+        
+    csv_wtr.write_record(&["group", "resolution", "size", "length", "full_path"])
+        .context("Failed to write CSV header")?;
 
     for (i, group) in final_groups.iter().enumerate() {
         let group_name = format!("group_{}", i + 1);
@@ -44,11 +51,13 @@ pub fn output_results(
             ));
 
             // 2. CSV Output
-            let escaped_path = fp.path.replace('"', "\"\"");
-            csv_out.push_str(&format!(
-                "{};{};{};{};\"{}\"\n",
-                group_name, res_str, size_str, duration_str, escaped_path
-            ));
+            csv_wtr.write_record(&[
+                &group_name,
+                &res_str,
+                &size_str,
+                &duration_str,
+                &fp.path,
+            ]).context("Failed to write CSV record")?;
 
             // 3. JSON File Output
             json_files.push(serde_json::json!({
@@ -94,7 +103,8 @@ pub fn output_results(
 
         match ext.as_str() {
             "csv" => {
-                std::fs::write(path, csv_out)
+                let csv_bytes = csv_wtr.into_inner().context("Failed to finalize CSV buffer")?;
+                std::fs::write(path, csv_bytes)
                     .context(format!("Failed to write CSV to {}", out_path))?;
             }
             "json" => {
