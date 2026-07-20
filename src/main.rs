@@ -1,16 +1,32 @@
 mod compare;
 mod fingerprint;
 
+use clap::Parser; // Added for argument parsing
 use compare::find_all_matches;
 use fingerprint::{fingerprint_video, VideoFingerprint};
 use rayon::prelude::*;
 use std::collections::HashSet;
-use std::env;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::io::Write;
 use std::time::Instant;
 use walkdir::WalkDir;
+
+// Define the CLI arguments
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Folder path to scan for videos
+    folder_path: String,
+
+    /// Maximum Hamming distance
+    #[arg(short = 'd', long = "hamming-distance", default_value_t = 6)]
+    hamming_distance: u32,
+
+    /// Minimum match percentage (e.g., 15 for 15%)
+    #[arg(short = 'p', long = "match-percent", default_value_t = 10.0)]
+    match_percent: f32,
+}
 
 // Graph Traversal with Pivoting logic to handle aggressive densifying cliques flawlessly
 fn bron_kerbosch(
@@ -55,21 +71,26 @@ fn main() {
     // Start tracking time immediately upon execution
     let start_time = Instant::now();
 
+    // Parse command line arguments
+    let args = Args::parse();
+
     ffmpeg_next::init().expect("Failed to initialize FFmpeg bindings.");
     ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Quiet);
 
-    let folder_path = env::args().nth(1).expect("Please provide a folder path!");
+    let folder_path = args.folder_path;
     
     // Initialize embedded Sled Database Cache 
     let db = sled::open("video_hashes.db").expect("Failed to open cache database");
     
-    let max_hamming = 6;
-    let min_match_pct = 0.10;
+    // Extract parameters and convert percentage to float (15.0 -> 0.15)
+    let max_hamming = args.hamming_distance;
+    let min_match_pct = args.match_percent / 100.0;
 
     let extensions = ["mp4", "mkv", "avi", "mov", "flv", "webm"];
     let mut video_files = Vec::new();
 
     println!("Scanning folder recursively: {}", folder_path);
+    println!("Settings -> Max Hamming: {}, Min Match: {}%", max_hamming, args.match_percent);
 
     for entry in WalkDir::new(&folder_path).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
