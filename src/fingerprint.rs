@@ -7,6 +7,10 @@ pub struct VideoFingerprint {
     pub valid_t_start: Vec<u32>,
     pub valid_t_end: Vec<u32>,
     pub total_frames: u32,
+    pub width: u32,
+    pub height: u32,
+    pub duration: f64,
+    pub file_size: u64,
 }
 
 pub fn fingerprint_video(filepath: &str) -> Option<VideoFingerprint> {
@@ -15,13 +19,30 @@ pub fn fingerprint_video(filepath: &str) -> Option<VideoFingerprint> {
     let input = ictx.streams().best(ffmpeg_next::media::Type::Video)?;
     let video_stream_index = input.index();
 
+    // Extract duration natively from stream or format context without delay
+    let mut duration_sec = 0.0;
+    let stream_duration = input.duration();
+    if stream_duration >= 0 {
+        let tb = input.time_base();
+        if tb.denominator() > 0 {
+            duration_sec = stream_duration as f64 * (tb.numerator() as f64 / tb.denominator() as f64);
+        }
+    }
+    if duration_sec <= 0.0 {
+        duration_sec = ictx.duration() as f64 / 1_000_000.0; // Fallback to FFmpeg's AV_TIME_BASE format duration
+    }
+
     let context_decoder = ffmpeg_next::codec::context::Context::from_parameters(input.parameters()).ok()?;
     let mut decoder = context_decoder.decoder().video().ok()?;
 
+    let width = decoder.width();
+    let height = decoder.height();
+    let file_size = std::fs::metadata(filepath).map(|m| m.len()).unwrap_or(0);
+
     let mut scaler = ffmpeg_next::software::scaling::context::Context::get(
         decoder.format(),
-        decoder.width(),
-        decoder.height(),
+        width,
+        height,
         ffmpeg_next::format::Pixel::GRAY8,
         64,
         64,
@@ -253,5 +274,9 @@ pub fn fingerprint_video(filepath: &str) -> Option<VideoFingerprint> {
         valid_t_start: final_t_start,
         valid_t_end: final_t_end,
         total_frames: total_frames as u32,
+        width,
+        height,
+        duration: duration_sec,
+        file_size,
     })
 }

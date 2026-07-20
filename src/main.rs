@@ -67,6 +67,28 @@ fn bron_kerbosch(
     }
 }
 
+// Helpers for formatted printing
+fn format_size(bytes: u64) -> String {
+    let b = bytes as f64;
+    if b >= 1_073_741_824.0 {
+        format!("{:.1}GB", b / 1_073_741_824.0).replace('.', ",")
+    } else if b >= 1_048_576.0 {
+        format!("{:.1}MB", b / 1_048_576.0).replace('.', ",")
+    } else if b >= 1024.0 {
+        format!("{:.1}KB", b / 1024.0).replace('.', ",")
+    } else {
+        format!("{}B", bytes)
+    }
+}
+
+fn format_duration(seconds: f64) -> String {
+    let total_secs = seconds.round() as u64;
+    let hours = total_secs / 3600;
+    let mins = (total_secs % 3600) / 60;
+    let secs = total_secs % 60;
+    format!("{:02}:{:02}:{:02}", hours, mins, secs)
+}
+
 fn main() {
     // Start tracking time immediately upon execution
     let start_time = Instant::now();
@@ -224,14 +246,15 @@ fn main() {
         }
     }
 
-    let mut final_groups: Vec<Vec<String>> = Vec::new();
+    // Keep indices mapped directly to the original struct to print properties naturally
+    let mut final_groups: Vec<Vec<usize>> = Vec::new();
     for g in final_groups_sets {
-        let mut group_paths: Vec<String> = g.into_iter().map(|idx| fingerprints[idx].path.clone()).collect();
-        group_paths.sort();
-        final_groups.push(group_paths);
+        let mut group_indices: Vec<usize> = g.into_iter().collect();
+        group_indices.sort_by(|&a, &b| fingerprints[a].path.cmp(&fingerprints[b].path));
+        final_groups.push(group_indices);
     }
 
-    final_groups.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a[0].cmp(&b[0])));
+    final_groups.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| fingerprints[a[0]].path.cmp(&fingerprints[b[0]].path)));
 
     println!("\n========================================");
     println!("             RESULTS");
@@ -240,11 +263,14 @@ fn main() {
     let mut total_files_linked = 0;
 
     for (i, group) in final_groups.iter().enumerate() {
-        println!("group{}:", i + 1);
+        println!("group_{}:", i + 1);
         total_files_linked += group.len();
         
-        for path_str in group {
-            println!("{}", Path::new(path_str).file_name().unwrap_or_default().to_string_lossy());
+        for &idx in group {
+            let fp = &fingerprints[idx];
+            let size_str = format_size(fp.file_size);
+            let duration_str = format_duration(fp.duration);
+            println!("\t{}x{}, {}, {}, {}", fp.width, fp.height, size_str, duration_str, fp.path);
         }
         println!();
     }
