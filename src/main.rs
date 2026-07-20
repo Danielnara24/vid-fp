@@ -4,17 +4,21 @@ mod export;
 mod fingerprint;
 mod utils;
 
+use anyhow::{Context, Result};
 use clap::Parser;
 use compare::find_all_matches;
 use fingerprint::{fingerprint_video, VideoFingerprint};
+use indicatif::{ProgressBar, ProgressStyle};
+use log::info;
 use rayon::prelude::*;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use walkdir::WalkDir;
 
-// Define the CLI arguments
+// Cache schema versioning - bump this if VideoFingerprint struct ever changes!
+const CACHE_VERSION: &str = "v1";
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -38,15 +42,33 @@ struct Args {
     silent: bool,
 }
 
-fn main() {
+fn main() -> Result<()> {
     let start_time = Instant::now();
     let args = Args::parse();
-    let silent = args.silent;
 
-    ffmpeg_next::init().expect("Failed to initialize FFmpeg bindings.");
+    // 1. Initialize custom CLI Logger
+    // This removes the need for `if !silent` everywhere. If silent, only Errors print.
+    let log_level = if args.silent {
+        log::LevelFilter::Error
+    } else {
+        log::LevelFilter::Info
+    };
+
+    env_logger::Builder::new()
+        .filter_level(log_level)
+        .format(|buf, record| {
+            if record.level() == log::Level::Error {
+                writeln!(buf, "Error: {}", record.args())
+            } else {
+                writeln!(buf, "{}", record.args()) // Clean output for CLI tools
+            }
+        })
+        .init();
+
+    ffmpeg_next::init().context("Failed to initialize FFmpeg bindings.")?;
     ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Quiet);
 
-    // Follow XDG Base Directory Specification for caching on Linux
+    // Follow XDG Base Directory Specification for caching
     let cache_dir = std::env::var("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
@@ -58,10 +80,10 @@ fn main() {
         })
         .join("video-dedup");
 
-    std::fs::create_dir_all(&cache_dir).expect("Failed to create cache directory");
+    std::fs::create_dir_all(&cache_dir).context("Failed to create cache directory")?;
     let db_path = cache_dir.join("video_hashes.db");
 
-    let db = sled::open(&db_path).expect("Failed to open cache database");
+    let db = sled::open(&db_path).context("Failed to open or lock cache database")?;
 
     let max_hamming = args.hamming_distance;
     let min_match_pct = args.match_percent / 100.0;
@@ -69,14 +91,12 @@ fn main() {
     let extensions = ["mp4", "mkv", "avi", "mov", "flv", "webm"];
     let mut video_files = Vec::new();
 
-    if !silent {
-        println!("Scanning folder recursively: {}", args.folder_path);
-        println!(
-            "Settings -> Max Hamming: {}, Min Match: {}%",
-            max_hamming, args.match_percent
-        );
-        println!("Using Cache Directory: {}", cache_dir.display());
-    }
+    info!("Scanning folder recursively: {}", args.folder_path);
+    info!(
+        "Settings -> Max Hamming: {}, Min Match: {}%",
+        max_hamming, args.match_percent
+    );
+    info!("Using Cache Directory: {}", cache_dir.display());
 
     for entry in WalkDir::new(&args.folder_path).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
@@ -90,42 +110,34 @@ fn main() {
     }
 
     if video_files.is_empty() {
-        if !silent {
-            println!("No videos found.");
-        }
-        return;
+        info!("No videos found.");
+        return Ok(());
     }
 
     let total_videos = video_files.len();
-    if !silent {
-        println!("Found {} video files. Fingerprinting...", total_videos);
-    }
+    info!("Found {} video files. Fingerprinting...", total_videos);
 
-    let processed_count = AtomicUsize::new(0);
-
-    let print_progress = |status: &str, done: usize, total: usize, start: Instant, vf: &str| {
-        if silent {
-            return;
-        }
-        let pct = (done as f64 / total as f64) * 100.0;
-        let elapsed = start.elapsed().as_secs();
-        let hours = elapsed / 3600;
-        let mins = (elapsed % 3600) / 60;
-        let secs = elapsed % 60;
-        let filename = Path::new(vf).file_name().unwrap_or_default().to_string_lossy();
-
-        let mut stdout = std::io::stdout().lock();
-        let _ = write!(
-            stdout,
-            "\x1B[2K\r[{}] {}/{} [{:.1}%] - Time elapsed: {:02}:{:02}:{:02} - {}",
-            status, done, total, pct, hours, mins, secs, filename
+    // 2. Setup robust Thread-Safe Progress Bar
+    let pb = if args.silent {
+        ProgressBar::hidden()
+    } else {
+        let pb = ProgressBar::new(total_videos as u64);
+        pb.set_style(
+            ProgressStyle::with_template(
+                "[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) - {msg}",
+            )
+            .unwrap()
+            .progress_chars("=>-"),
         );
-        let _ = stdout.flush();
+        pb
     };
 
     let fingerprints: Vec<VideoFingerprint> = video_files
         .par_iter()
         .filter_map(|vf| {
+            let file_name = Path::new(vf).file_name().unwrap_or_default().to_string_lossy().into_owned();
+            pb.set_message(file_name);
+
             let metadata = std::fs::metadata(vf).ok()?;
             let mtime = metadata
                 .modified()
@@ -135,13 +147,19 @@ fn main() {
                 .as_secs();
             let size = metadata.len();
 
-            let cache_key = format!("{}_{}_{}", vf, mtime, size);
+            // Versioned cache key ensures schema changes don't cause deserialization crashes
+            let cache_key = format!("{}_{}_{}_{}", vf, mtime, size, CACHE_VERSION);
 
             if let Ok(Some(data)) = db.get(&cache_key) {
-                if let Ok(fp) = bincode::deserialize::<VideoFingerprint>(&data) {
-                    let done = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
-                    print_progress("Cached", done, total_videos, start_time, vf);
-                    return Some(fp);
+                match bincode::deserialize::<VideoFingerprint>(&data) {
+                    Ok(fp) => {
+                        pb.inc(1);
+                        return Some(fp);
+                    }
+                    Err(_) => {
+                        // Corrupted or outdated schema; ignore and overwrite below
+                        log::debug!("Cache deserialization failed for {}. Re-processing.", vf);
+                    }
                 }
             }
 
@@ -151,46 +169,34 @@ fn main() {
                 let _ = db.insert(&cache_key, encoded);
             }
 
-            let done = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
-            print_progress("Processing", done, total_videos, start_time, vf);
+            pb.inc(1);
             Some(fp)
         })
         .collect();
 
-    if !silent {
-        println!();
-    }
+    pb.finish_and_clear();
     let _ = db.flush();
 
     let n = fingerprints.len();
     if n < 2 {
-        if !silent {
-            println!("Not enough valid videos to compare.");
-        }
-        return;
+        info!("Not enough valid videos to compare.");
+        return Ok(());
     }
 
-    if !silent {
-        println!(
-            "\nFingerprinting complete. Cross-analyzing {} videos...",
-            n
-        );
-    }
+    info!("\nFingerprinting complete. Cross-analyzing {} videos...", n);
 
-    // Process logic is now cleanly offloaded
     let edges = find_all_matches(&fingerprints, max_hamming, min_match_pct);
     
-    if !silent {
-        println!("Grouping duplicate clusters...");
-    }
+    info!("Grouping duplicate clusters...");
     
     let final_groups = clustering::find_duplicate_groups(n, edges, &fingerprints);
 
     export::output_results(
         &final_groups,
         &fingerprints,
-        silent,
         args.output.as_ref(),
         start_time.elapsed().as_secs(),
-    );
+    )?;
+
+    Ok(())
 }

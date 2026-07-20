@@ -1,3 +1,5 @@
+use anyhow::{Context, Result};
+use log::info;
 use crate::fingerprint::VideoFingerprint;
 use crate::utils::{format_duration, format_size};
 use std::path::Path;
@@ -5,15 +7,13 @@ use std::path::Path;
 pub fn output_results(
     final_groups: &[Vec<usize>],
     fingerprints: &[VideoFingerprint],
-    silent: bool,
     output_file: Option<&String>,
     total_elapsed_secs: u64,
-) {
-    if !silent {
-        println!("\n========================================");
-        println!("             RESULTS");
-        println!("========================================\n");
-    }
+) -> Result<()> {
+    
+    info!("\n========================================");
+    info!("             RESULTS");
+    info!("========================================\n");
 
     let mut total_files_linked = 0;
 
@@ -24,9 +24,7 @@ pub fn output_results(
     for (i, group) in final_groups.iter().enumerate() {
         let group_name = format!("group_{}", i + 1);
 
-        if !silent {
-            println!("{}:", group_name);
-        }
+        info!("{}:", group_name);
         txt_out.push_str(&format!("{}:\n", group_name));
 
         total_files_linked += group.len();
@@ -39,9 +37,7 @@ pub fn output_results(
             let res_str = format!("{}x{}", fp.width, fp.height);
 
             // 1. Console / Text Output
-            if !silent {
-                println!("\t{}, {}, {}, {}", res_str, size_str, duration_str, fp.path);
-            }
+            info!("\t{}, {}, {}, {}", res_str, size_str, duration_str, fp.path);
             txt_out.push_str(&format!(
                 "\t{}, {}, {}, {}\n",
                 res_str, size_str, duration_str, fp.path
@@ -63,9 +59,7 @@ pub fn output_results(
             }));
         }
 
-        if !silent {
-            println!();
-        }
+        info!(""); // Empty line for spacing
         txt_out.push_str("\n");
 
         json_out_groups.push(serde_json::json!({
@@ -87,10 +81,9 @@ pub fn output_results(
         total_secs
     );
 
-    if !silent {
-        println!("{}", summary);
-    }
+    info!("{}", summary);
 
+    // Save outputs cleanly returning Result<()>
     if let Some(out_path) = output_file {
         let path = Path::new(&out_path);
         let ext = path
@@ -99,8 +92,11 @@ pub fn output_results(
             .unwrap_or("")
             .to_lowercase();
 
-        let write_result = match ext.as_str() {
-            "csv" => std::fs::write(path, csv_out),
+        match ext.as_str() {
+            "csv" => {
+                std::fs::write(path, csv_out)
+                    .context(format!("Failed to write CSV to {}", out_path))?;
+            }
             "json" => {
                 let json_final = serde_json::json!({
                     "summary": {
@@ -111,6 +107,7 @@ pub fn output_results(
                     "results": json_out_groups
                 });
                 std::fs::write(path, serde_json::to_string_pretty(&json_final).unwrap())
+                    .context(format!("Failed to write JSON to {}", out_path))?;
             }
             _ => {
                 let mut full_txt = String::new();
@@ -119,16 +116,12 @@ pub fn output_results(
                 full_txt.push_str("\n");
 
                 std::fs::write(path, full_txt)
+                    .context(format!("Failed to write Text to {}", out_path))?;
             }
         };
 
-        match write_result {
-            Ok(_) => {
-                if !silent {
-                    println!("\nResults successfully saved to {}", out_path);
-                }
-            }
-            Err(e) => eprintln!("\nError saving results to {}: {}", out_path, e),
-        }
+        info!("\nResults saved to {}", out_path);
     }
+
+    Ok(())
 }
