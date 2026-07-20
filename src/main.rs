@@ -142,12 +142,20 @@ fn main() -> Result<()> {
             let file_name = Path::new(vf).file_name().unwrap_or_default().to_string_lossy().into_owned();
             pb.set_message(file_name);
 
-            let metadata = std::fs::metadata(vf).ok()?;
+            let metadata = match std::fs::metadata(vf) {
+                Ok(m) => m,
+                Err(e) => {
+                    log::error!("Cannot access metadata for {}: {}", vf, e);
+                    pb.inc(1);
+                    return None;
+                }
+            };
+
             let mtime = metadata
                 .modified()
                 .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs();
             let size = metadata.len();
 
@@ -160,14 +168,21 @@ fn main() -> Result<()> {
                         pb.inc(1);
                         return Some(fp);
                     }
-                    Err(_) => {
+                    Err(e) => {
                         // Corrupted or outdated schema; ignore and overwrite below
-                        log::debug!("Cache deserialization failed for {}. Re-processing.", vf);
+                        log::debug!("Cache deserialization failed for {}: {}. Re-processing.", vf, e);
                     }
                 }
             }
 
-            let fp = fingerprint_video(vf)?;
+            let fp = match fingerprint_video(vf) {
+                Ok(f) => f,
+                Err(e) => {
+                    log::error!("Failed to process {}: {:#}", vf, e);
+                    pb.inc(1); // Increment progress bar so it completes properly
+                    return None;
+                }
+            };
 
             // Batch database insertions to heavily reduce Disk I/O bottlenecks
             if let Ok(encoded) = bincode::serialize(&fp) {

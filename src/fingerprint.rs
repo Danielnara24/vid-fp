@@ -1,3 +1,4 @@
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -13,10 +14,13 @@ pub struct VideoFingerprint {
     pub file_size: u64,
 }
 
-pub fn fingerprint_video(filepath: &str) -> Option<VideoFingerprint> {
+pub fn fingerprint_video(filepath: &str) -> Result<VideoFingerprint> {
     // 1. Native Zero-Copy Extraction (No Subprocess Overhead)
-    let mut ictx = ffmpeg_next::format::input(&filepath).ok()?;
-    let input = ictx.streams().best(ffmpeg_next::media::Type::Video)?;
+    let mut ictx = ffmpeg_next::format::input(&filepath)
+        .with_context(|| format!("Failed to open video file: {}", filepath))?;
+        
+    let input = ictx.streams().best(ffmpeg_next::media::Type::Video)
+        .ok_or_else(|| anyhow!("No video stream found in {}", filepath))?;
     let video_stream_index = input.index();
 
     // Extract duration natively from stream or format context without delay
@@ -32,8 +36,10 @@ pub fn fingerprint_video(filepath: &str) -> Option<VideoFingerprint> {
         duration_sec = ictx.duration() as f64 / 1_000_000.0; // Fallback to FFmpeg's AV_TIME_BASE format duration
     }
 
-    let context_decoder = ffmpeg_next::codec::context::Context::from_parameters(input.parameters()).ok()?;
-    let mut decoder = context_decoder.decoder().video().ok()?;
+    let context_decoder = ffmpeg_next::codec::context::Context::from_parameters(input.parameters())
+        .context("Failed to create codec context from parameters")?;
+    let mut decoder = context_decoder.decoder().video()
+        .context("Failed to initialize video decoder")?;
 
     let width = decoder.width();
     let height = decoder.height();
@@ -47,7 +53,7 @@ pub fn fingerprint_video(filepath: &str) -> Option<VideoFingerprint> {
         64,
         64,
         ffmpeg_next::software::scaling::flag::Flags::FAST_BILINEAR,
-    ).ok()?;
+    ).context("Failed to initialize video scaler")?;
 
     let mut u_frames = Vec::new();
     let mut unique_frame_indices = Vec::new();
@@ -112,7 +118,9 @@ pub fn fingerprint_video(filepath: &str) -> Option<VideoFingerprint> {
     }
 
     let total_frames = frame_idx;
-    if total_frames == 0 { return None; }
+    if total_frames == 0 { 
+        return Err(anyhow!("No valid frames found or successfully decoded in {}", filepath)); 
+    }
 
     let n_unique = u_frames.len();
     let n_f32 = n_unique as f32;
@@ -268,7 +276,7 @@ pub fn fingerprint_video(filepath: &str) -> Option<VideoFingerprint> {
         }
     }
 
-    Some(VideoFingerprint {
+    Ok(VideoFingerprint {
         path: filepath.to_string(),
         valid_hashes: final_hashes,
         valid_t_start: final_t_start,
