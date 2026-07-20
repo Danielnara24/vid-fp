@@ -30,6 +30,10 @@ struct Args {
     /// Output file for the results (supports .txt, .csv, .json)
     #[arg(short = 'o', long = "output")]
     output: Option<String>,
+
+    /// Suppress all terminal output except errors
+    #[arg(short = 's', long = "silent")]
+    silent: bool,
 }
 
 // Graph Traversal with Pivoting logic to handle aggressive densifying cliques flawlessly
@@ -100,6 +104,7 @@ fn main() {
 
     // Parse command line arguments
     let args = Args::parse();
+    let silent = args.silent;
 
     ffmpeg_next::init().expect("Failed to initialize FFmpeg bindings.");
     ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Quiet);
@@ -116,8 +121,10 @@ fn main() {
     let extensions = ["mp4", "mkv", "avi", "mov", "flv", "webm"];
     let mut video_files = Vec::new();
 
-    println!("Scanning folder recursively: {}", folder_path);
-    println!("Settings -> Max Hamming: {}, Min Match: {}%", max_hamming, args.match_percent);
+    if !silent {
+        println!("Scanning folder recursively: {}", folder_path);
+        println!("Settings -> Max Hamming: {}, Min Match: {}%", max_hamming, args.match_percent);
+    }
 
     for entry in WalkDir::new(&folder_path).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
@@ -131,17 +138,21 @@ fn main() {
     }
 
     if video_files.is_empty() { 
-        println!("No videos found.");
+        if !silent { println!("No videos found."); }
         return; 
     }
     
     let total_videos = video_files.len();
-    println!("Found {} video files. Starting parallel fingerprinting...", total_videos);
+    if !silent {
+        println!("Found {} video files. Fingerprinting...", total_videos);
+    }
 
     let processed_count = AtomicUsize::new(0);
 
     // Helper closure to format and cleanly overwrite the single line progress bar output
     let print_progress = |status: &str, done: usize, total: usize, start: Instant, vf: &str| {
+        if silent { return; }
+
         let pct = (done as f64 / total as f64) * 100.0;
         let elapsed = start.elapsed().as_secs();
         let hours = elapsed / 3600;
@@ -191,16 +202,16 @@ fn main() {
         })
         .collect();
 
-    println!(); // Move to a new line once the single-line progress iteration is complete
+    if !silent { println!(); } // Move to a new line once the single-line progress iteration is complete
     let _ = db.flush();
 
     let n = fingerprints.len();
     if n < 2 {
-        println!("Not enough valid videos to compare.");
+        if !silent { println!("Not enough valid videos to compare."); }
         return;
     }
 
-    println!("\nFingerprinting complete. Cross-analyzing {} videos...", n);
+    if !silent { println!("\nFingerprinting complete. Cross-analyzing {} videos...", n); }
 
     // 2. Global Multi-Index Pair Analysis mapped in Parallel completely bypassing nested loop O(N*N) traps
     let mut adjacency = vec![HashSet::new(); n];
@@ -211,7 +222,7 @@ fn main() {
         adjacency[j].insert(i);
     }
 
-    println!("Grouping duplicate clusters...");
+    if !silent { println!("Grouping duplicate clusters..."); }
     let mut base_cliques = Vec::new();
     let all_nodes: HashSet<usize> = (0..n).collect();
     
@@ -261,9 +272,11 @@ fn main() {
 
     final_groups.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| fingerprints[a[0]].path.cmp(&fingerprints[b[0]].path)));
 
-    println!("\n========================================");
-    println!("             RESULTS");
-    println!("========================================\n");
+    if !silent {
+        println!("\n========================================");
+        println!("             RESULTS");
+        println!("========================================\n");
+    }
 
     let mut total_files_linked = 0;
 
@@ -276,7 +289,7 @@ fn main() {
     for (i, group) in final_groups.iter().enumerate() {
         let group_name = format!("group_{}", i + 1);
         
-        println!("{}:", group_name);
+        if !silent { println!("{}:", group_name); }
         txt_out.push_str(&format!("{}:\n", group_name));
         
         total_files_linked += group.len();
@@ -290,7 +303,7 @@ fn main() {
             let res_str = format!("{}x{}", fp.width, fp.height);
             
             // 1. Console / Text Output
-            println!("\t{}, {}, {}, {}", res_str, size_str, duration_str, fp.path);
+            if !silent { println!("\t{}, {}, {}, {}", res_str, size_str, duration_str, fp.path); }
             txt_out.push_str(&format!("\t{}, {}, {}, {}\n", res_str, size_str, duration_str, fp.path));
             
             // 2. CSV Output (Semicolon Delimiter)
@@ -306,7 +319,7 @@ fn main() {
             }));
         }
         
-        println!();
+        if !silent { println!(); }
         txt_out.push_str("\n");
         
         json_out_groups.push(serde_json::json!({
@@ -323,7 +336,7 @@ fn main() {
     let summary = format!("Total groups found: {}\nTotal files linked: {}\nTotal time elapsed: {:02}:{:02}:{:02}", 
         final_groups.len(), total_files_linked, total_hours, total_mins, total_secs);
     
-    println!("{}", summary);
+    if !silent { println!("{}", summary); }
 
     // Save to the specified output file if requested by the user
     if let Some(out_path) = args.output {
@@ -355,7 +368,12 @@ fn main() {
         };
 
         match write_result {
-            Ok(_) => println!("\nResults successfully saved to {}", out_path),
+            Ok(_) => {
+                if !silent {
+                    println!("\nResults successfully saved to {}", out_path);
+                }
+            },
+            // Errors remain unsuppressed, printed to stderr
             Err(e) => eprintln!("\nError saving results to {}: {}", out_path, e),
         }
     }
