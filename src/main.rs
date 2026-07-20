@@ -132,6 +132,10 @@ fn main() -> Result<()> {
         pb
     };
 
+    // Thread-safe Sled Batching 
+    let batch_lock = std::sync::Mutex::new((sled::Batch::default(), 0));
+    const BATCH_SIZE: usize = 32; // Flush to disk after every 64 writes
+
     let fingerprints: Vec<VideoFingerprint> = video_files
         .par_iter()
         .filter_map(|vf| {
@@ -165,8 +169,20 @@ fn main() -> Result<()> {
 
             let fp = fingerprint_video(vf)?;
 
+            // Batch database insertions to heavily reduce Disk I/O bottlenecks
             if let Ok(encoded) = bincode::serialize(&fp) {
-                let _ = db.insert(&cache_key, encoded);
+                let mut b = batch_lock.lock().unwrap();
+                b.0.insert(cache_key.as_bytes(), encoded);
+                b.1 += 1;
+                
+                if b.1 >= BATCH_SIZE {
+                    let current_batch = std::mem::take(&mut b.0);
+                    b.1 = 0;
+                    
+                    // Release the lock BEFORE writing so other threads can keep appending to the new empty batch
+                    drop(b);
+                    let _ = db.apply_batch(current_batch);
+                }
             }
 
             pb.inc(1);
@@ -175,6 +191,14 @@ fn main() -> Result<()> {
         .collect();
 
     pb.finish_and_clear();
+    
+    // Apply any remaining queued database items that haven't hit the size trigger
+    if let Ok(b) = batch_lock.into_inner() {
+        if b.1 > 0 {
+            let _ = db.apply_batch(b.0);
+        }
+    }
+    
     let _ = db.flush();
 
     let n = fingerprints.len();
