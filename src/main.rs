@@ -11,6 +11,7 @@ use fingerprint::{fingerprint_video, VideoFingerprint};
 use indicatif::{ProgressBar, ProgressStyle};
 use log::info;
 use rayon::prelude::*;
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -36,6 +37,14 @@ struct Args {
     /// Output file for the results (supports .txt, .csv, .json)
     #[arg(short = 'o', long = "output")]
     output: Option<String>,
+
+    /// Delete ALL cache before running
+    #[arg(short = 'C', long = "clear-cache")]
+    clear_cache: bool,
+
+    /// Delete the cache of files not included in the current folder to scan
+    #[arg(short = 'P', long = "prune-cache")]
+    prune_cache: bool,
 
     /// Suppress all terminal output except errors
     #[arg(short = 's', long = "silent")]
@@ -85,6 +94,11 @@ fn main() -> Result<()> {
 
     let db = sled::open(&db_path).context("Failed to open or lock cache database")?;
 
+    if args.clear_cache {
+        info!("Clearing all cache...");
+        db.clear().context("Failed to clear cache database")?;
+    }
+
     let max_hamming = args.hamming_distance;
     let min_match_pct = args.match_percent / 100.0;
 
@@ -106,6 +120,43 @@ fn main() -> Result<()> {
                     video_files.push(path.to_string_lossy().to_string());
                 }
             }
+        }
+    }
+
+    if args.prune_cache && !args.clear_cache {
+        info!("Pruning cache for files not in the current scan...");
+        let valid_files: HashSet<&str> = video_files.iter().map(|s| s.as_str()).collect();
+        let mut batch = sled::Batch::default();
+        let mut pruned_count = 0;
+
+        for kv in db.iter() {
+            if let Ok((key_bytes, _)) = kv {
+                let mut should_remove = true;
+                if let Ok(key_str) = std::str::from_utf8(&key_bytes) {
+                    // Extract filepath from cache key (format: filepath_mtime_size_version)
+                    let mut parts = key_str.rsplitn(4, '_');
+                    let _version = parts.next();
+                    let _size = parts.next();
+                    let _mtime = parts.next();
+                    if let Some(filepath) = parts.next() {
+                        if valid_files.contains(filepath) {
+                            should_remove = false; // It's still valid, keep it
+                        }
+                    }
+                }
+                
+                if should_remove {
+                    batch.remove(key_bytes);
+                    pruned_count += 1;
+                }
+            }
+        }
+
+        if pruned_count > 0 {
+            db.apply_batch(batch).context("Failed to apply cache pruning")?;
+            info!("Pruned {} stale entries from cache.", pruned_count);
+        } else {
+            info!("No stale entries found to prune.");
         }
     }
 
@@ -134,7 +185,7 @@ fn main() -> Result<()> {
 
     // Thread-safe Sled Batching 
     let batch_lock = std::sync::Mutex::new((sled::Batch::default(), 0));
-    const BATCH_SIZE: usize = 32; // Flush to disk after every 64 writes
+    const BATCH_SIZE: usize = 32; // Flush to disk after every 32 writes
 
     let fingerprints: Vec<VideoFingerprint> = video_files
         .par_iter()
