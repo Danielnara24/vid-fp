@@ -38,14 +38,19 @@ pub fn fingerprint_video(filepath: &str) -> Option<VideoFingerprint> {
     let mut prev_frame = vec![0u8; 4096];
     let mut is_first = true;
 
-    let mut process_frame = |decoded: &ffmpeg_next::frame::Video| -> Result<(), ffmpeg_next::Error> {
-        let mut scaled = ffmpeg_next::frame::Video::empty();
-        scaler.run(decoded, &mut scaled)?;
+    // By hoisting `decoded`, `scaled`, and `current_frame` outside the loop, 
+    // we prevent extremely slow and fragmenting continuous allocation of AVFrame structures and memory buffers.
+    // FFmpeg's zero-copy buffer pool is now properly utilized.
+    let mut decoded = ffmpeg_next::frame::Video::empty();
+    let mut scaled = ffmpeg_next::frame::Video::empty();
+    let mut current_frame = vec![0u8; 4096];
+
+    let mut process_frame = |dec: &ffmpeg_next::frame::Video| -> Result<(), ffmpeg_next::Error> {
+        scaler.run(dec, &mut scaled)?;
 
         let data = scaled.data(0);
         let stride = scaled.stride(0);
 
-        let mut current_frame = vec![0u8; 4096];
         for y in 0..64 {
             let src_idx = y * stride;
             let dst_idx = y * 64;
@@ -62,7 +67,7 @@ pub fn fingerprint_video(filepath: &str) -> Option<VideoFingerprint> {
                 sum_sq[i] += v * v;
             }
 
-            prev_frame = current_frame;
+            prev_frame.copy_from_slice(&current_frame);
             is_first = false;
         }
         frame_idx += 1;
@@ -73,7 +78,6 @@ pub fn fingerprint_video(filepath: &str) -> Option<VideoFingerprint> {
     for (stream, packet) in ictx.packets() {
         if stream.index() == video_stream_index && packet.is_key() {
             if decoder.send_packet(&packet).is_ok() {
-                let mut decoded = ffmpeg_next::frame::Video::empty();
                 while decoder.receive_frame(&mut decoded).is_ok() {
                     let _ = process_frame(&decoded);
                 }
@@ -82,7 +86,6 @@ pub fn fingerprint_video(filepath: &str) -> Option<VideoFingerprint> {
     }
 
     let _ = decoder.send_eof();
-    let mut decoded = ffmpeg_next::frame::Video::empty();
     while decoder.receive_frame(&mut decoded).is_ok() {
         let _ = process_frame(&decoded);
     }

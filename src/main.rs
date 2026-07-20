@@ -39,8 +39,8 @@ fn bron_kerbosch(
         new_r.insert(v);
 
         let neighbors = &adjacency[v];
-        let new_p: HashSet<usize> = p.intersection(neighbors).cloned().collect();
-        let new_x: HashSet<usize> = x.intersection(neighbors).cloned().collect();
+        let new_p: HashSet<usize> = neighbors.intersection(&p).cloned().collect();
+        let new_x: HashSet<usize> = neighbors.intersection(&x).cloned().collect();
 
         bron_kerbosch(new_r, new_p, new_x, adjacency, base_cliques);
 
@@ -51,6 +51,7 @@ fn bron_kerbosch(
 
 fn main() {
     ffmpeg_next::init().expect("Failed to initialize FFmpeg bindings.");
+    ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Quiet);
 
     let folder_path = env::args().nth(1).expect("Please provide a folder path!");
     

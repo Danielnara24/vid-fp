@@ -83,9 +83,24 @@ pub fn find_all_matches(
                 for k in 0..4 {
                     for bit in 0..17 {
                         let key = if bit == 16 { b[k] } else { b[k] ^ (1 << bit) };
-                        for entry in indices[k].get_bin(key) {
-                            if entry.video_idx as usize > v_a {
-                                if (h_a ^ entry.hash).count_ones() <= max_hamming_dist {
+                        let bin_entries = indices[k].get_bin(key);
+                        
+                        // Binary search to skip past already processed videos to bypass O(N^2) linear scanning waste
+                        let start_idx = bin_entries.partition_point(|e| (e.video_idx as usize) <= v_a);
+                        
+                        for entry in &bin_entries[start_idx..] {
+                            let xor = h_a ^ entry.hash;
+                            if xor.count_ones() <= max_hamming_dist {
+                                // First-block deduplication: Only count the match if `k` is the very first block that would have successfully triggered it
+                                let mut is_first = true;
+                                for j in 0..k {
+                                    if ((xor >> (48 - j * 16)) & 0xFFFF).count_ones() <= 1 {
+                                        is_first = false;
+                                        break;
+                                    }
+                                }
+                                
+                                if is_first {
                                     matches_flat.push((entry.video_idx as usize, idx_a as u32, entry.hash_idx));
                                 }
                             }
