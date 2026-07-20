@@ -1,7 +1,7 @@
 mod compare;
 mod fingerprint;
 
-use clap::Parser; // Added for argument parsing
+use clap::Parser;
 use compare::find_all_matches;
 use fingerprint::{fingerprint_video, VideoFingerprint};
 use rayon::prelude::*;
@@ -26,6 +26,10 @@ struct Args {
     /// Minimum match percentage (e.g., 15 for 15%)
     #[arg(short = 'p', long = "match-percent", default_value_t = 10.0)]
     match_percent: f32,
+
+    /// Output file for the results (supports .txt, .csv, .json)
+    #[arg(short = 'o', long = "output")]
+    output: Option<String>,
 }
 
 // Graph Traversal with Pivoting logic to handle aggressive densifying cliques flawlessly
@@ -70,12 +74,13 @@ fn bron_kerbosch(
 // Helpers for formatted printing
 fn format_size(bytes: u64) -> String {
     let b = bytes as f64;
+    // Rust's formatting inherently uses a dot (.) for decimals
     if b >= 1_073_741_824.0 {
-        format!("{:.1}GB", b / 1_073_741_824.0).replace('.', ",")
+        format!("{:.1}GB", b / 1_073_741_824.0)
     } else if b >= 1_048_576.0 {
-        format!("{:.1}MB", b / 1_048_576.0).replace('.', ",")
+        format!("{:.1}MB", b / 1_048_576.0)
     } else if b >= 1024.0 {
-        format!("{:.1}KB", b / 1024.0).replace('.', ",")
+        format!("{:.1}KB", b / 1024.0)
     } else {
         format!("{}B", bytes)
     }
@@ -262,17 +267,52 @@ fn main() {
 
     let mut total_files_linked = 0;
 
+    // Output builders to support file saving options (.txt, .csv, .json)
+    let mut txt_out = String::new();
+    // Switched to semicolon strictly to bypass any commas from paths or sizing locational defaults
+    let mut csv_out = String::from("group;resolution;size;length;full_path\n"); 
+    let mut json_out_groups = Vec::new();
+
     for (i, group) in final_groups.iter().enumerate() {
-        println!("group_{}:", i + 1);
+        let group_name = format!("group_{}", i + 1);
+        
+        println!("{}:", group_name);
+        txt_out.push_str(&format!("{}:\n", group_name));
+        
         total_files_linked += group.len();
         
+        let mut json_files = Vec::new();
+
         for &idx in group {
             let fp = &fingerprints[idx];
             let size_str = format_size(fp.file_size);
             let duration_str = format_duration(fp.duration);
-            println!("\t{}x{}, {}, {}, {}", fp.width, fp.height, size_str, duration_str, fp.path);
+            let res_str = format!("{}x{}", fp.width, fp.height);
+            
+            // 1. Console / Text Output
+            println!("\t{}, {}, {}, {}", res_str, size_str, duration_str, fp.path);
+            txt_out.push_str(&format!("\t{}, {}, {}, {}\n", res_str, size_str, duration_str, fp.path));
+            
+            // 2. CSV Output (Semicolon Delimiter)
+            let escaped_path = fp.path.replace('"', "\"\"");
+            csv_out.push_str(&format!("{};{};{};{};\"{}\"\n", group_name, res_str, size_str, duration_str, escaped_path));
+            
+            // 3. JSON File Output
+            json_files.push(serde_json::json!({
+                "resolution": res_str,
+                "size": size_str,
+                "length": duration_str,
+                "full_path": fp.path,
+            }));
         }
+        
         println!();
+        txt_out.push_str("\n");
+        
+        json_out_groups.push(serde_json::json!({
+            "group": group_name,
+            "files": json_files
+        }));
     }
 
     let total_elapsed = start_time.elapsed().as_secs();
@@ -280,7 +320,43 @@ fn main() {
     let total_mins = (total_elapsed % 3600) / 60;
     let total_secs = total_elapsed % 60;
 
-    println!("Total groups found: {}", final_groups.len());
-    println!("Total files linked: {}", total_files_linked);
-    println!("Total time elapsed: {:02}:{:02}:{:02}", total_hours, total_mins, total_secs);
+    let summary = format!("Total groups found: {}\nTotal files linked: {}\nTotal time elapsed: {:02}:{:02}:{:02}", 
+        final_groups.len(), total_files_linked, total_hours, total_mins, total_secs);
+    
+    println!("{}", summary);
+
+    // Save to the specified output file if requested by the user
+    if let Some(out_path) = args.output {
+        let path = Path::new(&out_path);
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+        
+        let write_result = match ext.as_str() {
+            "csv" => std::fs::write(path, csv_out),
+            "json" => {
+                let json_final = serde_json::json!({
+                    "summary": {
+                        "total_groups": final_groups.len(),
+                        "total_files_linked": total_files_linked,
+                        "time_elapsed_seconds": total_elapsed,
+                    },
+                    "results": json_out_groups
+                });
+                std::fs::write(path, serde_json::to_string_pretty(&json_final).unwrap())
+            },
+            _ => {
+                // Default to .txt format if nothing specific (.txt or random extension)
+                let mut full_txt = String::new();
+                full_txt.push_str(&txt_out);
+                full_txt.push_str(&summary);
+                full_txt.push_str("\n");
+                
+                std::fs::write(path, full_txt)
+            }
+        };
+
+        match write_result {
+            Ok(_) => println!("\nResults successfully saved to {}", out_path),
+            Err(e) => eprintln!("\nError saving results to {}: {}", out_path, e),
+        }
+    }
 }
