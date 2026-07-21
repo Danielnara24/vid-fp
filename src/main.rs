@@ -49,6 +49,10 @@ struct Args {
     /// Suppress all terminal output except errors
     #[arg(short = 's', long = "silent")]
     silent: bool,
+
+    /// Maximum number of threads to use. 0 uses all available CPU cores (default).
+    #[arg(short = 't', long = "threads", default_value_t = 0)]
+    threads: usize,
 }
 
 fn main() -> Result<()> {
@@ -73,6 +77,19 @@ fn main() -> Result<()> {
             }
         })
         .init();
+
+    // Configure Rayon thread pool if a specific limit is requested
+    if args.threads > 0 {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(args.threads)
+            .build_global()
+            .context("Failed to configure global thread pool")?;
+    }
+
+    let default_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let active_threads = if args.threads > 0 { args.threads } else { default_threads };
 
     ffmpeg_next::init().context("Failed to initialize FFmpeg bindings.")?;
     ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Quiet);
@@ -107,8 +124,8 @@ fn main() -> Result<()> {
 
     info!("Scanning folder recursively: {}", args.folder_path);
     info!(
-        "Settings -> Max Hamming: {}, Min Match: {}%",
-        max_hamming, args.match_percent
+        "Settings -> Max Hamming: {}, Min Match: {}%, Threads: {}",
+        max_hamming, args.match_percent, active_threads
     );
     info!("Using Cache Directory: {}", cache_dir.display());
 
