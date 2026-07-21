@@ -106,3 +106,63 @@ pub fn find_duplicate_groups(
 
     final_groups
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Helper function to create dummy fingerprints for testing
+    fn mock_fingerprint(path: &str) -> VideoFingerprint {
+        VideoFingerprint {
+            path: path.to_string(),
+            valid_hashes: vec![],
+            valid_t_start: vec![],
+            valid_t_end: vec![],
+            total_frames: 100,
+            width: 1920,
+            height: 1080,
+            duration: 10.0,
+            file_size: 1024,
+        }
+    }
+
+    #[test]
+    fn test_find_duplicate_groups_simple_clique() {
+        let fps = vec![
+            mock_fingerprint("a.mp4"),
+            mock_fingerprint("b.mp4"),
+            mock_fingerprint("c.mp4"),
+        ];
+
+        // Fully connected graph (a-b, b-c, a-c)
+        let edges = vec![(0, 1), (1, 2), (0, 2)];
+        
+        let groups = find_duplicate_groups(3, edges, &fps);
+        
+        assert_eq!(groups.len(), 1, "Should find exactly one group");
+        assert_eq!(groups[0].len(), 3, "Group should contain all 3 videos");
+        
+        // Ensure they are sorted by path
+        assert_eq!(groups[0], vec![0, 1, 2]); 
+    }
+
+    #[test]
+    fn test_find_duplicate_groups_disjoint_sets() {
+        let fps = vec![
+            mock_fingerprint("a.mp4"), // Group 1
+            mock_fingerprint("b.mp4"), // Group 1
+            mock_fingerprint("c.mp4"), // Group 2
+            mock_fingerprint("d.mp4"), // Group 2
+            mock_fingerprint("e.mp4"), // Unrelated
+        ];
+
+        // Edges: (a,b) and (c,d)
+        let edges = vec![(0, 1), (2, 3)];
+        
+        let groups = find_duplicate_groups(5, edges, &fps);
+        
+        assert_eq!(groups.len(), 2, "Should find exactly two groups");
+        assert!(groups.contains(&vec![0, 1]));
+        assert!(groups.contains(&vec![2, 3]));
+    }
+}

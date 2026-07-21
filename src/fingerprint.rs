@@ -288,3 +288,64 @@ pub fn fingerprint_video(filepath: &str) -> Result<VideoFingerprint> {
         file_size,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::Once;
+
+    // Rust runs tests in parallel. FFmpeg's global initialization must only happen once,
+    // so we use `std::sync::Once` to prevent thread-safety crashes during testing.
+    static INIT: Once = Once::new();
+
+    fn init_ffmpeg_for_tests() {
+        INIT.call_once(|| {
+            ffmpeg_next::init().expect("Failed to initialize FFmpeg for tests");
+            ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Quiet);
+        });
+    }
+
+    #[test]
+    fn test_fingerprint_real_video() {
+        init_ffmpeg_for_tests();
+
+        let mut fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        fixture_path.push("tests");
+        fixture_path.push("fixtures");
+        fixture_path.push("test_video.mp4"); // <--- CHANGE THIS TO YOUR EXACT FILE NAME
+
+        let filepath = fixture_path.to_string_lossy().to_string();
+        assert!(
+            fixture_path.exists(),
+            "Fixture video not found at: {}.",
+            filepath
+        );
+
+        // Run the fingerprinting function
+        let result = fingerprint_video(&filepath);
+        assert!(result.is_ok(), "Failed to fingerprint video: {:?}", result.err());
+        let fp = result.unwrap();
+
+        // Assert the properties of the generated fingerprint
+        assert!(fp.total_frames > 0, "Video should have parsed at least 1 frame");
+        assert!(fp.width > 0, "Video width should be parsed correctly");
+        assert!(fp.height > 0, "Video height should be parsed correctly");
+        assert!(fp.file_size > 0, "File size should be captured");
+        assert!(
+            fp.duration > 0.0 && fp.duration < 5.0, 
+            "Duration should be roughly 1 second, got: {}", fp.duration
+        );
+
+        // Ensure the hashing logic successfully triggered and populated arrays
+        assert!(
+            !fp.valid_hashes.is_empty(),
+            "Video should have generated at least one hash"
+        );
+        assert_eq!(
+            fp.valid_hashes.len(),
+            fp.valid_t_start.len(),
+            "Hash lists and timing lists must stay synchronized"
+        );
+    }
+}

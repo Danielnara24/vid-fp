@@ -135,3 +135,39 @@ pub fn output_results(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+    use std::fs;
+
+    fn mock_fp() -> VideoFingerprint {
+        VideoFingerprint {
+            path: "/fake/path/vid.mp4".to_string(),
+            valid_hashes: vec![], valid_t_start: vec![], valid_t_end: vec![],
+            total_frames: 100, width: 1920, height: 1080, duration: 60.0, file_size: 1048576,
+        }
+    }
+
+    #[test]
+    fn test_csv_output() {
+        let fps = vec![mock_fp()];
+        let groups = vec![vec![0]];
+        
+        let temp_file = NamedTempFile::new().unwrap();
+        let path_str = temp_file.path().with_extension("csv").to_string_lossy().to_string();
+
+        output_results(&groups, &fps, Some(&path_str), 120).unwrap();
+
+        let contents = fs::read_to_string(&path_str).unwrap();
+        
+        // Assert headers exist (separated by semicolons based on your logic)
+        assert!(contents.contains("group;resolution;size;length;full_path"));
+        // Assert data exists
+        assert!(contents.contains("group_1;1920x1080;1.0MB;00:01:00;/fake/path/vid.mp4"));
+        
+        // Clean up
+        let _ = fs::remove_file(path_str);
+    }
+}

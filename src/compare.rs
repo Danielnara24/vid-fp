@@ -156,3 +156,60 @@ pub fn find_all_matches(
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mock_fp_with_hashes(hashes: Vec<u64>, frames: u32) -> VideoFingerprint {
+        let len = hashes.len();
+        VideoFingerprint {
+            path: "mock.mp4".to_string(),
+            valid_hashes: hashes,
+            // Mock time intervals directly correlating to the index
+            valid_t_start: (0..len as u32).collect(),
+            valid_t_end: (1..=len as u32).collect(),
+            total_frames: frames,
+            width: 1920,
+            height: 1080,
+            duration: 10.0,
+            file_size: 1024,
+        }
+    }
+
+    #[test]
+    fn test_find_all_matches_exact() {
+        let hash = 0xFFFF_0000_FFFF_0000;
+        let fps = vec![
+            mock_fp_with_hashes(vec![hash, hash], 2), // Video A
+            mock_fp_with_hashes(vec![hash, hash], 2), // Video B (Exact match)
+        ];
+
+        // max_hamming: 0, min_match: 1.0 (100%)
+        let matches = find_all_matches(&fps, 0, 1.0);
+        
+        // Remember that find_all_matches tests pairs. Depending on thread order, 
+        // it usually yields pairs like (0, 1) or (1, 0)
+        assert!(!matches.is_empty(), "Exact duplicates should match");
+        assert!(matches.contains(&(0, 1)) || matches.contains(&(1, 0)));
+    }
+
+    #[test]
+    fn test_find_all_matches_hamming_limit() {
+        let base_hash = 0x0000_0000_0000_0000;
+        let diff_hash = 0x0000_0000_0000_0007; // 3 bits different
+
+        let fps = vec![
+            mock_fp_with_hashes(vec![base_hash, base_hash], 2), 
+            mock_fp_with_hashes(vec![diff_hash, diff_hash], 2), 
+        ];
+
+        // Should NOT match if max_hamming is 2
+        let no_matches = find_all_matches(&fps, 2, 1.0);
+        assert!(no_matches.is_empty(), "Should be filtered by hamming distance");
+
+        // SHOULD match if max_hamming is 3
+        let valid_matches = find_all_matches(&fps, 3, 1.0);
+        assert!(!valid_matches.is_empty(), "Should pass hamming distance check");
+    }
+}
