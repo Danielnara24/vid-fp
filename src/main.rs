@@ -15,6 +15,7 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use utils::Priority;
 use walkdir::WalkDir;
 
 // Cache schema versioning - bump this if VideoFingerprint struct ever changes!
@@ -33,6 +34,10 @@ struct Args {
     /// Minimum match percentage (e.g., 15 for 15%)
     #[arg(short = 'p', long = "match-percent", default_value_t = 10.0)]
     match_percent: f32,
+
+    /// Priority for determining the best file to KEEP
+    #[arg(short = 'k', long = "priority", default_value = "length")]
+    priority: Priority,
 
     /// Output file for the results (supports .txt, .csv, .json)
     #[arg(short = 'o', long = "output")]
@@ -60,7 +65,6 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     // 1. Initialize custom CLI Logger
-    // This removes the need for `if !silent` everywhere. If silent, only Errors print.
     let log_level = if args.silent {
         log::LevelFilter::Error
     } else {
@@ -124,8 +128,8 @@ fn main() -> Result<()> {
 
     info!("Scanning folder recursively: {}", args.folder_path);
     info!(
-        "Settings -> Max Hamming: {}, Min Match: {}%, Threads: {}",
-        max_hamming, args.match_percent, active_threads
+        "Settings -> Max Hamming: {}, Min Match: {}%, Priority: {:?}, Threads: {}",
+        max_hamming, args.match_percent, args.priority, active_threads
     );
     info!("Using Cache Directory: {}", cache_dir.display());
 
@@ -303,6 +307,7 @@ fn main() -> Result<()> {
         &fingerprints,
         args.output.as_ref(),
         start_time.elapsed().as_secs(),
+        args.priority,
     )?;
 
     Ok(())

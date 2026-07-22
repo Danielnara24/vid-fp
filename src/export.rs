@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use log::info;
 use crate::fingerprint::VideoFingerprint;
-use crate::utils::{format_duration, format_size};
+use crate::utils::{format_duration, format_size, find_best, Priority};
 use std::path::Path;
 
 pub fn output_results(
@@ -9,6 +9,7 @@ pub fn output_results(
     fingerprints: &[VideoFingerprint],
     output_file: Option<&String>,
     total_elapsed_secs: u64,
+    priority: Priority,
 ) -> Result<()> {
     
     info!("\n========================================");
@@ -25,11 +26,48 @@ pub fn output_results(
         .delimiter(b';')
         .from_writer(Vec::new());
         
-    csv_wtr.write_record(&["group", "resolution", "size", "length", "full_path"])
+    csv_wtr.write_record(&["group", "resolution", "size", "length", "full_path", "action"])
         .context("Failed to write CSV header")?;
 
     for (i, group) in final_groups.iter().enumerate() {
         let group_name = format!("group_{}", i + 1);
+
+        // 1. Determine KEEP and REVIEW logic
+        let max_dur = group.iter().map(|&idx| fingerprints[idx].duration).fold(0.0, f64::max);
+        let max_res = group.iter().map(|&idx| fingerprints[idx].width * fingerprints[idx].height).max().unwrap_or(0);
+
+        let keep_idx = find_best(group, fingerprints, priority, max_dur);
+        let keep_fp = &fingerprints[keep_idx];
+        let keep_res = keep_fp.width * keep_fp.height;
+
+        let mut review_idx = None;
+
+        match priority {
+            Priority::Length => {
+                // If KEEP isn't the absolute max resolution, find the best Res file for REVIEW
+                if keep_res < max_res {
+                    let candidate = find_best(group, fingerprints, Priority::Resolution, max_dur);
+                    if candidate != keep_idx { review_idx = Some(candidate); }
+                }
+            },
+            Priority::Resolution => {
+                // If KEEP isn't close to absolute max length, find the best Length file for REVIEW
+                if keep_fp.duration < max_dur - 0.5 {
+                    let candidate = find_best(group, fingerprints, Priority::Length, max_dur);
+                    if candidate != keep_idx { review_idx = Some(candidate); }
+                }
+            },
+            Priority::Size => {
+                // Recommend length if lacking, else recommend resolution if lacking
+                if keep_fp.duration < max_dur - 0.5 {
+                    let candidate = find_best(group, fingerprints, Priority::Length, max_dur);
+                    if candidate != keep_idx { review_idx = Some(candidate); }
+                } else if keep_res < max_res {
+                    let candidate = find_best(group, fingerprints, Priority::Resolution, max_dur);
+                    if candidate != keep_idx { review_idx = Some(candidate); }
+                }
+            }
+        }
 
         info!("{}:", group_name);
         txt_out.push_str(&format!("{}:\n", group_name));
@@ -42,12 +80,20 @@ pub fn output_results(
             let size_str = format_size(fp.file_size);
             let duration_str = format_duration(fp.duration);
             let res_str = format!("{}x{}", fp.width, fp.height);
+            
+            let action_str = if idx == keep_idx {
+                "KEEP"
+            } else if Some(idx) == review_idx {
+                "REVIEW"
+            } else {
+                "DELETE"
+            };
 
             // 1. Console / Text Output
-            info!("\t{}, {}, {}, {}", res_str, size_str, duration_str, fp.path);
+            info!("\t{}, {}, {}, {}, {}", res_str, size_str, duration_str, fp.path, action_str);
             txt_out.push_str(&format!(
-                "\t{}, {}, {}, {}\n",
-                res_str, size_str, duration_str, fp.path
+                "\t{}, {}, {}, {}, {}\n",
+                res_str, size_str, duration_str, fp.path, action_str
             ));
 
             // 2. CSV Output
@@ -57,6 +103,7 @@ pub fn output_results(
                 &size_str,
                 &duration_str,
                 &fp.path,
+                action_str,
             ]).context("Failed to write CSV record")?;
 
             // 3. JSON File Output
@@ -65,6 +112,7 @@ pub fn output_results(
                 "size": size_str,
                 "length": duration_str,
                 "full_path": fp.path,
+                "action": action_str,
             }));
         }
 
@@ -139,6 +187,7 @@ pub fn output_results(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::Priority;
     use tempfile::NamedTempFile;
     use std::fs;
 
@@ -158,14 +207,14 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let path_str = temp_file.path().with_extension("csv").to_string_lossy().to_string();
 
-        output_results(&groups, &fps, Some(&path_str), 120).unwrap();
+        output_results(&groups, &fps, Some(&path_str), 120, Priority::Length).unwrap();
 
         let contents = fs::read_to_string(&path_str).unwrap();
         
-        // Assert headers exist (separated by semicolons based on your logic)
-        assert!(contents.contains("group;resolution;size;length;full_path"));
-        // Assert data exists
-        assert!(contents.contains("group_1;1920x1080;1.0MB;00:01:00;/fake/path/vid.mp4"));
+        // Assert headers exist (separated by semicolons)
+        assert!(contents.contains("group;resolution;size;length;full_path;action"));
+        // Assert data exists and defaults single item to KEEP
+        assert!(contents.contains("group_1;1920x1080;1.0MB;00:01:00;/fake/path/vid.mp4;KEEP"));
         
         // Clean up
         let _ = fs::remove_file(path_str);
