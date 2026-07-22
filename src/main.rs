@@ -24,8 +24,17 @@ const CACHE_VERSION: &str = "v1";
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Folder path to scan for videos
-    folder_path: String,
+    /// Folders to include in the scan
+    #[arg(short = 'i', long = "include", required = true, num_args = 1..)]
+    include: Vec<String>,
+
+    /// Folders to exclude from the scan
+    #[arg(short = 'e', long = "exclude", num_args = 1..)]
+    exclude: Vec<String>,
+
+    /// Do not scan folders recursively
+    #[arg(short = 'n', long = "no-recursive")]
+    no_recursive: bool,
 
     /// Maximum Hamming distance
     #[arg(short = 'd', long = "hamming-distance", default_value_t = 6)]
@@ -126,19 +135,53 @@ fn main() -> Result<()> {
     let extensions = ["mp4", "mkv", "avi", "mov", "flv", "webm"];
     let mut video_files = Vec::new();
 
-    info!("Scanning folder recursively: {}", args.folder_path);
+    info!("Scanning folders: {:?}", args.include);
+    if !args.exclude.is_empty() {
+        info!("Excluding folders: {:?}", args.exclude);
+    }
+    
     info!(
-        "Settings -> Max Hamming: {}, Min Match: {}%, Priority: {:?}, Threads: {}",
-        max_hamming, args.match_percent, args.priority, active_threads
+        "Settings -> Max Hamming: {}, Min Match: {}%, Priority: {:?}, Threads: {}, Recursive: {}",
+        max_hamming, args.match_percent, args.priority, active_threads, !args.no_recursive
     );
     info!("Using Cache Directory: {}", cache_dir.display());
 
-    for entry in WalkDir::new(&args.folder_path).into_iter().filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if path.is_file() {
-            if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-                if extensions.contains(&ext.to_lowercase().as_str()) {
-                    video_files.push(path.to_string_lossy().to_string());
+    // Canonicalize exclude paths so prefix matching is safe and reliable
+    let exclude_paths: Vec<PathBuf> = args
+        .exclude
+        .iter()
+        .filter_map(|p| std::fs::canonicalize(p).ok())
+        .collect();
+
+    for include_dir in &args.include {
+        let base_path = match std::fs::canonicalize(include_dir) {
+            Ok(p) => p,
+            Err(e) => {
+                log::error!("Could not resolve include path '{}': {}", include_dir, e);
+                continue;
+            }
+        };
+
+        let mut walker = WalkDir::new(&base_path);
+        
+        if args.no_recursive {
+            // Limits depth. 0 = The directory itself, 1 = Immediate files inside the directory
+            walker = walker.max_depth(1); 
+        }
+
+        // Filter out any paths that begin with an excluded directory path
+        let it = walker.into_iter().filter_entry(|e| {
+            let p = e.path();
+            !exclude_paths.iter().any(|ex| p.starts_with(ex))
+        });
+
+        for entry in it.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+                    if extensions.contains(&ext.to_lowercase().as_str()) {
+                        video_files.push(path.to_string_lossy().to_string());
+                    }
                 }
             }
         }
