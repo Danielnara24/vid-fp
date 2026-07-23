@@ -39,8 +39,8 @@ struct Args {
     recursive: bool,
 
     /// Maximum Hamming distance.
-    /// Higher = looser matching, lower = stricter matching. Default is 6.
-    #[arg(short = 'd', long = "hamming-distance", default_value_t = 6)]
+    /// Higher = looser matching, lower = stricter matching. Default is 2.
+    #[arg(short = 'd', long = "hamming-distance", default_value_t = 2)]
     hamming_distance: u32,
 
     /// Minimum match percentage required to be considered a duplicate. Default is 10.0 (10%).
@@ -67,6 +67,16 @@ struct Args {
     /// Output file for the results (supports .txt, .csv, .json)
     #[arg(short = 'o', long = "output")]
     output: Option<String>,
+
+    /// Delete the files marked DELETE. By default they are moved to the system
+    /// trash (recoverable). Files marked KEEP or REVIEW are never touched.
+    #[arg(long = "delete")]
+    delete: bool,
+
+    /// With --delete, remove files permanently instead of moving them to the
+    /// trash. Irreversible — use with care. Has no effect without --delete.
+    #[arg(long = "permanent")]
+    permanent: bool,
 
     /// Delete ALL cache before running
     #[arg(long = "clear-cache")]
@@ -155,7 +165,7 @@ fn main() -> Result<()> {
     if !args.exclude.is_empty() {
         info!("Excluding folders: {:?}", args.exclude);
     }
-    
+
     info!(
         "Settings -> Max Hamming: {}, Min Match: {}%, Priority: {:?}, Threads: {}, Recursive: {}",
         max_hamming, args.match_percent, args.priority, active_threads, args.recursive
@@ -179,12 +189,12 @@ fn main() -> Result<()> {
         };
 
         let mut walker = WalkDir::new(&base_path);
-        
+
         if !args.recursive {
             // Non-recursive by default: limit depth so only the directory itself
             // and its immediate files are scanned.
             // 0 = The directory itself, 1 = Immediate files inside the directory
-            walker = walker.max_depth(1); 
+            walker = walker.max_depth(1);
         }
 
         // Filter out any paths that begin with an excluded directory path
@@ -228,7 +238,7 @@ fn main() -> Result<()> {
                         }
                     }
                 }
-                
+
                 if should_remove {
                     batch.remove(key_bytes);
                     pruned_count += 1;
@@ -271,7 +281,7 @@ fn main() -> Result<()> {
         pb
     };
 
-    // Thread-safe Sled Batching 
+    // Thread-safe Sled Batching
     let batch_lock = std::sync::Mutex::new((sled::Batch::default(), 0));
     const BATCH_SIZE: usize = 32; // Flush to disk after every 32 writes
 
@@ -334,11 +344,11 @@ fn main() -> Result<()> {
                 let mut b = batch_lock.lock().unwrap();
                 b.0.insert(cache_key.as_bytes(), encoded);
                 b.1 += 1;
-                
+
                 if b.1 >= BATCH_SIZE {
                     let current_batch = std::mem::take(&mut b.0);
                     b.1 = 0;
-                    
+
                     // Release the lock BEFORE writing so other threads can keep appending to the new empty batch
                     drop(b);
                     let _ = db.apply_batch(current_batch);
@@ -351,14 +361,14 @@ fn main() -> Result<()> {
         .collect();
 
     pb.finish_and_clear();
-    
+
     // Apply any remaining queued database items that haven't hit the size trigger
     if let Ok(b) = batch_lock.into_inner() {
         if b.1 > 0 {
             let _ = db.apply_batch(b.0);
         }
     }
-    
+
     let _ = db.flush();
 
     let n = fingerprints.len();
@@ -370,10 +380,19 @@ fn main() -> Result<()> {
     info!("\nFingerprinting complete. Cross-analyzing {} videos...", n);
 
     let edges = find_all_matches(&fingerprints, max_hamming, min_match_pct);
-    
+
     info!("Grouping duplicate clusters...");
-    
+
     let final_groups = clustering::find_duplicate_groups(n, edges, &fingerprints);
+
+    // Announce destructive intent up front so it's visible above the per-file log.
+    if args.delete {
+        if args.permanent {
+            info!("\n--permanent enabled: files marked DELETE will be removed permanently.");
+        } else {
+            info!("\n--delete enabled: files marked DELETE will be moved to the trash.");
+        }
+    }
 
     export::output_results(
         &final_groups,
@@ -381,6 +400,8 @@ fn main() -> Result<()> {
         args.output.as_ref(),
         start_time.elapsed().as_secs(),
         args.priority,
+        args.delete,
+        args.permanent,
     )?;
 
     Ok(())
