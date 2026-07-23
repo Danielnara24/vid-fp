@@ -36,8 +36,16 @@ pub fn fingerprint_video(filepath: &str) -> Result<VideoFingerprint> {
         duration_sec = ictx.duration() as f64 / 1_000_000.0; // Fallback to FFmpeg's AV_TIME_BASE format duration
     }
 
-    let context_decoder = ffmpeg_next::codec::context::Context::from_parameters(input.parameters())
+    let mut context_decoder = ffmpeg_next::codec::context::Context::from_parameters(input.parameters())
         .context("Failed to create codec context from parameters")?;
+
+    unsafe {
+        let ctx = context_decoder.as_mut_ptr();
+        (*ctx).thread_count = 1;
+        (*ctx).skip_loop_filter = ffmpeg_next::ffi::AVDiscard::AVDISCARD_ALL;
+        (*ctx).flags2 |= ffmpeg_next::ffi::AV_CODEC_FLAG2_FAST as i32;
+    }
+
     let mut decoder = context_decoder.decoder().video()
         .context("Failed to initialize video decoder")?;
 

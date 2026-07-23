@@ -229,6 +229,10 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    video_files.sort_by_cached_key(|vf| {
+        std::cmp::Reverse(std::fs::metadata(vf).map(|m| m.len()).unwrap_or(0))
+    });
+
     let total_videos = video_files.len();
     info!("Found {} video files. Fingerprinting...", total_videos);
 
