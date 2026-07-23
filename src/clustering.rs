@@ -98,10 +98,15 @@ pub fn find_duplicate_groups(
         final_groups.push(group_indices);
     }
 
+    // Sort fully deterministically: size of group descending, then deep comparison of all paths ascending
     final_groups.sort_by(|a, b| {
         b.len()
             .cmp(&a.len())
-            .then_with(|| fingerprints[a[0]].path.cmp(&fingerprints[b[0]].path))
+            .then_with(|| {
+                let paths_a = a.iter().map(|&idx| &fingerprints[idx].path);
+                let paths_b = b.iter().map(|&idx| &fingerprints[idx].path);
+                paths_a.cmp(paths_b)
+            })
     });
 
     final_groups
