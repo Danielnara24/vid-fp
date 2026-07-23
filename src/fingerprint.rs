@@ -14,7 +14,7 @@ pub struct VideoFingerprint {
     pub file_size: u64,
 }
 
-pub fn fingerprint_video(filepath: &str) -> Result<VideoFingerprint> {
+pub fn fingerprint_video(filepath: &str, kf_interval: f64, min_kf_samples: f64) -> Result<VideoFingerprint> {
     // 1. Native Zero-Copy Extraction (No Subprocess Overhead)
     let mut ictx = ffmpeg_next::format::input(&filepath)
         .with_context(|| format!("Failed to open video file: {}", filepath))?;
@@ -44,6 +44,7 @@ pub fn fingerprint_video(filepath: &str) -> Result<VideoFingerprint> {
         (*ctx).thread_count = 1;
         (*ctx).skip_loop_filter = ffmpeg_next::ffi::AVDiscard::AVDISCARD_ALL;
         (*ctx).flags2 |= ffmpeg_next::ffi::AV_CODEC_FLAG2_FAST as i32;
+        (*ctx).skip_frame = ffmpeg_next::ffi::AVDiscard::AVDISCARD_NONKEY;
     }
 
     let mut decoder = context_decoder.decoder().video()
@@ -109,9 +110,47 @@ pub fn fingerprint_video(filepath: &str) -> Result<VideoFingerprint> {
         Ok(())
     };
 
-    // Rapid Demuxing: Only push Key-frames (I-Frames) into decoder 
+    unsafe {
+        let fmt_ctx = ictx.as_mut_ptr();
+        let stream_ptr = *(*fmt_ctx).streams.add(video_stream_index);
+        (*stream_ptr).discard = ffmpeg_next::ffi::AVDiscard::AVDISCARD_NONKEY;
+    }
+
+    // --- Length-aware keyframe subsampling -----------------------------------
+    // A fixed interval decimates short videos long before long ones. Scaling the
+    // interval WITH duration would fix that but break clip detection: a long host
+    // sampled sparsely no longer has sampled frames inside a short clip's time
+    // window, so the clip's hashes find nothing to match. So we bound the interval
+    // in absolute time (protecting clip detection in long hosts) and FLOOR it for
+    // short videos so they always keep at least min_kf_samples frames.
+    // min_kf_samples guards short videos: they get a finer interval so they always
+    // keep at least this many frames. Guard against <= 0 to avoid div-by-zero / NaN.
+    let effective_interval = if kf_interval > 0.0 && duration_sec > 0.0 && min_kf_samples > 0.0 {
+        kf_interval.min(duration_sec / min_kf_samples)
+    } else {
+        0.0
+    };
+    let mut last_kept_t: Option<f64> = None;
+
+    // Rapid Demuxing: Only push Key-frames (I-Frames) into decoder
     for (stream, packet) in ictx.packets() {
         if stream.index() == video_stream_index && packet.is_key() {
+            if effective_interval > 0.0 {
+                let tb = stream.time_base();
+                let t = packet.pts().or_else(|| packet.dts()).map(|ts| {
+                    ts as f64 * tb.numerator() as f64 / tb.denominator() as f64
+                });
+                if let Some(t) = t {
+                    if let Some(last) = last_kept_t {
+                        if t - last < effective_interval {
+                            continue; // too close to the last kept keyframe; skip decode
+                        }
+                    }
+                    last_kept_t = Some(t);
+                }
+                // If PTS/DTS is missing we fall through and keep the frame (safe default).
+            }
+
             if decoder.send_packet(&packet).is_ok() {
                 while decoder.receive_frame(&mut decoded).is_ok() {
                     let _ = process_frame(&decoded);
@@ -331,7 +370,7 @@ mod tests {
         );
 
         // Run the fingerprinting function
-        let result = fingerprint_video(&filepath);
+        let result = fingerprint_video(&filepath, 0.0, 4.0);
         assert!(result.is_ok(), "Failed to fingerprint video: {:?}", result.err());
         let fp = result.unwrap();
 

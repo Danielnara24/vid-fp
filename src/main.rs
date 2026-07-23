@@ -37,12 +37,26 @@ struct Args {
     no_recursive: bool,
 
     /// Maximum Hamming distance
+    /// Higher = looser matching, lower = stricter matching. Default is 6.
     #[arg(short = 'd', long = "hamming-distance", default_value_t = 6)]
     hamming_distance: u32,
 
-    /// Minimum match percentage (e.g., 15 for 15%)
+    /// Minimum match percentage required to be considered a duplicate. Default is 10.0 (10%).
     #[arg(short = 'p', long = "match-percent", default_value_t = 10.0)]
     match_percent: f32,
+
+    /// Base keyframe sampling interval in seconds (0 = decode every keyframe).
+    /// Long videos sample at this interval; short videos use a finer interval
+    /// automatically so they keep at least 8 frames.
+    #[arg(long = "kf-interval", default_value_t = 0.0)]
+    kf_interval: f64,
+
+    /// Minimum keyframes to keep for short videos. They use a finer interval
+    /// automatically so subsampling never drops them below this count.
+    /// Default is 4.0.
+    /// This is only used when --kf-interval is > 0.0.
+    #[arg(long = "min-kf-samples", default_value_t = 4.0)]
+    min_kf_samples: f64,
 
     /// Priority for determining the best file to KEEP
     #[arg(short = 'k', long = "priority", default_value = "length")]
@@ -198,10 +212,12 @@ fn main() -> Result<()> {
                 let mut should_remove = true;
                 if let Ok(key_str) = std::str::from_utf8(&key_bytes) {
                     // Extract filepath from cache key (format: filepath_mtime_size_version)
-                    let mut parts = key_str.rsplitn(4, '_');
+                    let mut parts = key_str.rsplitn(6, '_');
                     let _version = parts.next();
                     let _size = parts.next();
                     let _mtime = parts.next();
+                    let _kf_interval = parts.next();
+                    let _min_kf_samples = parts.next();
                     if let Some(filepath) = parts.next() {
                         if valid_files.contains(filepath) {
                             should_remove = false; // It's still valid, keep it
@@ -255,6 +271,12 @@ fn main() -> Result<()> {
     let batch_lock = std::sync::Mutex::new((sled::Batch::default(), 0));
     const BATCH_SIZE: usize = 32; // Flush to disk after every 32 writes
 
+    let kf_interval = args.kf_interval;
+    let min_kf_samples = args.min_kf_samples;
+    if kf_interval > 0.0 {
+        info!("Using keyframe interval: {}s, minimum keyframes: {}", kf_interval, min_kf_samples);
+    }
+
     let fingerprints: Vec<VideoFingerprint> = video_files
         .par_iter()
         .filter_map(|vf| {
@@ -279,7 +301,7 @@ fn main() -> Result<()> {
             let size = metadata.len();
 
             // Versioned cache key ensures schema changes don't cause deserialization crashes
-            let cache_key = format!("{}_{}_{}_{}", vf, mtime, size, CACHE_VERSION);
+            let cache_key = format!("{}_{}_{}_{}_{}_{}", vf, mtime, size, CACHE_VERSION, kf_interval, min_kf_samples);
 
             if let Ok(Some(data)) = db.get(&cache_key) {
                 match bincode::deserialize::<VideoFingerprint>(&data) {
@@ -294,7 +316,7 @@ fn main() -> Result<()> {
                 }
             }
 
-            let fp = match fingerprint_video(vf) {
+            let fp = match fingerprint_video(vf, kf_interval, min_kf_samples) {
                 Ok(f) => f,
                 Err(e) => {
                     log::error!("Failed to process {}: {:#}", vf, e);
