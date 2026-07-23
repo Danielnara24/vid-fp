@@ -24,19 +24,21 @@ const CACHE_VERSION: &str = "v1";
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Folders to include in the scan
-    #[arg(short = 'i', long = "include", required = true, num_args = 1..)]
+    /// Folders to scan (one or more)
+    #[arg(required = true, num_args = 1.., value_name = "FOLDER")]
     include: Vec<String>,
 
-    /// Folders to exclude from the scan
-    #[arg(short = 'e', long = "exclude", num_args = 1..)]
+    /// Folder to exclude from the scan. Repeat the flag to exclude several
+    /// (e.g. -e ~/a -e ~/b).
+    #[arg(short = 'e', long = "exclude", value_name = "FOLDER")]
     exclude: Vec<String>,
 
-    /// Do not scan folders recursively
-    #[arg(short = 'n', long = "no-recursive")]
-    no_recursive: bool,
+    /// Scan folders recursively. Off by default (only the given folders and
+    /// their immediate files are scanned).
+    #[arg(short = 'r', long = "recursive")]
+    recursive: bool,
 
-    /// Maximum Hamming distance
+    /// Maximum Hamming distance.
     /// Higher = looser matching, lower = stricter matching. Default is 6.
     #[arg(short = 'd', long = "hamming-distance", default_value_t = 6)]
     hamming_distance: u32,
@@ -47,15 +49,15 @@ struct Args {
 
     /// Base keyframe sampling interval in seconds (0 = decode every keyframe).
     /// Long videos sample at this interval; short videos use a finer interval
-    /// automatically so they keep at least 8 frames.
-    #[arg(long = "kf-interval", default_value_t = 0.0)]
+    /// automatically so they keep at least --min-keyframes frames.
+    #[arg(long = "keyframe-interval", default_value_t = 0.0)]
     kf_interval: f64,
 
     /// Minimum keyframes to keep for short videos. They use a finer interval
     /// automatically so subsampling never drops them below this count.
     /// Default is 4.0.
-    /// This is only used when --kf-interval is > 0.0.
-    #[arg(long = "min-kf-samples", default_value_t = 4.0)]
+    /// This is only used when --keyframe-interval is > 0.0.
+    #[arg(long = "min-keyframes", default_value_t = 4.0)]
     min_kf_samples: f64,
 
     /// Priority for determining the best file to KEEP
@@ -67,16 +69,16 @@ struct Args {
     output: Option<String>,
 
     /// Delete ALL cache before running
-    #[arg(short = 'C', long = "clear-cache")]
+    #[arg(long = "clear-cache")]
     clear_cache: bool,
 
     /// Delete the cache of files not included in the current folder to scan
-    #[arg(short = 'P', long = "prune-cache")]
+    #[arg(long = "prune-cache")]
     prune_cache: bool,
 
     /// Suppress all terminal output except errors
-    #[arg(short = 's', long = "silent")]
-    silent: bool,
+    #[arg(short = 'q', long = "quiet")]
+    quiet: bool,
 
     /// Maximum number of threads to use. 0 uses all available CPU cores (default).
     #[arg(short = 't', long = "threads", default_value_t = 0)]
@@ -88,7 +90,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     // 1. Initialize custom CLI Logger
-    let log_level = if args.silent {
+    let log_level = if args.quiet {
         log::LevelFilter::Error
     } else {
         log::LevelFilter::Info
@@ -156,7 +158,7 @@ fn main() -> Result<()> {
     
     info!(
         "Settings -> Max Hamming: {}, Min Match: {}%, Priority: {:?}, Threads: {}, Recursive: {}",
-        max_hamming, args.match_percent, args.priority, active_threads, !args.no_recursive
+        max_hamming, args.match_percent, args.priority, active_threads, args.recursive
     );
     info!("Using Cache Directory: {}", cache_dir.display());
 
@@ -178,8 +180,10 @@ fn main() -> Result<()> {
 
         let mut walker = WalkDir::new(&base_path);
         
-        if args.no_recursive {
-            // Limits depth. 0 = The directory itself, 1 = Immediate files inside the directory
+        if !args.recursive {
+            // Non-recursive by default: limit depth so only the directory itself
+            // and its immediate files are scanned.
+            // 0 = The directory itself, 1 = Immediate files inside the directory
             walker = walker.max_depth(1); 
         }
 
@@ -253,7 +257,7 @@ fn main() -> Result<()> {
     info!("Found {} video files. Fingerprinting...", total_videos);
 
     // 2. Setup robust Thread-Safe Progress Bar
-    let pb = if args.silent {
+    let pb = if args.quiet {
         ProgressBar::hidden()
     } else {
         let pb = ProgressBar::new(total_videos as u64);
