@@ -1,6 +1,13 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
+// Every stored frame is a 64x64 GRAY8 buffer. Crucially we keep them all in ONE
+// contiguous allocation (`u_frames` below) instead of a Vec<Vec<u8>>. A single
+// large buffer is served by mmap on Linux and returned to the OS (munmap) the
+// moment this video is done, so RSS falls back between videos instead of
+// ratcheting up across a multi-threaded run.
+const FRAME_STRIDE: usize = 64 * 64;
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct VideoFingerprint {
     pub path: String,
@@ -18,7 +25,7 @@ pub fn fingerprint_video(filepath: &str, kf_interval: f64, min_kf_samples: f64) 
     // 1. Native Zero-Copy Extraction (No Subprocess Overhead)
     let mut ictx = ffmpeg_next::format::input(&filepath)
         .with_context(|| format!("Failed to open video file: {}", filepath))?;
-        
+
     let input = ictx.streams().best(ffmpeg_next::media::Type::Video)
         .ok_or_else(|| anyhow!("No video stream found in {}", filepath))?;
     let video_stream_index = input.index();
@@ -44,6 +51,11 @@ pub fn fingerprint_video(filepath: &str, kf_interval: f64, min_kf_samples: f64) 
         (*ctx).thread_count = 1;
         (*ctx).skip_loop_filter = ffmpeg_next::ffi::AVDiscard::AVDISCARD_ALL;
         (*ctx).flags2 |= ffmpeg_next::ffi::AV_CODEC_FLAG2_FAST as i32;
+        // Emit decoded frames immediately with no reordering delay. We only decode
+        // independent keyframes, so this is safe and keeps the decoder from parking
+        // several full-resolution frames in its internal pool (a big per-thread cost
+        // on hi-res, hour-long inputs).
+        (*ctx).flags |= ffmpeg_next::ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
         (*ctx).skip_frame = ffmpeg_next::ffi::AVDiscard::AVDISCARD_NONKEY;
     }
 
@@ -64,7 +76,10 @@ pub fn fingerprint_video(filepath: &str, kf_interval: f64, min_kf_samples: f64) 
         ffmpeg_next::software::scaling::flag::Flags::FAST_BILINEAR,
     ).context("Failed to initialize video scaler")?;
 
-    let mut u_frames = Vec::new();
+    // All unique frames packed back-to-back, FRAME_STRIDE bytes each. One growable
+    // allocation instead of N tiny ones -> no heap fragmentation/retention, and the
+    // whole thing is released to the OS when this function returns.
+    let mut u_frames: Vec<u8> = Vec::with_capacity(FRAME_STRIDE * 64);
     let mut unique_frame_indices = Vec::new();
 
     let mut sum = vec![0u64; 64 * 64];
@@ -74,7 +89,7 @@ pub fn fingerprint_video(filepath: &str, kf_interval: f64, min_kf_samples: f64) 
     let mut prev_frame = vec![0u8; 4096];
     let mut is_first = true;
 
-    // By hoisting `decoded`, `scaled`, and `current_frame` outside the loop, 
+    // By hoisting `decoded`, `scaled`, and `current_frame` outside the loop,
     // we prevent extremely slow and fragmenting continuous allocation of AVFrame structures and memory buffers.
     // FFmpeg's zero-copy buffer pool is now properly utilized.
     let mut decoded = ffmpeg_next::frame::Video::empty();
@@ -94,7 +109,8 @@ pub fn fingerprint_video(filepath: &str, kf_interval: f64, min_kf_samples: f64) 
         }
 
         if is_first || current_frame != prev_frame {
-            u_frames.push(current_frame.clone());
+            // Append into the single flat buffer instead of pushing a new Vec.
+            u_frames.extend_from_slice(&current_frame);
             unique_frame_indices.push(frame_idx);
 
             for (i, &val) in current_frame.iter().enumerate() {
@@ -165,11 +181,12 @@ pub fn fingerprint_video(filepath: &str, kf_interval: f64, min_kf_samples: f64) 
     }
 
     let total_frames = frame_idx;
-    if total_frames == 0 { 
-        return Err(anyhow!("No valid frames found or successfully decoded in {}", filepath)); 
+    if total_frames == 0 {
+        return Err(anyhow!("No valid frames found or successfully decoded in {}", filepath));
     }
 
-    let n_unique = u_frames.len();
+    // u_frames holds n_unique * FRAME_STRIDE bytes; the frame count is the index list.
+    let n_unique = unique_frame_indices.len();
     let n_f32 = n_unique as f32;
 
     // 2. Variance & Auto-Crop Algebra (Untouched - accurate)
@@ -247,7 +264,9 @@ pub fn fingerprint_video(filepath: &str, kf_interval: f64, min_kf_samples: f64) 
     }
 
     let mut hashes = Vec::with_capacity(n_unique);
-    for frame in &u_frames {
+    // Iterate the flat buffer in FRAME_STRIDE-sized windows; each `frame` is a
+    // &[u8] of length 4096, so all the indexing below is unchanged.
+    for frame in u_frames.chunks_exact(FRAME_STRIDE) {
         let mut frame_8x9 = [0u8; 72];
 
         if crop_h != 8 || crop_w != 9 {
@@ -282,6 +301,10 @@ pub fn fingerprint_video(filepath: &str, kf_interval: f64, min_kf_samples: f64) 
         }
         hashes.push(hash);
     }
+
+    // Frame pixels are no longer needed; release the large buffer (munmap) now
+    // rather than at end of scope, trimming the peak during the cheap tail work.
+    drop(u_frames);
 
     let mut changes_hashes = Vec::new();
     let mut changes_t_start = Vec::new();
@@ -380,7 +403,7 @@ mod tests {
         assert!(fp.height > 0, "Video height should be parsed correctly");
         assert!(fp.file_size > 0, "File size should be captured");
         assert!(
-            fp.duration > 0.0 && fp.duration < 5.0, 
+            fp.duration > 0.0 && fp.duration < 5.0,
             "Duration should be roughly 1 second, got: {}", fp.duration
         );
 

@@ -117,7 +117,22 @@ fn main() -> Result<()> {
         })
         .init();
 
+    // --- Allocator tuning (Linux / glibc) ------------------------------------
+    // Each video's frame data is now a single large buffer. We pin glibc's mmap
+    // and trim thresholds low and FIXED so those buffers are always served by
+    // mmap and handed straight back to the OS the moment a video finishes,
+    // instead of being parked on the main heap where RSS ratchets up across the
+    // run. Pinning them also disables glibc's *dynamic* mmap-threshold growth,
+    // which would otherwise start routing big buffers back onto the heap after a
+    // few large frees. (This is why MALLOC_ARENA_MAX had no effect: the issue was
+    // heap retention of freed memory, not the number of arenas.)
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 1024 * 1024); // 1 MiB
+        libc::mallopt(libc::M_TRIM_THRESHOLD, 1024 * 1024);
+    }
     // Configure Rayon thread pool if a specific limit is requested
+    
     if args.threads > 0 {
         rayon::ThreadPoolBuilder::new()
             .num_threads(args.threads)

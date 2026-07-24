@@ -11,6 +11,9 @@ walkdir = "2.4"
 # Multi-threading library for parallel video processing
 rayon = "1.8"
 
+# Direct libc access for glibc allocator tuning (mallopt) on Linux
+libc = "0.2"
+
 # FFmpeg bindings (Safe wrapper around libav*)
 ffmpeg-next = "6.0"
 
