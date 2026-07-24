@@ -38,6 +38,18 @@ struct Args {
     #[arg(short = 'r', long = "recursive")]
     recursive: bool,
 
+    /// Video file extensions to search for (case-insensitive; a leading dot is
+    /// optional). Repeat the flag or comma-separate, e.g. `-x mp4,mkv` or
+    /// `-x mp4 -x mkv`. Defaults to the common video containers.
+    #[arg(
+        short = 'x',
+        long = "extensions",
+        value_delimiter = ',',
+        value_name = "EXT",
+        default_values_t = ["mp4", "mkv", "avi", "mov", "flv", "webm"].map(String::from)
+    )]
+    extensions: Vec<String>,
+
     /// Maximum Hamming distance.
     /// Higher = looser matching, lower = stricter matching. Default is 2.
     #[arg(short = 'd', long = "hamming-distance", default_value_t = 2)]
@@ -132,7 +144,7 @@ fn main() -> Result<()> {
         libc::mallopt(libc::M_TRIM_THRESHOLD, 1024 * 1024);
     }
     // Configure Rayon thread pool if a specific limit is requested
-    
+
     if args.threads > 0 {
         rayon::ThreadPoolBuilder::new()
             .num_threads(args.threads)
@@ -173,13 +185,31 @@ fn main() -> Result<()> {
     let max_hamming = args.hamming_distance;
     let min_match_pct = args.match_percent / 100.0;
 
-    let extensions = ["mp4", "mkv", "avi", "mov", "flv", "webm"];
+    // Normalize the requested extensions: strip an optional leading dot and
+    // lowercase, so `-x .MP4`, `-x MP4`, and `-x mp4` all behave identically.
+    // A HashSet gives O(1) lookups during the walk and dedups automatically.
+    let extensions: HashSet<String> = args
+        .extensions
+        .iter()
+        .map(|e| e.trim().trim_start_matches('.').to_lowercase())
+        .filter(|e| !e.is_empty())
+        .collect();
+
+    if extensions.is_empty() {
+        anyhow::bail!("No valid video extensions to search for (--extensions was empty).");
+    }
+
     let mut video_files = Vec::new();
 
     info!("Scanning folders: {:?}", args.include);
     if !args.exclude.is_empty() {
         info!("Excluding folders: {:?}", args.exclude);
     }
+
+    // HashSet iteration order is unspecified; sort for a stable, readable log.
+    let mut ext_display: Vec<&str> = extensions.iter().map(|s| s.as_str()).collect();
+    ext_display.sort_unstable();
+    info!("Searching extensions: {:?}", ext_display);
 
     info!(
         "Settings -> Max Hamming: {}, Min Match: {}%, Priority: {:?}, Threads: {}, Recursive: {}",
@@ -222,7 +252,7 @@ fn main() -> Result<()> {
             let path = entry.path();
             if path.is_file() {
                 if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-                    if extensions.contains(&ext.to_lowercase().as_str()) {
+                    if extensions.contains(ext.to_lowercase().as_str()) {
                         video_files.push(path.to_string_lossy().to_string());
                     }
                 }
