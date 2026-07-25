@@ -1,7 +1,24 @@
 [package]
-name = "video-dedup"
+name = "vid-fp"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.74"
+description = "Fast video duplicate and clip finder using perceptual keyframe fingerprints"
+authors = ["Danielnara24"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Danielnara24/vid-fp"
+homepage = "https://github.com/Danielnara24/vid-fp"
+readme = "README.md"
+keywords = ["video", "duplicate", "deduplication", "fingerprint", "cli"]
+categories = ["command-line-utilities", "multimedia::video"]
+exclude = ["tests/fixtures/*"]
+
+[[bin]]
+name = "vid-fp"
+path = "src/main.rs"
+
+[features]
+static-ffmpeg = ["ffmpeg-next/build"]
 
 [dependencies]
 # CLI Argument Parser
@@ -39,3 +56,10 @@ trash = "5"
 
 [dev-dependencies]
 tempfile = "3.8"
+
+# Smaller, faster release binaries. `strip` removes debug symbols; `lto` and a
+# single codegen unit trade compile time for runtime speed and size.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
