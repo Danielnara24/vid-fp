@@ -215,7 +215,6 @@ fn main() -> Result<()> {
         "Settings -> Max Hamming: {}, Min Match: {}%, Priority: {:?}, Threads: {}, Recursive: {}",
         max_hamming, args.match_percent, args.priority, active_threads, args.recursive
     );
-    info!("Using Cache Directory: {}", cache_dir.display());
 
     // Canonicalize exclude paths so prefix matching is safe and reliable
     let exclude_paths: Vec<PathBuf> = args
