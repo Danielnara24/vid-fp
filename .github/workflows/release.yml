@@ -1,0 +1,110 @@
+# .github/workflows/release.yml
+#
+# Builds release binaries and attaches them to a GitHub Release whenever you push
+# a version tag (e.g. `git tag v0.1.0 && git push origin v0.1.0`).
+#
+# Two artifacts are produced:
+#   * x86_64-linux-musl  -> fully static, FFmpeg baked in, runs on any distro
+#                           with NO runtime dependencies. This is the "download
+#                           and run anywhere" binary.
+#   * x86_64-linux-gnu   -> smaller, dynamically linked, but requires FFmpeg 6.x
+#                           libraries installed on the target machine.
+#
+# The musl job compiles FFmpeg from source (via the `static-ffmpeg` feature). It
+# is the slowest and most fragile step; if it ever breaks, the gnu job still
+# ships a working binary.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # required to create/update the GitHub Release
+
+jobs:
+  build-musl:
+    name: Static musl binary (no runtime deps)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            musl-tools clang llvm nasm yasm pkg-config build-essential
+
+      - name: Install Rust (musl target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Cache cargo + FFmpeg build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: musl-static
+
+      - name: Build (FFmpeg compiled & linked statically)
+        # These env vars point the bundled FFmpeg build and cc-rs at the musl
+        # compiler. This is the step most likely to need a tweak per environment.
+        env:
+          CC: musl-gcc
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: |
+          cargo build --release --locked \
+            --features static-ffmpeg \
+            --target x86_64-unknown-linux-musl
+
+      - name: Package artifact
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          NAME="vid-fp-${VERSION}-x86_64-linux-musl"
+          mkdir -p dist
+          cp "target/x86_64-unknown-linux-musl/release/vid-fp" "dist/${NAME}"
+          ( cd dist && sha256sum "${NAME}" > "${NAME}.sha256" )
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+
+  build-gnu:
+    name: Dynamic glibc binary (needs FFmpeg installed)
+    runs-on: ubuntu-24.04 # 24.04 ships FFmpeg 6.x, matching ffmpeg-next 6.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install FFmpeg dev libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+            clang pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: gnu-dynamic
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package artifact
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          NAME="vid-fp-${VERSION}-x86_64-linux-gnu"
+          mkdir -p dist
+          cp "target/release/vid-fp" "dist/${NAME}"
+          ( cd dist && sha256sum "${NAME}" > "${NAME}.sha256" )
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
