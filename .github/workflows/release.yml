@@ -3,13 +3,13 @@
 # Builds a release binary and attaches it to a GitHub Release when you push a
 # version tag (e.g. `git tag v0.1.0 && git push origin v0.1.0`).
 #
-# This version ships ONE artifact: a dynamically-linked glibc binary.
-#   x86_64-linux-gnu -> requires FFmpeg 6.x libraries installed on the target
-#                       machine (`apt install ffmpeg`, `pacman -S ffmpeg`, etc).
+# Each release publishes the same binary under TWO names:
+#   vid-fp-<version>-x86_64-linux-gnu  -> archival, one per release
+#   vid-fp-x86_64-linux-gnu            -> stable name, so this URL always works:
+#     https://github.com/Danielnara24/vid-fp/releases/latest/download/vid-fp-x86_64-linux-gnu
 #
-# The static musl binary (FFmpeg compiled in, zero runtime deps) is intentionally
-# left out for now — compiling FFmpeg from source under musl is slow and brittle,
-# and it was blocking releases. Add it back once it builds reliably.
+# The binary is dynamically linked and requires FFmpeg 6.x installed on the
+# target machine (`apt install ffmpeg`, `pacman -S ffmpeg`, etc).
 
 name: release
 
@@ -29,9 +29,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install FFmpeg dev libraries
-        # ffmpeg-sys-next links the FULL family. Missing any one of these makes
-        # pkg-config fail with "Package 'libav...' not found". libavdevice-dev
-        # pulls in most of the others, but list them all so it's obvious.
+        # ffmpeg-sys-next links the FULL family; missing any one makes pkg-config
+        # fail with "Package 'libav...' not found".
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -51,13 +50,18 @@ jobs:
       - name: Build
         run: cargo build --release --locked
 
-      - name: Package artifact
+      - name: Package artifacts
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          NAME="vid-fp-${VERSION}-x86_64-linux-gnu"
           mkdir -p dist
-          cp "target/release/vid-fp" "dist/${NAME}"
-          ( cd dist && sha256sum "${NAME}" > "${NAME}.sha256" )
+          # Same binary, two names: a versioned copy for history and a stable
+          # copy so the /releases/latest/download/ URL never changes.
+          cp "target/release/vid-fp" "dist/vid-fp-${VERSION}-x86_64-linux-gnu"
+          cp "target/release/vid-fp" "dist/vid-fp-x86_64-linux-gnu"
+          ( cd dist
+            for f in "vid-fp-${VERSION}-x86_64-linux-gnu" "vid-fp-x86_64-linux-gnu"; do
+              sha256sum "$f" > "$f.sha256"
+            done )
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
