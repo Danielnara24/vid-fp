@@ -170,7 +170,7 @@ fn main() -> Result<()> {
                 PathBuf::from("/tmp")
             }
         })
-        .join("video-dedup");
+        .join("vid-fp");
 
     std::fs::create_dir_all(&cache_dir).context("Failed to create cache directory")?;
     let db_path = cache_dir.join("video_hashes.db");
