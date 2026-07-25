@@ -71,6 +71,15 @@ libswscale-dev libswresample-dev`, `clang`, and `pkg-config` on Debian/Ubuntu):
 cargo install --git https://github.com/Danielnara24/vid-fp
 ```
 
+## Updating
+
+Use same command as installing, it will overwrite the last version.
+
+Run `vid-fp --version` to see what you have installed and compare it against the
+[latest release](https://github.com/USERNAME/vid-fp/releases/latest). FFmpeg is
+separate and doesn't need reinstalling. Installed from source? Re-run the
+`cargo install` command above with `--force`.
+
 ## Usage
 
 Point it at one or more folders:
