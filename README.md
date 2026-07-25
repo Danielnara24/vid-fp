@@ -97,6 +97,7 @@ vid-fp ~/Videos -r -o results.csv
 
 By default the scan is **not** recursive (only the folders you name and their
 immediate files). Add `-r` to descend into subfolders.
+To change what's detected as a duplicate, try increasing/decreasing the Hamming Distance or the Min Match Percentage.
 
 ### Deleting duplicates
 
@@ -113,17 +114,17 @@ vid-fp ~/Videos -r --delete --permanent
 | Flag | Description | Default |
 | --- | --- | --- |
 | `<FOLDER>...` | One or more folders to scan (required) | — |
-| `-r`, `--recursive` | Descend into subfolders | off |
+| `-r`, `--recursive` | Include subfolders | off |
 | `-e`, `--exclude <FOLDER>` | Exclude a folder; repeat for several | — |
-| `-x`, `--extensions <EXT>` | Video extensions, comma-separated or repeated | `mp4,mkv,avi,mov,flv,webm` |
-| `-d`, `--hamming-distance <N>` | Frame-match tolerance; higher = looser | `2` |
-| `-p`, `--match-percent <F>` | Min % of overlap to count as a duplicate | `10.0` |
+| `-x`, `--extensions <EXT>` | Video extensions to include, comma-separated or repeated | `mp4,mkv,avi,mov,flv,webm` |
+| `-d`, `--hamming-distance <N>` | Frame-match tolerance; higher = less strict matching. Raise to increase duplicates found (but raises chance false positives) | `3` |
+| `-p`, `--match-percent <F>` | Min % of overlap to count as a duplicate; Lower = Finds shorter matches (but raises chance false positives) | `10.0` |
 | `-k`, `--priority <P>` | Criteria for KEEPING files: `length`, `resolution`, or `size` | `length` |
-| `--keyframe-interval <F>` | Seconds between sampled keyframes (`0` = every keyframe) | `0.0` |
-| `--min-keyframes <F>` | Min keyframes kept for short videos (only when keyframe-interval > 0) | `4.0` |
-| `-o`, `--output <FILE>` | Save a report — `.txt`, `.csv`, or `.json` | — |
+| `--keyframe-interval <F>` | Seconds between sampled keyframes (`0` = every keyframe); Higher = Faster processing (Increasing this can hinder the capability of finding short matches between videos) | `0.0` |
+| `--min-keyframes <F>` | Min keyframes kept for short videos (only relevant when keyframe-interval > 0) | `4.0` |
+| `-o`, `--output <FILE>` | Optional path to save the report — `.txt`, `.csv`, or `.json` | — |
 | `--delete` | Move files marked DELETE to the trash | off |
-| `--permanent` | With `--delete`, remove permanently instead | off |
+| `--permanent` | With `--delete`, permanently remove instead | off |
 | `-t`, `--threads <N>` | Worker threads (`0` = uses all cores) | `0` |
 | `-q`, `--quiet` | Only print errors | off |
 | `--clear-cache` | Wipe ALL vid-fp cache before running | off |

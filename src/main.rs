@@ -51,8 +51,8 @@ struct Args {
     extensions: Vec<String>,
 
     /// Maximum Hamming distance.
-    /// Higher = looser matching, lower = stricter matching. Default is 2.
-    #[arg(short = 'd', long = "hamming-distance", default_value_t = 2)]
+    /// Higher = looser matching, lower = stricter matching. Default is 3.
+    #[arg(short = 'd', long = "hamming-distance", default_value_t = 3)]
     hamming_distance: u32,
 
     /// Minimum match percentage required to be considered a duplicate. Default is 10.0 (10%).
