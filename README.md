@@ -117,8 +117,8 @@ vid-fp ~/Videos -r --delete --permanent
 | `-r`, `--recursive` | Include subfolders | off |
 | `-e`, `--exclude <FOLDER>` | Exclude a folder; repeat for several | — |
 | `-x`, `--extensions <EXT>` | Video extensions to include, comma-separated or repeated | `mp4,mkv,avi,mov,flv,webm` |
-| `-d`, `--hamming-distance <N>` | Frame-match tolerance; higher = less strict matching. Raise to increase duplicates found (but raises chance false positives) | `3` |
-| `-p`, `--match-percent <F>` | Min % of overlap to count as a duplicate; Lower = Finds shorter matches (but raises chance false positives) | `10.0` |
+| `-d`, `--hamming-distance <N>` | Frame-match tolerance; higher = less strict matching. Raise to increase duplicates found (but can increase false positives) | `3` |
+| `-p`, `--match-percent <F>` | Min % of overlap to count as a duplicate; Lower = Finds shorter matches (but can increase false positive) | `10.0` |
 | `-k`, `--priority <P>` | Criteria for KEEPING files: `length`, `resolution`, or `size` | `length` |
 | `--keyframe-interval <F>` | Seconds between sampled keyframes (`0` = every keyframe); Higher = Faster processing (Increasing this can hinder the capability of finding short matches between videos) | `0.0` |
 | `--min-keyframes <F>` | Min keyframes kept for short videos (only relevant when keyframe-interval > 0) | `4.0` |
