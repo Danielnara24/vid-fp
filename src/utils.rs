@@ -1,5 +1,24 @@
 use crate::fingerprint::VideoFingerprint;
 use std::cmp::Ordering;
+use std::sync::atomic::AtomicBool;
+
+/// Set once, never cleared. Every long-running loop polls it and unwinds.
+///
+/// Relaxed ordering is deliberate: this is a hint, not a data handoff. The
+/// fingerprints themselves travel through the batch mutex and rayon's collect,
+/// which carry their own synchronization.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// Called from the signal handler. Doing only this — no locks, no I/O — is what
+/// makes the handler impossible to deadlock.
+pub fn request_shutdown() {
+    SHUTDOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[inline(always)]
+pub fn shutdown_requested() -> bool {
+    SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 #[derive(clap::ValueEnum, Clone, Debug, Copy, PartialEq, Eq)]
 pub enum Priority {

@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use log::info;
 use crate::fingerprint::VideoFingerprint;
 use crate::utils::{
-    find_best, format_bitrate, format_duration, format_size, GroupMaxima, Priority,
+    find_best, format_bitrate, format_duration, format_size, shutdown_requested, GroupMaxima, Priority,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -105,6 +105,14 @@ pub fn output_results(
 
     if delete {
         for &idx in &delete_indices {
+            if shutdown_requested() {
+                info!(
+                    "Interrupted: stopped after {} deletion(s); {} file(s) left untouched.",
+                    deleted_count,
+                    delete_candidate_count - deleted_count - failed_count
+                );
+                break;
+            }
             let fp = &fingerprints[idx];
             match remove_path(&fp.path, permanent_delete) {
                 Ok(()) => {
@@ -165,7 +173,7 @@ pub fn output_results(
                 "REVIEW"
             } else if delete_candidates.contains(&idx) {
                 if delete {
-                    delete_outcome.get(&idx).copied().unwrap_or("FAILED")
+                    delete_outcome.get(&idx).copied().unwrap_or("SKIPPED")
                 } else {
                     "DELETE"
                 }

@@ -15,8 +15,9 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
-use utils::Priority;
+use utils::{shutdown_requested, Priority};
 use walkdir::WalkDir;
 
 // Cache schema versioning - bump this if VideoFingerprint struct ever changes!
@@ -115,6 +116,43 @@ struct Args {
     threads: usize,
 }
 
+/// How the run ended. `Interrupted` carries the phase name purely so the final
+/// message can tell the user where it stopped.
+enum Outcome {
+    Completed,
+    Interrupted(&'static str),
+}
+
+/// Arrange for Ctrl-C (and, thanks to the `termination` feature, SIGTERM and
+/// SIGHUP) to unwind the run instead of killing it.
+///
+/// The handler does the absolute minimum: flip one atomic and print. It never
+/// touches the database, never takes a lock, and never waits on a worker, so it
+/// cannot deadlock against whatever the program happened to be doing.
+///
+/// The second signal is the escape hatch. It bypasses the clean shutdown, which
+/// is tolerable precisely because fingerprints are written as they are produced
+/// -- at worst it costs whatever sled's flusher has not yet fsynced.
+fn install_signal_handler() -> Result<()> {
+    let hits = AtomicUsize::new(0);
+
+    ctrlc::set_handler(move || {
+        if hits.fetch_add(1, Ordering::SeqCst) == 0 {
+            utils::request_shutdown();
+            // Straight to stderr, not through the logger, so it still shows
+            // under --quiet. The user pressed a key; they get an answer now.
+            eprintln!(
+                "\nInterrupt received — stopping and saving finished fingerprints to cache.\n\
+                 (Press Ctrl-C again to quit immediately.)"
+            );
+        } else {
+            eprintln!("\nSecond interrupt — quitting now.");
+            std::process::exit(130);
+        }
+    })
+    .context("Failed to install signal handler")
+}
+
 fn main() -> Result<()> {
     let start_time = Instant::now();
     let args = Args::parse();
@@ -136,6 +174,9 @@ fn main() -> Result<()> {
             }
         })
         .init();
+
+    // Installed before any real work so even the directory walk is cancellable.
+    install_signal_handler()?;
 
     // --- Allocator tuning (Linux / glibc) ------------------------------------
     // Each video's frame data is now a single large buffer. We pin glibc's mmap
@@ -183,8 +224,43 @@ fn main() -> Result<()> {
     std::fs::create_dir_all(&cache_dir).context("Failed to create cache directory")?;
     let db_path = cache_dir.join("video_hashes.db");
 
-    let db = sled::open(&db_path).context("Failed to open or lock cache database")?;
+    // A background flush every second means the cache survives even the paths
+    // that skip our own shutdown: a second Ctrl-C, a SIGKILL, a power cut.
+    // Nothing already fingerprinted is ever more than a second from durable.
+    let db = sled::Config::new()
+        .path(&db_path)
+        .flush_every_ms(Some(1_000))
+        .open()
+        .context("Failed to open or lock cache database")?;
 
+    let outcome = run(&args, &db, start_time, active_threads);
+
+    // --- The only exit path ---------------------------------------------------
+    // Every route out of `run` lands here -- success, failure, or interrupt --
+    // and the database is flushed and DROPPED before the process is allowed to
+    // end. The drop is the point: std::process::exit skips destructors, so
+    // exiting with a live Db means sled never runs its own shutdown and its
+    // flusher thread dies mid-write. That is how "saved 20 videos" becomes 6 on
+    // the next run. Flush, drop, then leave.
+    if let Err(e) = db.flush() {
+        log::error!("Failed to flush the fingerprint cache: {}", e);
+    }
+    drop(db);
+
+    match outcome? {
+        Outcome::Completed => Ok(()),
+        Outcome::Interrupted(phase) => {
+            info!(
+                "Stopped during {}. Cached work is saved — re-running picks up where this left off.",
+                phase
+            );
+            // 130 is the shell convention for "terminated by SIGINT".
+            std::process::exit(130);
+        }
+    }
+}
+
+fn run(args: &Args, db: &sled::Db, start_time: Instant, active_threads: usize) -> Result<Outcome> {
     if args.clear_cache {
         info!("Clearing all cache...");
         db.clear().context("Failed to clear cache database")?;
@@ -265,6 +341,13 @@ fn main() -> Result<()> {
         });
 
         for entry in it.filter_map(|e| e.ok()) {
+            // Nothing has been fingerprinted yet, so there is nothing to lose --
+            // but a walk over a cold network mount can take minutes, and the
+            // user should not have to wait it out.
+            if shutdown_requested() {
+                return Ok(Outcome::Interrupted("the folder scan"));
+            }
+
             let path = entry.path();
 
             // Extension first: it is free, and it keeps us from stat()ing every
@@ -321,6 +404,13 @@ fn main() -> Result<()> {
         let mut pruned_count = 0;
 
         for kv in db.iter() {
+            // Abandon the half-built batch rather than applying a partial prune:
+            // dropping cache entries is the one thing here that costs the user
+            // real time to rebuild.
+            if shutdown_requested() {
+                return Ok(Outcome::Interrupted("the cache prune (nothing was removed)"));
+            }
+
             if let Ok((key_bytes, _)) = kv {
                 let mut should_remove = true;
                 if let Ok(key_str) = std::str::from_utf8(&key_bytes) {
@@ -355,7 +445,7 @@ fn main() -> Result<()> {
 
     if video_files.is_empty() {
         info!("No videos found.");
-        return Ok(());
+        return Ok(Outcome::Completed);
     }
 
     video_files.sort_by_cached_key(|vf| {
@@ -363,26 +453,6 @@ fn main() -> Result<()> {
     });
 
     let total_videos = video_files.len();
-    info!("Found {} video files. Fingerprinting...", total_videos);
-
-    // 2. Setup robust Thread-Safe Progress Bar
-    let pb = if args.quiet {
-        ProgressBar::hidden()
-    } else {
-        let pb = ProgressBar::new(total_videos as u64);
-        pb.set_style(
-            ProgressStyle::with_template(
-                "[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) - {msg}",
-            )
-            .unwrap()
-            .progress_chars("=>-"),
-        );
-        pb
-    };
-
-    // Thread-safe Sled Batching
-    let batch_lock = std::sync::Mutex::new((sled::Batch::default(), 0));
-    const BATCH_SIZE: usize = 32; // Flush to disk after every 32 writes
 
     let kf_interval = args.kf_interval;
     let min_kf_samples = args.min_kf_samples;
@@ -390,18 +460,31 @@ fn main() -> Result<()> {
         info!("Using keyframe interval: {}s, minimum keyframes: {}", kf_interval, min_kf_samples);
     }
 
-    let fingerprints: Vec<VideoFingerprint> = video_files
-        .par_iter()
-        .filter_map(|vf| {
-            let file_name = Path::new(vf).file_name().unwrap_or_default().to_string_lossy().into_owned();
-            pb.set_message(file_name);
+    // --- Pass 1: resolve the entire cache before decoding anything ------------
+    // This used to be interleaved with fingerprinting in a single par_iter, and
+    // rayon gives each worker a contiguous slice of the input: a cached file
+    // sitting behind an uncached one in the same slice could not be read until
+    // that decode finished, no matter how many threads were idle. Hence a bar
+    // stuck at 7/22 while 21 files were already known and exactly one was being
+    // worked on.
+    //
+    // A lookup is a stat, a tree read and a bincode decode -- microseconds -- so
+    // this pass finishes effectively instantly even on a large library, and by
+    // the time the bar appears we know exactly how much real work there is.
+    enum Lookup {
+        Hit(VideoFingerprint),
+        Miss { path: String, cache_key: String },
+        Unreadable,
+    }
 
+    let lookups: Vec<Lookup> = video_files
+        .par_iter()
+        .map(|vf| {
             let metadata = match std::fs::metadata(vf) {
                 Ok(m) => m,
                 Err(e) => {
                     log::error!("Cannot access metadata for {}: {}", vf, e);
-                    pb.inc(1);
-                    return None;
+                    return Lookup::Unreadable;
                 }
             };
 
@@ -418,71 +501,173 @@ fn main() -> Result<()> {
 
             if let Ok(Some(data)) = db.get(&cache_key) {
                 match bincode::deserialize::<VideoFingerprint>(&data) {
-                    Ok(fp) => {
-                        pb.inc(1);
-                        return Some(fp);
-                    }
+                    Ok(fp) => return Lookup::Hit(fp),
                     Err(e) => {
-                        // Corrupted or outdated schema; ignore and overwrite below
+                        // Corrupted or outdated schema; ignore and re-process.
                         log::debug!("Cache deserialization failed for {}: {}. Re-processing.", vf, e);
                     }
                 }
             }
 
-            let fp = match fingerprint_video(vf, kf_interval, min_kf_samples) {
-                Ok(f) => f,
-                Err(e) => {
-                    log::error!("Failed to process {}: {:#}", vf, e);
-                    pb.inc(1); // Increment progress bar so it completes properly
-                    return None;
-                }
-            };
-
-            // Batch database insertions to heavily reduce Disk I/O bottlenecks
-            if let Ok(encoded) = bincode::serialize(&fp) {
-                let mut b = batch_lock.lock().unwrap();
-                b.0.insert(cache_key.as_bytes(), encoded);
-                b.1 += 1;
-
-                if b.1 >= BATCH_SIZE {
-                    let current_batch = std::mem::take(&mut b.0);
-                    b.1 = 0;
-
-                    // Release the lock BEFORE writing so other threads can keep appending to the new empty batch
-                    drop(b);
-                    let _ = db.apply_batch(current_batch);
-                }
-            }
-
-            pb.inc(1);
-            Some(fp)
+            Lookup::Miss { path: vf.clone(), cache_key }
         })
         .collect();
 
-    pb.finish_and_clear();
-
-    // Apply any remaining queued database items that haven't hit the size trigger
-    if let Ok(b) = batch_lock.into_inner() {
-        if b.1 > 0 {
-            let _ = db.apply_batch(b.0);
+    // collect() preserves input order, so `todo` inherits the largest-first sort
+    // and the heaviest decodes still start first.
+    let mut fingerprints: Vec<VideoFingerprint> = Vec::with_capacity(total_videos);
+    let mut todo: Vec<(String, String)> = Vec::new();
+    for lookup in lookups {
+        match lookup {
+            Lookup::Hit(fp) => fingerprints.push(fp),
+            Lookup::Miss { path, cache_key } => todo.push((path, cache_key)),
+            Lookup::Unreadable => {}
         }
     }
 
-    let _ = db.flush();
+    let cached_count = fingerprints.len();
+    let todo_count = todo.len();
+
+    if cached_count > 0 {
+        info!(
+            "Found {} video files; {} already cached, {} to fingerprint.",
+            total_videos, cached_count, todo_count
+        );
+    } else {
+        info!("Found {} video files. Fingerprinting...", total_videos);
+    }
+
+    if shutdown_requested() {
+        return Ok(Outcome::Interrupted("the cache scan"));
+    }
+
+    // --- Pass 2: the work that actually costs something -----------------------
+    // Declared out here so the counters survive the block and can be reported
+    // even when every file was cached and the block never ran.
+    let newly_cached = AtomicUsize::new(0);
+    let abandoned = AtomicUsize::new(0);
+
+    if todo_count > 0 {
+        // The bar now counts decodes and nothing else, so its denominator is the
+        // work remaining rather than the size of the library.
+        let pb = if args.quiet {
+            ProgressBar::hidden()
+        } else {
+            let pb = ProgressBar::new(todo_count as u64);
+            pb.set_style(
+                ProgressStyle::with_template(
+                    "[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) - {msg}",
+                )
+                .unwrap()
+                .progress_chars("=>-"),
+            );
+            pb
+        };
+
+        let fresh: Vec<VideoFingerprint> = todo
+            .par_iter()
+            .filter_map(|(vf, cache_key)| {
+                // Cheapest possible bail-out. Every video still queued costs one
+                // relaxed atomic load, so the tail of a 50k-file scan drains in
+                // microseconds; the videos actually being decoded right now stop
+                // via the identical check inside fingerprint_video's demux loop.
+                if shutdown_requested() {
+                    return None;
+                }
+
+                let file_name = Path::new(vf).file_name().unwrap_or_default().to_string_lossy().into_owned();
+                pb.set_message(file_name);
+
+                let fp = match fingerprint_video(vf, kf_interval, min_kf_samples) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        // A video that abandoned its decode because of Ctrl-C is
+                        // not a failure, and printing one line per in-flight
+                        // worker would just bury the interrupt message.
+                        if shutdown_requested() {
+                            abandoned.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            log::error!("Failed to process {}: {:#}", vf, e);
+                        }
+                        pb.inc(1); // Keep the bar consistent with work attempted
+                        return None;
+                    }
+                };
+
+                // Written to the tree the moment it exists, not staged in a
+                // shared batch. The batch this replaces held up to 31 finished
+                // fingerprints in RAM -- precisely the work an interrupt was
+                // throwing away -- and on a small library the 32-item threshold
+                // was never reached at all, so NOTHING was written until the run
+                // ended. One sled insert costs tens of microseconds against a
+                // decode measured in seconds.
+                match bincode::serialize(&fp) {
+                    Ok(encoded) => match db.insert(cache_key.as_bytes(), encoded) {
+                        Ok(_) => {
+                            newly_cached.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => log::error!("Failed to cache fingerprint for {}: {}", vf, e),
+                    },
+                    Err(e) => log::error!("Failed to serialize fingerprint for {}: {}", vf, e),
+                }
+
+                pb.inc(1);
+                Some(fp)
+            })
+            .collect();
+
+        pb.finish_and_clear();
+        fingerprints.extend(fresh);
+    }
+
+    let newly_cached = newly_cached.into_inner();
+    let abandoned = abandoned.into_inner();
+
+    if shutdown_requested() {
+        info!(
+            "Cached {} newly fingerprinted video(s) this run; {} of {} are now cached in total.",
+            newly_cached,
+            fingerprints.len(),
+            total_videos
+        );
+        if abandoned > 0 {
+            // Worth stating plainly rather than hiding: a half-decoded video
+            // cannot be cached, and because the queue is sorted largest-first,
+            // the videos in flight are usually the longest ones.
+            info!(
+                "{} video(s) were mid-decode and will be redone next run.",
+                abandoned
+            );
+        }
+        return Ok(Outcome::Interrupted("fingerprinting"));
+    }
 
     let n = fingerprints.len();
     if n < 2 {
         info!("Not enough valid videos to compare.");
-        return Ok(());
+        return Ok(Outcome::Completed);
     }
 
     info!("\nFingerprinting complete. Cross-analyzing {} videos...", n);
 
     let edges = find_all_matches(&fingerprints, max_hamming, min_match_pct);
 
+    // Comparison results are all-or-nothing: a partial edge list would produce a
+    // report that quietly under-reports duplicates, which is worse than no
+    // report. The cache is already durable, so a re-run skips straight to here.
+    if shutdown_requested() {
+        return Ok(Outcome::Interrupted("the comparison pass"));
+    }
+
     info!("Grouping duplicate clusters...");
 
     let final_groups = clustering::find_duplicate_groups(n, edges, &fingerprints);
+
+    // Last gate before anything destructive can happen: an interrupt must never
+    // be followed by a deletion the user did not watch happen.
+    if shutdown_requested() {
+        return Ok(Outcome::Interrupted("clustering"));
+    }
 
     // Announce destructive intent up front so it's visible above the per-file log.
     if args.delete {
@@ -503,5 +688,11 @@ fn main() -> Result<()> {
         args.permanent,
     )?;
 
-    Ok(())
+    // The report still printed and the output file was still written; only the
+    // exit code records that deletion was cut short.
+    if shutdown_requested() {
+        return Ok(Outcome::Interrupted("the results output"));
+    }
+
+    Ok(Outcome::Completed)
 }

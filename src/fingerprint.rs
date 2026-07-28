@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
+use crate::utils::shutdown_requested;
 
 // Every stored frame is a 64x64 GRAY8 buffer. Crucially we keep them all in ONE
 // contiguous allocation (`u_frames` below) instead of a Vec<Vec<u8>>. A single
@@ -173,6 +174,9 @@ pub fn fingerprint_video(filepath: &str, kf_interval: f64, min_kf_samples: f64) 
 
     // Rapid Demuxing: Only push Key-frames (I-Frames) into decoder
     for (stream, packet) in ictx.packets() {
+        if shutdown_requested() {
+            return Err(anyhow!("Interrupted while fingerprinting {}", filepath));
+        }
         if stream.index() == video_stream_index && packet.is_key() {
             if effective_interval > 0.0 {
                 let tb = stream.time_base();

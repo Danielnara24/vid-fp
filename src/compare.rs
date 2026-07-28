@@ -1,6 +1,7 @@
 use crate::fingerprint::VideoFingerprint;
 use log::info;
 use rayon::prelude::*;
+use crate::utils::shutdown_requested;
 
 /// One stored hash, tagged with the video it came from.
 ///
@@ -84,6 +85,9 @@ fn candidate_pairs(
     (0..n)
         .into_par_iter()
         .flat_map(|v_a| {
+            if shutdown_requested() {
+                return Vec::new();
+            }
             let fp_a = &fingerprints[v_a];
 
             // Once a video is a known candidate, further hits against it are
@@ -95,6 +99,9 @@ fn candidate_pairs(
             let mut candidates: Vec<(usize, usize)> = Vec::new();
 
             for &h_a in fp_a.valid_hashes.iter() {
+                if shutdown_requested() {
+                    return Vec::new();
+                }
                 let b = [
                     ((h_a >> 48) & 0xFFFF) as usize,
                     ((h_a >> 32) & 0xFFFF) as usize,
@@ -192,11 +199,17 @@ pub fn find_all_matches(
     min_match_percent: f32,
 ) -> Vec<(usize, usize)> {
     let candidates = candidate_pairs(fingerprints, max_hamming_dist);
+    if shutdown_requested() {
+        return Vec::new();
+    }
     info!("Index scan produced {} candidate pair(s); verifying...", candidates.len());
 
     candidates
         .into_par_iter()
         .filter(|&(v_a, v_b)| {
+            if shutdown_requested() {
+                return false;
+            }
             let (pct_a, pct_b) =
                 match_overlap(&fingerprints[v_a], &fingerprints[v_b], max_hamming_dist);
             pct_a.max(pct_b) >= min_match_percent
