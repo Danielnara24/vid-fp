@@ -1,9 +1,17 @@
 use anyhow::{anyhow, Context, Result};
 use log::info;
 use crate::fingerprint::VideoFingerprint;
-use crate::utils::{format_duration, format_size, find_best, Priority};
+use crate::utils::{
+    find_best, format_bitrate, format_duration, format_size, GroupMaxima, Priority,
+};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+
+/// Metrics that can justify a REVIEW flag, in default precedence order. Size is
+/// absent on purpose: it carries no quality information that bitrate and length
+/// don't already express (size IS bitrate x length), so flagging on it would
+/// only ever repeat a flag one of those two already raised.
+const REVIEW_METRICS: [Priority; 2] = [Priority::Length, Priority::Resolution];
 
 /// Remove a single file, either by moving it to the system trash (default,
 /// recoverable) or by deleting it permanently. Trash semantics are handled by
@@ -51,41 +59,22 @@ pub fn output_results(
     let mut delete_candidates: HashSet<usize> = HashSet::new();
 
     for group in final_groups {
-        let max_dur = group.iter().map(|&idx| fingerprints[idx].duration).fold(0.0, f64::max);
-        let max_res = group.iter().map(|&idx| fingerprints[idx].width * fingerprints[idx].height).max().unwrap_or(0);
+        let maxima = GroupMaxima::of(group, fingerprints);
 
-        let keep_idx = find_best(group, fingerprints, priority, max_dur);
+        let keep_idx = find_best(group, fingerprints, priority, &maxima);
         let keep_fp = &fingerprints[keep_idx];
-        let keep_res = keep_fp.width * keep_fp.height;
 
-        let mut review_idx = None;
-
-        match priority {
-            Priority::Length => {
-                // If KEEP isn't the absolute max resolution, find the best Res file for REVIEW
-                if keep_res < max_res {
-                    let candidate = find_best(group, fingerprints, Priority::Resolution, max_dur);
-                    if candidate != keep_idx { review_idx = Some(candidate); }
-                }
-            },
-            Priority::Resolution => {
-                // If KEEP isn't close to absolute max length, find the best Length file for REVIEW
-                if keep_fp.duration < max_dur - 0.5 {
-                    let candidate = find_best(group, fingerprints, Priority::Length, max_dur);
-                    if candidate != keep_idx { review_idx = Some(candidate); }
-                }
-            },
-            Priority::Size => {
-                // Recommend length if lacking, else recommend resolution if lacking
-                if keep_fp.duration < max_dur - 0.5 {
-                    let candidate = find_best(group, fingerprints, Priority::Length, max_dur);
-                    if candidate != keep_idx { review_idx = Some(candidate); }
-                } else if keep_res < max_res {
-                    let candidate = find_best(group, fingerprints, Priority::Resolution, max_dur);
-                    if candidate != keep_idx { review_idx = Some(candidate); }
-                }
-            }
-        }
+        // If the KEEP pick isn't top-tier on some quality metric, surface the
+        // file that IS as worth a manual look. Metrics are checked in default
+        // precedence order, skipping the one the user prioritised (KEEP wins
+        // that by construction). Laziness matters here: find_best only runs for
+        // the first metric KEEP actually falls short on.
+        let review_idx = REVIEW_METRICS
+            .iter()
+            .copied()
+            .filter(|&m| m != priority && maxima.tier(keep_fp, m) == 0)
+            .map(|m| find_best(group, fingerprints, m, &maxima))
+            .find(|&candidate| candidate != keep_idx);
 
         if let Some(r) = review_idx {
             review_set.insert(r);
@@ -147,7 +136,8 @@ pub fn output_results(
         .delimiter(b';')
         .from_writer(Vec::new());
 
-    csv_wtr.write_record(&["group", "resolution", "size", "length", "full_path", "action"])
+    csv_wtr
+        .write_record(&["group", "resolution", "size", "bitrate", "length", "full_path", "action"])
         .context("Failed to write CSV header")?;
 
     for (i, group) in final_groups.iter().enumerate() {
@@ -162,6 +152,7 @@ pub fn output_results(
         for &idx in group {
             let fp = &fingerprints[idx];
             let size_str = format_size(fp.file_size);
+            let bitrate_str = format_bitrate(fp.bitrate());
             let duration_str = format_duration(fp.duration);
             let res_str = format!("{}x{}", fp.width, fp.height);
 
@@ -185,10 +176,13 @@ pub fn output_results(
             };
 
             // 1. Console / Text Output
-            info!("\t{}, {}, {}, {}, {}", res_str, size_str, duration_str, fp.path, action_str);
+            info!(
+                "\t{}, {}, {}, {}, {}, {}",
+                res_str, size_str, bitrate_str, duration_str, fp.path, action_str
+            );
             txt_out.push_str(&format!(
-                "\t{}, {}, {}, {}, {}\n",
-                res_str, size_str, duration_str, fp.path, action_str
+                "\t{}, {}, {}, {}, {}, {}\n",
+                res_str, size_str, bitrate_str, duration_str, fp.path, action_str
             ));
 
             // 2. CSV Output
@@ -196,6 +190,7 @@ pub fn output_results(
                 &group_name,
                 &res_str,
                 &size_str,
+                &bitrate_str,
                 &duration_str,
                 &fp.path,
                 action_str,
@@ -205,6 +200,8 @@ pub fn output_results(
             json_files.push(serde_json::json!({
                 "resolution": res_str,
                 "size": size_str,
+                "bitrate": bitrate_str,
+                "bitrate_bps": fp.bitrate(),
                 "length": duration_str,
                 "full_path": fp.path,
                 "action": action_str,
@@ -329,6 +326,20 @@ mod tests {
         }
     }
 
+    /// A mock whose size scales with duration, holding bitrate at exactly
+    /// 1 Mbps. This matters now that bitrate is derived: give a 10s file the
+    /// same byte count as a 90s one and it genuinely IS a 9x higher-bitrate
+    /// copy, which the REVIEW rule will correctly flag and protect from
+    /// deletion. These tests are about the KEEP/DELETE precedence logic, so
+    /// they hold every other variable still.
+    fn mock_fp_at(path: &str, duration: f64) -> VideoFingerprint {
+        let mut fp = mock_fp();
+        fp.path = path.to_string();
+        fp.duration = duration;
+        fp.file_size = (duration * 131_072.0) as u64; // 1 Mbps
+        fp
+    }
+
     #[test]
     fn test_csv_output() {
         let fps = vec![mock_fp()];
@@ -343,9 +354,11 @@ mod tests {
         let contents = fs::read_to_string(&path_str).unwrap();
 
         // Assert headers exist (separated by semicolons)
-        assert!(contents.contains("group;resolution;size;length;full_path;action"));
-        // Assert data exists and defaults single item to KEEP
-        assert!(contents.contains("group_1;1920x1080;1.0MB;00:01:00;/fake/path/vid.mp4;KEEP"));
+        assert!(contents.contains("group;resolution;size;bitrate;length;full_path;action"));
+        // 1 MiB over 60s = ~140kbps. Assert data exists and defaults to KEEP.
+        assert!(contents.contains(
+            "group_1;1920x1080;1.0MB;140kbps;00:01:00;/fake/path/vid.mp4;KEEP"
+        ));
 
         // Clean up
         let _ = fs::remove_file(path_str);
@@ -362,13 +375,8 @@ mod tests {
         let del_path = del_file.path().to_string_lossy().to_string();
 
         // Longer duration => higher "tier" => KEEP under Priority::Length.
-        let mut fp_keep = mock_fp();
-        fp_keep.path = keep_path.clone();
-        fp_keep.duration = 60.0;
-
-        let mut fp_del = mock_fp();
-        fp_del.path = del_path.clone();
-        fp_del.duration = 10.0;
+        let fp_keep = mock_fp_at(&keep_path, 60.0);
+        let fp_del = mock_fp_at(&del_path, 10.0);
 
         let fps = vec![fp_keep, fp_del];
         let groups = vec![vec![0, 1]];
@@ -392,9 +400,9 @@ mod tests {
         let p1 = f1.path().to_string_lossy().to_string();
         let p2 = f2.path().to_string_lossy().to_string();
 
-        let mut fp0 = mock_fp(); fp0.path = p0.clone(); fp0.duration = 100.0; // global best
-        let mut fp1 = mock_fp(); fp1.path = p1.clone(); fp1.duration = 90.0;  // bridge
-        let mut fp2 = mock_fp(); fp2.path = p2.clone(); fp2.duration = 10.0;
+        let fp0 = mock_fp_at(&p0, 100.0); // global best
+        let fp1 = mock_fp_at(&p1, 90.0);  // bridge
+        let fp2 = mock_fp_at(&p2, 10.0);
 
         let fps = vec![fp0, fp1, fp2];
         let groups = vec![vec![0, 1], vec![1, 2]];
@@ -419,9 +427,9 @@ mod tests {
         let p1 = f1.path().to_string_lossy().to_string();
         let p2 = f2.path().to_string_lossy().to_string();
 
-        let mut fp0 = mock_fp(); fp0.path = p0.clone(); fp0.duration = 60.0;
-        let mut fp1 = mock_fp(); fp1.path = p1.clone(); fp1.duration = 60.0;
-        let mut fp2 = mock_fp(); fp2.path = p2.clone(); fp2.duration = 10.0;
+        let fp0 = mock_fp_at(&p0, 60.0);
+        let fp1 = mock_fp_at(&p1, 60.0);
+        let fp2 = mock_fp_at(&p2, 10.0);
 
         let fps = vec![fp0, fp1, fp2];
         let groups = vec![vec![0, 2], vec![1, 2]];
@@ -432,5 +440,28 @@ mod tests {
         assert!(Path::new(&p0).exists(), "independent best A must remain");
         assert!(Path::new(&p1).exists(), "independent best B must remain");
         assert!(!Path::new(&p2).exists(), "shared duplicate must be removed exactly once");
+    }
+
+    #[test]
+    fn test_bitrate_settles_groups_that_tie_on_length_and_resolution() {
+        // Same length, same resolution: under the default order the decision
+        // reaches bitrate, and the denser copy is kept. Nothing is flagged
+        // REVIEW, because the KEEP pick is top-tier on every metric.
+        let f_hi = NamedTempFile::new().unwrap();
+        let f_lo = NamedTempFile::new().unwrap();
+        let p_hi = f_hi.path().to_string_lossy().to_string();
+        let p_lo = f_lo.path().to_string_lossy().to_string();
+
+        let mut fp_hi = mock_fp_at(&p_hi, 60.0);
+        fp_hi.file_size *= 2; // 2 Mbps
+        let fp_lo = mock_fp_at(&p_lo, 60.0); // 1 Mbps
+
+        let fps = vec![fp_hi, fp_lo];
+        let groups = vec![vec![0, 1]];
+
+        output_results(&groups, &fps, None, 0, Priority::Length, true, true).unwrap();
+
+        assert!(Path::new(&p_hi).exists(), "higher-bitrate copy must be kept");
+        assert!(!Path::new(&p_lo).exists(), "lower-bitrate copy must be deleted");
     }
 }

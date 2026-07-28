@@ -21,6 +21,29 @@ pub struct VideoFingerprint {
     pub file_size: u64,
 }
 
+impl VideoFingerprint {
+    /// Overall bitrate in bits per second.
+    ///
+    /// Derived from bytes and seconds rather than read from the container, on
+    /// purpose. Per-stream `bit_rate` is set for MP4/AVI but almost never for
+    /// MKV/WebM, so reading it would compare a video-only number against a
+    /// container-total one whenever a group spans containers -- a bias the
+    /// size of an audio track, in the exact case this tool exists to catch.
+    /// This definition is identical for every file and costs nothing: both
+    /// operands are already stored, so it adds no decode work and no cache
+    /// churn.
+    ///
+    /// Caveat worth knowing: it counts audio. A copy with lossless 5.1 can
+    /// outrank one with a better video track and stereo AAC.
+    pub fn bitrate(&self) -> u64 {
+        if self.duration > 0.0 {
+            ((self.file_size as f64 * 8.0) / self.duration) as u64
+        } else {
+            0
+        }
+    }
+}
+
 pub fn fingerprint_video(filepath: &str, kf_interval: f64, min_kf_samples: f64) -> Result<VideoFingerprint> {
     // 1. Native Zero-Copy Extraction (No Subprocess Overhead)
     let mut ictx = ffmpeg_next::format::input(&filepath)
