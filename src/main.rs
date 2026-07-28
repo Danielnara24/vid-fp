@@ -120,7 +120,7 @@ struct Args {
 /// message can tell the user where it stopped.
 enum Outcome {
     Completed,
-    Interrupted(&'static str),
+    Interrupted,
 }
 
 /// Arrange for Ctrl-C (and, thanks to the `termination` feature, SIGTERM and
@@ -142,8 +142,7 @@ fn install_signal_handler() -> Result<()> {
             // Straight to stderr, not through the logger, so it still shows
             // under --quiet. The user pressed a key; they get an answer now.
             eprintln!(
-                "\nInterrupt received — stopping and saving finished fingerprints to cache.\n\
-                 (Press Ctrl-C again to quit immediately.)"
+                "\nInterrupt received — saving finished fingerprints to cache."
             );
         } else {
             eprintln!("\nSecond interrupt — quitting now.");
@@ -249,11 +248,7 @@ fn main() -> Result<()> {
 
     match outcome? {
         Outcome::Completed => Ok(()),
-        Outcome::Interrupted(phase) => {
-            info!(
-                "Stopped during {}. Cached work is saved — re-running picks up where this left off.",
-                phase
-            );
+        Outcome::Interrupted => {
             // 130 is the shell convention for "terminated by SIGINT".
             std::process::exit(130);
         }
@@ -341,11 +336,8 @@ fn run(args: &Args, db: &sled::Db, start_time: Instant, active_threads: usize) -
         });
 
         for entry in it.filter_map(|e| e.ok()) {
-            // Nothing has been fingerprinted yet, so there is nothing to lose --
-            // but a walk over a cold network mount can take minutes, and the
-            // user should not have to wait it out.
             if shutdown_requested() {
-                return Ok(Outcome::Interrupted("the folder scan"));
+                return Ok(Outcome::Interrupted);
             }
 
             let path = entry.path();
@@ -404,11 +396,8 @@ fn run(args: &Args, db: &sled::Db, start_time: Instant, active_threads: usize) -
         let mut pruned_count = 0;
 
         for kv in db.iter() {
-            // Abandon the half-built batch rather than applying a partial prune:
-            // dropping cache entries is the one thing here that costs the user
-            // real time to rebuild.
             if shutdown_requested() {
-                return Ok(Outcome::Interrupted("the cache prune (nothing was removed)"));
+                return Ok(Outcome::Interrupted);
             }
 
             if let Ok((key_bytes, _)) = kv {
@@ -538,7 +527,7 @@ fn run(args: &Args, db: &sled::Db, start_time: Instant, active_threads: usize) -
     }
 
     if shutdown_requested() {
-        return Ok(Outcome::Interrupted("the cache scan"));
+        return Ok(Outcome::Interrupted);
     }
 
     // --- Pass 2: the work that actually costs something -----------------------
@@ -621,25 +610,15 @@ fn run(args: &Args, db: &sled::Db, start_time: Instant, active_threads: usize) -
     }
 
     let newly_cached = newly_cached.into_inner();
-    let abandoned = abandoned.into_inner();
 
     if shutdown_requested() {
         info!(
-            "Cached {} newly fingerprinted video(s) this run; {} of {} are now cached in total.",
+            "Cached {} video(s); {} of {} are now cached in total.",
             newly_cached,
             fingerprints.len(),
             total_videos
         );
-        if abandoned > 0 {
-            // Worth stating plainly rather than hiding: a half-decoded video
-            // cannot be cached, and because the queue is sorted largest-first,
-            // the videos in flight are usually the longest ones.
-            info!(
-                "{} video(s) were mid-decode and will be redone next run.",
-                abandoned
-            );
-        }
-        return Ok(Outcome::Interrupted("fingerprinting"));
+        return Ok(Outcome::Interrupted);
     }
 
     let n = fingerprints.len();
@@ -652,21 +631,16 @@ fn run(args: &Args, db: &sled::Db, start_time: Instant, active_threads: usize) -
 
     let edges = find_all_matches(&fingerprints, max_hamming, min_match_pct);
 
-    // Comparison results are all-or-nothing: a partial edge list would produce a
-    // report that quietly under-reports duplicates, which is worse than no
-    // report. The cache is already durable, so a re-run skips straight to here.
     if shutdown_requested() {
-        return Ok(Outcome::Interrupted("the comparison pass"));
+        return Ok(Outcome::Interrupted);
     }
 
     info!("Grouping duplicate clusters...");
 
     let final_groups = clustering::find_duplicate_groups(n, edges, &fingerprints);
 
-    // Last gate before anything destructive can happen: an interrupt must never
-    // be followed by a deletion the user did not watch happen.
     if shutdown_requested() {
-        return Ok(Outcome::Interrupted("clustering"));
+        return Ok(Outcome::Interrupted);
     }
 
     // Announce destructive intent up front so it's visible above the per-file log.
@@ -688,10 +662,8 @@ fn run(args: &Args, db: &sled::Db, start_time: Instant, active_threads: usize) -
         args.permanent,
     )?;
 
-    // The report still printed and the output file was still written; only the
-    // exit code records that deletion was cut short.
     if shutdown_requested() {
-        return Ok(Outcome::Interrupted("the results output"));
+        return Ok(Outcome::Interrupted);
     }
 
     Ok(Outcome::Completed)
