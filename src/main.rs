@@ -13,6 +13,7 @@ use log::info;
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use utils::Priority;
@@ -37,6 +38,13 @@ struct Args {
     /// their immediate files are scanned).
     #[arg(short = 'r', long = "recursive")]
     recursive: bool,
+
+    /// Follow symbolic links while scanning. Off by default, which means a
+    /// symlinked directory is not descended into. Safe to enable: files are
+    /// deduplicated by (device, inode), so following a link never fingerprints
+    /// the same bytes twice.
+    #[arg(long = "follow-symlinks")]
+    follow_symlinks: bool,
 
     /// Video file extensions to search for (case-insensitive; a leading dot is
     /// optional). Repeat the flag or comma-separate, e.g. `-x mp4,mkv` or
@@ -212,8 +220,8 @@ fn main() -> Result<()> {
     info!("Searching extensions: {:?}", ext_display);
 
     info!(
-        "Settings -> Max Hamming: {}, Min Match: {}%, Priority: {:?}, Threads: {}, Recursive: {}",
-        max_hamming, args.match_percent, args.priority, active_threads, args.recursive
+        "Settings -> Max Hamming: {}, Min Match: {}%, Priority: {:?}, Threads: {}, Recursive: {}, Follow symlinks: {}",
+        max_hamming, args.match_percent, args.priority, active_threads, args.recursive, args.follow_symlinks
     );
 
     // Canonicalize exclude paths so prefix matching is safe and reliable
@@ -222,6 +230,15 @@ fn main() -> Result<()> {
         .iter()
         .filter_map(|p| std::fs::canonicalize(p).ok())
         .collect();
+
+    // Identity-based deduplication. A symlink, a hard link, a second scan root
+    // that overlaps the first, and a bind-mount alias all resolve to the same
+    // (device, inode) pair. Keying on that identity means each set of bytes is
+    // fingerprinted exactly once, under the first path we reach it by -- so the
+    // report never lists a file as a duplicate of itself, and the "space freed"
+    // figure never counts bytes that deleting a link would not actually return.
+    let mut seen_inodes: HashSet<(u64, u64)> = HashSet::new();
+    let mut alias_skipped = 0usize;
 
     for include_dir in &args.include {
         let base_path = match std::fs::canonicalize(include_dir) {
@@ -232,7 +249,7 @@ fn main() -> Result<()> {
             }
         };
 
-        let mut walker = WalkDir::new(&base_path);
+        let mut walker = WalkDir::new(&base_path).follow_links(args.follow_symlinks);
 
         if !args.recursive {
             // Non-recursive by default: limit depth so only the directory itself
@@ -249,14 +266,52 @@ fn main() -> Result<()> {
 
         for entry in it.filter_map(|e| e.ok()) {
             let path = entry.path();
-            if path.is_file() {
-                if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-                    if extensions.contains(ext.to_lowercase().as_str()) {
-                        video_files.push(path.to_string_lossy().to_string());
-                    }
-                }
+
+            // Extension first: it is free, and it keeps us from stat()ing every
+            // non-video file in the tree.
+            let ext_matches = path
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|ext| extensions.contains(ext.to_lowercase().as_str()))
+                .unwrap_or(false);
+
+            if !ext_matches {
+                continue;
             }
+
+            // One stat does three jobs: it follows symlinks (so a link to a
+            // video is treated as that video), confirms this is a regular file,
+            // and yields the identity used for deduplication.
+            let meta = match std::fs::metadata(path) {
+                Ok(m) => m,
+                Err(e) => {
+                    log::error!("Cannot stat {}: {}", path.display(), e);
+                    continue;
+                }
+            };
+
+            if !meta.is_file() {
+                continue;
+            }
+
+            if !seen_inodes.insert((meta.dev(), meta.ino())) {
+                alias_skipped += 1;
+                log::debug!(
+                    "Skipping {}: same inode as a path already queued",
+                    path.display()
+                );
+                continue;
+            }
+
+            video_files.push(path.to_string_lossy().to_string());
         }
+    }
+
+    if alias_skipped > 0 {
+        info!(
+            "Skipped {} path(s) resolving to files already queued (symlinks, hard links, or overlapping folders).",
+            alias_skipped
+        );
     }
 
     if args.prune_cache && !args.clear_cache {

@@ -97,7 +97,12 @@ vid-fp ~/Videos -r -o results.csv
 
 By default the scan is **not** recursive (only the folders you name and their
 immediate files). Add `-r` to descend into subfolders.
-To change what's detected as a duplicate, try increasing/decreasing the Hamming Distance or the Min Match Percentage.
+
+Files are identified by inode, not by path. If the same file is reachable more
+than once — through a symlink, a hard link, or two scan folders that overlap —
+it's fingerprinted once and reported once, so nothing is ever listed as a
+duplicate of itself. Symlinked *folders* are skipped unless you pass
+`--follow-symlinks`.
 
 ### Deleting duplicates
 
@@ -115,9 +120,10 @@ vid-fp ~/Videos -r --delete --permanent
 | --- | --- | --- |
 | `<FOLDER>...` | One or more folders to scan (required) | — |
 | `-r`, `--recursive` | Include subfolders | off |
+| `--follow-symlinks` | Descend into symlinked folders | off |
 | `-e`, `--exclude <FOLDER>` | Exclude a folder; repeat for several | — |
 | `-x`, `--extensions <EXT>` | Video extensions to include, comma-separated or repeated | `mp4,mkv,avi,mov,flv,webm` |
-| `-d`, `--hamming-distance <N>` | Frame-match tolerance; higher = less strict matching. Raise to increase duplicates found (but can increase false positives) | `3` |
+| `-d`, `--hamming-distance <N>` | Frame-match tolerance; higher = less strict matching. Raise to increase duplicates found (but can increase false positives). Values above `7` work but see [Tuning](#tuning) | `3` |
 | `-p`, `--match-percent <F>` | Min % of overlap to count as a duplicate; Lower = Finds shorter matches (but can increase false positives) | `10.0` |
 | `-k`, `--priority <P>` | Criteria for KEEPING files: `length`, `resolution`, or `size` | `length` |
 | `--keyframe-interval <F>` | Seconds between sampled keyframes (`0` = every keyframe); Higher = Faster processing (Increasing this can hinder the capability of finding short matches between videos) | `0.0` |
@@ -129,6 +135,25 @@ vid-fp ~/Videos -r --delete --permanent
 | `-q`, `--quiet` | Only print errors | off |
 | `--clear-cache` | Wipe ALL vid-fp cache before running | off |
 | `--prune-cache` | Drop cached entries only for files not in this scan | off |
+
+## Tuning
+
+The two knobs that decide what counts as a duplicate are `-d` (how different two
+frames may be) and `-p` (how much of a video must match). They trade off against
+each other, so change one at a time.
+
+**Not finding duplicates you expect?** Raise `-d` to 5–7, or lower `-p` if the
+match is a short clip inside a long video.
+
+**Getting false positives?** Lower `-d` first — it's the blunter of the two.
+Dark scenes, fades, and letterboxed content look alike to any perceptual hash,
+and a loose `-d` conflates them.
+
+Above `-d 7` the index that proposes candidate pairs is no longer exhaustive: it
+may fail to *propose* a pair whose frames are all near the far edge of the
+tolerance. Once a pair is proposed it is always compared exactly, and genuine
+duplicates share hundreds of frames, so a miss is very unlikely — but if you go
+that high, raise `-p` alongside it to keep false positives in check.
 
 ## How it reads the results
 
@@ -151,6 +176,8 @@ Fingerprints are cached (under `$XDG_CACHE_HOME/video-dedup`, falling back to
   FreeDesktop.org spec, so they're recoverable — unless you add `--permanent`.
 - **Do a dry run first.** Look at the output (or a saved `--output` report) before
   running with `--delete`.
+  - **No double-counting.** Hard links and symlinks to the same file collapse into
+  a single entry, so the reported space freed reflects bytes actually reclaimed.
 
 ## License
 
