@@ -181,6 +181,15 @@ Fingerprints are cached (under `$XDG_CACHE_HOME/video-dedup`, falling back to
 `~/.cache/video-dedup`), so re-scanning the same library is near-instant. Use
 `--clear-cache` or `--prune-cache` to manage it.
 
+## Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Ran clean |
+| `1` | Fatal error; the run did not complete |
+| `2` | Completed, but something failed (see the `Problems` summary) |
+| `130` | Interrupted with Ctrl-C |
+
 ## Safety
 
 - **Report-only by default.** Without `--delete`, nothing is ever removed.

@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use log::info;
 use crate::fingerprint::VideoFingerprint;
+use crate::stats::RunStats;
 use crate::utils::{
     find_best, format_bitrate, format_duration, format_size, shutdown_requested, GroupMaxima, Priority,
 };
@@ -35,6 +36,7 @@ pub fn output_results(
     priority: Priority,
     delete: bool,
     permanent: bool,
+    stats: &RunStats,
 ) -> Result<()> {
 
     // `--permanent` only has meaning alongside `--delete`; on its own it must
@@ -123,6 +125,7 @@ pub fn output_results(
                 Err(e) => {
                     log::error!("{:#}", e);
                     failed_count += 1;
+                    stats.delete_failed.record(fp.path.clone());
                     delete_outcome.insert(idx, "FAILED");
                 }
             }
@@ -357,7 +360,10 @@ mod tests {
         let path_str = temp_file.path().with_extension("csv").to_string_lossy().to_string();
 
         // Report-only run: single item defaults to KEEP.
-        output_results(&groups, &fps, Some(&path_str), 120, Priority::Length, false, false).unwrap();
+        output_results(
+            &groups, &fps, Some(&path_str), 120, Priority::Length, false, false,
+            &RunStats::default(),
+        ).unwrap();
 
         let contents = fs::read_to_string(&path_str).unwrap();
 
@@ -388,11 +394,13 @@ mod tests {
 
         let fps = vec![fp_keep, fp_del];
         let groups = vec![vec![0, 1]];
+        let stats = RunStats::default();
 
-        output_results(&groups, &fps, None, 0, Priority::Length, true, true).unwrap();
+        output_results(&groups, &fps, None, 0, Priority::Length, true, true, &stats).unwrap();
 
         assert!(Path::new(&keep_path).exists(), "KEEP file must remain");
         assert!(!Path::new(&del_path).exists(), "DELETE file must be removed");
+        assert!(!stats.had_problems(), "a clean deletion must not fail the run");
     }
 
     #[test]
@@ -415,7 +423,9 @@ mod tests {
         let fps = vec![fp0, fp1, fp2];
         let groups = vec![vec![0, 1], vec![1, 2]];
 
-        output_results(&groups, &fps, None, 0, Priority::Length, true, true).unwrap();
+        output_results(
+            &groups, &fps, None, 0, Priority::Length, true, true, &RunStats::default(),
+        ).unwrap();
 
         assert!(Path::new(&p0).exists(), "global best must remain");
         assert!(!Path::new(&p1).exists(), "bridge duplicate must be deleted in one pass");
@@ -441,13 +451,18 @@ mod tests {
 
         let fps = vec![fp0, fp1, fp2];
         let groups = vec![vec![0, 2], vec![1, 2]];
+        let stats = RunStats::default();
 
         // Previously errored on the second deletion attempt; must succeed now.
-        output_results(&groups, &fps, None, 0, Priority::Length, true, true).unwrap();
+        output_results(&groups, &fps, None, 0, Priority::Length, true, true, &stats).unwrap();
 
         assert!(Path::new(&p0).exists(), "independent best A must remain");
         assert!(Path::new(&p1).exists(), "independent best B must remain");
         assert!(!Path::new(&p2).exists(), "shared duplicate must be removed exactly once");
+        assert_eq!(
+            stats.delete_failed.count(), 0,
+            "a target queued by two groups must not report a second, failing attempt"
+        );
     }
 
     #[test]
@@ -467,9 +482,28 @@ mod tests {
         let fps = vec![fp_hi, fp_lo];
         let groups = vec![vec![0, 1]];
 
-        output_results(&groups, &fps, None, 0, Priority::Length, true, true).unwrap();
+        output_results(
+            &groups, &fps, None, 0, Priority::Length, true, true, &RunStats::default(),
+        ).unwrap();
 
         assert!(Path::new(&p_hi).exists(), "higher-bitrate copy must be kept");
         assert!(!Path::new(&p_lo).exists(), "lower-bitrate copy must be deleted");
+    }
+
+    #[test]
+    fn test_failed_deletion_is_recorded_for_the_summary_and_exit_code() {
+        let keep_file = NamedTempFile::new().unwrap();
+        let keep_path = keep_file.path().to_string_lossy().to_string();
+        let missing = "/nonexistent/vid-fp/definitely-not-here.mp4".to_string();
+
+        let fps = vec![mock_fp_at(&keep_path, 60.0), mock_fp_at(&missing, 10.0)];
+        let groups = vec![vec![0, 1]];
+        let stats = RunStats::default();
+
+        output_results(&groups, &fps, None, 0, Priority::Length, true, true, &stats).unwrap();
+
+        assert_eq!(stats.delete_failed.count(), 1, "the failure must be tallied");
+        assert!(stats.had_problems(), "a failed deletion must fail the run");
+        assert!(Path::new(&keep_path).exists(), "the KEEP pick is untouched either way");
     }
 }

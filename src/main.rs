@@ -2,6 +2,7 @@ mod clustering;
 mod compare;
 mod export;
 mod fingerprint;
+mod stats;
 mod utils;
 
 use anyhow::{Context, Result};
@@ -11,6 +12,7 @@ use fingerprint::{fingerprint_video, VideoFingerprint, MAX_DECODE_THREADS};
 use indicatif::{ProgressBar, ProgressStyle};
 use log::info;
 use rayon::prelude::*;
+use stats::RunStats;
 use std::collections::HashSet;
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
@@ -22,6 +24,13 @@ use walkdir::WalkDir;
 
 // Cache schema versioning - bump this if VideoFingerprint struct ever changes!
 const CACHE_VERSION: &str = "v1";
+
+/// Exit code for a run that finished, reported, and did everything it could --
+/// but hit at least one problem on the way (an unreadable file, a video that
+/// would not decode, a deletion that failed). 0 means clean, 1 is anyhow's
+/// fatal path, 130 is the shell convention for SIGINT. Scripts that don't care
+/// can ignore it; scripts that do finally have something to test.
+const EXIT_WITH_PROBLEMS: i32 = 2;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -260,7 +269,12 @@ fn main() -> Result<()> {
         .open()
         .context("Failed to open or lock cache database")?;
 
-    let outcome = run(&args, &db, start_time, active_threads);
+    // Every non-fatal problem and every deliberate skip lands here, from any
+    // thread and any phase, so the run can account for itself at the end
+    // instead of leaving the user to reconstruct it from scrollback.
+    let stats = RunStats::default();
+
+    let outcome = run(&args, &db, start_time, active_threads, &stats);
 
     // --- The only exit path ---------------------------------------------------
     // Every route out of `run` lands here -- success, failure, or interrupt --
@@ -271,19 +285,37 @@ fn main() -> Result<()> {
     // the next run. Flush, drop, then leave.
     if let Err(e) = db.flush() {
         log::error!("Failed to flush the fingerprint cache: {}", e);
+        stats.cache_write_failed.record(format!("final cache flush: {}", e));
     }
     drop(db);
 
+    // Printed last, deliberately: it is the part you act on, and after a long
+    // scan it is the only part still on screen.
+    stats.print_summary();
+
     match outcome? {
-        Outcome::Completed => Ok(()),
+        Outcome::Completed => {
+            if stats.had_problems() {
+                std::process::exit(EXIT_WITH_PROBLEMS);
+            }
+            Ok(())
+        }
         Outcome::Interrupted => {
-            // 130 is the shell convention for "terminated by SIGINT".
+            // 130 is the shell convention for "terminated by SIGINT", and it
+            // takes precedence over EXIT_WITH_PROBLEMS: "you stopped it"
+            // explains the unfinished work better than "something failed".
             std::process::exit(130);
         }
     }
 }
 
-fn run(args: &Args, db: &sled::Db, start_time: Instant, active_threads: usize) -> Result<Outcome> {
+fn run(
+    args: &Args,
+    db: &sled::Db,
+    start_time: Instant,
+    active_threads: usize,
+    stats: &RunStats,
+) -> Result<Outcome> {
     if args.clear_cache {
         info!("Clearing all cache...");
         db.clear().context("Failed to clear cache database")?;
@@ -327,12 +359,26 @@ fn run(args: &Args, db: &sled::Db, start_time: Instant, active_threads: usize) -
         max_hamming, args.match_percent, min_duration, args.priority, active_threads, args.recursive
     );
 
-    // Canonicalize exclude paths so prefix matching is safe and reliable
-    let exclude_paths: Vec<PathBuf> = args
-        .exclude
-        .iter()
-        .filter_map(|p| std::fs::canonicalize(p).ok())
-        .collect();
+    // Canonicalize exclude paths so prefix matching is safe and reliable.
+    //
+    // A path that will not resolve excludes NOTHING. That used to be swallowed
+    // by `filter_map(.ok())`, so a typo in `-e` quietly scanned the folder you
+    // were protecting -- and with `--delete` armed, that is how files die. It
+    // is now loud, counted, and reflected in the exit code.
+    let mut exclude_paths: Vec<PathBuf> = Vec::with_capacity(args.exclude.len());
+    for p in &args.exclude {
+        match std::fs::canonicalize(p) {
+            Ok(resolved) => exclude_paths.push(resolved),
+            Err(e) => {
+                log::error!(
+                    "Could not resolve exclude path '{}': {} -- nothing was excluded for it",
+                    p,
+                    e
+                );
+                stats.unresolved_excludes.record(format!("{}: {}", p, e));
+            }
+        }
+    }
 
     // Identity-based deduplication. A symlink, a hard link, a second scan root
     // that overlaps the first, and a bind-mount alias all resolve to the same
@@ -341,13 +387,15 @@ fn run(args: &Args, db: &sled::Db, start_time: Instant, active_threads: usize) -
     // report never lists a file as a duplicate of itself, and the "space freed"
     // figure never counts bytes that deleting a link would not actually return.
     let mut seen_inodes: HashSet<(u64, u64)> = HashSet::new();
-    let mut alias_skipped = 0usize;
 
     for include_dir in &args.include {
         let base_path = match std::fs::canonicalize(include_dir) {
             Ok(p) => p,
             Err(e) => {
                 log::error!("Could not resolve include path '{}': {}", include_dir, e);
+                stats
+                    .unresolved_includes
+                    .record(format!("{}: {}", include_dir, e));
                 continue;
             }
         };
@@ -367,10 +415,28 @@ fn run(args: &Args, db: &sled::Db, start_time: Instant, active_threads: usize) -
             !exclude_paths.iter().any(|ex| p.starts_with(ex))
         });
 
-        for entry in it.filter_map(|e| e.ok()) {
+        for entry in it {
             if shutdown_requested() {
                 return Ok(Outcome::Interrupted);
             }
+
+            // WalkDir reports per-entry failures: an unreadable subfolder, a
+            // dangling link under --follow-symlinks, a symlink loop. Dropping
+            // these with `.ok()` made a permission-denied folder
+            // indistinguishable from an empty one, which is the worst possible
+            // way to silently miss half a library.
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    let at = e
+                        .path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| base_path.display().to_string());
+                    log::error!("Cannot scan {}: {}", at, e);
+                    stats.unwalkable.record(format!("{}: {}", at, e));
+                    continue;
+                }
+            };
 
             let path = entry.path();
 
@@ -393,6 +459,9 @@ fn run(args: &Args, db: &sled::Db, start_time: Instant, active_threads: usize) -
                 Ok(m) => m,
                 Err(e) => {
                     log::error!("Cannot stat {}: {}", path.display(), e);
+                    stats
+                        .unreadable
+                        .record(format!("{}: {}", path.display(), e));
                     continue;
                 }
             };
@@ -402,7 +471,7 @@ fn run(args: &Args, db: &sled::Db, start_time: Instant, active_threads: usize) -
             }
 
             if !seen_inodes.insert((meta.dev(), meta.ino())) {
-                alias_skipped += 1;
+                stats.skipped_alias.bump();
                 log::debug!(
                     "Skipping {}: same inode as a path already queued",
                     path.display()
@@ -412,13 +481,6 @@ fn run(args: &Args, db: &sled::Db, start_time: Instant, active_threads: usize) -
 
             video_files.push(path.to_string_lossy().to_string());
         }
-    }
-
-    if alias_skipped > 0 {
-        info!(
-            "Skipped {} path(s) resolving to files already queued (symlinks, hard links, or overlapping folders).",
-            alias_skipped
-        );
     }
 
     if args.prune_cache && !args.clear_cache {
@@ -507,6 +569,7 @@ fn run(args: &Args, db: &sled::Db, start_time: Instant, active_threads: usize) -
                 Ok(m) => m,
                 Err(e) => {
                     log::error!("Cannot access metadata for {}: {}", vf, e);
+                    stats.unreadable.record(format!("{}: {}", vf, e));
                     return Lookup::Unreadable;
                 }
             };
@@ -545,12 +608,15 @@ fn run(args: &Args, db: &sled::Db, start_time: Instant, active_threads: usize) -
     // files are the ones that claim the widest thread allocations.
     let mut fingerprints: Vec<VideoFingerprint> = Vec::with_capacity(total_videos);
     let mut todo: Vec<(String, String)> = Vec::new();
-    let mut short_cached = 0usize;
     for lookup in lookups {
         match lookup {
             Lookup::Hit(fp) => {
                 if min_duration > 0.0 && fp.duration > 0.0 && fp.duration < min_duration {
-                    short_cached += 1;
+                    // Already cached, so we know without decoding that it is too
+                    // short to matter. Counted in the same bucket as the ones
+                    // discovered by reading a header: from the user's side it is
+                    // the same skip for the same reason.
+                    stats.skipped_short.bump();
                 } else {
                     fingerprints.push(fp);
                 }
@@ -576,11 +642,9 @@ fn run(args: &Args, db: &sled::Db, start_time: Instant, active_threads: usize) -
     }
 
     // --- Pass 2: the work that actually costs something -----------------------
-    // Declared out here so the counters survive the block and can be reported
+    // Declared out here so the counter survives the block and can be reported
     // even when every file was cached and the block never ran.
     let newly_cached = AtomicUsize::new(0);
-    let abandoned = AtomicUsize::new(0);
-    let short_decoded = AtomicUsize::new(0);
 
     if todo_count > 0 {
         // --- Thread budget ---------------------------------------------------
@@ -629,15 +693,21 @@ fn run(args: &Args, db: &sled::Db, start_time: Instant, active_threads: usize) -
                         // Shorter than --min-duration. Not a failure, and nothing
                         // to cache: the header read that decided this is cheap
                         // enough to repeat next run.
-                        short_decoded.fetch_add(1, Ordering::Relaxed);
+                        stats.skipped_short.bump();
                         pb.inc(1);
                         return None;
                     }
                     Err(e) => {
-                        if shutdown_requested() {
-                            abandoned.fetch_add(1, Ordering::Relaxed);
-                        } else {
+                        // An interrupt unwinds through here as our own
+                        // "Interrupted while fingerprinting ..." error. That is
+                        // the user's doing rather than the file's, so it is
+                        // neither logged as a failure nor counted anywhere:
+                        // exit code 130 already says what happened.
+                        if !shutdown_requested() {
                             log::error!("Failed to process {}: {:#}", vf, e);
+                            stats
+                                .fingerprint_failed
+                                .record(format!("{}: {:#}", vf, e));
                         }
                         pb.inc(1); // Keep the bar consistent with work attempted
                         return None;
@@ -656,9 +726,15 @@ fn run(args: &Args, db: &sled::Db, start_time: Instant, active_threads: usize) -
                         Ok(_) => {
                             newly_cached.fetch_add(1, Ordering::Relaxed);
                         }
-                        Err(e) => log::error!("Failed to cache fingerprint for {}: {}", vf, e),
+                        Err(e) => {
+                            log::error!("Failed to cache fingerprint for {}: {}", vf, e);
+                            stats.cache_write_failed.record(format!("{}: {}", vf, e));
+                        }
                     },
-                    Err(e) => log::error!("Failed to serialize fingerprint for {}: {}", vf, e),
+                    Err(e) => {
+                        log::error!("Failed to serialize fingerprint for {}: {}", vf, e);
+                        stats.cache_write_failed.record(format!("{}: {}", vf, e));
+                    }
                 }
 
                 pb.inc(1);
@@ -671,13 +747,6 @@ fn run(args: &Args, db: &sled::Db, start_time: Instant, active_threads: usize) -
     }
 
     let newly_cached = newly_cached.into_inner();
-    let skipped_short = short_cached + short_decoded.into_inner();
-    if skipped_short > 0 {
-        info!(
-            "Skipped {} video(s) shorter than --min-duration ({}s).",
-            skipped_short, min_duration
-        );
-    }
 
     if shutdown_requested() {
         info!(
@@ -733,6 +802,7 @@ fn run(args: &Args, db: &sled::Db, start_time: Instant, active_threads: usize) -
         args.priority,
         args.delete,
         args.permanent,
+        stats,
     )?;
 
     if shutdown_requested() {
