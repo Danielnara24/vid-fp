@@ -6,7 +6,8 @@ mod stats;
 mod utils;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
+use clap_complete::Shell;
 use compare::find_all_matches;
 use fingerprint::{fingerprint_video, VideoFingerprint, MAX_DECODE_THREADS};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -33,15 +34,29 @@ const CACHE_VERSION: &str = "v1";
 const EXIT_WITH_PROBLEMS: i32 = 2;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(
+    author, version,
+    about = "Fast video duplicate and clip finder",
+    long_about = "Fingerprints videos from their keyframes and groups files with the \
+                  same content, even at different resolutions or containers, and even \
+                  when one video is only a trimmed clip inside another.\n\n\
+                  Report-only by default: nothing is deleted unless --delete is given."
+)]
+
 struct Args {
     /// Folders to scan (one or more)
-    #[arg(required = true, num_args = 1.., value_name = "FOLDER")]
+    #[arg(
+        required_unless_present_any = ["completions", "man"],
+        num_args = 1..,
+        value_name = "FOLDER",
+        value_hint = clap::ValueHint::DirPath
+    )]
     include: Vec<String>,
 
     /// Folder to exclude from the scan. Repeat the flag to exclude several
     /// (e.g. -e ~/a -e ~/b).
-    #[arg(short = 'e', long = "exclude", value_name = "FOLDER")]
+    #[arg(short = 'e', long = "exclude", value_name = "FOLDER",
+          value_hint = clap::ValueHint::DirPath)]
     exclude: Vec<String>,
 
     /// Scan folders recursively. Off by default (only the given folders and
@@ -101,7 +116,7 @@ struct Args {
     priority: Priority,
 
     /// Output file for the results (supports .txt, .csv, .json)
-    #[arg(short = 'o', long = "output")]
+    #[arg(short = 'o', long = "output", value_hint = clap::ValueHint::FilePath)]
     output: Option<String>,
 
     /// Delete the files marked DELETE. By default they are moved to the system
@@ -129,6 +144,14 @@ struct Args {
     /// Maximum number of threads to use. 0 uses all available CPU cores (default).
     #[arg(short = 't', long = "threads", default_value_t = 0)]
     threads: usize,
+
+    /// Print a shell completion script to stdout and exit.
+    #[arg(long = "completions", value_name = "SHELL", exclusive = true)]
+    completions: Option<Shell>,
+
+    /// Print the roff man page to stdout and exit.
+    #[arg(long = "man", exclusive = true)]
+    man: bool,
 }
 
 /// How the run ended. `Interrupted` carries the phase name purely so the final
@@ -192,6 +215,32 @@ fn install_signal_handler() -> Result<()> {
 fn main() -> Result<()> {
     let start_time = Instant::now();
     let args = Args::parse();
+
+    if let Some(shell) = args.completions {
+        let mut cmd = Args::command();
+        let name = cmd.get_name().to_string();
+        clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
+        return Ok(());
+    }
+
+    if args.man {
+        let mut buf: Vec<u8> = Vec::new();
+        clap_mangen::Man::new(Args::command()).render(&mut buf)?;
+        buf.extend_from_slice(
+b".SH EXIT STATUS
+.TP
+.B 0
+Ran clean.
+.TP
+.B 2
+Completed, but something failed; see the Problems summary.
+.TP
+.B 130
+Interrupted with Ctrl-C.
+");
+        std::io::stdout().write_all(&buf)?;
+        return Ok(());
+    }
 
     // 1. Initialize custom CLI Logger
     let log_level = if args.quiet {

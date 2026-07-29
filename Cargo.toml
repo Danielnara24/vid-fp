@@ -1,8 +1,8 @@
 [package]
 name = "vid-fp"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
-rust-version = "1.74"
+rust-version = "1.85"
 description = "Fast video duplicate and clip finder using perceptual keyframe fingerprints"
 authors = ["Danielnara24"]
 license = "MIT OR Apache-2.0"
@@ -23,6 +23,8 @@ static-ffmpeg = ["ffmpeg-next/build"]
 [dependencies]
 # CLI Argument Parser
 clap = { version = "4.4", features = ["derive"] }
+clap_complete = "4.6"
+clap_mangen = "0.3"
 walkdir = "2.4"
 
 # Graceful Ctrl-C. The handler runs on its own thread (not in async-signal

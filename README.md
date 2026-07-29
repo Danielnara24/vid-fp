@@ -70,13 +70,50 @@ libswscale-dev libswresample-dev`, `clang`, and `pkg-config` on Debian/Ubuntu):
 ```bash
 cargo install --git https://github.com/Danielnara24/vid-fp
 ```
+### Shell completions and man page
+
+Each release ships `vid-fp-<version>-extras.tar.gz` with completions for bash,
+zsh, and fish plus a man page:
+
+```bash
+tar -xzf vid-fp-*-extras.tar.gz
+sudo install -Dm644 completions/vid-fp.bash /usr/share/bash-completion/completions/vid-fp
+sudo install -Dm644 completions/_vid-fp     /usr/share/zsh/site-functions/_vid-fp
+sudo install -Dm644 completions/vid-fp.fish /usr/share/fish/vendor_completions.d/vid-fp.fish
+sudo install -Dm644 man/vid-fp.1            /usr/share/man/man1/vid-fp.1
+```
+
+Without `sudo`, into your home directory instead (for zsh, use any directory
+already on your `fpath`):
+
+```bash
+install -Dm644 completions/vid-fp.bash ~/.local/share/bash-completion/completions/vid-fp
+install -Dm644 completions/vid-fp.fish ~/.config/fish/completions/vid-fp.fish
+install -Dm644 man/vid-fp.1            ~/.local/share/man/man1/vid-fp.1
+```
+
+Installed from source? The binary generates both itself:
+
+```bash
+vid-fp --completions bash | sudo tee /usr/share/bash-completion/completions/vid-fp >/dev/null
+vid-fp --man | sudo tee /usr/share/man/man1/vid-fp.1 >/dev/null
+```
+
+Open a new shell (bash, fish) or run `compinit` (zsh) to pick them up. Then
+`man vid-fp` is the full offline reference, and tab-completion fills in flags,
+folder paths, and enum values:
+
+```bash
+vid-fp ~/Videos -e ~/Down<TAB>   # completes to a real folder
+vid-fp ~/Videos -k <TAB>         # length  resolution  bitrate  size
+```
 
 ## Updating
 
 Use same command as installing, it will overwrite the last version.
 
 Run `vid-fp --version` to see what you have installed and compare it against the
-[latest release](https://github.com/USERNAME/vid-fp/releases/latest). FFmpeg is
+[latest release](https://github.com/Danielnara24/vid-fp/releases/latest). FFmpeg is
 separate and doesn't need reinstalling. Installed from source? Re-run the
 `cargo install` command above with `--force`.
 

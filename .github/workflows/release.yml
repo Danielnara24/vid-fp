@@ -53,6 +53,14 @@ jobs:
       - name: Package artifacts
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          BIN=target/release/vid-fp
+          mkdir -p dist/extras/completions dist/extras/man
+          "$BIN" --completions bash > dist/extras/completions/vid-fp.bash
+          "$BIN" --completions zsh  > dist/extras/completions/_vid-fp
+          "$BIN" --completions fish > dist/extras/completions/vid-fp.fish
+          "$BIN" --man              > dist/extras/man/vid-fp.1
+          tar -C dist/extras -czf "dist/vid-fp-${VERSION}-extras.tar.gz" completions man
+          rm -rf dist/extras
           mkdir -p dist
           # Same binary, two names: a versioned copy for history and a stable
           # copy so the /releases/latest/download/ URL never changes.
