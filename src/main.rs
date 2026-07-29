@@ -7,7 +7,7 @@ mod utils;
 use anyhow::{Context, Result};
 use clap::Parser;
 use compare::find_all_matches;
-use fingerprint::{fingerprint_video, VideoFingerprint};
+use fingerprint::{fingerprint_video, VideoFingerprint, MAX_DECODE_THREADS};
 use indicatif::{ProgressBar, ProgressStyle};
 use log::info;
 use rayon::prelude::*;
@@ -123,16 +123,38 @@ enum Outcome {
     Interrupted,
 }
 
-/// Arrange for Ctrl-C (and, thanks to the `termination` feature, SIGTERM and
-/// SIGHUP) to unwind the run instead of killing it.
-///
-/// The handler does the absolute minimum: flip one atomic and print. It never
-/// touches the database, never takes a lock, and never waits on a worker, so it
-/// cannot deadlock against whatever the program happened to be doing.
-///
-/// The second signal is the escape hatch. It bypasses the clean shutdown, which
-/// is tolerable precisely because fingerprints are written as they are produced
-/// -- at worst it costs whatever sled's flusher has not yet fsynced.
+fn decode_threads_for(budget: usize, jobs: usize) -> usize {
+    let budget = budget.max(1);
+    let concurrent = jobs.clamp(1, budget);
+    (budget / concurrent).clamp(1, MAX_DECODE_THREADS)
+}
+
+struct JobSlot<'a> {
+    running: &'a AtomicUsize,
+    threads: usize,
+}
+
+impl<'a> JobSlot<'a> {
+    fn claim(budget: usize, running: &'a AtomicUsize, queued: &AtomicUsize) -> Self {
+        // fetch_* return the value from BEFORE the update, hence the +1 / -1:
+        // this job is part of the work still outstanding, and is no longer
+        // queued now that it has started.
+        let now_running = running.fetch_add(1, Ordering::SeqCst) + 1;
+        let still_queued = queued.fetch_sub(1, Ordering::SeqCst).saturating_sub(1);
+
+        JobSlot {
+            running,
+            threads: decode_threads_for(budget, now_running.saturating_add(still_queued)),
+        }
+    }
+}
+
+impl Drop for JobSlot<'_> {
+    fn drop(&mut self) {
+        self.running.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 fn install_signal_handler() -> Result<()> {
     let hits = AtomicUsize::new(0);
 
@@ -460,6 +482,8 @@ fn run(args: &Args, db: &sled::Db, start_time: Instant, active_threads: usize) -
     // A lookup is a stat, a tree read and a bincode decode -- microseconds -- so
     // this pass finishes effectively instantly even on a large library, and by
     // the time the bar appears we know exactly how much real work there is.
+    // That count is now load-bearing twice over: it also sets the per-video
+    // decoder thread budget, which is only knowable once the cache has spoken.
     enum Lookup {
         Hit(VideoFingerprint),
         Miss { path: String, cache_key: String },
@@ -486,6 +510,10 @@ fn run(args: &Args, db: &sled::Db, start_time: Instant, active_threads: usize) -
             let size = metadata.len();
 
             // Versioned cache key ensures schema changes don't cause deserialization crashes
+            // Note: thread count is deliberately NOT part of the key. Threading
+            // changes only how fast frames arrive, never which ones, so a
+            // fingerprint made with 8 threads is byte-identical to one made with
+            // 1 and stays valid across runs with different -t.
             let cache_key = format!("{}_{}_{}_{}_{}_{}", vf, mtime, size, CACHE_VERSION, kf_interval, min_kf_samples);
 
             if let Ok(Some(data)) = db.get(&cache_key) {
@@ -503,7 +531,8 @@ fn run(args: &Args, db: &sled::Db, start_time: Instant, active_threads: usize) -
         .collect();
 
     // collect() preserves input order, so `todo` inherits the largest-first sort
-    // and the heaviest decodes still start first.
+    // and the heaviest decodes still start first -- which also means the biggest
+    // files are the ones that claim the widest thread allocations.
     let mut fingerprints: Vec<VideoFingerprint> = Vec::with_capacity(total_videos);
     let mut todo: Vec<(String, String)> = Vec::new();
     for lookup in lookups {
@@ -537,6 +566,10 @@ fn run(args: &Args, db: &sled::Db, start_time: Instant, active_threads: usize) -
     let abandoned = AtomicUsize::new(0);
 
     if todo_count > 0 {
+        // --- Thread budget ---------------------------------------------------
+        let queued = AtomicUsize::new(todo_count);
+        let running = AtomicUsize::new(0);
+
         // The bar now counts decodes and nothing else, so its denominator is the
         // work remaining rather than the size of the library.
         let pb = if args.quiet {
@@ -564,10 +597,16 @@ fn run(args: &Args, db: &sled::Db, start_time: Instant, active_threads: usize) -
                     return None;
                 }
 
+                // Claimed AFTER the bail-out, so a shutdown-abandoned job never
+                // takes a share of the budget it will not use. Held for exactly
+                // as long as the decode runs; the guard releases it on drop,
+                // including on the error path below.
+                let slot = JobSlot::claim(active_threads, &running, &queued);
+
                 let file_name = Path::new(vf).file_name().unwrap_or_default().to_string_lossy().into_owned();
                 pb.set_message(file_name);
 
-                let fp = match fingerprint_video(vf, kf_interval, min_kf_samples) {
+                let fp = match fingerprint_video(vf, kf_interval, min_kf_samples, slot.threads) {
                     Ok(f) => f,
                     Err(e) => {
                         // A video that abandoned its decode because of Ctrl-C is
@@ -624,6 +663,11 @@ fn run(args: &Args, db: &sled::Db, start_time: Instant, active_threads: usize) -
     let n = fingerprints.len();
     if n < 2 {
         info!("Not enough valid videos to compare.");
+        // Print time elapsed anyway in same format.
+        let total_hours = start_time.elapsed().as_secs() / 3600;
+        let total_minutes = (start_time.elapsed().as_secs() % 3600) / 60;
+        let total_seconds = start_time.elapsed().as_secs() % 60;
+        info!("Total time elapsed: {:02}:{:02}:{:02}", total_hours, total_minutes, total_seconds);
         return Ok(Outcome::Completed);
     }
 
@@ -667,4 +711,100 @@ fn run(args: &Args, db: &sled::Db, start_time: Instant, active_threads: usize) -
     }
 
     Ok(Outcome::Completed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_budget_is_split_evenly_when_videos_are_scarce() {
+        // The cases from the spec: 8 threads, N videos.
+        assert_eq!(decode_threads_for(8, 4), 2);
+        assert_eq!(decode_threads_for(8, 2), 4);
+        assert_eq!(decode_threads_for(8, 1), 8);
+    }
+
+    #[test]
+    fn test_one_thread_each_once_videos_outnumber_threads() {
+        // Rayon runs at most `budget` decodes at once, so one thread each IS the
+        // whole budget here. Dividing further would leave cores idle.
+        assert_eq!(decode_threads_for(8, 8), 1);
+        assert_eq!(decode_threads_for(8, 9), 1);
+        assert_eq!(decode_threads_for(8, 5_000), 1);
+    }
+
+    #[test]
+    fn test_never_exceeds_the_budget() {
+        // The invariant that matters for -t: threads-per-video times videos
+        // running concurrently must never exceed what the user allowed.
+        for budget in 1..=64usize {
+            for jobs in 1..=200usize {
+                let per_video = decode_threads_for(budget, jobs);
+                let concurrent = jobs.min(budget);
+                assert!(per_video >= 1, "a decode must never get zero threads");
+                assert!(
+                    per_video * concurrent <= budget.max(1),
+                    "budget {} with {} jobs handed out {} x {}",
+                    budget, jobs, per_video, concurrent
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_uneven_split_rounds_down_rather_than_overcommitting() {
+        // 8 threads over 3 videos is 2 each and two threads left on the table.
+        // Rounding up would put 9 decoder threads on 8 cores.
+        assert_eq!(decode_threads_for(8, 3), 2);
+        assert_eq!(decode_threads_for(4, 3), 1);
+    }
+
+    #[test]
+    fn test_degenerate_budgets() {
+        assert_eq!(decode_threads_for(0, 4), 1, "a zero budget still runs, single-threaded");
+        assert_eq!(decode_threads_for(4, 0), 4, "no jobs left is not a division by zero");
+    }
+
+    #[test]
+    fn test_huge_budget_is_capped_at_what_a_decoder_can_use() {
+        assert_eq!(decode_threads_for(256, 1), MAX_DECODE_THREADS);
+    }
+
+    #[test]
+    fn test_slot_widens_as_the_queue_drains() {
+        let queued = AtomicUsize::new(4);
+        let running = AtomicUsize::new(0);
+
+        // Four outstanding on a budget of 8: two threads each.
+        let a = JobSlot::claim(8, &running, &queued);
+        assert_eq!(a.threads, 2);
+        let b = JobSlot::claim(8, &running, &queued);
+        assert_eq!(b.threads, 2);
+
+        // Two finish. Only two jobs remain outstanding, so the next to start
+        // claims half the budget instead of a quarter.
+        drop(a);
+        drop(b);
+        let c = JobSlot::claim(8, &running, &queued);
+        assert_eq!(c.threads, 4, "the tail of a scan must widen out");
+
+        // And the last one on its own gets everything.
+        drop(c);
+        let d = JobSlot::claim(8, &running, &queued);
+        assert_eq!(d.threads, 8);
+    }
+
+    #[test]
+    fn test_slot_releases_its_claim_on_drop() {
+        let queued = AtomicUsize::new(1);
+        let running = AtomicUsize::new(0);
+
+        {
+            let _slot = JobSlot::claim(8, &running, &queued);
+            assert_eq!(running.load(Ordering::SeqCst), 1);
+        }
+
+        assert_eq!(running.load(Ordering::SeqCst), 0, "a finished job must free its threads");
+    }
 }

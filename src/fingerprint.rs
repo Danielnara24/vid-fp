@@ -9,6 +9,18 @@ use crate::utils::shutdown_requested;
 // ratcheting up across a multi-threaded run.
 const FRAME_STRIDE: usize = 64 * 64;
 
+/// `FF_THREAD_FRAME` and `FF_THREAD_SLICE` from libavcodec. Spelled out rather
+/// than taken from the bindings because they are plain `#define`s, and the name
+/// bindgen gives them has moved between ffmpeg-sys-next releases.
+const FF_THREAD_FRAME: i32 = 1;
+const FF_THREAD_SLICE: i32 = 2;
+
+/// Ceiling on decoder threads for a single video. Past roughly this point extra
+/// threads buy almost nothing on keyframe-only decoding, and each one costs a
+/// full-resolution frame buffer in the decoder's pool. Exported so the
+/// scheduler in `main` never plans an allocation this function would clamp away.
+pub const MAX_DECODE_THREADS: usize = 16;
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct VideoFingerprint {
     pub path: String,
@@ -45,7 +57,17 @@ impl VideoFingerprint {
     }
 }
 
-pub fn fingerprint_video(filepath: &str, kf_interval: f64, min_kf_samples: f64) -> Result<VideoFingerprint> {
+/// Fingerprint one video.
+///
+/// `decode_threads` is this video's share of the process-wide thread budget,
+/// decided by the caller from how many decodes are still outstanding. It is
+/// clamped to `1..=MAX_DECODE_THREADS`, so passing 0 is harmless.
+pub fn fingerprint_video(
+    filepath: &str,
+    kf_interval: f64,
+    min_kf_samples: f64,
+    decode_threads: usize,
+) -> Result<VideoFingerprint> {
     // 1. Native Zero-Copy Extraction (No Subprocess Overhead)
     let mut ictx = ffmpeg_next::format::input(&filepath)
         .with_context(|| format!("Failed to open video file: {}", filepath))?;
@@ -70,16 +92,21 @@ pub fn fingerprint_video(filepath: &str, kf_interval: f64, min_kf_samples: f64) 
     let mut context_decoder = ffmpeg_next::codec::context::Context::from_parameters(input.parameters())
         .context("Failed to create codec context from parameters")?;
 
+    let decode_threads = decode_threads.clamp(1, MAX_DECODE_THREADS);
+
     unsafe {
         let ctx = context_decoder.as_mut_ptr();
-        (*ctx).thread_count = 1;
+        (*ctx).thread_count = decode_threads as i32;
         (*ctx).skip_loop_filter = ffmpeg_next::ffi::AVDiscard::AVDISCARD_ALL;
         (*ctx).flags2 |= ffmpeg_next::ffi::AV_CODEC_FLAG2_FAST as i32;
-        // Emit decoded frames immediately with no reordering delay. We only decode
-        // independent keyframes, so this is safe and keeps the decoder from parking
-        // several full-resolution frames in its internal pool (a big per-thread cost
-        // on hi-res, hour-long inputs).
-        (*ctx).flags |= ffmpeg_next::ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
+        if decode_threads > 1 {
+            // Frame threading preferred; slice threading is the fallback for
+            // codecs that don't advertise AV_CODEC_CAP_FRAME_THREADS. FFmpeg
+            // picks between them itself from the codec's capabilities.
+            (*ctx).thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+        } else {
+            (*ctx).flags |= ffmpeg_next::ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
+        }
         (*ctx).skip_frame = ffmpeg_next::ffi::AVDiscard::AVDISCARD_NONKEY;
     }
 
@@ -202,6 +229,9 @@ pub fn fingerprint_video(filepath: &str, kf_interval: f64, min_kf_samples: f64) 
         }
     }
 
+    // With frame threading the decoder holds up to thread_count frames back, so
+    // this drain is not a formality -- on a short video it can be where MOST of
+    // the frames arrive.
     let _ = decoder.send_eof();
     while decoder.receive_frame(&mut decoded).is_ok() {
         let _ = process_frame(&decoded);
@@ -403,8 +433,7 @@ mod tests {
         });
     }
 
-    #[test]
-    fn test_fingerprint_real_video() {
+    fn fingerprint_fixture(threads: usize) -> VideoFingerprint {
         init_ffmpeg_for_tests();
 
         let mut fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -419,10 +448,14 @@ mod tests {
             filepath
         );
 
-        // Run the fingerprinting function
-        let result = fingerprint_video(&filepath, 0.0, 4.0);
+        let result = fingerprint_video(&filepath, 0.0, 4.0, threads);
         assert!(result.is_ok(), "Failed to fingerprint video: {:?}", result.err());
-        let fp = result.unwrap();
+        result.unwrap()
+    }
+
+    #[test]
+    fn test_fingerprint_real_video() {
+        let fp = fingerprint_fixture(1);
 
         // Assert the properties of the generated fingerprint
         assert!(fp.total_frames > 0, "Video should have parsed at least 1 frame");
@@ -444,5 +477,29 @@ mod tests {
             fp.valid_t_start.len(),
             "Hash lists and timing lists must stay synchronized"
         );
+    }
+
+    #[test]
+    fn test_threaded_decode_is_bit_identical() {
+        // The whole point of the thread budget is that it is a pure speed knob.
+        // Frame threading changes WHEN frames come out of the decoder, never
+        // which frames or in what order, so every field of the fingerprint --
+        // and therefore every cache key's payload -- must be unchanged.
+        let single = fingerprint_fixture(1);
+        let threaded = fingerprint_fixture(4);
+
+        assert_eq!(single.total_frames, threaded.total_frames, "frame count must not depend on thread count");
+        assert_eq!(single.valid_hashes, threaded.valid_hashes, "hashes must not depend on thread count");
+        assert_eq!(single.valid_t_start, threaded.valid_t_start, "hash start times must not depend on thread count");
+        assert_eq!(single.valid_t_end, threaded.valid_t_end, "hash end times must not depend on thread count");
+    }
+
+    #[test]
+    fn test_zero_threads_is_treated_as_one() {
+        // A caller that computes a share of 0 must not hand FFmpeg
+        // thread_count = 0, which means "autodetect" and would quietly blow past
+        // the user's -t budget.
+        let fp = fingerprint_fixture(0);
+        assert!(!fp.valid_hashes.is_empty());
     }
 }
