@@ -116,8 +116,7 @@ Run `vid-fp --version` to see what you have installed and compare it against the
 [latest release](https://github.com/Danielnara24/vid-fp/releases/latest). FFmpeg is
 separate and doesn't need reinstalling. Installed from source? Re-run the
 `cargo install` command above with `--force`.
-Reinstall the completions and man page too — they're generated from the binary,
-so an old copy documents flags you may no longer have.
+The completions and man page should be reinstalled too to have the latest documentation.
 
 ## Usage
 
@@ -194,13 +193,11 @@ and a loose `-d` conflates them.
 Above `-d 7` the index that proposes candidate pairs is no longer exhaustive: it
 may fail to *propose* a pair whose frames are all near the far edge of the
 tolerance. Once a pair is proposed it is always compared exactly, and genuine
-duplicates share hundreds of frames, so a miss is very unlikely — but if you go
-that high, raise `-p` alongside it to keep false positives in check.
+duplicates many frames, so a miss is very unlikely.
 
 `--min-duration` is an absolute floor, in seconds, on how much footage two files
 must share. It's the tool to reach for when `-p` alone can't express what you
-want: 5% of a two-hour film is six minutes of real content, while 5% of a
-minute long clip is five seconds. Both gates apply, so `-p 5 --min-duration 60`
+want. Both gates apply, so `-p 5 --min-duration 60`
 means "at least 5% overlap *and* at least a minute of it".
 
 It also skips fingerprinting anything shorter than the floor outright — such a

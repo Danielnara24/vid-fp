@@ -226,14 +226,20 @@ fn main() -> Result<()> {
     if args.man {
         let mut buf: Vec<u8> = Vec::new();
         clap_mangen::Man::new(Args::command()).render(&mut buf)?;
+        if !buf.ends_with(b"\n") {
+            buf.push(b'\n');
+        }
         buf.extend_from_slice(
 b".SH EXIT STATUS
 .TP
 .B 0
 Ran clean.
 .TP
+.B 1
+Fatal error; the run did not complete.
+.TP
 .B 2
-Completed, but something failed; see the Problems summary.
+Completed, but something failed. See the Problems summary.
 .TP
 .B 130
 Interrupted with Ctrl-C.
