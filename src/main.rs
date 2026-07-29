@@ -68,6 +68,12 @@ struct Args {
     #[arg(short = 'p', long = "match-percent", default_value_t = 10.0)]
     match_percent: f32,
 
+    /// Minimum shared clip length, in seconds, for two videos to count as a
+    /// match. Also skips fingerprinting any video shorter than this. 0 = off.
+    /// Independent of --match-percent; both must be satisfied.
+    #[arg(long = "min-duration", default_value_t = 0.0)]
+    min_duration: f64,
+
     /// Base keyframe sampling interval in seconds (0 = decode every keyframe).
     /// Long videos sample at this interval; short videos use a finer interval
     /// automatically so they keep at least --min-keyframes frames.
@@ -285,6 +291,10 @@ fn run(args: &Args, db: &sled::Db, start_time: Instant, active_threads: usize) -
 
     let max_hamming = args.hamming_distance;
     let min_match_pct = args.match_percent / 100.0;
+    let min_duration = args.min_duration;
+    if min_duration < 0.0 {
+        anyhow::bail!("--min-duration cannot be negative.");
+    }
 
     // Normalize the requested extensions: strip an optional leading dot and
     // lowercase, so `-x .MP4`, `-x MP4`, and `-x mp4` all behave identically.
@@ -313,8 +323,8 @@ fn run(args: &Args, db: &sled::Db, start_time: Instant, active_threads: usize) -
     info!("Searching extensions: {:?}", ext_display);
 
     info!(
-        "Settings -> Max Hamming: {}, Min Match: {}%, Priority: {:?}, Threads: {}, Recursive: {}, Follow symlinks: {}",
-        max_hamming, args.match_percent, args.priority, active_threads, args.recursive, args.follow_symlinks
+        "Settings -> Max Hamming: {}, Min Match: {}%, Min Duration: {}s, Priority: {:?}, Threads: {}, Recursive: {}",
+        max_hamming, args.match_percent, min_duration, args.priority, active_threads, args.recursive
     );
 
     // Canonicalize exclude paths so prefix matching is safe and reliable
@@ -535,14 +545,20 @@ fn run(args: &Args, db: &sled::Db, start_time: Instant, active_threads: usize) -
     // files are the ones that claim the widest thread allocations.
     let mut fingerprints: Vec<VideoFingerprint> = Vec::with_capacity(total_videos);
     let mut todo: Vec<(String, String)> = Vec::new();
+    let mut short_cached = 0usize;
     for lookup in lookups {
         match lookup {
-            Lookup::Hit(fp) => fingerprints.push(fp),
+            Lookup::Hit(fp) => {
+                if min_duration > 0.0 && fp.duration > 0.0 && fp.duration < min_duration {
+                    short_cached += 1;
+                } else {
+                    fingerprints.push(fp);
+                }
+            }
             Lookup::Miss { path, cache_key } => todo.push((path, cache_key)),
             Lookup::Unreadable => {}
         }
     }
-
     let cached_count = fingerprints.len();
     let todo_count = todo.len();
 
@@ -564,6 +580,7 @@ fn run(args: &Args, db: &sled::Db, start_time: Instant, active_threads: usize) -
     // even when every file was cached and the block never ran.
     let newly_cached = AtomicUsize::new(0);
     let abandoned = AtomicUsize::new(0);
+    let short_decoded = AtomicUsize::new(0);
 
     if todo_count > 0 {
         // --- Thread budget ---------------------------------------------------
@@ -606,12 +623,17 @@ fn run(args: &Args, db: &sled::Db, start_time: Instant, active_threads: usize) -
                 let file_name = Path::new(vf).file_name().unwrap_or_default().to_string_lossy().into_owned();
                 pb.set_message(file_name);
 
-                let fp = match fingerprint_video(vf, kf_interval, min_kf_samples, slot.threads) {
-                    Ok(f) => f,
+                let fp = match fingerprint_video(vf, kf_interval, min_kf_samples, slot.threads, min_duration) {
+                    Ok(Some(f)) => f,
+                    Ok(None) => {
+                        // Shorter than --min-duration. Not a failure, and nothing
+                        // to cache: the header read that decided this is cheap
+                        // enough to repeat next run.
+                        short_decoded.fetch_add(1, Ordering::Relaxed);
+                        pb.inc(1);
+                        return None;
+                    }
                     Err(e) => {
-                        // A video that abandoned its decode because of Ctrl-C is
-                        // not a failure, and printing one line per in-flight
-                        // worker would just bury the interrupt message.
                         if shutdown_requested() {
                             abandoned.fetch_add(1, Ordering::Relaxed);
                         } else {
@@ -649,6 +671,13 @@ fn run(args: &Args, db: &sled::Db, start_time: Instant, active_threads: usize) -
     }
 
     let newly_cached = newly_cached.into_inner();
+    let skipped_short = short_cached + short_decoded.into_inner();
+    if skipped_short > 0 {
+        info!(
+            "Skipped {} video(s) shorter than --min-duration ({}s).",
+            skipped_short, min_duration
+        );
+    }
 
     if shutdown_requested() {
         info!(
@@ -673,7 +702,7 @@ fn run(args: &Args, db: &sled::Db, start_time: Instant, active_threads: usize) -
 
     info!("\nFingerprinting complete. Cross-analyzing {} videos...", n);
 
-    let edges = find_all_matches(&fingerprints, max_hamming, min_match_pct);
+    let edges = find_all_matches(&fingerprints, max_hamming, min_match_pct, min_duration);
 
     if shutdown_requested() {
         return Ok(Outcome::Interrupted);

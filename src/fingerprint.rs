@@ -62,12 +62,20 @@ impl VideoFingerprint {
 /// `decode_threads` is this video's share of the process-wide thread budget,
 /// decided by the caller from how many decodes are still outstanding. It is
 /// clamped to `1..=MAX_DECODE_THREADS`, so passing 0 is harmless.
+///
+/// `min_duration` (seconds, 0 = off) skips the video entirely if it is shorter
+/// than the shortest match we are willing to report — such a file cannot
+/// possibly contain a long enough shared clip, so decoding it is pure waste.
+/// Returns `Ok(None)` in that case: a skip is not an error, and the caller must
+/// not log it as one. A video whose duration cannot be determined is NOT
+/// skipped; unknown is not the same as short.
 pub fn fingerprint_video(
     filepath: &str,
     kf_interval: f64,
     min_kf_samples: f64,
     decode_threads: usize,
-) -> Result<VideoFingerprint> {
+    min_duration: f64,
+) -> Result<Option<VideoFingerprint>> {
     // 1. Native Zero-Copy Extraction (No Subprocess Overhead)
     let mut ictx = ffmpeg_next::format::input(&filepath)
         .with_context(|| format!("Failed to open video file: {}", filepath))?;
@@ -87,6 +95,11 @@ pub fn fingerprint_video(
     }
     if duration_sec <= 0.0 {
         duration_sec = ictx.duration() as f64 / 1_000_000.0; // Fallback to FFmpeg's AV_TIME_BASE format duration
+    }
+    // Bail before the decoder, the scaler, and the 4 MiB frame buffer exist.
+    // Only a positive, known duration can disqualify a file.
+    if min_duration > 0.0 && duration_sec > 0.0 && duration_sec < min_duration {
+        return Ok(None);
     }
 
     let mut context_decoder = ffmpeg_next::codec::context::Context::from_parameters(input.parameters())
@@ -403,7 +416,7 @@ pub fn fingerprint_video(
         }
     }
 
-    Ok(VideoFingerprint {
+    Ok(Some(VideoFingerprint {
         path: filepath.to_string(),
         valid_hashes: final_hashes,
         valid_t_start: final_t_start,
@@ -413,7 +426,7 @@ pub fn fingerprint_video(
         height,
         duration: duration_sec,
         file_size,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -433,24 +446,34 @@ mod tests {
         });
     }
 
+    fn fixture_path() -> PathBuf {
+        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.push("tests");
+        p.push("fixtures");
+        p.push("test_video.mp4");
+        p
+    }
+
     fn fingerprint_fixture(threads: usize) -> VideoFingerprint {
         init_ffmpeg_for_tests();
 
-        let mut fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        fixture_path.push("tests");
-        fixture_path.push("fixtures");
-        fixture_path.push("test_video.mp4"); // <--- CHANGE THIS TO YOUR EXACT FILE NAME
-
+        let fixture_path = fixture_path();
         let filepath = fixture_path.to_string_lossy().to_string();
-        assert!(
-            fixture_path.exists(),
-            "Fixture video not found at: {}.",
-            filepath
-        );
+        assert!(fixture_path.exists(), "Fixture video not found at: {}.", filepath);
 
-        let result = fingerprint_video(&filepath, 0.0, 4.0, threads);
+        let result = fingerprint_video(&filepath, 0.0, 4.0, threads, 0.0);
         assert!(result.is_ok(), "Failed to fingerprint video: {:?}", result.err());
-        result.unwrap()
+        result.unwrap().expect("min_duration is off, nothing should be skipped")
+    }
+
+    #[test]
+    fn test_video_shorter_than_min_duration_is_skipped() {
+        init_ffmpeg_for_tests();
+        let filepath = fixture_path().to_string_lossy().to_string();
+
+        // The fixture is ~1s; an hour-long floor must reject it without error.
+        let skipped = fingerprint_video(&filepath, 0.0, 4.0, 1, 3600.0).unwrap();
+        assert!(skipped.is_none(), "a short video must be skipped, not fingerprinted");
     }
 
     #[test]

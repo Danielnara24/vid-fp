@@ -197,6 +197,7 @@ pub fn find_all_matches(
     fingerprints: &[VideoFingerprint],
     max_hamming_dist: u32,
     min_match_percent: f32,
+    min_duration: f64,
 ) -> Vec<(usize, usize)> {
     let candidates = candidate_pairs(fingerprints, max_hamming_dist);
     if shutdown_requested() {
@@ -210,9 +211,24 @@ pub fn find_all_matches(
             if shutdown_requested() {
                 return false;
             }
-            let (pct_a, pct_b) =
-                match_overlap(&fingerprints[v_a], &fingerprints[v_b], max_hamming_dist);
-            pct_a.max(pct_b) >= min_match_percent
+            let fp_a = &fingerprints[v_a];
+            let fp_b = &fingerprints[v_b];
+
+            let (pct_a, pct_b) = match_overlap(fp_a, fp_b, max_hamming_dist);
+
+            if pct_a.max(pct_b) < min_match_percent {
+                return false;
+            }
+
+            if min_duration > 0.0 {
+                let matched_secs =
+                    (pct_a as f64 * fp_a.duration).max(pct_b as f64 * fp_b.duration);
+                if matched_secs < min_duration {
+                    return false;
+                }
+            }
+
+            true
         })
         .collect()
 }
@@ -245,7 +261,7 @@ mod tests {
             mock_fp_with_hashes(vec![hash, hash], 2), // Video B (Exact match)
         ];
 
-        let matches = find_all_matches(&fps, 0, 1.0);
+        let matches = find_all_matches(&fps, 0, 1.0, 0.0);
 
         assert!(!matches.is_empty(), "Exact duplicates should match");
         assert!(matches.contains(&(0, 1)) || matches.contains(&(1, 0)));
@@ -262,11 +278,11 @@ mod tests {
         ];
 
         // Should NOT match if max_hamming is 2
-        let no_matches = find_all_matches(&fps, 2, 1.0);
+        let no_matches = find_all_matches(&fps, 2, 1.0, 0.0);
         assert!(no_matches.is_empty(), "Should be filtered by hamming distance");
 
         // SHOULD match if max_hamming is 3
-        let valid_matches = find_all_matches(&fps, 3, 1.0);
+        let valid_matches = find_all_matches(&fps, 3, 1.0, 0.0);
         assert!(!valid_matches.is_empty(), "Should pass hamming distance check");
     }
 
@@ -279,7 +295,7 @@ mod tests {
             mock_fp_with_hashes(vec![hash], 1),
         ];
 
-        let mut matches = find_all_matches(&fps, 0, 1.0);
+        let mut matches = find_all_matches(&fps, 0, 1.0, 0.0);
         matches.sort_unstable();
 
         // Each unordered pair exactly once, always with the lower index first.
@@ -305,7 +321,23 @@ mod tests {
 
         // Demanding 100% overlap: only reachable if BOTH frames are counted.
         // The old index-only accounting would have scored this pair at 50%.
-        let matches = find_all_matches(&fps, 8, 1.0);
+        let matches = find_all_matches(&fps, 8, 1.0, 0.0);
         assert_eq!(matches, vec![(0, 1)], "phase 2 must recover the index-invisible frame");
+    }
+
+    #[test]
+    fn test_min_duration_gates_independently_of_match_percent() {
+        let hash = 0xABCD_1234_ABCD_1234u64;
+        let fps = vec![
+            mock_fp_with_hashes(vec![hash, hash], 2),
+            mock_fp_with_hashes(vec![hash, hash], 2),
+        ];
+
+        // 100% overlap of a 10s mock = 10 matched seconds.
+        assert_eq!(find_all_matches(&fps, 0, 1.0, 5.0), vec![(0, 1)], "10s clears a 5s floor");
+        assert!(
+            find_all_matches(&fps, 0, 1.0, 30.0).is_empty(),
+            "a full-coverage match must still fail a 30s floor"
+        );
     }
 }

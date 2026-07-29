@@ -125,6 +125,7 @@ vid-fp ~/Videos -r --delete --permanent
 | `-x`, `--extensions <EXT>` | Video extensions to include, comma-separated or repeated | `mp4,mkv,avi,mov,flv,webm` |
 | `-d`, `--hamming-distance <N>` | Frame-match tolerance; higher = less strict matching. Raise to increase duplicates found (but can increase false positives). Values above `7` work but see [Tuning](#tuning) | `3` |
 | `-p`, `--match-percent <F>` | Min % of overlap to count as a duplicate; Lower = Finds shorter matches (but can increase false positives) | `10.0` |
+| `--min-duration <SECS>` | Min shared clip length in seconds for a match. Videos shorter than this are skipped entirely. `0` = off | `0.0` |
 | `-k`, `--priority <P>` | Criteria for KEEPING files: `length`, `resolution`, `bitrate`, or `size`. The chosen one is compared first; the rest follow in the default order | `length` |
 | `--keyframe-interval <F>` | Seconds between sampled keyframes (`0` = every keyframe); Higher = Faster processing (Increasing this can hinder the capability of finding short matches between videos) | `0.0` |
 | `--min-keyframes <F>` | Min keyframes kept for short videos (only relevant when keyframe-interval > 0) | `4.0` |
@@ -154,6 +155,17 @@ may fail to *propose* a pair whose frames are all near the far edge of the
 tolerance. Once a pair is proposed it is always compared exactly, and genuine
 duplicates share hundreds of frames, so a miss is very unlikely — but if you go
 that high, raise `-p` alongside it to keep false positives in check.
+
+`--min-duration` is an absolute floor, in seconds, on how much footage two files
+must share. It's the tool to reach for when `-p` alone can't express what you
+want: 5% of a two-hour film is six minutes of real content, while 5% of a
+minute long clip is five seconds. Both gates apply, so `-p 5 --min-duration 60`
+means "at least 5% overlap *and* at least a minute of it".
+
+It also skips fingerprinting anything shorter than the floor outright — such a
+file can't contain a long enough shared clip, so there's nothing to gain by
+decoding it. Videos whose duration the container doesn't report are never
+skipped. Changing this flag doesn't invalidate the cache.
 
 ## How it reads the results
 
