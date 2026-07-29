@@ -116,6 +116,8 @@ Run `vid-fp --version` to see what you have installed and compare it against the
 [latest release](https://github.com/Danielnara24/vid-fp/releases/latest). FFmpeg is
 separate and doesn't need reinstalling. Installed from source? Re-run the
 `cargo install` command above with `--force`.
+Reinstall the completions and man page too — they're generated from the binary,
+so an old copy documents flags you may no longer have.
 
 ## Usage
 
@@ -173,6 +175,8 @@ vid-fp ~/Videos -r --delete --permanent
 | `-q`, `--quiet` | Only print errors | off |
 | `--clear-cache` | Wipe ALL vid-fp cache before running | off |
 | `--prune-cache` | Drop cached entries only for files not in this scan | off |
+| `--completions <SHELL>` | Print a completion script for `bash`, `zsh`, `fish`, `elvish`, or `powershell` and exit | — |
+| `--man` | Print the man page (roff) and exit | — |
 
 ## Tuning
 
@@ -236,6 +240,9 @@ Fingerprints are cached (under `$XDG_CACHE_HOME/video-dedup`, falling back to
   running with `--delete`.
   - **No double-counting.** Hard links and symlinks to the same file collapse into
   a single entry, so the reported space freed reflects bytes actually reclaimed.
+  - **Tab-complete your `-e` paths.** An exclude folder that can't be resolved
+  excludes nothing. Letting the shell complete the path proves it exists before you
+  start.
 
 ## License
 
