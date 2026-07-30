@@ -1,9 +1,11 @@
 use anyhow::{anyhow, Context, Result};
 use log::info;
+use crate::compare::MatchIndex;
 use crate::fingerprint::VideoFingerprint;
 use crate::stats::RunStats;
 use crate::utils::{
-    find_best, format_bitrate, format_duration, format_size, shutdown_requested, GroupMaxima, Priority,
+    find_best, format_bitrate, format_duration, format_shared, format_size, shutdown_requested,
+    GroupMaxima, Priority,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -31,6 +33,7 @@ fn remove_path(path: &str, permanent: bool) -> Result<()> {
 pub fn output_results(
     final_groups: &[Vec<usize>],
     fingerprints: &[VideoFingerprint],
+    matches: &MatchIndex,
     output_file: Option<&String>,
     total_elapsed_secs: u64,
     priority: Priority,
@@ -137,7 +140,17 @@ pub fn output_results(
     info!("             RESULTS");
     info!("========================================\n");
 
-    let mut total_files_linked = 0;
+    // Groups overlap, so summing their sizes counts a shared file once per
+    // group it appears in -- a figure that can exceed the number of videos
+    // scanned and means nothing to anyone. What is actually being reported is
+    // how many distinct files are implicated in a duplicate relationship at
+    // all, which is the same set the KEEP/DELETE/REVIEW labels below describe.
+    let matched_file_count = final_groups
+        .iter()
+        .flatten()
+        .copied()
+        .collect::<HashSet<usize>>()
+        .len();
 
     let mut txt_out = String::new();
     let mut json_out_groups = Vec::new();
@@ -148,7 +161,18 @@ pub fn output_results(
         .from_writer(Vec::new());
 
     csv_wtr
-        .write_record(&["group", "resolution", "size", "bitrate", "length", "full_path", "action"])
+        .write_record(&[
+            "group",
+            "resolution",
+            "size",
+            "bitrate",
+            "length",
+            "shared",
+            "shared_seconds",
+            "match_percent",
+            "full_path",
+            "action",
+        ])
         .context("Failed to write CSV header")?;
 
     for (i, group) in final_groups.iter().enumerate() {
@@ -157,8 +181,8 @@ pub fn output_results(
         info!("{}:", group_name);
         txt_out.push_str(&format!("{}:\n", group_name));
 
-        total_files_linked += group.len();
         let mut json_files = Vec::new();
+        let mut group_low: Option<f64> = None;
 
         for &idx in group {
             let fp = &fingerprints[idx];
@@ -166,6 +190,31 @@ pub fn output_results(
             let bitrate_str = format_bitrate(fp.bitrate());
             let duration_str = format_duration(fp.duration);
             let res_str = format!("{}x{}", fp.width, fp.height);
+
+            // How much footage this file has in common with the rest of its
+            // group, in seconds rather than as a percentage.
+            //
+            // A percentage was the obvious choice and the wrong one. It invites
+            // comparison against --match-percent, which measures the opposite
+            // end of the pair and so routinely sits above what is shown here --
+            // making a correct report look broken. Worse, on short videos it
+            // quantizes brutally: a file with four keyframes can only ever
+            // score 0, 25, 50, 75 or 100%, so a single incidental frame reads
+            // as an authoritative-looking 25%. In seconds that same match reads
+            // "0.8s", next to a length of "00:00:03", and needs no explaining.
+            let shared = matches.weakest_shared_in_group(idx, group, fingerprints);
+            let shared_str = format_shared(shared);
+
+            if let Some(s) = shared {
+                group_low = Some(group_low.map_or(s, |g: f64| g.min(s)));
+            }
+
+            // The percentage still goes to the machine-readable outputs, where
+            // nothing is being read at a glance and a filter like "at least 90%
+            // redundant" is a reasonable thing to want.
+            let coverage = matches.weakest_in_group(idx, group);
+            let coverage_pct = coverage
+                .map(|c| ((c * 100.0).clamp(0.0, 100.0) as f64 * 10.0).round() / 10.0);
 
             // Label by the file's GLOBAL fate (precedence REVIEW > DELETE > KEEP).
             // A file that is redundant in an overlapping group is shown DELETE/
@@ -187,13 +236,17 @@ pub fn output_results(
             };
 
             // 1. Console / Text Output
+            //
+            // "shared" is spelled out on every row because the console has no
+            // header, and two time values side by side ("00:00:09, 0.8s") would
+            // otherwise be ambiguous about which is which.
             info!(
-                "\t{}, {}, {}, {}, {}, {}",
-                res_str, size_str, bitrate_str, duration_str, fp.path, action_str
+                "\t{}, {}, {}, {}, {} shared, {}, {}",
+                res_str, size_str, bitrate_str, duration_str, shared_str, fp.path, action_str
             );
             txt_out.push_str(&format!(
-                "\t{}, {}, {}, {}, {}, {}\n",
-                res_str, size_str, bitrate_str, duration_str, fp.path, action_str
+                "\t{}, {}, {}, {}, {} shared, {}, {}\n",
+                res_str, size_str, bitrate_str, duration_str, shared_str, fp.path, action_str
             ));
 
             // 2. CSV Output
@@ -203,6 +256,9 @@ pub fn output_results(
                 &size_str,
                 &bitrate_str,
                 &duration_str,
+                &shared_str,
+                &shared.map(|s| format!("{:.2}", s)).unwrap_or_default(),
+                &coverage_pct.map(|p| format!("{:.1}", p)).unwrap_or_default(),
                 &fp.path,
                 action_str,
             ]).context("Failed to write CSV record")?;
@@ -214,6 +270,9 @@ pub fn output_results(
                 "bitrate": bitrate_str,
                 "bitrate_bps": fp.bitrate(),
                 "length": duration_str,
+                "shared": shared_str,
+                "shared_seconds": shared.map(|s| (s * 100.0).round() / 100.0),
+                "match_percent": coverage_pct,
                 "full_path": fp.path,
                 "action": action_str,
             }));
@@ -224,6 +283,10 @@ pub fn output_results(
 
         json_out_groups.push(serde_json::json!({
             "group": group_name,
+            // The group's thinnest link, for filtering. Not printed to the
+            // console: every row already carries its own worst-case figure, so
+            // a header repeating one of them would be noise.
+            "lowest_shared_seconds": group_low.map(|s| (s * 100.0).round() / 100.0),
             "files": json_files
         }));
     }
@@ -233,9 +296,9 @@ pub fn output_results(
     let total_secs = total_elapsed_secs % 60;
 
     let mut summary = format!(
-        "Total groups found: {}\nTotal files linked: {}\nTotal time elapsed: {:02}:{:02}:{:02}",
+        "Total groups found: {}\nTotal files matched: {}\nTotal time elapsed: {:02}:{:02}:{:02}",
         final_groups.len(),
-        total_files_linked,
+        matched_file_count,
         total_hours,
         total_mins,
         total_secs
@@ -293,7 +356,7 @@ pub fn output_results(
                 let json_final = serde_json::json!({
                     "summary": {
                         "total_groups": final_groups.len(),
-                        "total_files_linked": total_files_linked,
+                        "total_files_matched": matched_file_count,
                         "time_elapsed_seconds": total_elapsed_secs,
                         "deletion_enabled": delete,
                         "permanent": permanent_delete,
@@ -325,6 +388,7 @@ pub fn output_results(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compare::Match;
     use crate::utils::Priority;
     use tempfile::NamedTempFile;
     use std::fs;
@@ -351,6 +415,12 @@ mod tests {
         fp
     }
 
+    /// Tests about deletion precedence don't care about overlap; an empty index
+    /// reports every figure as unknown, which the report renders as "-".
+    fn no_matches() -> MatchIndex {
+        MatchIndex::new(vec![])
+    }
+
     #[test]
     fn test_csv_output() {
         let fps = vec![mock_fp()];
@@ -361,20 +431,158 @@ mod tests {
 
         // Report-only run: single item defaults to KEEP.
         output_results(
-            &groups, &fps, Some(&path_str), 120, Priority::Length, false, false,
+            &groups, &fps, &no_matches(), Some(&path_str), 120, Priority::Length, false, false,
             &RunStats::default(),
         ).unwrap();
 
         let contents = fs::read_to_string(&path_str).unwrap();
 
         // Assert headers exist (separated by semicolons)
-        assert!(contents.contains("group;resolution;size;bitrate;length;full_path;action"));
+        assert!(contents.contains(
+            "group;resolution;size;bitrate;length;shared;shared_seconds;match_percent;full_path;action"
+        ));
         // 1 MiB over 60s = ~140kbps. Assert data exists and defaults to KEEP.
         assert!(contents.contains(
-            "group_1;1920x1080;1.0MB;140kbps;00:01:00;/fake/path/vid.mp4;KEEP"
+            "group_1;1920x1080;1.0MB;140kbps;00:01:00;-;;;/fake/path/vid.mp4;KEEP"
         ));
 
         // Clean up
+        let _ = fs::remove_file(path_str);
+    }
+
+    #[test]
+    fn test_shared_duration_reads_the_same_on_a_clip_and_its_host() {
+        // The reason this column is a duration. As coverage these two rows read
+        // 10% and 100% and look like a malfunction next to any --match-percent;
+        // as seconds they both read a minute, which is the truth.
+        let fps = vec![
+            mock_fp_at("/fake/host.mp4", 600.0),
+            mock_fp_at("/fake/clip.mp4", 60.0),
+        ];
+        let groups = vec![vec![0, 1]];
+
+        let matches = MatchIndex::new(vec![Match {
+            a: 0,
+            b: 1,
+            coverage_a: 0.10,
+            coverage_b: 1.0,
+        }]);
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let path_str = temp_file.path().with_extension("csv").to_string_lossy().to_string();
+
+        output_results(
+            &groups, &fps, &matches, Some(&path_str), 0, Priority::Length, false, false,
+            &RunStats::default(),
+        ).unwrap();
+
+        let contents = fs::read_to_string(&path_str).unwrap();
+        assert!(contents.contains(";1m00s;60.00;10.0;/fake/host.mp4;"), "host row: {}", contents);
+        assert!(contents.contains(";1m00s;60.00;100.0;/fake/clip.mp4;"), "clip row: {}", contents);
+
+        let _ = fs::remove_file(path_str);
+    }
+
+    #[test]
+    fn test_a_single_shared_keyframe_reports_as_a_fraction_of_a_second() {
+        // Four short clips from the same camera sharing one incidental frame.
+        // Every coverage figure here is a headline-looking 10-25%; every shared
+        // duration is under a second, which is what the reader needs.
+        let fps = vec![
+            mock_fp_at("/fake/bench_29.mp4", 9.0),
+            mock_fp_at("/fake/bench_38.mp4", 3.0),
+        ];
+        let groups = vec![vec![0, 1]];
+
+        let matches = MatchIndex::new(vec![Match {
+            a: 0,
+            b: 1,
+            coverage_a: 0.0714, // 1 of 14 keyframes
+            coverage_b: 0.25,   // 1 of 4
+        }]);
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let path_str = temp_file.path().with_extension("csv").to_string_lossy().to_string();
+
+        output_results(
+            &groups, &fps, &matches, Some(&path_str), 0, Priority::Length, false, false,
+            &RunStats::default(),
+        ).unwrap();
+
+        let contents = fs::read_to_string(&path_str).unwrap();
+        assert!(contents.contains(";0.6s;"), "sub-second overlap must stay legible: {}", contents);
+        assert!(
+            !contents.contains(";00:00:00;"),
+            "a real overlap must never render as a zeroed clock: {}",
+            contents
+        );
+
+        let _ = fs::remove_file(path_str);
+    }
+
+    #[test]
+    fn test_files_in_several_groups_are_counted_once() {
+        // File 1 belongs to both groups. Summing group sizes gives 4; there are
+        // only 3 files, and 4 would be a nonsense figure the moment a user
+        // compared it against the number of videos scanned.
+        let fps = vec![
+            mock_fp_at("/fake/a.mp4", 100.0),
+            mock_fp_at("/fake/b.mp4", 90.0),
+            mock_fp_at("/fake/c.mp4", 10.0),
+        ];
+        let groups = vec![vec![0, 1], vec![1, 2]];
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let path_str = temp_file.path().with_extension("json").to_string_lossy().to_string();
+
+        output_results(
+            &groups, &fps, &no_matches(), Some(&path_str), 0, Priority::Length, false, false,
+            &RunStats::default(),
+        ).unwrap();
+
+        let report: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path_str).unwrap()).unwrap();
+
+        assert_eq!(report["summary"]["total_groups"], 2);
+        assert_eq!(
+            report["summary"]["total_files_matched"], 3,
+            "a file in two groups is still one file"
+        );
+
+        let _ = fs::remove_file(path_str);
+    }
+
+    #[test]
+    fn test_json_carries_raw_figures_alongside_the_formatted_ones() {
+        let fps = vec![
+            mock_fp_at("/fake/a.mp4", 100.0),
+            mock_fp_at("/fake/b.mp4", 100.0),
+        ];
+        let groups = vec![vec![0, 1]];
+        let matches = MatchIndex::new(vec![Match {
+            a: 0,
+            b: 1,
+            coverage_a: 0.80,
+            coverage_b: 0.80,
+        }]);
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let path_str = temp_file.path().with_extension("json").to_string_lossy().to_string();
+
+        output_results(
+            &groups, &fps, &matches, Some(&path_str), 0, Priority::Length, false, false,
+            &RunStats::default(),
+        ).unwrap();
+
+        let report: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path_str).unwrap()).unwrap();
+        let group = &report["results"][0];
+
+        assert_eq!(group["lowest_shared_seconds"], 80.0);
+        assert_eq!(group["files"][0]["shared"], "1m20s");
+        assert_eq!(group["files"][0]["shared_seconds"], 80.0);
+        assert_eq!(group["files"][0]["match_percent"], 80.0);
+
         let _ = fs::remove_file(path_str);
     }
 
@@ -396,7 +604,9 @@ mod tests {
         let groups = vec![vec![0, 1]];
         let stats = RunStats::default();
 
-        output_results(&groups, &fps, None, 0, Priority::Length, true, true, &stats).unwrap();
+        output_results(
+            &groups, &fps, &no_matches(), None, 0, Priority::Length, true, true, &stats,
+        ).unwrap();
 
         assert!(Path::new(&keep_path).exists(), "KEEP file must remain");
         assert!(!Path::new(&del_path).exists(), "DELETE file must be removed");
@@ -424,7 +634,8 @@ mod tests {
         let groups = vec![vec![0, 1], vec![1, 2]];
 
         output_results(
-            &groups, &fps, None, 0, Priority::Length, true, true, &RunStats::default(),
+            &groups, &fps, &no_matches(), None, 0, Priority::Length, true, true,
+            &RunStats::default(),
         ).unwrap();
 
         assert!(Path::new(&p0).exists(), "global best must remain");
@@ -454,7 +665,9 @@ mod tests {
         let stats = RunStats::default();
 
         // Previously errored on the second deletion attempt; must succeed now.
-        output_results(&groups, &fps, None, 0, Priority::Length, true, true, &stats).unwrap();
+        output_results(
+            &groups, &fps, &no_matches(), None, 0, Priority::Length, true, true, &stats,
+        ).unwrap();
 
         assert!(Path::new(&p0).exists(), "independent best A must remain");
         assert!(Path::new(&p1).exists(), "independent best B must remain");
@@ -483,7 +696,8 @@ mod tests {
         let groups = vec![vec![0, 1]];
 
         output_results(
-            &groups, &fps, None, 0, Priority::Length, true, true, &RunStats::default(),
+            &groups, &fps, &no_matches(), None, 0, Priority::Length, true, true,
+            &RunStats::default(),
         ).unwrap();
 
         assert!(Path::new(&p_hi).exists(), "higher-bitrate copy must be kept");
@@ -500,7 +714,9 @@ mod tests {
         let groups = vec![vec![0, 1]];
         let stats = RunStats::default();
 
-        output_results(&groups, &fps, None, 0, Priority::Length, true, true, &stats).unwrap();
+        output_results(
+            &groups, &fps, &no_matches(), None, 0, Priority::Length, true, true, &stats,
+        ).unwrap();
 
         assert_eq!(stats.delete_failed.count(), 1, "the failure must be tallied");
         assert!(stats.had_problems(), "a failed deletion must fail the run");

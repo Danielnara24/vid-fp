@@ -8,7 +8,7 @@ mod utils;
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
 use clap_complete::Shell;
-use compare::find_all_matches;
+use compare::{find_all_matches, MatchIndex};
 use fingerprint::{fingerprint_video, VideoFingerprint, MAX_DECODE_THREADS};
 use indicatif::{ProgressBar, ProgressStyle};
 use log::info;
@@ -826,7 +826,7 @@ fn run(
 
     info!("\nFingerprinting complete. Cross-analyzing {} videos...", n);
 
-    let edges = find_all_matches(&fingerprints, max_hamming, min_match_pct, min_duration);
+    let matches = find_all_matches(&fingerprints, max_hamming, min_match_pct, min_duration);
 
     if shutdown_requested() {
         return Ok(Outcome::Interrupted);
@@ -834,7 +834,15 @@ fn run(
 
     info!("Grouping duplicate clusters...");
 
+    // Clustering only needs to know which pairs matched -- it decides membership
+    // and nothing else. The coverage figures travel separately to the report,
+    // where they are the only thing that tells a genuine re-encode apart from a
+    // clip that happened to clear --match-percent.
+    let edges: Vec<(usize, usize)> = matches.iter().map(|m| (m.a, m.b)).collect();
     let final_groups = clustering::find_duplicate_groups(n, edges, &fingerprints);
+
+    // Consumes the Vec, so the pair list is not kept alive alongside the index.
+    let matches = MatchIndex::new(matches);
 
     if shutdown_requested() {
         return Ok(Outcome::Interrupted);
@@ -852,6 +860,7 @@ fn run(
     export::output_results(
         &final_groups,
         &fingerprints,
+        &matches,
         args.output.as_ref(),
         start_time.elapsed().as_secs(),
         args.priority,

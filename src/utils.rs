@@ -82,6 +82,50 @@ pub fn format_bitrate(bits_per_sec: u64) -> String {
     }
 }
 
+/// How much footage two files have in common, in a form a person can act on.
+///
+/// Deliberately NOT `format_duration`'s `HH:MM:SS`. Overlaps are frequently
+/// under a second -- one shared keyframe between two short clips is a real and
+/// common result -- and `00:00:00` is indistinguishable from a bug, while
+/// `0.6s` says exactly what happened. The differing shape also keeps this
+/// column from being mistaken for the file's own length sitting next to it.
+///
+/// `None` prints as a dash: the overlap was never measured, which is a
+/// different statement from "they share nothing".
+pub fn format_shared(seconds: Option<f64>) -> String {
+    let Some(s) = seconds else {
+        return "-".to_string();
+    };
+
+    if s <= 0.0 {
+        return "0s".to_string();
+    }
+    if s < 0.1 {
+        // A genuine but tiny overlap: one keyframe of a very long video. "0.0s"
+        // would read as nothing at all, which is the wrong conclusion.
+        return "<0.1s".to_string();
+    }
+    if s < 10.0 {
+        return format!("{:.1}s", s);
+    }
+
+    // From here on the figure is whole seconds, and the unit is chosen from the
+    // ROUNDED value rather than the raw one. Picking the unit first and
+    // rounding inside it is how 119.7s renders as "1m60s" and 3599.7s as
+    // "60m00s" -- both arithmetically defensible, both obviously wrong on the
+    // page, and both reachable only from values a hair under a boundary.
+    let total = s.round() as u64;
+
+    if total < 60 {
+        format!("{}s", total)
+    } else if total < 3600 {
+        format!("{}m{:02}s", total / 60, total % 60)
+    } else {
+        let total_mins = (total as f64 / 60.0).round() as u64;
+        format!("{}h{:02}m", total_mins / 60, total_mins % 60)
+    }
+}
+
 pub fn resolution(fp: &VideoFingerprint) -> u64 {
     fp.width as u64 * fp.height as u64
 }
@@ -262,6 +306,40 @@ mod tests {
         assert_eq!(format_bitrate(950), "950bps");
         assert_eq!(format_bitrate(128_000), "128kbps");
         assert_eq!(format_bitrate(4_500_000), "4.5Mbps");
+    }
+
+    #[test]
+    fn test_format_shared_keeps_sub_second_overlaps_legible() {
+        // The case that motivated the whole column. HH:MM:SS would render every
+        // one of these as 00:00:00 and look broken.
+        assert_eq!(format_shared(Some(0.64)), "0.6s");
+        assert_eq!(format_shared(Some(0.05)), "<0.1s");
+        assert_eq!(format_shared(Some(3.2)), "3.2s");
+    }
+
+    #[test]
+    fn test_format_shared_scales_with_magnitude() {
+        assert_eq!(format_shared(Some(12.0)), "12s");
+        assert_eq!(format_shared(Some(59.0)), "59s");
+        assert_eq!(format_shared(Some(118.0)), "1m58s");
+        assert_eq!(format_shared(Some(3600.0)), "1h00m");
+        assert_eq!(format_shared(Some(7_500.0)), "2h05m");
+    }
+
+    #[test]
+    fn test_format_shared_never_renders_an_impossible_clock() {
+        // Each of these sits a hair below a unit boundary, and each rounds up
+        // across it. The unit has to be chosen after that rounding, or they
+        // render as "1m60s", "60m00s" and "60s" respectively.
+        assert_eq!(format_shared(Some(119.7)), "2m00s");
+        assert_eq!(format_shared(Some(3_599.7)), "1h00m");
+        assert_eq!(format_shared(Some(59.6)), "1m00s");
+    }
+
+    #[test]
+    fn test_format_shared_distinguishes_unknown_from_none() {
+        assert_eq!(format_shared(None), "-", "never measured");
+        assert_eq!(format_shared(Some(0.0)), "0s", "measured, and it was nothing");
     }
 
     #[test]

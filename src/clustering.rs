@@ -1,45 +1,100 @@
+//! Turning "these two videos match" edges into groups.
+//!
+//! A group is a *maximal clique*: every file in it matched every other file in
+//! it, and no file outside it matched all of them. That definition is the whole
+//! safety argument for what `export.rs` does next -- it keeps one file per group
+//! and marks the rest DELETE, which is only defensible if every DELETE target
+//! was independently confirmed against every other member, including the one
+//! being kept.
+//!
+//! Anything looser breaks that argument, because matching here is not
+//! transitive. Three episodes sharing an opening sequence are pairwise linked
+//! without any two of them being duplicates; a clip cut from a long video links
+//! to the host without linking to the host's other clips. Merging on partial
+//! connectivity -- connected components, or "close enough" expansion rules --
+//! collapses exactly those cases into one group and deletes files that were
+//! never compared against the survivor. Requiring a complete subgraph is what
+//! makes that impossible to express.
+//!
+//! Whether an edge exists at all is decided upstream by `--hamming-distance`,
+//! `--match-percent` and `--min-duration`. This module adds no thresholds of its
+//! own; it only refuses to invent links that the comparison stage did not find.
+//!
+//! The price of being strict is that groups overlap: a file belonging to two
+//! cliques is reported in both. That is expected -- `export.rs` resolves each
+//! file's fate across every group it appears in.
+
 use crate::fingerprint::VideoFingerprint;
 use std::collections::HashSet;
 
-// Graph Traversal with Pivoting logic to handle aggressive densifying cliques flawlessly
+/// Bron-Kerbosch with Tomita pivoting.
+///
+/// `r` is the clique built so far, `p` the candidates that could still extend
+/// it, and `x` the candidates already used as an extension somewhere higher in
+/// the tree. A clique is maximal exactly when nothing can extend it (`p` empty)
+/// and nothing was deliberately excluded from it (`x` empty). `x` is what stops
+/// the same clique being emitted once per ordering of its members.
+///
+/// The pivot is what keeps this tractable on dense neighbourhoods. Every
+/// maximal clique must contain the pivot or one of its non-neighbours, so
+/// branching on only the non-neighbours skips whole subtrees that could not
+/// produce anything new. Picking the pivot with the most neighbours still in
+/// `p` skips the most.
 fn bron_kerbosch(
     r: HashSet<usize>,
     mut p: HashSet<usize>,
     mut x: HashSet<usize>,
     adjacency: &[HashSet<usize>],
-    base_cliques: &mut Vec<HashSet<usize>>,
+    cliques: &mut Vec<HashSet<usize>>,
 ) {
-    if p.is_empty() && x.is_empty() {
-        if r.len() > 1 {
-            base_cliques.push(r);
+    if p.is_empty() {
+        // Nothing left to add. If nothing was excluded either, `r` is maximal.
+        // A group of one is not a duplicate of anything, so it is dropped here
+        // rather than filtered out downstream.
+        if x.is_empty() && r.len() > 1 {
+            cliques.push(r);
         }
         return;
     }
 
-    // Heuristic: Use Pivot methodology choosing largest neighbor intersection maximizing node exclusion
-    let pivot = p.union(&x).max_by_key(|&&v| adjacency[v].intersection(&p).count()).cloned();
-    
-    let p_explore: Vec<usize> = if let Some(u) = pivot {
-        p.difference(&adjacency[u]).cloned().collect()
-    } else {
-        p.iter().cloned().collect()
+    // `p` is non-empty, so the union is too and this always yields a pivot; the
+    // fallback below is only there to keep the function total.
+    let pivot = p
+        .union(&x)
+        .max_by_key(|&&v| adjacency[v].intersection(&p).count())
+        .copied();
+
+    let branches: Vec<usize> = match pivot {
+        Some(u) => p.difference(&adjacency[u]).copied().collect(),
+        None => p.iter().copied().collect(),
     };
 
-    for v in p_explore {
-        let mut new_r = r.clone();
-        new_r.insert(v);
-
+    for v in branches {
         let neighbors = &adjacency[v];
-        let new_p: HashSet<usize> = neighbors.intersection(&p).cloned().collect();
-        let new_x: HashSet<usize> = neighbors.intersection(&x).cloned().collect();
 
-        bron_kerbosch(new_r, new_p, new_x, adjacency, base_cliques);
+        let mut next_r = r.clone();
+        next_r.insert(v);
 
+        bron_kerbosch(
+            next_r,
+            neighbors.intersection(&p).copied().collect(),
+            neighbors.intersection(&x).copied().collect(),
+            adjacency,
+            cliques,
+        );
+
+        // `v` has now appeared in every clique it can belong to at this level.
+        // Moving it into `x` stops the branches to its right rediscovering
+        // those same cliques with `v` appended.
         p.remove(&v);
         x.insert(v);
     }
 }
 
+/// Group `n` fingerprints into duplicate sets, given the pairs that matched.
+///
+/// Indices refer to positions in `fingerprints`. Within a group they are
+/// ordered by path; the groups themselves are ordered largest first.
 pub fn find_duplicate_groups(
     n: usize,
     edges: Vec<(usize, usize)>,
@@ -51,65 +106,49 @@ pub fn find_duplicate_groups(
         adjacency[j].insert(i);
     }
 
-    let mut base_cliques = Vec::new();
-    let all_nodes: HashSet<usize> = (0..n).collect();
-    
-    bron_kerbosch(HashSet::new(), all_nodes, HashSet::new(), &adjacency, &mut base_cliques);
+    // Only a linked file can be in a group of two or more, and a file with no
+    // edges cannot extend anyone else's clique either -- so leaving it out of
+    // `p` changes no result. On a real library the overwhelming majority of
+    // videos match nothing at all, and seeding them would spend one recursion,
+    // plus a clone of an n-sized set, per file to rediscover that.
+    let candidates: HashSet<usize> = (0..n).filter(|&v| !adjacency[v].is_empty()).collect();
 
-    let mut expanded_groups = Vec::new();
-    for clique in base_cliques {
-        let mut group = clique.clone();
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for v in 0..n {
-                if !group.contains(&v) {
-                    if adjacency[v].intersection(&group).count() >= 2 {
-                        group.insert(v);
-                        changed = true;
-                    }
-                }
-            }
-        }
-        expanded_groups.push(group);
-    }
+    let mut cliques = Vec::new();
+    bron_kerbosch(
+        HashSet::new(),
+        candidates,
+        HashSet::new(),
+        &adjacency,
+        &mut cliques,
+    );
 
-    expanded_groups.sort_by(|a, b| b.len().cmp(&a.len()));
+    // Note there is no subset-elimination pass here. Every clique above is
+    // maximal by construction, and a maximal clique cannot be contained in
+    // another one: the members making up the difference would have extended it.
 
-    let mut final_groups_sets: Vec<HashSet<usize>> = Vec::new();
-    for g in expanded_groups {
-        let mut is_subset = false;
-        for fg in &final_groups_sets {
-            if g.is_subset(fg) {
-                is_subset = true;
-                break;
-            }
-        }
-        if !is_subset {
-            final_groups_sets.push(g);
-        }
-    }
+    let mut groups: Vec<Vec<usize>> = cliques
+        .into_iter()
+        .map(|clique| {
+            let mut indices: Vec<usize> = clique.into_iter().collect();
+            indices.sort_by(|&a, &b| fingerprints[a].path.cmp(&fingerprints[b].path));
+            indices
+        })
+        .collect();
 
-    // Keep indices mapped directly to the original struct to print properties naturally
-    let mut final_groups: Vec<Vec<usize>> = Vec::new();
-    for g in final_groups_sets {
-        let mut group_indices: Vec<usize> = g.into_iter().collect();
-        group_indices.sort_by(|&a, &b| fingerprints[a].path.cmp(&fingerprints[b].path));
-        final_groups.push(group_indices);
-    }
-
-    // Sort fully deterministically: size of group descending, then deep comparison of all paths ascending
-    final_groups.sort_by(|a, b| {
-        b.len()
-            .cmp(&a.len())
-            .then_with(|| {
-                let paths_a = a.iter().map(|&idx| &fingerprints[idx].path);
-                let paths_b = b.iter().map(|&idx| &fingerprints[idx].path);
-                paths_a.cmp(paths_b)
-            })
+    // Discovery order follows HashSet iteration, which is not stable across
+    // runs, so the output is sorted into a total order instead: largest groups
+    // first, ties broken by comparing member paths in order. Paths are unique
+    // (files are deduplicated by inode before they reach this point), so no two
+    // distinct groups can compare equal and the result is fully reproducible.
+    groups.sort_by(|a, b| {
+        b.len().cmp(&a.len()).then_with(|| {
+            a.iter()
+                .map(|&i| &fingerprints[i].path)
+                .cmp(b.iter().map(|&i| &fingerprints[i].path))
+        })
     });
 
-    final_groups
+    groups
 }
 
 #[cfg(test)]
@@ -131,6 +170,23 @@ mod tests {
         }
     }
 
+    /// `n` fingerprints whose paths sort in index order, so a group printed as
+    /// `[0, 1, 2]` is also the path order the real sort would produce.
+    fn mock_library(n: usize) -> Vec<VideoFingerprint> {
+        (0..n)
+            .map(|i| mock_fingerprint(&format!("{:04}.mp4", i)))
+            .collect()
+    }
+
+    fn adjacency_of(n: usize, edges: &[(usize, usize)]) -> Vec<HashSet<usize>> {
+        let mut adjacency: Vec<HashSet<usize>> = vec![HashSet::new(); n];
+        for &(i, j) in edges {
+            adjacency[i].insert(j);
+            adjacency[j].insert(i);
+        }
+        adjacency
+    }
+
     #[test]
     fn test_find_duplicate_groups_simple_clique() {
         let fps = vec![
@@ -141,14 +197,14 @@ mod tests {
 
         // Fully connected graph (a-b, b-c, a-c)
         let edges = vec![(0, 1), (1, 2), (0, 2)];
-        
+
         let groups = find_duplicate_groups(3, edges, &fps);
-        
+
         assert_eq!(groups.len(), 1, "Should find exactly one group");
         assert_eq!(groups[0].len(), 3, "Group should contain all 3 videos");
-        
+
         // Ensure they are sorted by path
-        assert_eq!(groups[0], vec![0, 1, 2]); 
+        assert_eq!(groups[0], vec![0, 1, 2]);
     }
 
     #[test]
@@ -163,11 +219,127 @@ mod tests {
 
         // Edges: (a,b) and (c,d)
         let edges = vec![(0, 1), (2, 3)];
-        
+
         let groups = find_duplicate_groups(5, edges, &fps);
-        
+
         assert_eq!(groups.len(), 2, "Should find exactly two groups");
         assert!(groups.contains(&vec![0, 1]));
         assert!(groups.contains(&vec![2, 3]));
+    }
+
+    #[test]
+    fn test_a_partially_linked_file_is_never_absorbed_into_a_group() {
+        // The regression this file exists to prevent. 0-1-2 is a triangle; 3 is
+        // linked to 0 and 1 but NOT to 2. The old expansion rule admitted any
+        // node with two edges into a group, so 3 was folded into {0,1,2} and
+        // then marked DELETE on the strength of a comparison against 2 that had
+        // never happened. With --delete --permanent, unrecoverably.
+        let fps = mock_library(4);
+        let edges = vec![(0, 1), (0, 2), (1, 2), (0, 3), (1, 3)];
+
+        let groups = find_duplicate_groups(4, edges, &fps);
+
+        assert_eq!(
+            groups,
+            vec![vec![0, 1, 2], vec![0, 1, 3]],
+            "the two maximal cliques must be reported separately"
+        );
+        for group in &groups {
+            assert!(
+                !(group.contains(&2) && group.contains(&3)),
+                "files that never matched must never share a group"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_chain_does_not_collapse_into_one_group() {
+        // 0-1 and 1-2 with no 0-2 edge. Treating the match relation as
+        // transitive would produce a single group of three; it is not
+        // transitive, so this is two overlapping pairs.
+        let fps = mock_library(3);
+        let groups = find_duplicate_groups(3, vec![(0, 1), (1, 2)], &fps);
+
+        assert_eq!(groups, vec![vec![0, 1], vec![1, 2]]);
+    }
+
+    #[test]
+    fn test_overlapping_cliques_are_both_reported() {
+        // Two triangles sharing node 2 -- e.g. one video that is genuinely a
+        // duplicate within two otherwise unrelated sets. Both groups stand, and
+        // export.rs resolves node 2's fate across them.
+        let fps = mock_library(5);
+        let edges = vec![(0, 1), (0, 2), (1, 2), (2, 3), (2, 4), (3, 4)];
+
+        let groups = find_duplicate_groups(5, edges, &fps);
+
+        assert_eq!(groups, vec![vec![0, 1, 2], vec![2, 3, 4]]);
+    }
+
+    #[test]
+    fn test_every_group_is_a_complete_subgraph() {
+        // The invariant export.rs depends on, checked over a graph messy enough
+        // to have several overlapping cliques and a stray cross-link.
+        let fps = mock_library(7);
+        let edges = vec![
+            (0, 1),
+            (0, 2),
+            (1, 2), // triangle
+            (2, 3),
+            (2, 4),
+            (3, 4), // triangle sharing node 2
+            (4, 5), // dangling pair
+            (0, 3), // a stray link between the two triangles
+        ];
+
+        let groups = find_duplicate_groups(7, edges.clone(), &fps);
+        let adjacency = adjacency_of(7, &edges);
+
+        assert!(!groups.is_empty(), "this graph clearly has duplicates");
+
+        for group in &groups {
+            assert!(group.len() > 1, "a group of one is not a duplicate set");
+            assert!(!group.contains(&6), "an unmatched file must not be grouped");
+
+            for (pos, &a) in group.iter().enumerate() {
+                for &b in &group[pos + 1..] {
+                    assert!(
+                        adjacency[a].contains(&b),
+                        "{:?} contains the unmatched pair ({}, {})",
+                        group,
+                        a,
+                        b
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_unmatched_files_cost_nothing() {
+        // A thousand videos, two matches. Isolated files are kept out of the
+        // search entirely, so this is instant rather than a thousand recursions
+        // each cloning a thousand-element set.
+        let fps = mock_library(1000);
+        let groups = find_duplicate_groups(1000, vec![(10, 20), (20, 30)], &fps);
+
+        assert_eq!(groups, vec![vec![10, 20], vec![20, 30]]);
+    }
+
+    #[test]
+    fn test_output_is_reproducible_despite_hashset_iteration_order() {
+        let fps = mock_library(6);
+        let edges = vec![(0, 1), (0, 2), (1, 2), (2, 3), (3, 4), (2, 4), (4, 5)];
+
+        let first = find_duplicate_groups(6, edges.clone(), &fps);
+        let second = find_duplicate_groups(6, edges, &fps);
+
+        assert_eq!(first, second, "two identical runs must report identically");
+    }
+
+    #[test]
+    fn test_no_edges_means_no_groups() {
+        let fps = mock_library(4);
+        assert!(find_duplicate_groups(4, vec![], &fps).is_empty());
     }
 }
