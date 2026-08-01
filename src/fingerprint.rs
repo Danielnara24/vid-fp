@@ -21,6 +21,12 @@ const FF_THREAD_SLICE: i32 = 2;
 /// scheduler in `main` never plans an allocation this function would clamp away.
 pub const MAX_DECODE_THREADS: usize = 16;
 
+/// Anything above this is not a frame rate. Containers occasionally park a
+/// timebase (90000/1) or a placeholder in the frame-rate fields, and a bogus
+/// denominator there would silently divide the quality figure into nothing.
+/// Above the ceiling we record "unknown", which every consumer already handles.
+const MAX_PLAUSIBLE_FRAME_RATE: f64 = 1000.0;
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct VideoFingerprint {
     pub path: String,
@@ -32,6 +38,20 @@ pub struct VideoFingerprint {
     pub height: u32,
     pub duration: f64,
     pub file_size: u64,
+    /// FFmpeg's short name for the codec of the video stream ("h264", "hevc",
+    /// "av1", ...). Empty only when FFmpeg cannot name the id it read.
+    ///
+    /// This is the one field that decides whether two copies' bitrate-derived
+    /// numbers mean the same thing, so it is stored rather than re-derived:
+    /// ranking must not depend on whether a file happened to be re-opened.
+    ///
+    /// Appended at the END of the struct on purpose. Cache entries written
+    /// before this field existed simply run out of bytes here, so bincode
+    /// fails cleanly and the file is fingerprinted again -- no version bump,
+    /// no chance of an old payload being misread as a new one.
+    pub codec: String,
+    /// Average frames per second, or 0.0 when the container never said.
+    pub frame_rate: f64,
 }
 
 impl VideoFingerprint {
@@ -48,6 +68,8 @@ impl VideoFingerprint {
     ///
     /// Caveat worth knowing: it counts audio. A copy with lossless 5.1 can
     /// outrank one with a better video track and stereo AAC.
+    ///
+    /// Reported, but never used to rank: see `quality`.
     pub fn bitrate(&self) -> u64 {
         if self.duration > 0.0 {
             ((self.file_size as f64 * 8.0) / self.duration) as u64
@@ -55,6 +77,40 @@ impl VideoFingerprint {
             0
         }
     }
+
+    /// Bits spent on an average frame: bitrate divided by frame rate.
+    ///
+    /// This is what ranks two copies, not raw bitrate. Bitrate answers "how
+    /// many bits per second", and a 60 fps copy spends those bits across twice
+    /// as many frames as a 30 fps one -- so the same bitrate is half the
+    /// picture. Dividing by the frame rate asks how much was spent on each
+    /// frame instead, which is much closer to what a viewer actually sees.
+    ///
+    /// It is still NOT comparable across codecs: 20 kbit/frame of AV1 looks
+    /// considerably better than 20 kbit/frame of MPEG-4, and ranking the two
+    /// against each other would punish exactly the file that was encoded well.
+    /// Only compare this figure between files that share a codec --
+    /// `GroupMaxima` is what enforces that, and nothing else should be using
+    /// this number to choose what to delete.
+    ///
+    /// 0 when the frame rate (or duration) is unknown. Read that as "no claim
+    /// either way", not as "the worst copy here".
+    pub fn quality(&self) -> u64 {
+        if self.frame_rate > 0.0 {
+            (self.bitrate() as f64 / self.frame_rate) as u64
+        } else {
+            0
+        }
+    }
+}
+
+/// A `Rational` as a plain float, with FFmpeg's "unknown" (a zero denominator)
+/// mapped to 0.0 instead of an infinity or a NaN.
+fn rational_f64(r: ffmpeg_next::Rational) -> f64 {
+    if r.denominator() == 0 {
+        return 0.0;
+    }
+    r.numerator() as f64 / r.denominator() as f64
 }
 
 /// Fingerprint one video.
@@ -100,6 +156,33 @@ pub fn fingerprint_video(
     // Only a positive, known duration can disqualify a file.
     if min_duration > 0.0 && duration_sec > 0.0 && duration_sec < min_duration {
         return Ok(None);
+    }
+
+    // --- Codec and frame rate ------------------------------------------------
+    // Both come straight out of the stream parameters the demuxer has already
+    // parsed, so they cost nothing beyond the header read that just happened --
+    // no extra decode, no second pass, and they are known even for a video that
+    // is about to be skipped for some other reason.
+    //
+    // The codec is stored by NAME rather than as a numeric id: the id is an
+    // enum whose values are FFmpeg's business and could be renumbered, while
+    // "h264" is stable, is what the user sees in the report, and is what the
+    // comparison rules key on.
+    let codec_id = input.parameters().id();
+    let codec = ffmpeg_next::codec::decoder::find(codec_id)
+        .map(|c| c.name().to_string())
+        .unwrap_or_else(|| format!("{:?}", codec_id).to_lowercase());
+
+    // avg_frame_rate is the honest average over the file; r_frame_rate is the
+    // smallest rate that can represent every timestamp, which is the better
+    // guess when the average is missing but is an overestimate on variable
+    // frame rate content. Prefer the average, fall back to the other.
+    let mut frame_rate = rational_f64(input.avg_frame_rate());
+    if frame_rate <= 0.0 {
+        frame_rate = rational_f64(input.rate());
+    }
+    if !frame_rate.is_finite() || frame_rate <= 0.0 || frame_rate > MAX_PLAUSIBLE_FRAME_RATE {
+        frame_rate = 0.0;
     }
 
     let mut context_decoder = ffmpeg_next::codec::context::Context::from_parameters(input.parameters())
@@ -426,6 +509,8 @@ pub fn fingerprint_video(
         height,
         duration: duration_sec,
         file_size,
+        codec,
+        frame_rate,
     }))
 }
 
@@ -466,6 +551,23 @@ mod tests {
         result.unwrap().expect("min_duration is off, nothing should be skipped")
     }
 
+    /// A fingerprint with nothing in it but the fields the quality figure needs.
+    fn timing_only(size: u64, duration: f64, frame_rate: f64) -> VideoFingerprint {
+        VideoFingerprint {
+            path: "mock.mp4".to_string(),
+            valid_hashes: vec![],
+            valid_t_start: vec![],
+            valid_t_end: vec![],
+            total_frames: 1,
+            width: 1920,
+            height: 1080,
+            duration,
+            file_size: size,
+            codec: "h264".to_string(),
+            frame_rate,
+        }
+    }
+
     #[test]
     fn test_video_shorter_than_min_duration_is_skipped() {
         init_ffmpeg_for_tests();
@@ -500,6 +602,35 @@ mod tests {
             fp.valid_t_start.len(),
             "Hash lists and timing lists must stay synchronized"
         );
+
+        // The two fields the ranking rules key on. A file whose codec could not
+        // be named would silently land in its own comparison bucket, so this is
+        // worth asserting on a real container rather than only on mocks.
+        assert!(!fp.codec.is_empty(), "the stream's codec must be recorded");
+        assert!(
+            fp.frame_rate >= 0.0 && fp.frame_rate <= MAX_PLAUSIBLE_FRAME_RATE,
+            "an implausible frame rate must be recorded as unknown, got {}",
+            fp.frame_rate
+        );
+    }
+
+    #[test]
+    fn test_quality_is_bitrate_spent_per_frame() {
+        // 7,864,320 bytes over 60s = 1,048,576 bits/s. At 32 fps each frame
+        // gets 32,768 of them.
+        let fp = timing_only(7_864_320, 60.0, 32.0);
+        assert_eq!(fp.bitrate(), 1_048_576);
+        assert_eq!(fp.quality(), 32_768);
+    }
+
+    #[test]
+    fn test_quality_is_unknown_rather_than_zero_when_the_frame_rate_is() {
+        // A container that never reported a frame rate makes no claim about how
+        // its bits are spread. 0 is the caller's cue to skip the metric, which
+        // is why nothing here divides by a guessed rate.
+        let fp = timing_only(7_864_320, 60.0, 0.0);
+        assert!(fp.bitrate() > 0, "the bitrate is still perfectly knowable");
+        assert_eq!(fp.quality(), 0);
     }
 
     #[test]
@@ -515,6 +646,8 @@ mod tests {
         assert_eq!(single.valid_hashes, threaded.valid_hashes, "hashes must not depend on thread count");
         assert_eq!(single.valid_t_start, threaded.valid_t_start, "hash start times must not depend on thread count");
         assert_eq!(single.valid_t_end, threaded.valid_t_end, "hash end times must not depend on thread count");
+        assert_eq!(single.codec, threaded.codec, "codec must not depend on thread count");
+        assert_eq!(single.frame_rate, threaded.frame_rate, "frame rate must not depend on thread count");
     }
 
     #[test]

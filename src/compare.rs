@@ -374,6 +374,9 @@ pub fn find_all_matches(
 mod tests {
     use super::*;
 
+    // Matching is codec-blind by design -- a perceptual hash of a decoded frame
+    // says nothing about what encoded it -- so the codec and frame rate here are
+    // plausible filler and never affect a result in this module.
     fn mock_fp_with_hashes(hashes: Vec<u64>, frames: u32) -> VideoFingerprint {
         let len = hashes.len();
         VideoFingerprint {
@@ -387,6 +390,8 @@ mod tests {
             height: 1080,
             duration: 10.0,
             file_size: 1024,
+            codec: "h264".to_string(),
+            frame_rate: 30.0,
         }
     }
 

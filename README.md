@@ -105,7 +105,7 @@ folder paths, and enum values:
 
 ```bash
 vid-fp ~/Videos -e ~/Down<TAB>   # completes to a real folder
-vid-fp ~/Videos -k <TAB>         # length  resolution  bitrate  size
+vid-fp ~/Videos -k <TAB>         # length  resolution  quality  size
 ```
 
 ## Updating
@@ -164,7 +164,7 @@ vid-fp ~/Videos -r --delete --permanent
 | `-d`, `--hamming-distance <N>` | Frame-match tolerance; higher = less strict matching. Raise to increase duplicates found (but can increase false positives). Values above `7` work but see [Tuning](#tuning) | `3` |
 | `-p`, `--match-percent <F>` | Min % of overlap to count as a duplicate; Lower = Finds shorter matches (but can increase false positives) | `10.0` |
 | `--min-duration <SECS>` | Min shared clip length in seconds for a match. Videos shorter than this are skipped entirely. `0` = off | `0.0` |
-| `-k`, `--priority <P>` | Criteria for KEEPING files: `length`, `resolution`, `bitrate`, or `size`. The chosen one is compared first; the rest follow in the default order | `length` |
+| `-k`, `--priority <P>` | Criteria for KEEPING files: `length`, `resolution`, `quality`, or `size`. The chosen one is compared first; the rest follow in the default order. See [Codecs and quality](#codecs-and-quality) | `length` |
 | `--keyframe-interval <F>` | Seconds between sampled keyframes (`0` = every keyframe); Higher = Faster processing (Increasing this can hinder the capability of finding short matches between videos) | `0.0` |
 | `--min-keyframes <F>` | Min keyframes kept for short videos (only relevant when keyframe-interval > 0) | `4.0` |
 | `-o`, `--output <FILE>` | Optional path to save the report — `.txt`, `.csv`, or `.json` | — |
@@ -205,6 +205,40 @@ file can't contain a long enough shared clip, so there's nothing to gain by
 decoding it. Videos whose duration the container doesn't report are never
 skipped. Changing this flag doesn't invalidate the cache.
 
+## Codecs and quality
+
+These rules decide which copy is kept, not which files match. Matching itself is
+codec-blind: it compares decoded pictures, so an AV1 encode and an H.264 encode
+of the same footage land in the same group as they should.
+
+**`quality` is bits per frame** — bitrate divided by the average frame rate.
+Bitrate on its own double-counts the frame rate: a 60 fps copy needs roughly
+twice the bitrate of a 30 fps one just to look the same, so ranking on raw
+bitrate preferred whichever copy simply had more frames in it. Dividing by the
+frame rate asks how much was spent on each picture instead.
+
+**Bits are never compared across codecs.** A modern codec's whole job is to
+carry the same picture in fewer bits, so an AV1 file that is half the size of an
+H.264 one is doing exactly what it's supposed to — treating that as "worse"
+would delete the better encode every time. Both `quality` and `size` are
+therefore only compared between files sharing a codec: within a codec they rank
+normally, across codecs they tie and the decision falls through to something
+else.
+
+**A group that spans codecs ends with one survivor per codec.** If the leading
+copies match on length and resolution but were made with different codecs,
+nothing comparable remains to rank the codecs against each other — so each
+codec keeps its own best copy, flagged REVIEW for you to choose between. The
+other copies of each codec lost to a file they *are* directly comparable with,
+so they're marked DELETE as usual: a library holding five HEVC encodes and three
+H.264 encodes of one episode ends up with two files to look at, not eight.
+
+Note that bitrate (and so quality) includes audio, so a copy with lossless 5.1
+can outrank one with a better video track and stereo AAC.
+
+Every report shows the codec, frame rate, size, bitrate and quality of each
+file.
+
 ## How it reads the results
 
 Every file in a duplicate group is labeled with an action:
@@ -212,11 +246,12 @@ Every file in a duplicate group is labeled with an action:
 - **KEEP** — the best copy in the group, chosen by your `--priority`.
 - **DELETE** — a redundant copy (removed only if you pass `--delete`).
 - **REVIEW** — a copy worth a manual look before deleting; for example, the KEEP
-  pick is the longest video but a *different* file has higher resolution. REVIEW
-  files are never deleted automatically.
+  pick is the longest video but a *different* file has higher resolution, or the
+  group holds the best copy of each of several codecs and nothing comparable can
+  choose between them. REVIEW files are never deleted automatically.
 
-Fingerprints are cached (under `$XDG_CACHE_HOME/video-dedup`, falling back to
-`~/.cache/video-dedup`), so re-scanning the same library is near-instant. Use
+Fingerprints are cached (under `$XDG_CACHE_HOME/vid-fp`, falling back to
+`~/.cache/vid-fp`), so re-scanning the same library is near-instant. Use
 `--clear-cache` or `--prune-cache` to manage it.
 
 ## Exit codes
@@ -240,6 +275,9 @@ Fingerprints are cached (under `$XDG_CACHE_HOME/video-dedup`, falling back to
   - **Tab-complete your `-e` paths.** An exclude folder that can't be resolved
   excludes nothing. Letting the shell complete the path proves it exists before you
   start.
+  - **Mixed codecs are never guessed at.** When the only thing separating two
+  copies is which encoder made them, both are left alone and flagged REVIEW —
+  one survivor per codec, chosen against that codec's own copies.
 
 ## License
 

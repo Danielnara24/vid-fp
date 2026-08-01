@@ -155,7 +155,9 @@ pub fn find_duplicate_groups(
 mod tests {
     use super::*;
 
-    // Helper function to create dummy fingerprints for testing
+    // Helper function to create dummy fingerprints for testing. Clustering only
+    // ever looks at paths, so the codec and frame rate are just plausible
+    // filler -- the rules that care about them live in utils and export.
     fn mock_fingerprint(path: &str) -> VideoFingerprint {
         VideoFingerprint {
             path: path.to_string(),
@@ -167,6 +169,8 @@ mod tests {
             height: 1080,
             duration: 10.0,
             file_size: 1024,
+            codec: "h264".to_string(),
+            frame_rate: 30.0,
         }
     }
 
