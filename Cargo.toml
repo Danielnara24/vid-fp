@@ -1,6 +1,6 @@
 [package]
 name = "vid-fp"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Fast video duplicate and clip finder using perceptual keyframe fingerprints"
@@ -42,7 +42,7 @@ libc = "0.2"
 ffmpeg-next = "6.0"
 
 # Embedded key-value database for caching signatures
-sled = "0.34"
+redb = "2"
 
 # Fast serialization for saving/loading hashes
 bincode = "1.3"

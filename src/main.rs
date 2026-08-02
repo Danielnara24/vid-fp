@@ -13,6 +13,7 @@ use fingerprint::{fingerprint_video, VideoFingerprint, MAX_DECODE_THREADS};
 use indicatif::{ProgressBar, ProgressStyle};
 use log::info;
 use rayon::prelude::*;
+use redb::{Database, ReadableTable, TableDefinition};
 use stats::RunStats;
 use std::collections::HashSet;
 use std::io::Write;
@@ -23,8 +24,26 @@ use std::time::Instant;
 use utils::{shutdown_requested, Priority};
 use walkdir::WalkDir;
 
-// Cache schema versioning - bump this if VideoFingerprint struct ever changes!
+// Cache schema versioning - bump this if VideoFingerprint struct ever changes
 const CACHE_VERSION: &str = "v1";
+
+/// The one table in the cache: versioned cache key -> bincode'd fingerprint.
+///
+/// A single flat namespace is all this needs. The key already carries every
+/// input that could invalidate an entry (path, mtime, size, schema version and
+/// the two keyframe-sampling knobs), so there is nothing left for a second
+/// table to disambiguate.
+const CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("fingerprints");
+
+/// Hard ceiling on the cache's page cache.
+///
+/// A cached fingerprint is a few kilobytes, so even a fifty-thousand-file
+/// library is a few hundred megabytes on disk and is read exactly once per run,
+/// in key order. There is nothing here for a large cache to help with, and this
+/// binary works hard elsewhere (see the `mallopt` calls below) to keep resident
+/// memory flat across a long scan -- letting the database quietly grow a
+/// gigabyte-scale cache would undo that.
+const CACHE_SIZE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Exit code for a run that finished, reported, and did everything it could --
 /// but hit at least one problem on the way (an unreadable file, a video that
@@ -212,6 +231,105 @@ fn install_signal_handler() -> Result<()> {
     .context("Failed to install signal handler")
 }
 
+/// Create the cache table if this is a fresh database.
+///
+/// Opening a table inside a write transaction creates it, so this is also the
+/// cheapest way to guarantee that every later *read* transaction finds
+/// something to open -- reads cannot create tables, and a missing one would
+/// otherwise turn every lookup on a new machine into an error path.
+fn ensure_cache_table(db: &Database) -> Result<()> {
+    let txn = db.begin_write().context("Failed to start a cache transaction")?;
+    txn.open_table(CACHE_TABLE).context("Failed to create the cache table")?;
+    txn.commit().context("Failed to commit the cache table")?;
+    Ok(())
+}
+
+/// Read one fingerprint out of the cache, or `None` for anything that isn't a
+/// clean hit.
+///
+/// A missing key, an unreadable table and a payload that no longer
+/// deserializes all mean exactly the same thing to the caller -- fingerprint
+/// the file again -- so they collapse into one answer here rather than making
+/// every call site handle three failure shapes that need identical treatment.
+///
+/// The read transaction is per-call on purpose. It is a snapshot handle rather
+/// than a lock, readers never block each other or the writer, and taking it
+/// here keeps the whole thing usable from a rayon worker without threading a
+/// borrow through the closure.
+fn cache_lookup(db: &Database, key: &str) -> Option<VideoFingerprint> {
+    let read = db.begin_read().ok()?;
+    let table = read.open_table(CACHE_TABLE).ok()?;
+    let stored = table.get(key).ok()??;
+
+    match bincode::deserialize::<VideoFingerprint>(stored.value()) {
+        Ok(fp) => Some(fp),
+        Err(e) => {
+            // Corrupt, or written by a build whose struct no longer matches.
+            // Either way it is about to be overwritten by a fresh decode.
+            log::debug!("Cache entry {} did not deserialize ({}); re-processing.", key, e);
+            None
+        }
+    }
+}
+
+/// Write one fingerprint to the cache, durably.
+///
+/// One transaction per video, committed immediately -- deliberately not batched.
+/// The batch this pattern replaces held finished fingerprints in memory, which
+/// is precisely the work an interrupt threw away. A commit costs an fsync
+/// against a decode measured in seconds, and when it returns the entry is on
+/// disk: no background flusher, no window, nothing for a `std::process::exit`
+/// to cut short.
+///
+/// Only one write transaction exists at a time, so concurrent callers queue
+/// here. The serialization happens outside the transaction so that queue is
+/// only ever holding a b-tree insert.
+fn cache_store(db: &Database, key: &str, fp: &VideoFingerprint) -> Result<()> {
+    let encoded = bincode::serialize(fp).context("Failed to serialize fingerprint")?;
+
+    let txn = db.begin_write().context("Failed to start a cache transaction")?;
+    {
+        let mut table = txn.open_table(CACHE_TABLE).context("Failed to open the cache table")?;
+        table
+            .insert(key, encoded.as_slice())
+            .context("Failed to insert the fingerprint")?;
+    }
+    txn.commit().context("Failed to commit the fingerprint")?;
+
+    Ok(())
+}
+
+/// The file path a cache key was built from, or `None` if it isn't one of ours.
+///
+/// Keys are `{path}_{mtime}_{size}_{version}_{kf_interval}_{min_kf_samples}`,
+/// and a path may itself contain underscores -- so the five known fields are
+/// split off from the RIGHT and whatever remains is the path.
+fn path_from_cache_key(key: &str) -> Option<&str> {
+    key.rsplitn(6, '_').nth(5)
+}
+
+/// Delete the cache this tool used to keep, if it is still lying around.
+///
+/// sled stored a directory; redb stores a single file, so the two cannot even
+/// share a name and an old cache is bytes nothing will ever read again. Failure
+/// is uninteresting -- the worst case is some dead weight in the cache
+/// directory -- so it is logged at debug and otherwise ignored.
+fn retire_legacy_cache(cache_dir: &Path) {
+    let legacy = cache_dir.join("video_hashes.db");
+    if !legacy.is_dir() {
+        return;
+    }
+
+    match std::fs::remove_dir_all(&legacy) {
+        Ok(()) => info!("Removed the superseded cache at {}.", legacy.display()),
+        Err(e) => log::debug!(
+            "Could not remove the superseded cache at {}: {}",
+            legacy.display(),
+            e
+        ),
+    }
+}
+
 fn main() -> Result<()> {
     let start_time = Instant::now();
     let args = Args::parse();
@@ -313,16 +431,21 @@ Interrupted with Ctrl-C.
         .join("vid-fp");
 
     std::fs::create_dir_all(&cache_dir).context("Failed to create cache directory")?;
-    let db_path = cache_dir.join("video_hashes.db");
+    retire_legacy_cache(&cache_dir);
 
-    // A background flush every second means the cache survives even the paths
-    // that skip our own shutdown: a second Ctrl-C, a SIGKILL, a power cut.
-    // Nothing already fingerprinted is ever more than a second from durable.
-    let db = sled::Config::new()
-        .path(&db_path)
-        .flush_every_ms(Some(1_000))
-        .open()
+    let db_path = cache_dir.join("fingerprints.redb");
+
+    // A single file, an explicitly bounded page cache, and no background
+    // threads: every write is durable when its transaction commits, so there is
+    // no buffered work to lose and nothing that has to be told to stop. Opening
+    // takes an exclusive lock on the file, which is what keeps two concurrent
+    // runs from fighting over the same cache.
+    let mut db = Database::builder()
+        .set_cache_size(CACHE_SIZE_BYTES)
+        .create(&db_path)
         .context("Failed to open or lock cache database")?;
+
+    ensure_cache_table(&db).context("Failed to initialize the fingerprint cache")?;
 
     // Every non-fatal problem and every deliberate skip lands here, from any
     // thread and any phase, so the run can account for itself at the end
@@ -332,15 +455,24 @@ Interrupted with Ctrl-C.
     let outcome = run(&args, &db, start_time, active_threads, &stats);
 
     // --- The only exit path ---------------------------------------------------
-    // Every route out of `run` lands here -- success, failure, or interrupt --
-    // and the database is flushed and DROPPED before the process is allowed to
-    // end. The drop is the point: std::process::exit skips destructors, so
-    // exiting with a live Db means sled never runs its own shutdown and its
-    // flusher thread dies mid-write. That is how "saved 20 videos" becomes 6 on
-    // the next run. Flush, drop, then leave.
-    if let Err(e) = db.flush() {
-        log::error!("Failed to flush the fingerprint cache: {}", e);
-        stats.cache_write_failed.record(format!("final cache flush: {}", e));
+    // Every route out of `run` lands here -- success, failure, or interrupt.
+    // There is nothing to flush: a fingerprint is on disk the moment its
+    // transaction commits, so the cache does not depend on this code running at
+    // all. The database is still dropped explicitly, before the process is
+    // allowed to end, so the file lock is released rather than left for the
+    // kernel to reap.
+    //
+    // Emptying a table frees its pages inside the file but does not shrink the
+    // file, so a cleared or pruned cache would otherwise keep occupying whatever
+    // it peaked at. Compaction is the only thing that hands that space back, and
+    // it is skipped after an interrupt: the user asked for this to stop, and
+    // rewriting the database is the opposite of stopping.
+    if !shutdown_requested() && (args.clear_cache || args.prune_cache) {
+        match db.compact() {
+            Ok(true) => info!("Compacted the fingerprint cache."),
+            Ok(false) => {}
+            Err(e) => log::error!("Could not compact the fingerprint cache: {}", e),
+        }
     }
     drop(db);
 
@@ -366,14 +498,20 @@ Interrupted with Ctrl-C.
 
 fn run(
     args: &Args,
-    db: &sled::Db,
+    db: &Database,
     start_time: Instant,
     active_threads: usize,
     stats: &RunStats,
 ) -> Result<Outcome> {
     if args.clear_cache {
         info!("Clearing all cache...");
-        db.clear().context("Failed to clear cache database")?;
+        let txn = db.begin_write().context("Failed to start a cache transaction")?;
+        txn.delete_table(CACHE_TABLE).context("Failed to clear cache database")?;
+        txn.commit().context("Failed to commit the cache clear")?;
+
+        // Dropping the table dropped its definition too; every later lookup
+        // needs something to open.
+        ensure_cache_table(db).context("Failed to recreate the cache table")?;
     }
 
     let max_hamming = args.hamming_distance;
@@ -541,41 +679,51 @@ fn run(
     if args.prune_cache && !args.clear_cache {
         info!("Pruning cache for files not in the current scan...");
         let valid_files: HashSet<&str> = video_files.iter().map(|s| s.as_str()).collect();
-        let mut batch = sled::Batch::default();
-        let mut pruned_count = 0;
 
-        for kv in db.iter() {
-            if shutdown_requested() {
-                return Ok(Outcome::Interrupted);
-            }
+        // Collected under a read transaction and removed under a write one,
+        // rather than filtered in place. Only this shape can abandon the scan
+        // partway through on Ctrl-C without leaving a half-applied prune behind
+        // -- the removals are one atomic commit or nothing at all.
+        let mut stale: Vec<String> = Vec::new();
+        {
+            let read = db.begin_read().context("Failed to open the cache for reading")?;
+            let table = read
+                .open_table(CACHE_TABLE)
+                .context("Failed to open the cache table")?;
 
-            if let Ok((key_bytes, _)) = kv {
-                let mut should_remove = true;
-                if let Ok(key_str) = std::str::from_utf8(&key_bytes) {
-                    // Extract filepath from cache key (format: filepath_mtime_size_version)
-                    let mut parts = key_str.rsplitn(6, '_');
-                    let _version = parts.next();
-                    let _size = parts.next();
-                    let _mtime = parts.next();
-                    let _kf_interval = parts.next();
-                    let _min_kf_samples = parts.next();
-                    if let Some(filepath) = parts.next() {
-                        if valid_files.contains(filepath) {
-                            should_remove = false; // It's still valid, keep it
-                        }
-                    }
+            for entry in table.iter().context("Failed to iterate the cache")? {
+                if shutdown_requested() {
+                    return Ok(Outcome::Interrupted);
                 }
 
-                if should_remove {
-                    batch.remove(key_bytes);
-                    pruned_count += 1;
+                let (key, _) = entry.context("Failed to read a cache entry")?;
+                let key = key.value();
+
+                // A key we cannot parse is not a key this build wrote, so it is
+                // stale by definition.
+                let still_wanted =
+                    path_from_cache_key(key).is_some_and(|p| valid_files.contains(p));
+
+                if !still_wanted {
+                    stale.push(key.to_string());
                 }
             }
         }
 
-        if pruned_count > 0 {
-            db.apply_batch(batch).context("Failed to apply cache pruning")?;
-            info!("Pruned {} stale entries from cache.", pruned_count);
+        if !stale.is_empty() {
+            let txn = db.begin_write().context("Failed to start a cache transaction")?;
+            {
+                let mut table = txn
+                    .open_table(CACHE_TABLE)
+                    .context("Failed to open the cache table")?;
+                for key in &stale {
+                    table
+                        .remove(key.as_str())
+                        .context("Failed to remove a stale cache entry")?;
+                }
+            }
+            txn.commit().context("Failed to apply cache pruning")?;
+            info!("Pruned {} stale entries from cache.", stale.len());
         } else {
             info!("No stale entries found to prune.");
         }
@@ -606,10 +754,10 @@ fn run(
     // stuck at 7/22 while 21 files were already known and exactly one was being
     // worked on.
     //
-    // A lookup is a stat, a tree read and a bincode decode -- microseconds -- so
-    // this pass finishes effectively instantly even on a large library, and by
-    // the time the bar appears we know exactly how much real work there is.
-    // That count is now load-bearing twice over: it also sets the per-video
+    // A lookup is a stat, a b-tree descent and a bincode decode -- microseconds
+    // -- so this pass finishes effectively instantly even on a large library,
+    // and by the time the bar appears we know exactly how much real work there
+    // is. That count is now load-bearing twice over: it also sets the per-video
     // decoder thread budget, which is only knowable once the cache has spoken.
     enum Lookup {
         Hit(VideoFingerprint),
@@ -644,14 +792,8 @@ fn run(
             // 1 and stays valid across runs with different -t.
             let cache_key = format!("{}_{}_{}_{}_{}_{}", vf, mtime, size, CACHE_VERSION, kf_interval, min_kf_samples);
 
-            if let Ok(Some(data)) = db.get(&cache_key) {
-                match bincode::deserialize::<VideoFingerprint>(&data) {
-                    Ok(fp) => return Lookup::Hit(fp),
-                    Err(e) => {
-                        // Corrupted or outdated schema; ignore and re-process.
-                        log::debug!("Cache deserialization failed for {}: {}. Re-processing.", vf, e);
-                    }
-                }
+            if let Some(fp) = cache_lookup(db, &cache_key) {
+                return Lookup::Hit(fp);
             }
 
             Lookup::Miss { path: vf.clone(), cache_key }
@@ -769,26 +911,17 @@ fn run(
                     }
                 };
 
-                // Written to the tree the moment it exists, not staged in a
-                // shared batch. The batch this replaces held up to 31 finished
-                // fingerprints in RAM -- precisely the work an interrupt was
-                // throwing away -- and on a small library the 32-item threshold
-                // was never reached at all, so NOTHING was written until the run
-                // ended. One sled insert costs tens of microseconds against a
-                // decode measured in seconds.
-                match bincode::serialize(&fp) {
-                    Ok(encoded) => match db.insert(cache_key.as_bytes(), encoded) {
-                        Ok(_) => {
-                            newly_cached.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Err(e) => {
-                            log::error!("Failed to cache fingerprint for {}: {}", vf, e);
-                            stats.cache_write_failed.record(format!("{}: {}", vf, e));
-                        }
-                    },
+                // Committed the moment it exists. See cache_store: this is one
+                // transaction per video on purpose, so an interrupt (or a kill,
+                // or a crash) can only ever cost the decode that was still in
+                // flight.
+                match cache_store(db, cache_key, &fp) {
+                    Ok(()) => {
+                        newly_cached.fetch_add(1, Ordering::Relaxed);
+                    }
                     Err(e) => {
-                        log::error!("Failed to serialize fingerprint for {}: {}", vf, e);
-                        stats.cache_write_failed.record(format!("{}: {}", vf, e));
+                        log::error!("Failed to cache fingerprint for {}: {:#}", vf, e);
+                        stats.cache_write_failed.record(format!("{}: {:#}", vf, e));
                     }
                 }
 
@@ -969,5 +1102,26 @@ mod tests {
         }
 
         assert_eq!(running.load(Ordering::SeqCst), 0, "a finished job must free its threads");
+    }
+
+    #[test]
+    fn test_a_cache_key_yields_the_path_it_was_built_from() {
+        // Paths contain underscores far more often than not, so the five known
+        // trailing fields are split off from the right and everything before
+        // them is the path -- not the other way round.
+        let key = format!("/videos/some_show_s01e01.mkv_1700000000_12345_{}_0_4", CACHE_VERSION);
+        assert_eq!(
+            path_from_cache_key(&key),
+            Some("/videos/some_show_s01e01.mkv"),
+            "underscores in a filename must not truncate it"
+        );
+    }
+
+    #[test]
+    fn test_a_key_that_is_not_ours_yields_no_path() {
+        // Anything with too few fields is not something this build wrote, and
+        // --prune-cache treats it as stale rather than guessing.
+        assert_eq!(path_from_cache_key("garbage"), None);
+        assert_eq!(path_from_cache_key("a_b_c_d_e"), None);
     }
 }
