@@ -227,7 +227,7 @@ and a loose `-d` conflates them.
 Above `-d 7` the index that proposes candidate pairs is no longer exhaustive: it
 may fail to *propose* a pair whose frames are all near the far edge of the
 tolerance. Once a pair is proposed it is always compared exactly, and genuine
-duplicates many frames, so a miss is very unlikely.
+duplicates have many frames, so a miss is very unlikely.
 
 `--min-duration` is an absolute floor, in seconds, on how much footage two files
 must share. It's the tool to reach for when `-p` alone can't express what you
