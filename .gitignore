@@ -4,6 +4,3 @@
 
 # Ignore local accuracy test file
 /tests/local_accuracy_test.rs
-
-# Ignore the hardcoded generated CSVs to prevent accidental commits
-vd_results*.csv
