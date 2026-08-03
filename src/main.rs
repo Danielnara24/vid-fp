@@ -14,6 +14,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use log::info;
 use rayon::prelude::*;
 use redb::{Database, ReadableTable, TableDefinition};
+use serde::{Deserialize, Serialize};
 use stats::RunStats;
 use std::collections::HashSet;
 use std::io::Write;
@@ -24,16 +25,24 @@ use std::time::Instant;
 use utils::{shutdown_requested, Priority};
 use walkdir::WalkDir;
 
-// Cache schema versioning - bump this if VideoFingerprint struct ever changes
-const CACHE_VERSION: &str = "v1";
-
-/// The one table in the cache: versioned cache key -> bincode'd fingerprint.
+/// The one table in the cache: absolute file path -> bincode'd `CacheEntry`.
 ///
-/// A single flat namespace is all this needs. The key already carries every
-/// input that could invalidate an entry (path, mtime, size, schema version and
-/// the two keyframe-sampling knobs), so there is nothing left for a second
-/// table to disambiguate.
-const CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("fingerprints");
+/// One entry per path, overwritten in place. That is the entire invalidation
+/// story, and it is why the cache is bounded by the number of files ever
+/// scanned rather than by the number of times they have changed: a file that is
+/// re-encoded, re-muxed, or scanned with different sampling settings replaces
+/// its own entry instead of growing a second one beside it.
+const CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("fingerprints_by_path");
+
+/// The table this replaced, keyed by path AND mtime AND size AND the sampling
+/// knobs.
+///
+/// That key was the leak. Touching a file wrote a NEW key and left the old one
+/// behind for the life of the cache, and `--prune-cache` could not tell the two
+/// apart because it only ever compared the path portion of the key -- so the
+/// one tool for the job saw a live path and kept every dead entry under it.
+/// Nothing reads this table now, so it is dropped whole on the first run.
+const SUPERSEDED_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("fingerprints");
 
 /// Hard ceiling on the cache's page cache.
 ///
@@ -51,6 +60,56 @@ const CACHE_SIZE_BYTES: usize = 64 * 1024 * 1024;
 /// fatal path, 130 is the shell convention for SIGINT. Scripts that don't care
 /// can ignore it; scripts that do finally have something to test.
 const EXIT_WITH_PROBLEMS: i32 = 2;
+
+/// Everything other than the file's contents that decides whether a cached
+/// fingerprint is still the right answer for the file at a given path.
+///
+/// This used to be spelled into the cache key. Moving it into the value is what
+/// makes a path map to exactly one entry: on a mismatch the file is
+/// re-fingerprinted and the insert OVERWRITES, rather than filing the new
+/// fingerprint under a new key and leaving the old one to accumulate.
+///
+/// Fixed-size fields only, and serialized BEFORE the fingerprint, so the
+/// fingerprint always begins at the same byte offset. That is what keeps the
+/// discipline `VideoFingerprint` already documents working: a field appended to
+/// the end of it makes older payloads run out of bytes, bincode fails, and the
+/// file is fingerprinted again. Changing THIS struct moves the offset and has
+/// no such guarantee, so it needs the same treatment `SUPERSEDED_TABLE` got.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+struct Stamp {
+    mtime: u64,
+    size: u64,
+    kf_interval: f64,
+    min_kf_samples: f64,
+}
+
+impl Stamp {
+    /// Whether an entry stamped `self` may be reused for a file stamped
+    /// `other`.
+    ///
+    /// Deliberately not `PartialEq`: `NaN != NaN`, and clap parses
+    /// `--keyframe-interval nan` without complaint. Derived equality would make
+    /// every lookup in such a run miss, re-decode the whole library, and miss
+    /// again on the next run. Nothing would leak any more -- the entry is
+    /// overwritten either way -- but there is no reason to decode twice for it.
+    fn matches(&self, other: &Stamp) -> bool {
+        self.mtime == other.mtime
+            && self.size == other.size
+            && same_setting(self.kf_interval, other.kf_interval)
+            && same_setting(self.min_kf_samples, other.min_kf_samples)
+    }
+}
+
+fn same_setting(a: f64, b: f64) -> bool {
+    a == b || (a.is_nan() && b.is_nan())
+}
+
+/// What one cache value holds.
+///
+/// A tuple rather than a pair of structs so the borrowed write path
+/// (`&(stamp, fp)`) and the owned read path cannot drift apart, and so storing
+/// a fingerprint never has to clone one.
+type CacheEntry = (Stamp, VideoFingerprint);
 
 #[derive(Parser, Debug)]
 #[command(
@@ -244,68 +303,83 @@ fn ensure_cache_table(db: &Database) -> Result<()> {
     Ok(())
 }
 
+/// Drop the table this build's cache replaced, if it is still there.
+///
+/// Returns whether there was one, so the caller can decide about reclaiming the
+/// space: deleting a table frees its pages inside the file but does not shrink
+/// the file, and only a compaction hands that back to the filesystem.
+fn retire_superseded_table(db: &Database) -> Result<bool> {
+    let txn = db.begin_write().context("Failed to start a cache transaction")?;
+    let existed = txn
+        .delete_table(SUPERSEDED_TABLE)
+        .context("Failed to remove the superseded cache table")?;
+    txn.commit().context("Failed to commit the cache table removal")?;
+    Ok(existed)
+}
+
 /// Read one fingerprint out of the cache, or `None` for anything that isn't a
 /// clean hit.
 ///
-/// A missing key, an unreadable table and a payload that no longer
-/// deserializes all mean exactly the same thing to the caller -- fingerprint
-/// the file again -- so they collapse into one answer here rather than making
-/// every call site handle three failure shapes that need identical treatment.
+/// A missing entry, an unreadable table, a payload that no longer deserializes,
+/// and a payload whose stamp no longer describes the file on disk all mean
+/// exactly the same thing to the caller -- fingerprint the file again -- so
+/// they collapse into one answer here rather than making every call site handle
+/// four failure shapes that need identical treatment. A stale entry is left
+/// where it is on the way past, because the re-fingerprint is about to
+/// overwrite it: one path, one entry, always.
 ///
 /// The read transaction is per-call on purpose. It is a snapshot handle rather
 /// than a lock, readers never block each other or the writer, and taking it
 /// here keeps the whole thing usable from a rayon worker without threading a
 /// borrow through the closure.
-fn cache_lookup(db: &Database, key: &str) -> Option<VideoFingerprint> {
+fn cache_lookup(db: &Database, path: &str, stamp: &Stamp) -> Option<VideoFingerprint> {
     let read = db.begin_read().ok()?;
     let table = read.open_table(CACHE_TABLE).ok()?;
-    let stored = table.get(key).ok()??;
+    let stored = table.get(path).ok()??;
 
-    match bincode::deserialize::<VideoFingerprint>(stored.value()) {
-        Ok(fp) => Some(fp),
+    match bincode::deserialize::<CacheEntry>(stored.value()) {
+        Ok((cached, fp)) if cached.matches(stamp) => Some(fp),
+        // The file was edited, or the sampling knobs moved. Either way the
+        // fingerprint on record describes something that is no longer there.
+        Ok(_) => None,
         Err(e) => {
             // Corrupt, or written by a build whose struct no longer matches.
             // Either way it is about to be overwritten by a fresh decode.
-            log::debug!("Cache entry {} did not deserialize ({}); re-processing.", key, e);
+            log::debug!("Cache entry for {} did not deserialize ({}); re-processing.", path, e);
             None
         }
     }
 }
 
-/// Write one fingerprint to the cache, durably.
+/// Write one fingerprint to the cache, durably, replacing whatever was filed
+/// under this path before.
 ///
-/// One transaction per video, committed immediately -- deliberately not batched.
-/// The batch this pattern replaces held finished fingerprints in memory, which
-/// is precisely the work an interrupt threw away. A commit costs an fsync
-/// against a decode measured in seconds, and when it returns the entry is on
-/// disk: no background flusher, no window, nothing for a `std::process::exit`
-/// to cut short.
+/// One transaction per video, committed immediately -- deliberately not
+/// batched. The batch this pattern replaces held finished fingerprints in
+/// memory, which is precisely the work an interrupt threw away. A commit costs
+/// an fsync against a decode measured in seconds, and when it returns the entry
+/// is on disk: no background flusher, no window, nothing for a
+/// `std::process::exit` to cut short.
 ///
 /// Only one write transaction exists at a time, so concurrent callers queue
 /// here. The serialization happens outside the transaction so that queue is
 /// only ever holding a b-tree insert.
-fn cache_store(db: &Database, key: &str, fp: &VideoFingerprint) -> Result<()> {
-    let encoded = bincode::serialize(fp).context("Failed to serialize fingerprint")?;
+fn cache_store(db: &Database, path: &str, stamp: Stamp, fp: &VideoFingerprint) -> Result<()> {
+    // `&(stamp, fp)` rather than an owned pair: serde follows the reference, so
+    // this writes the exact bytes `CacheEntry` reads back without copying the
+    // hash vectors to get there.
+    let encoded = bincode::serialize(&(stamp, fp)).context("Failed to serialize fingerprint")?;
 
     let txn = db.begin_write().context("Failed to start a cache transaction")?;
     {
         let mut table = txn.open_table(CACHE_TABLE).context("Failed to open the cache table")?;
         table
-            .insert(key, encoded.as_slice())
+            .insert(path, encoded.as_slice())
             .context("Failed to insert the fingerprint")?;
     }
     txn.commit().context("Failed to commit the fingerprint")?;
 
     Ok(())
-}
-
-/// The file path a cache key was built from, or `None` if it isn't one of ours.
-///
-/// Keys are `{path}_{mtime}_{size}_{version}_{kf_interval}_{min_kf_samples}`,
-/// and a path may itself contain underscores -- so the five known fields are
-/// split off from the RIGHT and whatever remains is the path.
-fn path_from_cache_key(key: &str) -> Option<&str> {
-    key.rsplitn(6, '_').nth(5)
 }
 
 /// Delete the cache this tool used to keep, if it is still lying around.
@@ -446,6 +520,22 @@ Interrupted with Ctrl-C.
         .context("Failed to open or lock cache database")?;
 
     ensure_cache_table(&db).context("Failed to initialize the fingerprint cache")?;
+
+    // Once, on the first run of this build. The old table is keyed by a string
+    // that no lookup will ever construct again, so every byte of it is dead --
+    // and by construction it is the bigger of the two, since it held an entry
+    // per version of every file rather than an entry per file. Compacting right
+    // afterwards is the only thing that returns those pages to the filesystem.
+    match retire_superseded_table(&db) {
+        Ok(true) => {
+            info!("Removed the superseded fingerprint cache; fingerprints will be rebuilt once.");
+            if let Err(e) = db.compact() {
+                log::error!("Could not compact the fingerprint cache: {}", e);
+            }
+        }
+        Ok(false) => {}
+        Err(e) => log::error!("{:#}", e),
+    }
 
     // Every non-fatal problem and every deliberate skip lands here, from any
     // thread and any phase, so the run can account for itself at the end
@@ -680,6 +770,12 @@ fn run(
         info!("Pruning cache for files not in the current scan...");
         let valid_files: HashSet<&str> = video_files.iter().map(|s| s.as_str()).collect();
 
+        // A key IS a path now, so this is the whole of pruning: an entry
+        // survives exactly when the file it describes is in front of us. It
+        // used to have to reconstruct a path out of a compound key and could
+        // not see the difference between the current entry for a file and four
+        // superseded ones -- all five matched a live path, so all five stayed.
+        //
         // Collected under a read transaction and removed under a write one,
         // rather than filtered in place. Only this shape can abandon the scan
         // partway through on Ctrl-C without leaving a half-applied prune behind
@@ -697,15 +793,10 @@ fn run(
                 }
 
                 let (key, _) = entry.context("Failed to read a cache entry")?;
-                let key = key.value();
+                let path = key.value();
 
-                // A key we cannot parse is not a key this build wrote, so it is
-                // stale by definition.
-                let still_wanted =
-                    path_from_cache_key(key).is_some_and(|p| valid_files.contains(p));
-
-                if !still_wanted {
-                    stale.push(key.to_string());
+                if !valid_files.contains(path) {
+                    stale.push(path.to_string());
                 }
             }
         }
@@ -761,7 +852,7 @@ fn run(
     // decoder thread budget, which is only knowable once the cache has spoken.
     enum Lookup {
         Hit(VideoFingerprint),
-        Miss { path: String, cache_key: String },
+        Miss { path: String, stamp: Stamp },
         Unreadable,
     }
 
@@ -785,18 +876,22 @@ fn run(
                 .as_secs();
             let size = metadata.len();
 
-            // Versioned cache key ensures schema changes don't cause deserialization crashes
-            // Note: thread count is deliberately NOT part of the key. Threading
+            // Thread count is deliberately NOT part of the stamp. Threading
             // changes only how fast frames arrive, never which ones, so a
             // fingerprint made with 8 threads is byte-identical to one made with
             // 1 and stays valid across runs with different -t.
-            let cache_key = format!("{}_{}_{}_{}_{}_{}", vf, mtime, size, CACHE_VERSION, kf_interval, min_kf_samples);
+            let stamp = Stamp {
+                mtime,
+                size,
+                kf_interval,
+                min_kf_samples,
+            };
 
-            if let Some(fp) = cache_lookup(db, &cache_key) {
+            if let Some(fp) = cache_lookup(db, vf, &stamp) {
                 return Lookup::Hit(fp);
             }
 
-            Lookup::Miss { path: vf.clone(), cache_key }
+            Lookup::Miss { path: vf.clone(), stamp }
         })
         .collect();
 
@@ -804,7 +899,7 @@ fn run(
     // and the heaviest decodes still start first -- which also means the biggest
     // files are the ones that claim the widest thread allocations.
     let mut fingerprints: Vec<VideoFingerprint> = Vec::with_capacity(total_videos);
-    let mut todo: Vec<(String, String)> = Vec::new();
+    let mut todo: Vec<(String, Stamp)> = Vec::new();
     for lookup in lookups {
         match lookup {
             Lookup::Hit(fp) => {
@@ -818,7 +913,7 @@ fn run(
                     fingerprints.push(fp);
                 }
             }
-            Lookup::Miss { path, cache_key } => todo.push((path, cache_key)),
+            Lookup::Miss { path, stamp } => todo.push((path, stamp)),
             Lookup::Unreadable => {}
         }
     }
@@ -866,7 +961,7 @@ fn run(
 
         let fresh: Vec<VideoFingerprint> = todo
             .par_iter()
-            .filter_map(|(vf, cache_key)| {
+            .filter_map(|(vf, stamp)| {
                 // Cheapest possible bail-out. Every video still queued costs one
                 // relaxed atomic load, so the tail of a 50k-file scan drains in
                 // microseconds; the videos actually being decoded right now stop
@@ -911,11 +1006,11 @@ fn run(
                     }
                 };
 
-                // Committed the moment it exists. See cache_store: this is one
-                // transaction per video on purpose, so an interrupt (or a kill,
-                // or a crash) can only ever cost the decode that was still in
-                // flight.
-                match cache_store(db, cache_key, &fp) {
+                // Committed the moment it exists, over whatever this path held
+                // before. See cache_store: this is one transaction per video on
+                // purpose, so an interrupt (or a kill, or a crash) can only ever
+                // cost the decode that was still in flight.
+                match cache_store(db, vf, *stamp, &fp) {
                     Ok(()) => {
                         newly_cached.fetch_add(1, Ordering::Relaxed);
                     }
@@ -1104,24 +1199,83 @@ mod tests {
         assert_eq!(running.load(Ordering::SeqCst), 0, "a finished job must free its threads");
     }
 
+    fn stamp(mtime: u64, size: u64) -> Stamp {
+        Stamp {
+            mtime,
+            size,
+            kf_interval: 0.0,
+            min_kf_samples: 4.0,
+        }
+    }
+
     #[test]
-    fn test_a_cache_key_yields_the_path_it_was_built_from() {
-        // Paths contain underscores far more often than not, so the five known
-        // trailing fields are split off from the right and everything before
-        // them is the path -- not the other way round.
-        let key = format!("/videos/some_show_s01e01.mkv_1700000000_12345_{}_0_4", CACHE_VERSION);
-        assert_eq!(
-            path_from_cache_key(&key),
-            Some("/videos/some_show_s01e01.mkv"),
-            "underscores in a filename must not truncate it"
+    fn test_an_edited_file_invalidates_the_entry_it_is_about_to_overwrite() {
+        // The bug this whole change exists to fix, stated as a property: a
+        // re-encode does not produce a SECOND valid entry, it produces a
+        // mismatch against the only entry this path has -- which is then
+        // replaced. Nothing accumulates, so nothing needs pruning.
+        let before = stamp(1_700_000_000, 12_345);
+        let after = stamp(1_700_009_999, 999);
+
+        assert!(before.matches(&before), "an untouched file must still hit");
+        assert!(!before.matches(&after), "a rewritten file must miss");
+        assert!(
+            !stamp(1_700_000_000, 999).matches(&before),
+            "a same-second edit is still caught by the size"
         );
     }
 
     #[test]
-    fn test_a_key_that_is_not_ours_yields_no_path() {
-        // Anything with too few fields is not something this build wrote, and
-        // --prune-cache treats it as stale rather than guessing.
-        assert_eq!(path_from_cache_key("garbage"), None);
-        assert_eq!(path_from_cache_key("a_b_c_d_e"), None);
+    fn test_the_sampling_knobs_are_part_of_what_makes_an_entry_valid() {
+        // These change which keyframes are decoded, so a fingerprint made under
+        // one setting is not an answer for a run using another.
+        let base = stamp(1_700_000_000, 12_345);
+
+        let coarser = Stamp { kf_interval: 5.0, ..base };
+        let fewer = Stamp { min_kf_samples: 2.0, ..base };
+
+        assert!(!base.matches(&coarser));
+        assert!(!base.matches(&fewer));
+        assert!(coarser.matches(&coarser));
+    }
+
+    #[test]
+    fn test_an_unparseable_interval_does_not_miss_forever() {
+        // clap accepts `--keyframe-interval nan`, and NaN != NaN. Derived
+        // equality would re-decode the entire library on every single run.
+        let nonsense = Stamp {
+            kf_interval: f64::NAN,
+            ..stamp(1_700_000_000, 12_345)
+        };
+
+        assert!(nonsense.matches(&nonsense), "an entry must be able to match itself");
+    }
+
+    #[test]
+    fn test_a_stamp_round_trips_through_the_cache_encoding() {
+        // The stamp is serialized ahead of the fingerprint, so its own encoding
+        // is what fixes the offset everything after it is read from.
+        let fp = VideoFingerprint {
+            path: "/videos/some_show_s01e01.mkv".to_string(),
+            valid_hashes: vec![1, 2, 3],
+            valid_t_start: vec![0, 1, 2],
+            valid_t_end: vec![1, 2, 3],
+            total_frames: 3,
+            width: 1920,
+            height: 1080,
+            duration: 60.0,
+            file_size: 12_345,
+            codec: "h264".to_string(),
+            frame_rate: 30.0,
+        };
+        let written = stamp(1_700_000_000, 12_345);
+
+        let bytes = bincode::serialize(&(written, &fp)).unwrap();
+        let (read, decoded): CacheEntry = bincode::deserialize(&bytes).unwrap();
+
+        assert!(read.matches(&written), "the borrowed write path must match the owned read path");
+        assert_eq!(decoded.path, fp.path);
+        assert_eq!(decoded.valid_hashes, fp.valid_hashes);
+        assert_eq!(decoded.codec, fp.codec);
     }
 }
