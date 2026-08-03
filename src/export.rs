@@ -25,6 +25,16 @@ use std::path::Path;
 /// impossible. The cross-codec case gets its own rule instead.
 const REVIEW_METRICS: [Priority; 2] = [Priority::Length, Priority::Resolution];
 
+/// A duration in seconds for the machine-readable outputs, rounded the same way
+/// the JSON rounds it, or an empty field when it was never measured.
+///
+/// Empty is the CSV's spelling of the JSON's `null`. It has to stay
+/// distinguishable from `0.00`: one means the overlap is unknown, the other
+/// means it was measured and there was none.
+fn csv_seconds(value: Option<f64>) -> String {
+    value.map(|s| format!("{:.2}", s)).unwrap_or_default()
+}
+
 /// Remove a single file, either by moving it to the system trash (default,
 /// recoverable) or by deleting it permanently. Trash semantics are handled by
 /// the `trash` crate, which implements the FreeDesktop.org spec on Linux.
@@ -243,19 +253,27 @@ pub fn output_results(
         .delimiter(b';')
         .from_writer(Vec::new());
 
+    // The CSV carries exactly what the JSON carries, field for field. Anything
+    // shown in a formatted column also appears as the raw number it was
+    // formatted from, because the formatted one is for reading and the raw one
+    // is for sorting and filtering -- a spreadsheet cannot sort "1.0MB" against
+    // "900.0KB", and no consumer of a CSV should have to parse a unit suffix to
+    // get a figure this tool already has.
     csv_wtr
         .write_record(&[
             "group",
             "resolution",
             "codec",
             "framerate",
+            "framerate_fps",
             "size",
+            "size_bytes",
             "bitrate",
+            "bitrate_bps",
             "quality",
+            "quality_bits_per_frame",
             "length",
-            "shared",
             "shared_seconds",
-            "match_percent",
             "full_path",
             "action",
         ])
@@ -268,10 +286,22 @@ pub fn output_results(
         txt_out.push_str(&format!("{}:\n", group_name));
 
         let mut json_files = Vec::new();
-        let mut group_low: Option<f64> = None;
 
+        // How much footage each file has in common with the rest of its group,
+        // in seconds rather than as a percentage.
+        //
+        // A percentage was the obvious choice and the wrong one. It invites
+        // comparison against --match-percent, which measures the opposite end of
+        // the pair and so routinely sits above what is shown here -- making a
+        // correct report look broken. Worse, on short videos it quantizes
+        // brutally: a file with four keyframes can only ever score 0, 25, 50, 75
+        // or 100%, so a single incidental frame reads as an authoritative-looking
+        // 25%. In seconds that same match reads "0.8s", next to a length of
+        // "00:00:03", and needs no explaining.
         for &idx in group {
             let fp = &fingerprints[idx];
+            let shared = matches.weakest_shared_in_group(idx, group, fingerprints);
+
             let size_str = format_size(fp.file_size);
             let bitrate_str = format_bitrate(fp.bitrate());
             let duration_str = format_duration(fp.duration);
@@ -287,31 +317,24 @@ pub fn output_results(
             // Bitrate stays alongside it because it is the number people know
             // and the one their other tools print, but it never ranks anything.
             let quality_str = format_quality(fp.quality());
-
-            // How much footage this file has in common with the rest of its
-            // group, in seconds rather than as a percentage.
-            //
-            // A percentage was the obvious choice and the wrong one. It invites
-            // comparison against --match-percent, which measures the opposite
-            // end of the pair and so routinely sits above what is shown here --
-            // making a correct report look broken. Worse, on short videos it
-            // quantizes brutally: a file with four keyframes can only ever
-            // score 0, 25, 50, 75 or 100%, so a single incidental frame reads
-            // as an authoritative-looking 25%. In seconds that same match reads
-            // "0.8s", next to a length of "00:00:03", and needs no explaining.
-            let shared = matches.weakest_shared_in_group(idx, group, fingerprints);
+            // The console and text report show only the formatted figure,
+            // because a human is reading it at a glance.
             let shared_str = format_shared(shared);
 
-            if let Some(s) = shared {
-                group_low = Some(group_low.map_or(s, |g: f64| g.min(s)));
-            }
+            // The same values as numbers, for the CSV and JSON. An unknown one
+            // is an empty field / a null rather than a zero: a container that
+            // never reported a frame rate is not a container that reported no
+            // frames, and a quality figure derived from one is unknowable
+            // rather than worst-in-group.
+            let frame_rate_num = (fp.frame_rate > 0.0)
+                .then(|| (fp.frame_rate * 1000.0).round() / 1000.0);
+            let quality_num = (fp.quality() > 0).then(|| fp.quality());
 
-            // The percentage still goes to the machine-readable outputs, where
-            // nothing is being read at a glance and a filter like "at least 90%
-            // redundant" is a reasonable thing to want.
-            let coverage = matches.weakest_in_group(idx, group);
-            let coverage_pct = coverage
-                .map(|c| ((c * 100.0).clamp(0.0, 100.0) as f64 * 10.0).round() / 10.0);
+            let frame_rate_raw = frame_rate_num.map(|f| f.to_string()).unwrap_or_default();
+            let quality_raw = quality_num.map(|q| q.to_string()).unwrap_or_default();
+            let size_bytes_raw = fp.file_size.to_string();
+            let bitrate_bps_raw = fp.bitrate().to_string();
+            let shared_seconds_raw = csv_seconds(shared);
 
             // Label by the file's GLOBAL fate (precedence REVIEW > DELETE > KEEP).
             // A file that is redundant in an overlapping group is shown DELETE/
@@ -371,13 +394,15 @@ pub fn output_results(
                 &res_str,
                 &codec_str,
                 &frame_rate_str,
+                &frame_rate_raw,
                 &size_str,
+                &size_bytes_raw,
                 &bitrate_str,
+                &bitrate_bps_raw,
                 &quality_str,
+                &quality_raw,
                 &duration_str,
-                &shared_str,
-                &shared.map(|s| format!("{:.2}", s)).unwrap_or_default(),
-                &coverage_pct.map(|p| format!("{:.1}", p)).unwrap_or_default(),
+                &shared_seconds_raw,
                 &fp.path,
                 action_str,
             ]).context("Failed to write CSV record")?;
@@ -386,20 +411,16 @@ pub fn output_results(
             json_files.push(serde_json::json!({
                 "resolution": res_str,
                 "codec": codec_str,
-                // null, not 0: a container that never reported a frame rate is
-                // not a container that reported no frames.
-                "frame_rate": (fp.frame_rate > 0.0)
-                    .then(|| (fp.frame_rate * 1000.0).round() / 1000.0),
+                "framerate": frame_rate_str,
+                "framerate_fps": frame_rate_num,
                 "size": size_str,
                 "size_bytes": fp.file_size,
                 "bitrate": bitrate_str,
                 "bitrate_bps": fp.bitrate(),
                 "quality": quality_str,
-                "quality_bits_per_frame": (fp.quality() > 0).then(|| fp.quality()),
+                "quality_bits_per_frame": quality_num,
                 "length": duration_str,
-                "shared": shared_str,
                 "shared_seconds": shared.map(|s| (s * 100.0).round() / 100.0),
-                "match_percent": coverage_pct,
                 "full_path": fp.path,
                 "action": action_str,
             }));
@@ -410,10 +431,6 @@ pub fn output_results(
 
         json_out_groups.push(serde_json::json!({
             "group": group_name,
-            // The group's thinnest link, for filtering. Not printed to the
-            // console: every row already carries its own worst-case figure, so
-            // a header repeating one of them would be noise.
-            "lowest_shared_seconds": group_low.map(|s| (s * 100.0).round() / 100.0),
             "files": json_files
         }));
     }
@@ -520,6 +537,10 @@ mod tests {
     use tempfile::NamedTempFile;
     use std::fs;
 
+    const CSV_HEADER: &str = "group;resolution;codec;framerate;framerate_fps;\
+size;size_bytes;bitrate;bitrate_bps;quality;quality_bits_per_frame;length;shared_seconds;\
+full_path;action";
+
     fn mock_fp() -> VideoFingerprint {
         VideoFingerprint {
             path: "/fake/path/vid.mp4".to_string(),
@@ -602,17 +623,71 @@ mod tests {
         let contents = fs::read_to_string(&path_str).unwrap();
 
         // Assert headers exist (separated by semicolons)
-        assert!(contents.contains(
-            "group;resolution;codec;framerate;size;bitrate;quality;length;shared;shared_seconds;match_percent;full_path;action"
-        ));
+        assert!(contents.contains(CSV_HEADER), "{}", contents);
         // 1 MiB over 60s = ~140kbps, which at 30fps is ~4.7kbit in each frame.
-        // Assert data exists and defaults to KEEP.
+        // Assert data exists and defaults to KEEP. The overlap was never
+        // measured, so both seconds fields are empty rather than 0.
         assert!(contents.contains(
-            "group_1;1920x1080;h264;30fps;1.0MB;140kbps;4.7kb/f;00:01:00;-;;;/fake/path/vid.mp4;KEEP"
+            "group_1;1920x1080;h264;30fps;30;1.0MB;1048576;140kbps;139810;4.7kb/f;4660;\
+00:01:00;;/fake/path/vid.mp4;KEEP"
         ), "{}", contents);
 
         // Clean up
         let _ = fs::remove_file(path_str);
+    }
+
+    #[test]
+    fn test_csv_carries_every_figure_the_json_does() {
+        // The two machine-readable outputs are the same data in two shapes.
+        // Anything the JSON knows, a CSV consumer can sort and filter on too,
+        // including the raw counterpart of every formatted column.
+        let fps = vec![
+            mock_fp_at("/fake/a.mp4", 100.0),
+            mock_fp_at("/fake/b.mp4", 100.0),
+        ];
+        let groups = vec![vec![0, 1]];
+        let matches = MatchIndex::new(vec![Match {
+            a: 0,
+            b: 1,
+            coverage_a: 0.80,
+            coverage_b: 0.80,
+        }]);
+
+        let csv_path = report_to("csv");
+        let json_path = report_to("json");
+
+        output_results(
+            &groups, &fps, &matches, Some(&csv_path), 0, Priority::Length, false, false,
+            &RunStats::default(),
+        ).unwrap();
+        output_results(
+            &groups, &fps, &matches, Some(&json_path), 0, Priority::Length, false, false,
+            &RunStats::default(),
+        ).unwrap();
+
+        let csv = fs::read_to_string(&csv_path).unwrap();
+        let report: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&json_path).unwrap()).unwrap();
+        let file = &report["results"][0]["files"][0];
+
+        assert!(
+            csv.contains(
+                "group_1;1920x1080;h264;30fps;30;12.5MB;13107200;1.0Mbps;1048576;\
+35.0kb/f;34952;00:01:40;80.00;/fake/a.mp4;KEEP"
+            ),
+            "{}",
+            csv
+        );
+
+        // Every raw figure in the row above is the one the JSON reports.
+        assert_eq!(file["framerate_fps"], 30.0);
+        assert_eq!(file["size_bytes"], 13_107_200u64);
+        assert_eq!(file["bitrate_bps"], 1_048_576u64);
+        assert_eq!(file["quality_bits_per_frame"], 34_952u64);
+        assert_eq!(file["shared_seconds"], 80.0);
+
+        let _ = fs::remove_file(csv_path);
+        let _ = fs::remove_file(json_path);
     }
 
     #[test]
@@ -641,8 +716,8 @@ mod tests {
         ).unwrap();
 
         let contents = fs::read_to_string(&path_str).unwrap();
-        assert!(contents.contains(";1m00s;60.00;10.0;/fake/host.mp4;"), "host row: {}", contents);
-        assert!(contents.contains(";1m00s;60.00;100.0;/fake/clip.mp4;"), "clip row: {}", contents);
+        assert!(contents.contains(";60.00;/fake/host.mp4;"), "host row: {}", contents);
+        assert!(contents.contains(";60.00;/fake/clip.mp4;"), "clip row: {}", contents);
 
         let _ = fs::remove_file(path_str);
     }
@@ -673,7 +748,7 @@ mod tests {
         ).unwrap();
 
         let contents = fs::read_to_string(&path_str).unwrap();
-        assert!(contents.contains(";0.6s;"), "sub-second overlap must stay legible: {}", contents);
+        assert!(contents.contains(";0.64;"), "sub-second overlap must stay legible: {}", contents);
         assert!(
             !contents.contains(";00:00:00;"),
             "a real overlap must never render as a zeroed clock: {}",
@@ -739,14 +814,12 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&path_str).unwrap()).unwrap();
         let group = &report["results"][0];
 
-        assert_eq!(group["lowest_shared_seconds"], 80.0);
-        assert_eq!(group["files"][0]["shared"], "1m20s");
         assert_eq!(group["files"][0]["shared_seconds"], 80.0);
-        assert_eq!(group["files"][0]["match_percent"], 80.0);
 
         // 1 Mbps at 30fps.
         assert_eq!(group["files"][0]["codec"], "h264");
-        assert_eq!(group["files"][0]["frame_rate"], 30.0);
+        assert_eq!(group["files"][0]["framerate"], "30fps");
+        assert_eq!(group["files"][0]["framerate_fps"], 30.0);
         assert_eq!(group["files"][0]["bitrate_bps"], 1_048_576);
         assert_eq!(group["files"][0]["quality_bits_per_frame"], 34_952);
 
@@ -754,29 +827,40 @@ mod tests {
     }
 
     #[test]
-    fn test_an_unreported_frame_rate_is_null_rather_than_zero() {
+    fn test_an_unreported_frame_rate_is_empty_rather_than_zero() {
         let mut lonely = mock_fp_at("/fake/a.mp4", 60.0);
         lonely.frame_rate = 0.0;
 
         let fps = vec![lonely];
         let groups = vec![vec![0]];
-        let path_str = report_to("json");
+        let json_path = report_to("json");
+        let csv_path = report_to("csv");
 
         output_results(
-            &groups, &fps, &no_matches(), Some(&path_str), 0, Priority::Length, false, false,
+            &groups, &fps, &no_matches(), Some(&json_path), 0, Priority::Length, false, false,
+            &RunStats::default(),
+        ).unwrap();
+        output_results(
+            &groups, &fps, &no_matches(), Some(&csv_path), 0, Priority::Length, false, false,
             &RunStats::default(),
         ).unwrap();
 
         let report: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path_str).unwrap()).unwrap();
+            serde_json::from_str(&fs::read_to_string(&json_path).unwrap()).unwrap();
         let file = &report["results"][0]["files"][0];
 
-        assert!(file["frame_rate"].is_null(), "unknown is not 0 fps");
+        assert!(file["framerate_fps"].is_null(), "unknown is not 0 fps");
         assert!(file["quality_bits_per_frame"].is_null(), "and it makes quality unknowable");
         assert_eq!(file["quality"], "-");
         assert_eq!(file["bitrate_bps"], 1_048_576, "the bitrate is still perfectly knowable");
 
-        let _ = fs::remove_file(path_str);
+        // The CSV says the same thing with empty fields rather than nulls: a
+        // dash in the formatted column, nothing at all in the raw one.
+        let csv = fs::read_to_string(&csv_path).unwrap();
+        assert!(csv.contains(";-;;7.5MB;7864320;1.0Mbps;1048576;-;;"), "{}", csv);
+
+        let _ = fs::remove_file(json_path);
+        let _ = fs::remove_file(csv_path);
     }
 
     #[test]

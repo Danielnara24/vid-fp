@@ -103,27 +103,6 @@ impl MatchIndex {
         self.coverage.get(&(subject, other)).copied()
     }
 
-    /// The weakest coverage `subject` has against any other member of `group`.
-    ///
-    /// Kept for the machine-readable outputs, and deliberately NOT what the
-    /// human-facing report shows. A percentage invites comparison against
-    /// `--match-percent`, and the two measure opposite ends of the same pair:
-    /// the gate asks whether EITHER file is well covered (which is what finds a
-    /// clip inside its host), while this asks about the least well covered. A
-    /// value below the threshold is therefore normal, correct, and reads like a
-    /// malfunction. `weakest_shared_in_group` is what the report uses instead.
-    pub fn weakest_in_group(&self, subject: usize, group: &[usize]) -> Option<f32> {
-        let mut weakest: Option<f32> = None;
-        for &other in group {
-            if other == subject {
-                continue;
-            }
-            let c = self.coverage(subject, other)?;
-            weakest = Some(weakest.map_or(c, |w: f32| w.min(c)));
-        }
-        weakest
-    }
-
     /// Seconds of content two files have in common.
     ///
     /// Each file gives its own estimate -- its coverage times its runtime --
@@ -540,26 +519,6 @@ mod tests {
         assert_eq!(idx.coverage(0, 1), Some(0.25));
         assert_eq!(idx.coverage(1, 0), Some(1.0));
         assert_eq!(idx.coverage(0, 2), None, "a pair that never matched has no figure");
-    }
-
-    #[test]
-    fn test_weakest_in_group_reports_the_worst_link_not_the_best() {
-        let idx = MatchIndex::new(vec![
-            Match { a: 0, b: 1, coverage_a: 0.95, coverage_b: 0.95 },
-            Match { a: 0, b: 2, coverage_a: 0.10, coverage_b: 0.90 },
-            Match { a: 1, b: 2, coverage_a: 0.80, coverage_b: 0.80 },
-        ]);
-        let group = [0, 1, 2];
-
-        assert_eq!(idx.weakest_in_group(0, &group), Some(0.10));
-        assert_eq!(idx.weakest_in_group(1, &group), Some(0.80));
-        assert_eq!(idx.weakest_in_group(2, &group), Some(0.80));
-    }
-
-    #[test]
-    fn test_weakest_in_group_has_nothing_to_report_for_a_lone_file() {
-        let idx = MatchIndex::new(vec![]);
-        assert_eq!(idx.weakest_in_group(0, &[0]), None);
     }
 
     #[test]
