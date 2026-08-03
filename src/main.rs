@@ -4,6 +4,7 @@ mod export;
 mod fingerprint;
 mod stats;
 mod utils;
+mod sources;
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
@@ -18,12 +19,10 @@ use serde::{Deserialize, Serialize};
 use stats::RunStats;
 use std::collections::HashSet;
 use std::io::Write;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use utils::{shutdown_requested, Priority};
-use walkdir::WalkDir;
 
 /// The one table in the cache: absolute file path -> bincode'd `CacheEntry`.
 ///
@@ -122,20 +121,36 @@ type CacheEntry = (Stamp, VideoFingerprint);
 )]
 
 struct Args {
-    /// Folders to scan (one or more)
+        /// Folders and video files to scan (one or more). A folder is searched for
+    /// videos; a file you name is scanned whatever its extension, since
+    /// --extensions is only a guess about what a FOLDER contains. Use `-` to
+    /// read a list of paths from stdin, e.g. `fd -e mkv | vid-fp -`.
     #[arg(
-        required_unless_present_any = ["completions", "man"],
+        required_unless_present_any = ["completions", "man", "from_file"],
         num_args = 1..,
-        value_name = "FOLDER",
-        value_hint = clap::ValueHint::DirPath
+        value_name = "PATH",
+        value_hint = clap::ValueHint::AnyPath
     )]
     include: Vec<String>,
 
     /// Folder to exclude from the scan. Repeat the flag to exclude several
-    /// (e.g. -e ~/a -e ~/b).
+    /// (e.g. -e ~/a -e ~/b). Applies to piped and explicitly named paths too.
     #[arg(short = 'e', long = "exclude", value_name = "FOLDER",
           value_hint = clap::ValueHint::DirPath)]
     exclude: Vec<String>,
+
+    /// Read the paths to scan from a file, one per line. `-` means stdin.
+    /// Entries may be folders or files, exactly as if given as arguments, and
+    /// combine with any paths already passed on the command line.
+    #[arg(long = "from-file", value_name = "FILE",
+          value_hint = clap::ValueHint::FilePath)]
+    from_file: Option<String>,
+
+    /// Paths in the list are separated by NUL bytes rather than newlines, for
+    /// `find -print0` or `fd -0`. The only way to pass a filename containing a
+    /// newline.
+    #[arg(short = '0', long = "null")]
+    null: bool,
 
     /// Scan folders recursively. Off by default (only the given folders and
     /// their immediate files are scanned).
@@ -653,160 +668,26 @@ fn run(
         anyhow::bail!("--min-duration cannot be negative.");
     }
 
-    // Normalize the requested extensions: strip an optional leading dot and
-    // lowercase, so `-x .MP4`, `-x MP4`, and `-x mp4` all behave identically.
-    // A HashSet gives O(1) lookups during the walk and dedups automatically.
-    let extensions: HashSet<String> = args
-        .extensions
-        .iter()
-        .map(|e| e.trim().trim_start_matches('.').to_lowercase())
-        .filter(|e| !e.is_empty())
-        .collect();
-
-    if extensions.is_empty() {
-        anyhow::bail!("No valid video extensions to search for (--extensions was empty).");
-    }
-
-    let mut video_files = Vec::new();
-
-    info!("Scanning folders: {:?}", args.include);
-    if !args.exclude.is_empty() {
-        info!("Excluding folders: {:?}", args.exclude);
-    }
-
-    // HashSet iteration order is unspecified; sort for a stable, readable log.
-    let mut ext_display: Vec<&str> = extensions.iter().map(|s| s.as_str()).collect();
-    ext_display.sort_unstable();
-    info!("Searching extensions: {:?}", ext_display);
-
     info!(
         "Settings -> Max Hamming: {}, Min Match: {}%, Min Duration: {}s, Priority: {:?}, Threads: {}, Recursive: {}",
         max_hamming, args.match_percent, min_duration, args.priority, active_threads, args.recursive
     );
 
-    // Canonicalize exclude paths so prefix matching is safe and reliable.
-    //
-    // A path that will not resolve excludes NOTHING. That used to be swallowed
-    // by `filter_map(.ok())`, so a typo in `-e` quietly scanned the folder you
-    // were protecting -- and with `--delete` armed, that is how files die. It
-    // is now loud, counted, and reflected in the exit code.
-    let mut exclude_paths: Vec<PathBuf> = Vec::with_capacity(args.exclude.len());
-    for p in &args.exclude {
-        match std::fs::canonicalize(p) {
-            Ok(resolved) => exclude_paths.push(resolved),
-            Err(e) => {
-                log::error!(
-                    "Could not resolve exclude path '{}': {} -- nothing was excluded for it",
-                    p,
-                    e
-                );
-                stats.unresolved_excludes.record(format!("{}: {}", p, e));
-            }
-        }
-    }
-
-    // Identity-based deduplication. A symlink, a hard link, a second scan root
-    // that overlaps the first, and a bind-mount alias all resolve to the same
-    // (device, inode) pair. Keying on that identity means each set of bytes is
-    // fingerprinted exactly once, under the first path we reach it by -- so the
-    // report never lists a file as a duplicate of itself, and the "space freed"
-    // figure never counts bytes that deleting a link would not actually return.
-    let mut seen_inodes: HashSet<(u64, u64)> = HashSet::new();
-
-    for include_dir in &args.include {
-        let base_path = match std::fs::canonicalize(include_dir) {
-            Ok(p) => p,
-            Err(e) => {
-                log::error!("Could not resolve include path '{}': {}", include_dir, e);
-                stats
-                    .unresolved_includes
-                    .record(format!("{}: {}", include_dir, e));
-                continue;
-            }
-        };
-
-        let mut walker = WalkDir::new(&base_path).follow_links(args.follow_symlinks);
-
-        if !args.recursive {
-            // Non-recursive by default: limit depth so only the directory itself
-            // and its immediate files are scanned.
-            // 0 = The directory itself, 1 = Immediate files inside the directory
-            walker = walker.max_depth(1);
-        }
-
-        // Filter out any paths that begin with an excluded directory path
-        let it = walker.into_iter().filter_entry(|e| {
-            let p = e.path();
-            !exclude_paths.iter().any(|ex| p.starts_with(ex))
-        });
-
-        for entry in it {
-            if shutdown_requested() {
-                return Ok(Outcome::Interrupted);
-            }
-
-            // WalkDir reports per-entry failures: an unreadable subfolder, a
-            // dangling link under --follow-symlinks, a symlink loop. Dropping
-            // these with `.ok()` made a permission-denied folder
-            // indistinguishable from an empty one, which is the worst possible
-            // way to silently miss half a library.
-            let entry = match entry {
-                Ok(e) => e,
-                Err(e) => {
-                    let at = e
-                        .path()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| base_path.display().to_string());
-                    log::error!("Cannot scan {}: {}", at, e);
-                    stats.unwalkable.record(format!("{}: {}", at, e));
-                    continue;
-                }
-            };
-
-            let path = entry.path();
-
-            // Extension first: it is free, and it keeps us from stat()ing every
-            // non-video file in the tree.
-            let ext_matches = path
-                .extension()
-                .and_then(|s| s.to_str())
-                .map(|ext| extensions.contains(ext.to_lowercase().as_str()))
-                .unwrap_or(false);
-
-            if !ext_matches {
-                continue;
-            }
-
-            // One stat does three jobs: it follows symlinks (so a link to a
-            // video is treated as that video), confirms this is a regular file,
-            // and yields the identity used for deduplication.
-            let meta = match std::fs::metadata(path) {
-                Ok(m) => m,
-                Err(e) => {
-                    log::error!("Cannot stat {}: {}", path.display(), e);
-                    stats
-                        .unreadable
-                        .record(format!("{}: {}", path.display(), e));
-                    continue;
-                }
-            };
-
-            if !meta.is_file() {
-                continue;
-            }
-
-            if !seen_inodes.insert((meta.dev(), meta.ino())) {
-                stats.skipped_alias.bump();
-                log::debug!(
-                    "Skipping {}: same inode as a path already queued",
-                    path.display()
-                );
-                continue;
-            }
-
-            video_files.push(path.to_string_lossy().to_string());
-        }
-    }
+    let mut video_files = match sources::collect(
+        &sources::Sources {
+            include: &args.include,
+            exclude: &args.exclude,
+            from_file: args.from_file.as_deref(),
+            null_separated: args.null,
+            extensions: &args.extensions,
+            recursive: args.recursive,
+            follow_symlinks: args.follow_symlinks,
+        },
+        stats,
+    )? {
+        sources::Scan::Complete(files) => files,
+        sources::Scan::Interrupted => return Ok(Outcome::Interrupted),
+    };
 
     if args.prune_cache && !args.clear_cache {
         info!("Pruning cache for files not in the current scan...");

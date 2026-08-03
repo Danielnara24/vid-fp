@@ -7,9 +7,9 @@
 //! non-zero when something went wrong, which is the only part a script sees.
 //!
 //! The split between "skipped" and "problems" is load-bearing: a skip is
-//! something the user asked for (`--min-duration`, a hard link already
-//! queued), a problem is something the user asked for that did NOT happen.
-//! Only the latter touches the exit code.
+//! something the user asked for (`--min-duration`, an `--exclude` folder, a hard
+//! link already queued), a problem is something the user asked for that did NOT
+//! happen. Only the latter touches the exit code.
 
 use log::info;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -81,12 +81,15 @@ pub struct RunStats {
     // --- skips: intentional, and not a reason to fail the run ----------------
     pub skipped_short: Tally,
     pub skipped_alias: Tally,
+    pub skipped_excluded: Tally,
 }
 
 impl RunStats {
     fn problems(&self) -> [(&Tally, &'static str); 8] {
         [
-            (&self.unresolved_includes, "scan folder(s) could not be resolved"),
+            // "path" rather than "folder": a scan target can now be a single
+            // file, or a line piped in from another tool.
+            (&self.unresolved_includes, "scan path(s) could not be resolved"),
             (
                 &self.unresolved_excludes,
                 "exclude folder(s) could not be resolved -- their contents were NOT excluded",
@@ -114,12 +117,21 @@ impl RunStats {
     // Work dropped by an interrupt is deliberately absent. The user pressed the
     // key; "you stopped it" already explains everything the number would, and
     // the exit code says it more precisely than a count of half-decoded files.
-    fn skips(&self) -> [(&Tally, &'static str); 2] {
+    fn skips(&self) -> [(&Tally, &'static str); 3] {
         [
             (&self.skipped_short, "video(s) shorter than --min-duration"),
             (
                 &self.skipped_alias,
                 "path(s) already queued under another name (symlink, hard link, or overlapping folders)",
+            ),
+            // Only ever raised for a path the user named or piped in. A file
+            // dropped during a walk is not counted: the folder was never
+            // descended into, and "you excluded it" is the whole story. A path
+            // asked for BY NAME and then silently dropped is a different
+            // matter, and the count is what keeps it from being silent.
+            (
+                &self.skipped_excluded,
+                "named path(s) skipped because they sit under an --exclude folder",
             ),
         ]
     }
@@ -214,13 +226,14 @@ mod tests {
 
     #[test]
     fn test_skips_alone_never_fail_the_run() {
-        // A run that skipped a thousand short videos and some hard links did
-        // exactly what it was told to do. Exit code 0.
+        // A run that skipped a thousand short videos, some hard links and an
+        // excluded path did exactly what it was told to do. Exit code 0.
         let s = RunStats::default();
         for _ in 0..1000 {
             s.skipped_short.bump();
         }
         s.skipped_alias.bump();
+        s.skipped_excluded.bump();
 
         assert_eq!(s.problem_count(), 0);
         assert!(!s.had_problems());

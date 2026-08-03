@@ -142,6 +142,38 @@ it's fingerprinted once and reported once, so nothing is ever listed as a
 duplicate of itself. Symlinked *folders* are skipped unless you pass
 `--follow-symlinks`.
 
+### Naming files, and reading a list
+
+Individual files can be named alongside folders:
+
+```bash
+vid-fp ~/Videos/episode_a.mkv ~/Videos/episode_b.mp4 ~/Downloads
+```
+
+A file you name is scanned whatever its extension.
+
+A list of paths can also be read from stdin with `-`, or from a file with
+`--from-file`, which lets the rest of the shell decide what gets scanned:
+
+```bash
+fd -e mkv --changed-within 30d ~/Media | vid-fp -
+find ~/Media -type f -size +500M | vid-fp -
+vid-fp --from-file suspects.txt -o results.csv
+```
+
+Blank lines are ignored and a trailing carriage return is trimmed. For filenames
+containing newlines, use NUL separators on both ends:
+
+```bash
+find ~/Media -name '*.mkv' -print0 | vid-fp - -0
+```
+
+Paths read this way behave exactly as if they had been typed as arguments:
+folders are walked, files are taken as given, `-e` still excludes, and the same
+file arriving twice is still scanned once. Piping in files that aren't videos
+will report them under `Problems`, so filter with `fd -e`/`find -name` rather
+than piping an entire tree.
+
 ### Deleting duplicates
 
 ```bash
@@ -156,7 +188,9 @@ vid-fp ~/Videos -r --delete --permanent
 
 | Flag | Description | Default |
 | --- | --- | --- |
-| `<FOLDER>...` | One or more folders to scan (required) | — |
+| `<PATH>...` | Folders and/or video files to scan (required). `-` reads a list of paths from stdin | — |
+| `--from-file <FILE>` | Read the paths to scan from a file, one per line (`-` = stdin) | — |
+| `-0`, `--null` | Paths in the list are NUL-separated, for `find -print0` / `fd -0` | off |
 | `-r`, `--recursive` | Include subfolders | off |
 | `--follow-symlinks` | Descend into symlinked folders | off |
 | `-e`, `--exclude <FOLDER>` | Exclude a folder; repeat for several | — |
