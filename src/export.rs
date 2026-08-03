@@ -49,6 +49,19 @@ fn remove_path(path: &str, permanent: bool) -> Result<()> {
     Ok(())
 }
 
+/// Report every duplicate group, act on the deletion flags, and hand back the
+/// paths that are no longer on disk as a result.
+///
+/// That list is the caller's cue to forget those files' cached fingerprints. It
+/// is deliberately a return value rather than a database handle passed in the
+/// other direction: this module decides which files die, and knowing nothing
+/// about the cache is what keeps that the only thing it decides.
+///
+/// It carries only what was successfully removed. A file that failed to delete
+/// is still sitting there, and its fingerprint is still the correct answer for
+/// it -- forgetting that entry would cost a needless decode on the next run.
+/// Trashed files count as removed: the trash is somewhere else, and nothing
+/// will ever find this fingerprint under the path it was cached against.
 pub fn output_results(
     final_groups: &[Vec<usize>],
     fingerprints: &[VideoFingerprint],
@@ -59,7 +72,7 @@ pub fn output_results(
     delete: bool,
     permanent: bool,
     stats: &RunStats,
-) -> Result<()> {
+) -> Result<Vec<String>> {
 
     // `--permanent` only has meaning alongside `--delete`; on its own it must
     // never trigger any destructive action.
@@ -198,6 +211,12 @@ pub fn output_results(
     let mut freed_bytes = 0u64;
     let delete_candidate_count = delete_indices.len();
 
+    // What this function returns. Only paths that are genuinely gone go in
+    // here, so it is built next to the counter rather than reconstructed from
+    // `delete_indices` afterwards -- the two would differ by every failure and
+    // by everything an interrupt left untouched.
+    let mut deleted_paths: Vec<String> = Vec::new();
+
     // Maps a file index to the outcome label to print in the results table.
     let mut delete_outcome: HashMap<usize, &'static str> = HashMap::new();
 
@@ -216,6 +235,7 @@ pub fn output_results(
                 Ok(()) => {
                     deleted_count += 1;
                     freed_bytes += fp.file_size;
+                    deleted_paths.push(fp.path.clone());
                     delete_outcome.insert(idx, "DELETED");
                 }
                 Err(e) => {
@@ -526,7 +546,7 @@ pub fn output_results(
         info!("\nResults saved to {}", out_path);
     }
 
-    Ok(())
+    Ok(deleted_paths)
 }
 
 #[cfg(test)]
@@ -615,10 +635,12 @@ full_path;action";
         let path_str = report_to("csv");
 
         // Report-only run: single item defaults to KEEP.
-        output_results(
+        let deleted = output_results(
             &groups, &fps, &no_matches(), Some(&path_str), 120, Priority::Length, false, false,
             &RunStats::default(),
         ).unwrap();
+
+        assert!(deleted.is_empty(), "a report-only run removes nothing, so it forgets nothing");
 
         let contents = fs::read_to_string(&path_str).unwrap();
 
@@ -881,13 +903,18 @@ full_path;action";
         let groups = vec![vec![0, 1]];
         let stats = RunStats::default();
 
-        output_results(
+        let deleted = output_results(
             &groups, &fps, &no_matches(), None, 0, Priority::Length, true, true, &stats,
         ).unwrap();
 
         assert!(Path::new(&keep_path).exists(), "KEEP file must remain");
         assert!(!Path::new(&del_path).exists(), "DELETE file must be removed");
         assert!(!stats.had_problems(), "a clean deletion must not fail the run");
+        assert_eq!(
+            deleted,
+            vec![del_path],
+            "the caller is told exactly which fingerprints to forget"
+        );
     }
 
     #[test]
@@ -910,14 +937,19 @@ full_path;action";
         let fps = vec![fp0, fp1, fp2];
         let groups = vec![vec![0, 1], vec![1, 2]];
 
-        output_results(
+        let mut deleted = output_results(
             &groups, &fps, &no_matches(), None, 0, Priority::Length, true, true,
             &RunStats::default(),
         ).unwrap();
+        deleted.sort();
 
         assert!(Path::new(&p0).exists(), "global best must remain");
         assert!(!Path::new(&p1).exists(), "bridge duplicate must be deleted in one pass");
         assert!(!Path::new(&p2).exists(), "tail duplicate must be deleted");
+
+        let mut expected = vec![p1, p2];
+        expected.sort();
+        assert_eq!(deleted, expected);
     }
 
     #[test]
@@ -942,7 +974,7 @@ full_path;action";
         let stats = RunStats::default();
 
         // Previously errored on the second deletion attempt; must succeed now.
-        output_results(
+        let deleted = output_results(
             &groups, &fps, &no_matches(), None, 0, Priority::Length, true, true, &stats,
         ).unwrap();
 
@@ -952,6 +984,11 @@ full_path;action";
         assert_eq!(
             stats.delete_failed.count(), 0,
             "a target queued by two groups must not report a second, failing attempt"
+        );
+        assert_eq!(
+            deleted,
+            vec![p2],
+            "and it must be handed back once, not once per group"
         );
     }
 
@@ -1002,13 +1039,14 @@ full_path;action";
         let groups = vec![vec![0, 1]];
         let path_str = report_to("json");
 
-        output_results(
+        let deleted = output_results(
             &groups, &fps, &no_matches(), Some(&path_str), 0, Priority::Length, true, true,
             &RunStats::default(),
         ).unwrap();
 
         assert!(Path::new(&p_h264).exists(), "the h264 copy must survive");
         assert!(Path::new(&p_av1).exists(), "the av1 copy must survive");
+        assert!(deleted.is_empty(), "a standoff deletes nothing, so it forgets nothing");
 
         let report: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&path_str).unwrap()).unwrap();
@@ -1154,12 +1192,16 @@ full_path;action";
         let groups = vec![vec![0, 1]];
         let stats = RunStats::default();
 
-        output_results(
+        let deleted = output_results(
             &groups, &fps, &no_matches(), None, 0, Priority::Length, true, true, &stats,
         ).unwrap();
 
         assert_eq!(stats.delete_failed.count(), 1, "the failure must be tallied");
         assert!(stats.had_problems(), "a failed deletion must fail the run");
         assert!(Path::new(&keep_path).exists(), "the KEEP pick is untouched either way");
+        assert!(
+            deleted.is_empty(),
+            "a file that is still on disk must keep the fingerprint that describes it"
+        );
     }
 }

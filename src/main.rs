@@ -382,6 +382,48 @@ fn cache_store(db: &Database, path: &str, stamp: Stamp, fp: &VideoFingerprint) -
     Ok(())
 }
 
+/// Forget the fingerprints of files that are no longer where they were.
+///
+/// Called with what `--delete` actually removed. Those entries describe bytes
+/// that are in the trash or gone entirely, so nothing will ever match them
+/// again: keeping them means every cleanup run grows the cache a little and it
+/// only shrinks if the user happens to remember `--prune-cache`. Deleting
+/// duplicates is the one thing this tool does that makes an entry obsolete
+/// WITHOUT writing a replacement over it, so it is the one place that has to
+/// say so out loud.
+///
+/// One transaction for the whole list, unlike `cache_store`. There is no
+/// partial state worth protecting here -- the files are already gone, and a run
+/// killed midway simply leaves entries the next `--prune-cache` will collect --
+/// so this pays one fsync rather than one per file.
+///
+/// Returns how many entries actually existed, which is normally all of them and
+/// is only interesting when it isn't.
+fn cache_forget(db: &Database, paths: &[String]) -> Result<usize> {
+    if paths.is_empty() {
+        return Ok(0);
+    }
+
+    let mut forgotten = 0usize;
+
+    let txn = db.begin_write().context("Failed to start a cache transaction")?;
+    {
+        let mut table = txn.open_table(CACHE_TABLE).context("Failed to open the cache table")?;
+        for path in paths {
+            let existed = table
+                .remove(path.as_str())
+                .context("Failed to remove a cache entry")?
+                .is_some();
+            if existed {
+                forgotten += 1;
+            }
+        }
+    }
+    txn.commit().context("Failed to commit the cache removals")?;
+
+    Ok(forgotten)
+}
+
 /// Delete the cache this tool used to keep, if it is still lying around.
 ///
 /// sled stored a directory; redb stores a single file, so the two cannot even
@@ -1085,7 +1127,7 @@ fn run(
         }
     }
 
-    export::output_results(
+    let deleted_paths = export::output_results(
         &final_groups,
         &fingerprints,
         &matches,
@@ -1097,6 +1139,22 @@ fn run(
         stats,
     )?;
 
+    // Those files are gone, so the fingerprints filed under their paths describe
+    // nothing at all. Deliberately BEFORE the interrupt check below: the
+    // deletions have already happened, and stopping is no reason to leave the
+    // cache claiming otherwise. It is one small transaction either way.
+    if !deleted_paths.is_empty() {
+        match cache_forget(db, &deleted_paths) {
+            Ok(forgotten) => {
+                log::debug!("Dropped {} cache entry(ies) for deleted file(s).", forgotten)
+            }
+            Err(e) => {
+                log::error!("Failed to drop cache entries for deleted files: {:#}", e);
+                stats.cache_purge_failed.record(format!("{:#}", e));
+            }
+        }
+    }
+
     if shutdown_requested() {
         return Ok(Outcome::Interrupted);
     }
@@ -1107,6 +1165,7 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use redb::ReadableTableMetadata;
 
     #[test]
     fn test_budget_is_split_evenly_when_videos_are_scarce() {
@@ -1251,12 +1310,9 @@ mod tests {
         assert!(nonsense.matches(&nonsense), "an entry must be able to match itself");
     }
 
-    #[test]
-    fn test_a_stamp_round_trips_through_the_cache_encoding() {
-        // The stamp is serialized ahead of the fingerprint, so its own encoding
-        // is what fixes the offset everything after it is read from.
-        let fp = VideoFingerprint {
-            path: "/videos/some_show_s01e01.mkv".to_string(),
+    fn mock_fp(path: &str) -> VideoFingerprint {
+        VideoFingerprint {
+            path: path.to_string(),
             valid_hashes: vec![1, 2, 3],
             valid_t_start: vec![0, 1, 2],
             valid_t_end: vec![1, 2, 3],
@@ -1267,15 +1323,86 @@ mod tests {
             file_size: 12_345,
             codec: "h264".to_string(),
             frame_rate: 30.0,
-        };
+        }
+    }
+
+    /// A cache of its own, inside a directory that cleans itself up.
+    fn temp_db(dir: &tempfile::TempDir) -> Database {
+        let db = Database::create(dir.path().join("fingerprints.redb")).unwrap();
+        ensure_cache_table(&db).unwrap();
+        db
+    }
+
+    #[test]
+    fn test_a_fingerprint_round_trips_through_the_cache() {
+        // The stamp is written ahead of the fingerprint, so this also pins the
+        // offset everything after it is read from: the borrowed write path and
+        // the owned read path have to agree byte for byte.
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
         let written = stamp(1_700_000_000, 12_345);
+        let fp = mock_fp("/videos/some_show_s01e01.mkv");
 
-        let bytes = bincode::serialize(&(written, &fp)).unwrap();
-        let (read, decoded): CacheEntry = bincode::deserialize(&bytes).unwrap();
+        cache_store(&db, &fp.path, written, &fp).unwrap();
 
-        assert!(read.matches(&written), "the borrowed write path must match the owned read path");
-        assert_eq!(decoded.path, fp.path);
-        assert_eq!(decoded.valid_hashes, fp.valid_hashes);
-        assert_eq!(decoded.codec, fp.codec);
+        let hit = cache_lookup(&db, &fp.path, &written).expect("an untouched file must hit");
+        assert_eq!(hit.valid_hashes, fp.valid_hashes);
+        assert_eq!(hit.codec, fp.codec);
+    }
+
+    #[test]
+    fn test_a_rewritten_file_replaces_its_entry_rather_than_adding_one() {
+        // What the key change actually buys, at the level the bug lived at: a
+        // path holds ONE entry no matter how many times its file is rewritten.
+        // The superseded fingerprint is not merely unreachable, it is gone.
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+        let path = "/videos/some_show_s01e01.mkv";
+
+        let old = stamp(1_700_000_000, 12_345);
+        let new = stamp(1_700_009_999, 6_000);
+
+        cache_store(&db, path, old, &mock_fp(path)).unwrap();
+        cache_store(&db, path, new, &mock_fp(path)).unwrap();
+
+        assert!(cache_lookup(&db, path, &new).is_some(), "the file as it stands now hits");
+        assert!(cache_lookup(&db, path, &old).is_none(), "the superseded stamp cannot");
+
+        let read = db.begin_read().unwrap();
+        let table = read.open_table(CACHE_TABLE).unwrap();
+        assert_eq!(table.len().unwrap(), 1, "one file, one entry, however often it changes");
+    }
+
+    #[test]
+    fn test_a_deleted_file_is_forgotten() {
+        // The other half of keeping the cache bounded. A cleanup run takes the
+        // duplicate off disk and nothing will ever ask about that path again,
+        // so leaving the fingerprint would make every --delete run grow the
+        // cache by exactly what it just cleaned up.
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+        let kept = "/videos/keep.mkv";
+        let gone = "/videos/duplicate.mkv";
+        let s = stamp(1_700_000_000, 12_345);
+
+        cache_store(&db, kept, s, &mock_fp(kept)).unwrap();
+        cache_store(&db, gone, s, &mock_fp(gone)).unwrap();
+
+        let forgotten = cache_forget(&db, &[gone.to_string()]).unwrap();
+
+        assert_eq!(forgotten, 1);
+        assert!(cache_lookup(&db, gone, &s).is_none(), "a deleted file keeps no fingerprint");
+        assert!(cache_lookup(&db, kept, &s).is_some(), "and its neighbours are untouched");
+    }
+
+    #[test]
+    fn test_forgetting_something_uncached_is_not_an_error() {
+        // A file whose cache write failed earlier in the run is still a
+        // perfectly good deletion target, and its absence here means nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+
+        assert_eq!(cache_forget(&db, &[]).unwrap(), 0);
+        assert_eq!(cache_forget(&db, &["/videos/never-cached.mkv".to_string()]).unwrap(), 0);
     }
 }

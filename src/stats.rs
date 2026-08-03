@@ -75,6 +75,7 @@ pub struct RunStats {
     pub unreadable: Tally,
     pub fingerprint_failed: Tally,
     pub cache_write_failed: Tally,
+    pub cache_purge_failed: Tally,
     pub delete_failed: Tally,
 
     // --- skips: intentional, and not a reason to fail the run ----------------
@@ -83,7 +84,7 @@ pub struct RunStats {
 }
 
 impl RunStats {
-    fn problems(&self) -> [(&Tally, &'static str); 7] {
+    fn problems(&self) -> [(&Tally, &'static str); 8] {
         [
             (&self.unresolved_includes, "scan folder(s) could not be resolved"),
             (
@@ -96,6 +97,15 @@ impl RunStats {
             (
                 &self.cache_write_failed,
                 "fingerprint(s) could not be cached (they will be redone next run)",
+            ),
+            // Nothing was lost and no file is at risk -- the entries describe
+            // videos that are already gone -- but a cache that will not accept
+            // a write is worth knowing about before the next run tries to write
+            // several thousand, so it is a problem rather than a skip.
+            (
+                &self.cache_purge_failed,
+                "cached fingerprint(s) of deleted file(s) could not be dropped \
+                 (use --prune-cache to clear them)",
             ),
             (&self.delete_failed, "file(s) marked DELETE could not be removed"),
         ]
@@ -253,9 +263,10 @@ mod tests {
         s.unreadable.record("/a.mp4");
         s.fingerprint_failed.record("/b.mkv");
         s.cache_write_failed.record("/c.mp4");
+        s.cache_purge_failed.record("cache write failed");
         s.delete_failed.record("/d.mp4");
 
-        assert_eq!(s.problem_count(), 7);
+        assert_eq!(s.problem_count(), 8);
         assert!(s.had_problems());
     }
 }
