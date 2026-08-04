@@ -229,7 +229,7 @@ doesn't, since moving files into the scan just feeds them back in next time.
 | `--follow-symlinks` | Descend into symlinked folders | off |
 | `-e`, `--exclude <FOLDER>` | Exclude a folder; repeat for several | — |
 | `-x`, `--extensions <EXT>` | Video extensions to include, comma-separated or repeated | `mp4,mkv,avi,mov,flv,webm` |
-| `-d`, `--hamming-distance <N>` | Frame-match tolerance; higher = less strict matching. Raise to increase duplicates found (but can increase false positives). Values above `7` work but see [Tuning](#tuning) | `3` |
+| `-d`, `--hamming-distance <N>` | Frame-match tolerance; higher = less strict matching. Raise to increase duplicates found (but can increase false positives). Values above `11` work but see [Tuning](#tuning) | `3` |
 | `-p`, `--match-percent <F>` | Min % of overlap to count as a duplicate; Lower = Finds shorter matches (but can increase false positives) | `10.0` |
 | `--min-duration <SECS>` | Min shared clip length in seconds for a match. Videos shorter than this are skipped entirely. `0` = off | `0.0` |
 | `-k`, `--priority <P>` | Criteria for KEEPING files: `length`, `resolution`, `quality`, or `size`. The chosen one is compared first; the rest follow in the default order. See [Codecs and quality](#codecs-and-quality) | `length` |
@@ -259,10 +259,13 @@ match is a short clip inside a long video.
 Dark scenes, fades, and letterboxed content look alike to any perceptual hash,
 and a loose `-d` conflates them.
 
-Above `-d 7` the index that proposes candidate pairs is no longer exhaustive: it
-may fail to *propose* a pair whose frames are all near the far edge of the
-tolerance. Once a pair is proposed it is always compared exactly, and genuine
-duplicates have many frames, so a miss is very unlikely.
+The index that proposes candidate pairs widens automatically with `-d`, so it is
+exhaustive up to `-d 11`: every pair within the tolerance is proposed. Widening
+costs time, in steps — `-d 0`–`3` probes one index bin per frame per block,
+`-d 4`–`7` probes 17, and `-d 8`–`11` probes 137. Above `-d 11` the probe stops
+widening, so it may fail to *propose* a pair whose frames are all near the far
+edge of the tolerance. Once a pair is proposed it is always compared exactly, and
+genuine duplicates share many frames, so a miss is very unlikely.
 
 `--min-duration` is an absolute floor, in seconds, on how much footage two files
 must share. It's the tool to reach for when `-p` alone can't express what you

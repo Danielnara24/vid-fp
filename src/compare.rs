@@ -4,59 +4,112 @@ use log::info;
 use rayon::prelude::*;
 use std::collections::HashMap;
 
-/// One stored hash, tagged with the video it came from.
+/// The hash is split into this many equal blocks for indexing.
 ///
-/// The per-video hash index is deliberately absent: phase 1 only needs to know
-/// *which videos* could overlap. All per-frame detail is recomputed exactly in
-/// phase 2, so carrying it through the index is dead weight.
-#[derive(Clone, Copy)]
-struct IndexEntry {
-    video_idx: u32,
-    hash: u64,
+/// This is the number the whole probe strategy is derived from: two hashes
+/// within total distance `d` must, by pigeonhole, agree to within `d / BLOCKS`
+/// bits in at least ONE block, because if every block were further apart than
+/// that the total would exceed `d`.
+const BLOCKS: usize = 4;
+const BLOCK_BITS: usize = 64 / BLOCKS;
+const BINS: usize = 1 << BLOCK_BITS;
+
+/// Ceiling on how far the probe will widen, whatever `--hamming-distance` says.
+///
+/// The number of keys probed per block is the number of 16-bit patterns with at
+/// most `radius` bits set: 1, 17, 137, 697. The first three steps are a
+/// reasonable price for exhaustiveness; the fourth is a 5x jump on top of an
+/// already 137x one, at tolerances where the candidate list is exploding anyway.
+/// Past the cap the index goes back to being a very good filter rather than a
+/// complete one -- which is exactly what it was at EVERY setting before, so
+/// nothing regresses, the honest-answer threshold just moves from 7 to 11.
+const MAX_PROBE_RADIUS: u32 = 2;
+
+/// The `k`th 16-bit block of a hash, most significant first.
+#[inline(always)]
+fn block_of(hash: u64, k: usize) -> usize {
+    ((hash >> (64 - BLOCK_BITS * (k + 1))) & (BINS as u64 - 1)) as usize
 }
 
-// Flat Index mapping utilizing Counting Sort methodology for cache alignment optimizations
-struct FlatIndex {
-    entries: Vec<IndexEntry>,
+/// How far around each block key the index must look to be exhaustive at
+/// `max_hamming_dist`.
+///
+/// Integer division is the whole rule. At the default tolerance of 3 this is 0:
+/// three differing bits cannot be spread across four blocks without leaving one
+/// of them untouched, so probing the exact bins alone finds every pair, and the
+/// 68 lookups per hash this code used to do were 64 lookups of pure ceremony.
+fn probe_radius(max_hamming_dist: u32) -> u32 {
+    (max_hamming_dist / BLOCKS as u32).min(MAX_PROBE_RADIUS)
+}
+
+/// Every bit pattern to XOR a block key with, i.e. every 16-bit value with at
+/// most `radius` bits set.
+///
+/// Enumerated by filtering all 65,536 patterns rather than by generating
+/// combinations. It runs once per scan, it is obviously complete by
+/// construction, and it does not have to be rewritten if the cap ever moves.
+fn probe_masks(radius: u32) -> Vec<u16> {
+    (0..=u16::MAX).filter(|m| m.count_ones() <= radius).collect()
+}
+
+/// A counting-sorted index over ONE block position: every stored hash, bucketed
+/// by the 16 bits at that position, tagged with the video it came from.
+///
+/// Hashes and video ids live in two parallel arrays rather than one array of
+/// `{ u32, u64 }` structs. That struct aligns to 8 and pads to 16 bytes to hold
+/// 12 bytes of payload, and this is the largest allocation in the program by a
+/// wide margin -- one entry per keyframe in the entire library.
+///
+/// The per-video hash index is deliberately absent: this phase only needs to
+/// know *which videos* could overlap. All per-frame detail is recomputed
+/// exactly in phase 2, so carrying it through the index is dead weight.
+struct BlockIndex {
+    hashes: Vec<u64>,
+    videos: Vec<u32>,
     offsets: Vec<u32>,
 }
 
-impl FlatIndex {
+impl BlockIndex {
     fn build(k: usize, fingerprints: &[VideoFingerprint]) -> Self {
-        let mut counts = vec![0u32; 65537];
+        let mut offsets = vec![0u32; BINS + 1];
 
-        for fp in fingerprints.iter() {
+        for fp in fingerprints {
             for &h in &fp.valid_hashes {
-                let bin = ((h >> (48 - k * 16)) & 0xFFFF) as usize;
-                counts[bin + 1] += 1;
+                offsets[block_of(h, k) + 1] += 1;
             }
         }
-
-        for i in 1..=65536 {
-            counts[i] += counts[i - 1];
+        for i in 1..=BINS {
+            offsets[i] += offsets[i - 1];
         }
 
-        let mut entries = vec![IndexEntry { video_idx: 0, hash: 0 }; counts[65536] as usize];
-        let mut offsets = counts.clone();
+        let total = offsets[BINS] as usize;
+        let mut hashes = vec![0u64; total];
+        let mut videos = vec![0u32; total];
+
+        // A separate write cursor so `offsets` keeps its bin boundaries; the
+        // cursor is 256 KiB of scratch and dies with this function.
+        let mut cursor = offsets.clone();
 
         for (v_idx, fp) in fingerprints.iter().enumerate() {
-            for &h in fp.valid_hashes.iter() {
-                let bin = ((h >> (48 - k * 16)) & 0xFFFF) as usize;
-                let pos = offsets[bin] as usize;
-                entries[pos] = IndexEntry { video_idx: v_idx as u32, hash: h };
-                offsets[bin] += 1;
+            for &h in &fp.valid_hashes {
+                let bin = block_of(h, k);
+                let pos = cursor[bin] as usize;
+                hashes[pos] = h;
+                videos[pos] = v_idx as u32;
+                cursor[bin] += 1;
             }
         }
 
-        Self { entries, offsets: counts }
+        Self { hashes, videos, offsets }
     }
 
+    /// The hashes in one bin and the videos they came from, index for index.
     #[inline(always)]
-    fn get_bin(&self, bin: usize) -> &[IndexEntry] {
-        let bin = bin & 0xFFFF; // Bounds hint allowing LLVM to elide panic branches safely
-        let start = self.offsets[bin] as usize;
-        let end = self.offsets[bin + 1] as usize;
-        &self.entries[start..end]
+    fn bin(&self, key: usize) -> (&[u64], &[u32]) {
+        let key = key & (BINS - 1); // Bounds hint allowing LLVM to elide panic branches safely
+        let start = self.offsets[key] as usize;
+        let end = self.offsets[key + 1] as usize;
+        (&self.hashes[start..end], &self.videos[start..end])
     }
 }
 
@@ -163,81 +216,104 @@ impl MatchIndex {
 
 /// --- Phase 1: candidate generation ---------------------------------------
 ///
-/// Probe the 4x16-bit multi-index at radius 1 and emit every ordered pair
-/// `(a, b)` with `a < b` that shares at least one frame within
-/// `max_hamming_dist`. This is a *filter*, not the answer: it decides which
-/// video pairs are worth a full comparison, and nothing else.
+/// Probe the 4x16-bit multi-index and emit every ordered pair `(a, b)` with
+/// `a < b` that shares at least one frame within `max_hamming_dist`. This is a
+/// *filter*, not the answer: it decides which video pairs are worth a full
+/// comparison, and nothing else.
 ///
-/// Completeness note: a pair is found only if some shared frame has a 16-bit
-/// block differing by <= 1 bit, which by pigeonhole is guaranteed for frame
-/// distances <= 7. Above that the probe can miss an individual frame pair, but
-/// real duplicates share hundreds of frames, so missing *every* one of them is
-/// vanishingly unlikely. Phase 2 then recovers the frames the probe skipped.
+/// The probe radius is derived from the tolerance rather than fixed (see
+/// `probe_radius`), which makes the index exhaustive for every `max_hamming_dist`
+/// up to `BLOCKS * MAX_PROBE_RADIUS + BLOCKS - 1` = 11: every pair within the
+/// tolerance is proposed. Above that the radius stops widening and an individual
+/// frame pair can be missed, but real duplicates share hundreds of frames, so
+/// missing *every* one of them is vanishingly unlikely -- and phase 2 then
+/// recovers the frames the probe skipped for any pair that was proposed at all.
+///
+/// The blocks are indexed ONE AT A TIME, and each index is dropped before the
+/// next is built. Four live indices is four entries per stored hash; one is one.
+/// The cost is that a pair found in several blocks is emitted several times,
+/// which a sort and a dedup at the end of each pass settles -- candidate pairs
+/// are orders of magnitude scarcer than the hashes they were found from.
 fn candidate_pairs(
     fingerprints: &[VideoFingerprint],
     max_hamming_dist: u32,
 ) -> Vec<(usize, usize)> {
     let n = fingerprints.len();
+    let radius = probe_radius(max_hamming_dist);
+    let masks = probe_masks(radius);
 
-    let indices: Vec<FlatIndex> = (0..4)
-        .into_par_iter()
-        .map(|k| FlatIndex::build(k, fingerprints))
-        .collect();
+    log::debug!(
+        "Probing each block at radius {} ({} key(s) per block) for -d {}.",
+        radius,
+        masks.len(),
+        max_hamming_dist
+    );
 
-    (0..n)
-        .into_par_iter()
-        .flat_map(|v_a| {
-            if shutdown_requested() {
-                return Vec::new();
-            }
-            let fp_a = &fingerprints[v_a];
+    let mut candidates: Vec<(usize, usize)> = Vec::new();
 
-            // Once a video is a known candidate, further hits against it are
-            // pure waste -- `seen` lets us skip the popcount entirely. This is
-            // also why the old first-block deduplication is gone: it existed to
-            // stop the same frame pair being counted twice, and set membership
-            // makes double counting impossible by construction.
-            let mut seen = vec![false; n];
-            let mut candidates: Vec<(usize, usize)> = Vec::new();
+    for k in 0..BLOCKS {
+        if shutdown_requested() {
+            return Vec::new();
+        }
 
-            for &h_a in fp_a.valid_hashes.iter() {
+        let index = BlockIndex::build(k, fingerprints);
+
+        let found: Vec<(usize, usize)> = (0..n)
+            .into_par_iter()
+            .flat_map(|v_a| {
                 if shutdown_requested() {
                     return Vec::new();
                 }
-                let b = [
-                    ((h_a >> 48) & 0xFFFF) as usize,
-                    ((h_a >> 32) & 0xFFFF) as usize,
-                    ((h_a >> 16) & 0xFFFF) as usize,
-                    (h_a & 0xFFFF) as usize,
-                ];
+                let fp_a = &fingerprints[v_a];
 
-                for k in 0..4 {
-                    for bit in 0..17 {
-                        let key = if bit == 16 { b[k] } else { b[k] ^ (1 << bit) };
-                        let bin_entries = indices[k].get_bin(key);
+                // Once a video is a known candidate in this pass, further hits
+                // against it are pure waste -- `seen` lets us skip the popcount
+                // entirely.
+                let mut seen = vec![false; n];
+                let mut local: Vec<(usize, usize)> = Vec::new();
+
+                for &h_a in fp_a.valid_hashes.iter() {
+                    if shutdown_requested() {
+                        return Vec::new();
+                    }
+                    let key = block_of(h_a, k);
+
+                    for &mask in masks.iter() {
+                        let (hashes, videos) = index.bin(key ^ mask as usize);
 
                         // Entries are built in video order, so a binary search
                         // skips every already-processed video in one step.
-                        let start_idx =
-                            bin_entries.partition_point(|e| (e.video_idx as usize) <= v_a);
+                        let start = videos.partition_point(|&v| (v as usize) <= v_a);
 
-                        for entry in &bin_entries[start_idx..] {
-                            let v_b = entry.video_idx as usize;
+                        for (&v_b, &h_b) in videos[start..].iter().zip(&hashes[start..]) {
+                            let v_b = v_b as usize;
                             if seen[v_b] {
                                 continue;
                             }
-                            if (h_a ^ entry.hash).count_ones() <= max_hamming_dist {
+                            if (h_a ^ h_b).count_ones() <= max_hamming_dist {
                                 seen[v_b] = true;
-                                candidates.push((v_a, v_b));
+                                local.push((v_a, v_b));
                             }
                         }
                     }
                 }
-            }
 
-            candidates
-        })
-        .collect()
+                local
+            })
+            .collect();
+
+        candidates.extend(found);
+
+        // Deduped per pass rather than once at the end, so the list never holds
+        // more than one pass worth of repeats -- the same reason only one index
+        // is alive at a time.
+        candidates.sort_unstable();
+        candidates.dedup();
+
+        // `index` dies here, before the next block's is allocated.
+    }
+
+    candidates
 }
 
 /// --- Phase 2: exact verification ------------------------------------------
@@ -248,8 +324,7 @@ fn candidate_pairs(
 ///
 /// Returns the fraction of each video's runtime that is matched by the other.
 /// Unlike the index-driven count it replaces, this sees *all* matching frames,
-/// including ones whose blocks all differ by >= 2 bits and are therefore
-/// invisible to the radius-1 probe.
+/// including ones the probe cannot reach at a tolerance above the radius cap.
 fn match_overlap(
     fp_a: &VideoFingerprint,
     fp_b: &VideoFingerprint,
@@ -405,6 +480,39 @@ mod tests {
     }
 
     #[test]
+    fn test_blocks_partition_the_hash_without_gaps_or_overlap() {
+        let h = 0x0123_4567_89AB_CDEFu64;
+        assert_eq!(block_of(h, 0), 0x0123);
+        assert_eq!(block_of(h, 1), 0x4567);
+        assert_eq!(block_of(h, 2), 0x89AB);
+        assert_eq!(block_of(h, 3), 0xCDEF);
+    }
+
+    #[test]
+    fn test_probe_radius_is_derived_from_the_tolerance() {
+        // The pigeonhole rule, and the reason the default setting needs no
+        // neighbour lookups at all: three differing bits cannot cover four
+        // blocks, so one block always matches exactly.
+        assert_eq!(probe_radius(0), 0);
+        assert_eq!(probe_radius(3), 0, "the default tolerance probes exact bins only");
+        assert_eq!(probe_radius(4), 1);
+        assert_eq!(probe_radius(7), 1);
+        assert_eq!(probe_radius(8), 2);
+        assert_eq!(probe_radius(11), 2);
+        assert_eq!(probe_radius(64), MAX_PROBE_RADIUS, "and it stops widening at the cap");
+    }
+
+    #[test]
+    fn test_probe_masks_are_exactly_the_patterns_within_the_radius() {
+        // 1, 17, 137: sum of C(16, i) up to the radius. These are the multiplier
+        // on every single bin lookup in the scan, which is why the cap exists.
+        assert_eq!(probe_masks(0), vec![0u16]);
+        assert_eq!(probe_masks(1).len(), 17);
+        assert_eq!(probe_masks(2).len(), 137);
+        assert!(probe_masks(2).iter().all(|m| m.count_ones() <= 2));
+    }
+
+    #[test]
     fn test_find_all_matches_exact() {
         let hash = 0xFFFF_0000_FFFF_0000;
         let fps = vec![
@@ -439,6 +547,8 @@ mod tests {
 
     #[test]
     fn test_pairs_are_emitted_once_in_ascending_order() {
+        // Identical hashes hit in all four block passes, so this is also the
+        // test that the per-pass dedup actually collapses them.
         let hash = 0xABCD_1234_ABCD_1234;
         let fps = vec![
             mock_fp_with_hashes(vec![hash], 1),
@@ -453,26 +563,66 @@ mod tests {
     }
 
     #[test]
-    fn test_two_phase_recovers_frames_the_index_misses() {
-        // Frame 2 differs by exactly 2 bits in EVERY 16-bit block (total
-        // distance 8), so the radius-1 probe can never see it. Frame 1 is
-        // identical, so the pair still becomes a candidate -- and phase 2's
+    fn test_the_default_tolerance_is_exhaustive_with_no_bit_flips() {
+        // Three differing bits spread across three blocks. Block 3 is untouched
+        // -- it has to be -- so the exact-bin probe finds the pair even though
+        // three quarters of the hash differs somewhere.
+        let a = 0x0000_0000_0000_0000u64;
+        let b = 0x0001_0001_0001_0000u64;
+        assert_eq!((a ^ b).count_ones(), 3);
+        assert_eq!(probe_radius(3), 0);
+
+        let fps = vec![mock_fp_with_hashes(vec![a], 1), mock_fp_with_hashes(vec![b], 1)];
+
+        assert_eq!(pairs(&find_all_matches(&fps, 3, 1.0, 0.0)), vec![(0, 1)]);
+    }
+
+    #[test]
+    fn test_a_pair_with_no_identical_block_is_found_once_the_radius_widens() {
+        // One differing bit in EVERY block: total distance 4, and nothing to
+        // find in an exact bin. floor(4 / 4) = 1, so the probe widens to radius
+        // 1 and the pair is proposed -- the pigeonhole guarantee, from the other
+        // side.
+        let a = 0x0000_0000_0000_0000u64;
+        let b = 0x0001_0001_0001_0001u64;
+        assert_eq!((a ^ b).count_ones(), 4);
+
+        let fps = vec![mock_fp_with_hashes(vec![a], 1), mock_fp_with_hashes(vec![b], 1)];
+
+        assert_eq!(pairs(&find_all_matches(&fps, 4, 1.0, 0.0)), vec![(0, 1)]);
+        assert!(
+            find_all_matches(&fps, 3, 1.0, 0.0).is_empty(),
+            "and four bits apart is genuinely outside a three-bit tolerance"
+        );
+    }
+
+    #[test]
+    fn test_two_phase_recovers_frames_the_index_cannot_propose() {
+        // Only reachable above the radius cap, which is the entire remaining
+        // gap in the index. Frame 2 differs by 3 bits in EVERY block (total 12)
+        // and the radius is capped at 2, so no probe can see it. Frame 1 is
+        // identical, so the PAIR still becomes a candidate -- and phase 2's
         // brute force then counts frame 2 as well.
         let shared = 0x0000_0000_0000_0000u64;
-        let invisible_a = 0xFFFF_FFFF_FFFF_FFFFu64;
-        let invisible_b = invisible_a ^ 0x0003_0003_0003_0003;
+        let unprobeable_a = 0xFFFF_FFFF_FFFF_FFFFu64;
+        let unprobeable_b = unprobeable_a ^ 0x0007_0007_0007_0007;
 
-        assert_eq!((invisible_a ^ invisible_b).count_ones(), 8);
+        assert_eq!((unprobeable_a ^ unprobeable_b).count_ones(), 12);
+        assert!(probe_radius(12) < 3, "no block is within reach of the probe");
 
         let fps = vec![
-            mock_fp_with_hashes(vec![shared, invisible_a], 2),
-            mock_fp_with_hashes(vec![shared, invisible_b], 2),
+            mock_fp_with_hashes(vec![shared, unprobeable_a], 2),
+            mock_fp_with_hashes(vec![shared, unprobeable_b], 2),
         ];
 
         // Demanding 100% overlap: only reachable if BOTH frames are counted.
-        // The old index-only accounting would have scored this pair at 50%.
-        let matches = find_all_matches(&fps, 8, 1.0, 0.0);
-        assert_eq!(pairs(&matches), vec![(0, 1)], "phase 2 must recover the index-invisible frame");
+        // Index-only accounting would have scored this pair at 50%.
+        let matches = find_all_matches(&fps, 12, 1.0, 0.0);
+        assert_eq!(
+            pairs(&matches),
+            vec![(0, 1)],
+            "phase 2 must recover the frame the probe could not reach"
+        );
     }
 
     #[test]
