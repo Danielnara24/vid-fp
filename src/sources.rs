@@ -19,6 +19,14 @@
 //! explicitly. It is the one flag whose entire purpose is "do not touch this",
 //! and `find ... | vid-fp - -e ~/keep --delete` has to mean what it obviously
 //! means.
+//!
+//! What comes back is not a list of paths but a list of files. Every entry has
+//! already been stat'ed here -- the walk needs (device, inode) to deduplicate
+//! aliases, and needs to know a directory entry is a regular file at all -- so
+//! the size and mtime that same stat returned travel out with it. Re-deriving
+//! them downstream cost two further stat() calls per file, which on a network
+//! mount or a spinning disk was the dominant cost of a run where every
+//! fingerprint was already cached and no video needed decoding at all.
 
 use anyhow::{Context, Result};
 use log::info;
@@ -45,15 +53,48 @@ pub struct Sources<'a> {
     pub follow_symlinks: bool,
 }
 
+/// One file to fingerprint, plus everything the rest of the run needs to know
+/// about it without going back to the disk.
+///
+/// The modification time is kept as the two halves stat actually reports rather
+/// than as one number: seconds since the epoch, and nanoseconds within that
+/// second. Whole seconds alone cannot see an edit made within the same second
+/// as the last one, which is exactly what a script or a fast re-encode does,
+/// and pairing it with `size` only catches such an edit when the length changed
+/// too. The nanoseconds close that gap wherever the filesystem keeps them; on
+/// one that does not (or that reports them as zero) this is no worse than
+/// before.
+///
+/// The (device, inode) pair the walk deduplicated on is deliberately NOT here.
+/// It has done its job by the time this struct exists, and nothing downstream
+/// has any business re-deciding which files are aliases of each other.
+pub struct ScannedFile {
+    pub path: String,
+    pub size: u64,
+    pub mtime: i64,
+    pub mtime_nsec: i64,
+}
+
+impl ScannedFile {
+    fn of(path: &Path, meta: &std::fs::Metadata) -> Self {
+        ScannedFile {
+            path: path.to_string_lossy().to_string(),
+            size: meta.len(),
+            mtime: meta.mtime(),
+            mtime_nsec: meta.mtime_nsec(),
+        }
+    }
+}
+
 pub enum Scan {
-    Complete(Vec<String>),
+    Complete(Vec<ScannedFile>),
     /// Ctrl-C arrived mid-walk. The partial list is discarded rather than
     /// returned: a truncated library would silently change what counts as a
     /// duplicate, which is the last thing an interrupted run should do.
     Interrupted,
 }
 
-/// Resolve the request into absolute paths of files to fingerprint.
+/// Resolve the request into the files to fingerprint, at absolute paths.
 pub fn collect(sources: &Sources, stats: &RunStats) -> Result<Scan> {
     // Before anything that can block on a pipe: a run that cannot possibly
     // match a file should not first wait for a list of them.
@@ -82,7 +123,7 @@ pub fn collect(sources: &Sources, stats: &RunStats) -> Result<Scan> {
     // report never lists a file as a duplicate of itself and the "space freed"
     // figure never counts bytes that deleting a link would not return.
     let mut seen_inodes: HashSet<(u64, u64)> = HashSet::new();
-    let mut found: Vec<String> = Vec::new();
+    let mut found: Vec<ScannedFile> = Vec::new();
 
     for path in &requested {
         if shutdown_requested() {
@@ -134,7 +175,7 @@ pub fn collect(sources: &Sources, stats: &RunStats) -> Result<Scan> {
         } else if meta.is_file() {
             // No extension check: see the module docs. The user named this file.
             if seen_inodes.insert((meta.dev(), meta.ino())) {
-                found.push(resolved.to_string_lossy().to_string());
+                found.push(ScannedFile::of(&resolved, &meta));
             } else {
                 stats.skipped_alias.bump();
                 log::debug!(
@@ -162,7 +203,7 @@ fn walk_folder(
     extensions: &HashSet<String>,
     excludes: &[PathBuf],
     seen_inodes: &mut HashSet<(u64, u64)>,
-    found: &mut Vec<String>,
+    found: &mut Vec<ScannedFile>,
     stats: &RunStats,
 ) -> bool {
     let mut walker = WalkDir::new(base).follow_links(sources.follow_symlinks);
@@ -208,9 +249,10 @@ fn walk_folder(
             continue;
         }
 
-        // One stat does three jobs: it follows symlinks (so a link to a video is
-        // treated as that video), confirms this is a regular file, and yields
-        // the identity used for deduplication.
+        // One stat does four jobs: it follows symlinks (so a link to a video is
+        // treated as that video), confirms this is a regular file, yields the
+        // identity used for deduplication, and supplies the size and mtime that
+        // travel out with the file so nothing downstream has to ask again.
         let meta = match std::fs::metadata(path) {
             Ok(m) => m,
             Err(e) => {
@@ -235,7 +277,7 @@ fn walk_folder(
             continue;
         }
 
-        found.push(path.to_string_lossy().to_string());
+        found.push(ScannedFile::of(path, &meta));
     }
 
     true
@@ -429,14 +471,19 @@ mod tests {
         }
     }
 
-    fn collected(sources: &Sources, stats: &RunStats) -> Vec<String> {
+    fn scanned(sources: &Sources, stats: &RunStats) -> Vec<ScannedFile> {
         match collect(sources, stats).unwrap() {
-            Scan::Complete(mut files) => {
-                files.sort();
-                files
-            }
+            Scan::Complete(files) => files,
             Scan::Interrupted => panic!("nothing interrupted this scan"),
         }
+    }
+
+    /// Most tests here are about WHICH files were found, not what was learned
+    /// about them on the way.
+    fn collected(sources: &Sources, stats: &RunStats) -> Vec<String> {
+        let mut paths: Vec<String> = scanned(sources, stats).into_iter().map(|f| f.path).collect();
+        paths.sort();
+        paths
     }
 
     #[test]
@@ -512,6 +559,43 @@ mod tests {
             collected(&sources(&include, &[], &extensions_of(&["mkv"])), &stats),
             vec![video]
         );
+    }
+
+    #[test]
+    fn test_a_walked_file_carries_the_stat_the_walk_already_did() {
+        // The whole point of ScannedFile: the size and mtime downstream needs
+        // are the ones this module read, not two further trips to the disk.
+        let dir = tempfile::tempdir().unwrap();
+        let video = touch(dir.path(), "episode.mkv");
+
+        let include = vec![dir.path().to_string_lossy().to_string()];
+        let stats = RunStats::default();
+        let files = scanned(&sources(&include, &[], &extensions_of(&["mkv"])), &stats);
+
+        let meta = fs::metadata(&video).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, video);
+        assert_eq!(files[0].size, meta.len());
+        assert_eq!(files[0].mtime, meta.mtime());
+        assert_eq!(files[0].mtime_nsec, meta.mtime_nsec());
+    }
+
+    #[test]
+    fn test_a_named_file_carries_it_too() {
+        // The other branch of collect(), which stats the path to find out
+        // whether it is a folder at all and must not throw that away either.
+        let dir = tempfile::tempdir().unwrap();
+        let odd = touch(dir.path(), "holiday.m4v");
+
+        let include = vec![odd.clone()];
+        let stats = RunStats::default();
+        let files = scanned(&sources(&include, &[], &extensions_of(&["mkv"])), &stats);
+
+        let meta = fs::metadata(&odd).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].size, meta.len());
+        assert_eq!(files[0].mtime, meta.mtime());
+        assert_eq!(files[0].mtime_nsec, meta.mtime_nsec());
     }
 
     #[test]

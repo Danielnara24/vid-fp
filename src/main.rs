@@ -17,6 +17,7 @@ use log::info;
 use rayon::prelude::*;
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
+use sources::ScannedFile;
 use stats::RunStats;
 use std::collections::HashSet;
 use std::io::Write;
@@ -69,6 +70,11 @@ const EXIT_WITH_PROBLEMS: i32 = 2;
 /// re-fingerprinted and the insert OVERWRITES, rather than filing the new
 /// fingerprint under a new key and leaving the old one to accumulate.
 ///
+/// `mtime`, `mtime_nsec` and `size` are whatever the scan's single stat()
+/// reported -- see `sources::ScannedFile`. Nothing here re-derives them, so the
+/// figure the stamp is written with is the same figure the file was selected
+/// and sorted on, and a file changing mid-run cannot make those three disagree.
+///
 /// Fixed-size fields only, and serialized BEFORE the fingerprint, so the
 /// fingerprint always begins at the same byte offset. That is what keeps the
 /// discipline `VideoFingerprint` already documents working: a field appended to
@@ -77,7 +83,8 @@ const EXIT_WITH_PROBLEMS: i32 = 2;
 /// no such guarantee, so it needs the same treatment `SUPERSEDED_TABLE` got.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 struct Stamp {
-    mtime: u64,
+    mtime: i64,
+    mtime_nsec: i64,
     size: u64,
     kf_interval: f64,
     min_kf_samples: f64,
@@ -94,6 +101,7 @@ impl Stamp {
     /// overwritten either way -- but there is no reason to decode twice for it.
     fn matches(&self, other: &Stamp) -> bool {
         self.mtime == other.mtime
+            && self.mtime_nsec == other.mtime_nsec
             && self.size == other.size
             && same_setting(self.kf_interval, other.kf_interval)
             && same_setting(self.min_kf_samples, other.min_kf_samples)
@@ -305,9 +313,9 @@ fn disposal_for(move_to: Option<PathBuf>, delete: bool, permanent: bool) -> Opti
 /// is what the scan actually reached: an exclude, a non-recursive walk, or an
 /// extension filter can all mean a named folder contributed nothing, and a
 /// folder nothing came out of is not one a moved file can be re-ingested from.
-fn scan_encloses(dest: &Path, scanned: &[String]) -> Option<String> {
+fn scan_encloses(dest: &Path, scanned: &[ScannedFile]) -> Option<String> {
     scanned.iter().find_map(|f| {
-        let parent = Path::new(f).parent()?;
+        let parent = Path::new(&f.path).parent()?;
         dest.starts_with(parent)
             .then(|| parent.display().to_string())
     })
@@ -775,6 +783,11 @@ fn run(
         max_hamming, args.match_percent, min_duration, args.priority, active_threads, args.recursive
     );
 
+    // Every file here has been stat'ed exactly once, and carries the size and
+    // mtime that stat returned. Nothing below asks the filesystem about these
+    // files again unless it is going to decode one: the sort, the cache stamp
+    // and the prune all read from this list. On a network mount that is the
+    // difference between three round trips per file and one.
     let mut video_files = match sources::collect(
         &sources::Sources {
             include: &args.include,
@@ -815,7 +828,7 @@ fn run(
         // path, so they sit in a sibling subtree the current scan never reaches
         // -- but a later recursive scan of the destination itself would find
         // both copies, so it is worth a word.
-        if video_files.iter().any(|f| Path::new(f).starts_with(dest)) {
+        if video_files.iter().any(|f| Path::new(&f.path).starts_with(dest)) {
             info!(
                 "Note: {} is above the folder(s) being scanned. The moved files land in a \
                  separate subtree under it, so this run is unaffected -- but exclude it with \
@@ -828,7 +841,7 @@ fn run(
 
     if args.prune_cache && !args.clear_cache {
         info!("Pruning cache for files not in the current scan...");
-        let valid_files: HashSet<&str> = video_files.iter().map(|s| s.as_str()).collect();
+        let valid_files: HashSet<&str> = video_files.iter().map(|f| f.path.as_str()).collect();
 
         // A key IS a path now, so this is the whole of pruning: an entry
         // survives exactly when the file it describes is in front of us. It
@@ -885,9 +898,11 @@ fn run(
         return Ok(Outcome::Completed);
     }
 
-    video_files.sort_by_cached_key(|vf| {
-        std::cmp::Reverse(std::fs::metadata(vf).map(|m| m.len()).unwrap_or(0))
-    });
+    // Largest first, so the heaviest decodes start while the widest thread
+    // allocations are still available. The size is the one the scan already
+    // read; this used to stat every file again to learn it, which on a cold
+    // network mount cost more than the sort saved.
+    video_files.sort_by_key(|f| std::cmp::Reverse(f.size));
 
     let total_videos = video_files.len();
 
@@ -905,53 +920,39 @@ fn run(
     // stuck at 7/22 while 21 files were already known and exactly one was being
     // worked on.
     //
-    // A lookup is a stat, a b-tree descent and a bincode decode -- microseconds
-    // -- so this pass finishes effectively instantly even on a large library,
-    // and by the time the bar appears we know exactly how much real work there
-    // is. That count is now load-bearing twice over: it also sets the per-video
-    // decoder thread budget, which is only knowable once the cache has spoken.
+    // A lookup is now a b-tree descent and a bincode decode and nothing else --
+    // the stat it used to open with came out of the scan -- so this pass costs
+    // no I/O against the library at all and finishes effectively instantly even
+    // on a large one. By the time the bar appears we know exactly how much real
+    // work there is, and that count is load-bearing twice over: it also sets the
+    // per-video decoder thread budget.
     enum Lookup {
         Hit(VideoFingerprint),
         Miss { path: String, stamp: Stamp },
-        Unreadable,
     }
 
     let lookups: Vec<Lookup> = video_files
         .par_iter()
-        .map(|vf| {
-            let metadata = match std::fs::metadata(vf) {
-                Ok(m) => m,
-                Err(e) => {
-                    log::error!("Cannot access metadata for {}: {}", vf, e);
-                    stats.unreadable.record(format!("{}: {}", vf, e));
-                    return Lookup::Unreadable;
-                }
-            };
-
-            let mtime = metadata
-                .modified()
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let size = metadata.len();
-
+        .map(|file| {
             // Thread count is deliberately NOT part of the stamp. Threading
             // changes only how fast frames arrive, never which ones, so a
             // fingerprint made with 8 threads is byte-identical to one made with
             // 1 and stays valid across runs with different -t.
             let stamp = Stamp {
-                mtime,
-                size,
+                mtime: file.mtime,
+                mtime_nsec: file.mtime_nsec,
+                size: file.size,
                 kf_interval,
                 min_kf_samples,
             };
 
-            if let Some(fp) = cache_lookup(db, vf, &stamp) {
-                return Lookup::Hit(fp);
+            match cache_lookup(db, &file.path, &stamp) {
+                Some(fp) => Lookup::Hit(fp),
+                None => Lookup::Miss {
+                    path: file.path.clone(),
+                    stamp,
+                },
             }
-
-            Lookup::Miss { path: vf.clone(), stamp }
         })
         .collect();
 
@@ -974,7 +975,6 @@ fn run(
                 }
             }
             Lookup::Miss { path, stamp } => todo.push((path, stamp)),
-            Lookup::Unreadable => {}
         }
     }
     let cached_count = fingerprints.len();
@@ -1055,6 +1055,11 @@ fn run(
                         // the user's doing rather than the file's, so it is
                         // neither logged as a failure nor counted anywhere:
                         // exit code 130 already says what happened.
+                        //
+                        // A file that vanished between the scan and now also
+                        // lands here rather than in a separate "unreadable"
+                        // bucket, which is the honest description: the run was
+                        // asked to fingerprint it and could not.
                         if !shutdown_requested() {
                             log::error!("Failed to process {}: {:#}", vf, e);
                             stats
@@ -1241,6 +1246,36 @@ mod tests {
         );
     }
 
+    fn scanned_at(path: &str) -> ScannedFile {
+        ScannedFile {
+            path: path.to_string(),
+            size: 12_345,
+            mtime: 1_700_000_000,
+            mtime_nsec: 0,
+        }
+    }
+
+    #[test]
+    fn test_a_destination_inside_the_scan_is_recognised() {
+        // Every landing path is dest + the source's absolute path, so a dest
+        // under a scanned folder puts all of them back in next run's input.
+        let scanned = vec![scanned_at("/mnt/media/show/ep01.mkv")];
+
+        assert_eq!(
+            scan_encloses(Path::new("/mnt/media/show/dupes"), &scanned).as_deref(),
+            Some("/mnt/media/show")
+        );
+    }
+
+    #[test]
+    fn test_a_destination_above_the_scan_is_not_a_loop() {
+        // The arrangement that used to trip the check: the moved file lands in
+        // a sibling subtree the scan never reaches.
+        let scanned = vec![scanned_at("/home/you/Documents/AN/ep01.mkv")];
+
+        assert!(scan_encloses(Path::new("/home/you/Documents"), &scanned).is_none());
+    }
+
     #[test]
     fn test_budget_is_split_evenly_when_videos_are_scarce() {
         // The cases from the spec: 8 threads, N videos.
@@ -1332,9 +1367,10 @@ mod tests {
         assert_eq!(running.load(Ordering::SeqCst), 0, "a finished job must free its threads");
     }
 
-    fn stamp(mtime: u64, size: u64) -> Stamp {
+    fn stamp(mtime: i64, size: u64) -> Stamp {
         Stamp {
             mtime,
+            mtime_nsec: 0,
             size,
             kf_interval: 0.0,
             min_kf_samples: 4.0,
@@ -1356,6 +1392,19 @@ mod tests {
             !stamp(1_700_000_000, 999).matches(&before),
             "a same-second edit is still caught by the size"
         );
+    }
+
+    #[test]
+    fn test_a_same_second_edit_that_preserves_the_size_is_still_caught() {
+        // The hole whole seconds leave open: a re-mux or a scripted re-encode
+        // finishing inside the same second the last one did, landing on the
+        // same byte count. Seconds and size both agree, and the fingerprint on
+        // record describes footage that is no longer in the file.
+        let before = stamp(1_700_000_000, 12_345);
+        let after = Stamp { mtime_nsec: 500_000_000, ..before };
+
+        assert!(!before.matches(&after), "the nanoseconds are the only thing that differs");
+        assert!(after.matches(&after));
     }
 
     #[test]
