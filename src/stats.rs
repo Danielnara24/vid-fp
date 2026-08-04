@@ -76,6 +76,7 @@ pub struct RunStats {
     pub fingerprint_failed: Tally,
     pub cache_write_failed: Tally,
     pub cache_purge_failed: Tally,
+    pub delete_stale: Tally,
     pub delete_failed: Tally,
 
     // --- skips: intentional, and not a reason to fail the run ----------------
@@ -85,7 +86,7 @@ pub struct RunStats {
 }
 
 impl RunStats {
-    fn problems(&self) -> [(&Tally, &'static str); 8] {
+    fn problems(&self) -> [(&Tally, &'static str); 9] {
         [
             // "path" rather than "folder": a scan target can now be a single
             // file, or a line piped in from another tool.
@@ -109,6 +110,17 @@ impl RunStats {
                 &self.cache_purge_failed,
                 "cached fingerprint(s) of deleted file(s) could not be dropped \
                  (use --prune-cache to clear them)",
+            ),
+            // A problem rather than a skip, even though nothing went wrong and
+            // the refusal is the point. The user asked for these files to be
+            // deleted and they are still there, the report's figures for them
+            // describe a file that no longer exists in that form, and the exit
+            // code is the only part of that a script can see. Re-running judges
+            // them as they now stand.
+            (
+                &self.delete_stale,
+                "file(s) marked DELETE changed on disk after they were scanned \
+                 and were NOT removed",
             ),
             (&self.delete_failed, "file(s) marked DELETE could not be removed"),
         ]
@@ -277,9 +289,10 @@ mod tests {
         s.fingerprint_failed.record("/b.mkv");
         s.cache_write_failed.record("/c.mp4");
         s.cache_purge_failed.record("cache write failed");
-        s.delete_failed.record("/d.mp4");
+        s.delete_stale.record("/d.mp4: 100 bytes when scanned, 200 bytes now");
+        s.delete_failed.record("/e.mp4");
 
-        assert_eq!(s.problem_count(), 8);
+        assert_eq!(s.problem_count(), 9);
         assert!(s.had_problems());
     }
 }

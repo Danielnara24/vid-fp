@@ -35,6 +35,38 @@ fn csv_seconds(value: Option<f64>) -> String {
     value.map(|s| format!("{:.2}", s)).unwrap_or_default()
 }
 
+/// Whether the file at `fp.path` is still the length it was when it was
+/// fingerprinted, and a description of the discrepancy if not.
+///
+/// Every DELETE decision in this module rests on measurements taken at the
+/// start of the scan, and a scan of a large library runs for hours. In that
+/// window a download finishes, a re-encode lands over the top, a copy is
+/// truncated -- and the file about to be removed is no longer the file that was
+/// judged redundant. Two syscalls immediately before an irreversible one is a
+/// cheap way to notice.
+///
+/// Size is the only property compared, because it is the only one the
+/// fingerprint records. It catches everything that changes a file's length,
+/// which is essentially every way a video file is rewritten in practice, but it
+/// cannot see an in-place edit that happens to preserve the byte count.
+/// Recording an mtime or an inode alongside the fingerprint would close that
+/// gap at the cost of a field on every cache entry; nothing has needed it yet.
+///
+/// A metadata error is deliberately NOT reported as a change. It proves nothing
+/// about the file's contents, and the removal that follows will fail with the
+/// real reason -- so a file that vanished mid-scan reads as a deletion that
+/// could not happen rather than as a file quietly left alone.
+fn changed_since_scan(fp: &VideoFingerprint) -> Option<String> {
+    let size = std::fs::metadata(&fp.path).ok()?.len();
+
+    (size != fp.file_size).then(|| {
+        format!(
+            "{}: {} bytes when scanned, {} bytes now",
+            fp.path, fp.file_size, size
+        )
+    })
+}
+
 /// Remove a single file, either by moving it to the system trash (default,
 /// recoverable) or by deleting it permanently. Trash semantics are handled by
 /// the `trash` crate, which implements the FreeDesktop.org spec on Linux.
@@ -57,9 +89,10 @@ fn remove_path(path: &str, permanent: bool) -> Result<()> {
 /// other direction: this module decides which files die, and knowing nothing
 /// about the cache is what keeps that the only thing it decides.
 ///
-/// It carries only what was successfully removed. A file that failed to delete
-/// is still sitting there, and its fingerprint is still the correct answer for
-/// it -- forgetting that entry would cost a needless decode on the next run.
+/// It carries only what was successfully removed. A file that failed to delete,
+/// or that was skipped because it changed under us, is still sitting there --
+/// and in the second case its cached fingerprint is already invalid by size, so
+/// the next run re-fingerprints it without being told anything here.
 /// Trashed files count as removed: the trash is somewhere else, and nothing
 /// will ever find this fingerprint under the path it was cached against.
 pub fn output_results(
@@ -208,13 +241,15 @@ pub fn output_results(
     // --- Pass 2: delete each unique target exactly once ----------------------
     let mut deleted_count = 0usize;
     let mut failed_count = 0usize;
+    let mut changed_count = 0usize;
     let mut freed_bytes = 0u64;
     let delete_candidate_count = delete_indices.len();
 
     // What this function returns. Only paths that are genuinely gone go in
     // here, so it is built next to the counter rather than reconstructed from
-    // `delete_indices` afterwards -- the two would differ by every failure and
-    // by everything an interrupt left untouched.
+    // `delete_indices` afterwards -- the two would differ by every failure,
+    // every file that changed under us, and everything an interrupt left
+    // untouched.
     let mut deleted_paths: Vec<String> = Vec::new();
 
     // Maps a file index to the outcome label to print in the results table.
@@ -226,11 +261,27 @@ pub fn output_results(
                 info!(
                     "Interrupted: stopped after {} deletion(s); {} file(s) left untouched.",
                     deleted_count,
-                    delete_candidate_count - deleted_count - failed_count
+                    delete_candidate_count - deleted_count - failed_count - changed_count
                 );
                 break;
             }
             let fp = &fingerprints[idx];
+
+            // The last thing before the irreversible step, and the only check in
+            // this module that consults the disk rather than the scan. See
+            // changed_since_scan: the decision above was made from information
+            // that may be hours old.
+            if let Some(detail) = changed_since_scan(fp) {
+                log::error!(
+                    "Not deleting {}: it changed on disk after it was scanned",
+                    fp.path
+                );
+                changed_count += 1;
+                stats.delete_stale.record(detail);
+                delete_outcome.insert(idx, "CHANGED");
+                continue;
+            }
+
             match remove_path(&fp.path, permanent_delete) {
                 Ok(()) => {
                     deleted_count += 1;
@@ -360,7 +411,9 @@ pub fn output_results(
             // A file that is redundant in an overlapping group is shown DELETE/
             // DELETED in every group, including one where it was the local best.
             // In a dry run the delete targets stay as the recommendation DELETE;
-            // with --delete they become DELETED (or FAILED on error).
+            // with --delete they become DELETED, FAILED if the removal errored,
+            // or CHANGED if the file stopped matching its fingerprint before we
+            // got to it.
             let action_str = if review_set.contains(&idx) {
                 "REVIEW"
             } else if delete_candidates.contains(&idx) {
@@ -488,6 +541,13 @@ pub fn output_results(
                 failed_count
             ));
         }
+        if changed_count > 0 {
+            summary.push_str(&format!(
+                "\n{} file(s) changed on disk after they were scanned and were left alone \
+                 (re-run to judge them as they now stand).",
+                changed_count
+            ));
+        }
     }
 
     info!("{}", summary);
@@ -526,6 +586,7 @@ pub fn output_results(
                         "permanent": permanent_delete,
                         "files_deleted": deleted_count,
                         "files_failed": failed_count,
+                        "files_changed": changed_count,
                     },
                     "results": json_out_groups
                 });
@@ -600,13 +661,32 @@ full_path;action";
         fp
     }
 
-    /// Real files with names WE choose, inside a directory that cleans itself
-    /// up. NamedTempFile picks random names, which is useless when the point of
-    /// a test is that alphabetical order must not decide the outcome.
-    fn touch(dir: &tempfile::TempDir, name: &str) -> String {
-        let path = dir.path().join(name);
-        fs::write(&path, b"video").unwrap();
-        path.to_string_lossy().to_string()
+    /// A path inside a directory that cleans itself up, with a name WE choose.
+    /// NamedTempFile picks random ones, which is useless when the point of a
+    /// test is that alphabetical order must not decide the outcome.
+    fn at(dir: &tempfile::TempDir, name: &str) -> String {
+        dir.path().join(name).to_string_lossy().to_string()
+    }
+
+    /// Put a real file on disk at `fp.path`, exactly as long as the fingerprint
+    /// claims it is.
+    ///
+    /// Mandatory for anything running with `delete: true`: the deletion path
+    /// re-stats every target and refuses to remove one whose length no longer
+    /// matches, so a mock claiming 7.8 MB against an empty temp file is skipped
+    /// as CHANGED rather than deleted. `set_len` leaves the file sparse, so a
+    /// 24 MB mock costs one syscall and no blocks.
+    fn materialize(fp: &VideoFingerprint) {
+        fs::File::create(&fp.path)
+            .unwrap()
+            .set_len(fp.file_size)
+            .unwrap();
+    }
+
+    fn materialize_all(fps: &[VideoFingerprint]) {
+        for fp in fps {
+            materialize(fp);
+        }
     }
 
     /// Tests about deletion precedence don't care about overlap; an empty index
@@ -887,19 +967,20 @@ full_path;action";
 
     #[test]
     fn test_permanent_delete_removes_only_delete_targets() {
-        // Two real temp files so we can verify actual filesystem effects. We use
+        // Two real files so we can verify actual filesystem effects. We use
         // permanent deletion here specifically so the test never pollutes the
         // user's trash.
-        let keep_file = NamedTempFile::new().unwrap();
-        let del_file = NamedTempFile::new().unwrap();
-        let keep_path = keep_file.path().to_string_lossy().to_string();
-        let del_path = del_file.path().to_string_lossy().to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let keep_path = at(&dir, "keep.mkv");
+        let del_path = at(&dir, "duplicate.mkv");
 
         // Longer duration => higher "tier" => KEEP under Priority::Length.
-        let fp_keep = mock_fp_at(&keep_path, 60.0);
-        let fp_del = mock_fp_at(&del_path, 10.0);
+        let fps = vec![
+            mock_fp_at(&keep_path, 60.0),
+            mock_fp_at(&del_path, 10.0),
+        ];
+        materialize_all(&fps);
 
-        let fps = vec![fp_keep, fp_del];
         let groups = vec![vec![0, 1]];
         let stats = RunStats::default();
 
@@ -918,23 +999,108 @@ full_path;action";
     }
 
     #[test]
+    fn test_a_target_that_changed_since_the_scan_is_not_deleted() {
+        // The window this guard exists for. The DELETE decision was made from a
+        // measurement taken at the start of a scan that may have run for hours;
+        // by the time we reach the file it has finished downloading, and it is
+        // no longer the file that was judged redundant.
+        let dir = tempfile::tempdir().unwrap();
+        let keep_path = at(&dir, "keep.mkv");
+        let grew_path = at(&dir, "still_downloading.mkv");
+
+        let fps = vec![
+            mock_fp_at(&keep_path, 60.0),
+            mock_fp_at(&grew_path, 10.0),
+        ];
+        materialize_all(&fps);
+
+        // ...and then it grew.
+        fs::File::create(&grew_path)
+            .unwrap()
+            .set_len(fps[1].file_size + 4096)
+            .unwrap();
+
+        let groups = vec![vec![0, 1]];
+        let stats = RunStats::default();
+        let path_str = report_to("json");
+
+        let deleted = output_results(
+            &groups, &fps, &no_matches(), Some(&path_str), 0, Priority::Length, true, true,
+            &stats,
+        ).unwrap();
+
+        assert!(Path::new(&grew_path).exists(), "a file that changed under us must survive");
+        assert!(Path::new(&keep_path).exists(), "and so must the KEEP pick");
+        assert!(
+            deleted.is_empty(),
+            "nothing was removed, so no fingerprint may be forgotten"
+        );
+        assert_eq!(stats.delete_stale.count(), 1);
+        assert!(
+            stats.had_problems(),
+            "a deletion the run was told to make and did not make must fail the run"
+        );
+
+        let report: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path_str).unwrap()).unwrap();
+        assert_eq!(report["results"][0]["files"][1]["action"], "CHANGED");
+        assert_eq!(report["summary"]["files_changed"], 1);
+        assert_eq!(report["summary"]["files_deleted"], 0);
+
+        let _ = fs::remove_file(path_str);
+    }
+
+    #[test]
+    fn test_a_truncated_target_is_caught_just_as_a_grown_one_is() {
+        // The other direction, and the more dangerous one: a copy that was
+        // truncated is now demonstrably not the video that was compared, so
+        // deleting it on the strength of that comparison is deleting something
+        // nobody looked at.
+        let dir = tempfile::tempdir().unwrap();
+        let keep_path = at(&dir, "keep.mkv");
+        let shrunk_path = at(&dir, "truncated.mkv");
+
+        let fps = vec![
+            mock_fp_at(&keep_path, 60.0),
+            mock_fp_at(&shrunk_path, 10.0),
+        ];
+        materialize_all(&fps);
+
+        fs::File::create(&shrunk_path).unwrap().set_len(1024).unwrap();
+
+        let groups = vec![vec![0, 1]];
+        let stats = RunStats::default();
+
+        output_results(
+            &groups, &fps, &no_matches(), None, 0, Priority::Length, true, true, &stats,
+        ).unwrap();
+
+        assert!(Path::new(&shrunk_path).exists());
+        assert_eq!(stats.delete_stale.count(), 1);
+        assert_eq!(
+            stats.delete_failed.count(), 0,
+            "refusing to act on stale information is not a failed removal"
+        );
+    }
+
+    #[test]
     fn test_delete_wins_across_overlapping_groups() {
         // A duplicate chain spread across overlapping groups must collapse in a
         // SINGLE pass. File 1 is the bridge: it is the KEEP pick of group B but
         // redundant in group A. Under DELETE-wins it is removed on the first run
         // rather than surviving until a later run.
-        let f0 = NamedTempFile::new().unwrap();
-        let f1 = NamedTempFile::new().unwrap();
-        let f2 = NamedTempFile::new().unwrap();
-        let p0 = f0.path().to_string_lossy().to_string();
-        let p1 = f1.path().to_string_lossy().to_string();
-        let p2 = f2.path().to_string_lossy().to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let p0 = at(&dir, "best.mkv");
+        let p1 = at(&dir, "bridge.mkv");
+        let p2 = at(&dir, "tail.mkv");
 
-        let fp0 = mock_fp_at(&p0, 100.0); // global best
-        let fp1 = mock_fp_at(&p1, 90.0);  // bridge
-        let fp2 = mock_fp_at(&p2, 10.0);
+        let fps = vec![
+            mock_fp_at(&p0, 100.0), // global best
+            mock_fp_at(&p1, 90.0),  // bridge
+            mock_fp_at(&p2, 10.0),
+        ];
+        materialize_all(&fps);
 
-        let fps = vec![fp0, fp1, fp2];
         let groups = vec![vec![0, 1], vec![1, 2]];
 
         let mut deleted = output_results(
@@ -958,18 +1124,18 @@ full_path;action";
         // must be removed exactly once (the original double-delete bug), while
         // the two independent "best" files are both retained -- DELETE-wins is
         // not a blunt component-collapse.
-        let f0 = NamedTempFile::new().unwrap();
-        let f1 = NamedTempFile::new().unwrap();
-        let f2 = NamedTempFile::new().unwrap();
-        let p0 = f0.path().to_string_lossy().to_string();
-        let p1 = f1.path().to_string_lossy().to_string();
-        let p2 = f2.path().to_string_lossy().to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let p0 = at(&dir, "best_a.mkv");
+        let p1 = at(&dir, "best_b.mkv");
+        let p2 = at(&dir, "shared.mkv");
 
-        let fp0 = mock_fp_at(&p0, 60.0);
-        let fp1 = mock_fp_at(&p1, 60.0);
-        let fp2 = mock_fp_at(&p2, 10.0);
+        let fps = vec![
+            mock_fp_at(&p0, 60.0),
+            mock_fp_at(&p1, 60.0),
+            mock_fp_at(&p2, 10.0),
+        ];
+        materialize_all(&fps);
 
-        let fps = vec![fp0, fp1, fp2];
         let groups = vec![vec![0, 2], vec![1, 2]];
         let stats = RunStats::default();
 
@@ -997,16 +1163,17 @@ full_path;action";
         // Same length, same resolution, same codec: under the default order the
         // decision reaches quality, and the denser copy is kept. Nothing is
         // flagged REVIEW, because the KEEP pick is top-tier on every metric.
-        let f_hi = NamedTempFile::new().unwrap();
-        let f_lo = NamedTempFile::new().unwrap();
-        let p_hi = f_hi.path().to_string_lossy().to_string();
-        let p_lo = f_lo.path().to_string_lossy().to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let p_hi = at(&dir, "high.mkv");
+        let p_lo = at(&dir, "low.mkv");
 
         let mut fp_hi = mock_fp_at(&p_hi, 60.0);
         fp_hi.file_size *= 2; // 2 Mbps
         let fp_lo = mock_fp_at(&p_lo, 60.0); // 1 Mbps
 
         let fps = vec![fp_hi, fp_lo];
+        materialize_all(&fps);
+
         let groups = vec![vec![0, 1]];
 
         output_results(
@@ -1026,16 +1193,17 @@ full_path;action";
         // size is what av1 is FOR. Each file is the whole of its codec's field,
         // so each is elected champion and neither may be deleted, even with
         // --delete --permanent armed.
-        let f_h264 = NamedTempFile::new().unwrap();
-        let f_av1 = NamedTempFile::new().unwrap();
-        let p_h264 = f_h264.path().to_string_lossy().to_string();
-        let p_av1 = f_av1.path().to_string_lossy().to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let p_h264 = at(&dir, "copy_h264.mkv");
+        let p_av1 = at(&dir, "copy_av1.mkv");
 
         let fp_h264 = mock_fp_coded(&p_h264, 60.0, "h264");
         let mut fp_av1 = mock_fp_coded(&p_av1, 60.0, "av1");
         fp_av1.file_size /= 2; // half the bytes, same picture
 
         let fps = vec![fp_h264, fp_av1];
+        materialize_all(&fps);
+
         let groups = vec![vec![0, 1]];
         let path_str = report_to("json");
 
@@ -1062,12 +1230,10 @@ full_path;action";
         // Two 1080p copies in different codecs deadlock, and a 720p copy of the
         // same footage sits under both of them. Resolution is codec-independent,
         // so nothing about the deadlock makes the 720p file worth keeping.
-        let f_h264 = NamedTempFile::new().unwrap();
-        let f_av1 = NamedTempFile::new().unwrap();
-        let f_small = NamedTempFile::new().unwrap();
-        let p_h264 = f_h264.path().to_string_lossy().to_string();
-        let p_av1 = f_av1.path().to_string_lossy().to_string();
-        let p_small = f_small.path().to_string_lossy().to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let p_h264 = at(&dir, "full_h264.mkv");
+        let p_av1 = at(&dir, "full_av1.mkv");
+        let p_small = at(&dir, "small_h264.mkv");
 
         let fp_h264 = mock_fp_coded(&p_h264, 60.0, "h264");
         let fp_av1 = mock_fp_coded(&p_av1, 60.0, "av1");
@@ -1076,6 +1242,8 @@ full_path;action";
         fp_small.height = 720;
 
         let fps = vec![fp_h264, fp_av1, fp_small];
+        materialize_all(&fps);
+
         let groups = vec![vec![0, 1, 2]];
 
         output_results(
@@ -1097,11 +1265,11 @@ full_path;action";
         // with, so they go, and the group does not need a human to look at
         // fifteen rows.
         let dir = tempfile::tempdir().unwrap();
-        let h264_best = touch(&dir, "h264_best.mkv");
-        let h264_mid = touch(&dir, "h264_mid.mkv");
-        let hevc_best = touch(&dir, "hevc_best.mkv");
-        let hevc_worst = touch(&dir, "hevc_worst.mkv");
-        let av1_only = touch(&dir, "av1_only.mkv");
+        let h264_best = at(&dir, "h264_best.mkv");
+        let h264_mid = at(&dir, "h264_mid.mkv");
+        let hevc_best = at(&dir, "hevc_best.mkv");
+        let hevc_worst = at(&dir, "hevc_worst.mkv");
+        let av1_only = at(&dir, "av1_only.mkv");
 
         let fps = vec![
             mock_fp_sized(&h264_best, 60.0, "h264", 24_000_000),
@@ -1110,6 +1278,8 @@ full_path;action";
             mock_fp_sized(&hevc_worst, 60.0, "hevc", 3_000_000),
             mock_fp_sized(&av1_only, 60.0, "av1", 6_000_000),
         ];
+        materialize_all(&fps);
+
         let groups = vec![vec![0, 1, 2, 3, 4]];
 
         output_results(
@@ -1133,15 +1303,17 @@ full_path;action";
         // file -- the champion is therefore elected against its own codec's
         // maxima, where the comparison is legitimate.
         let dir = tempfile::tempdir().unwrap();
-        let a_worse = touch(&dir, "a_worse.mkv");
-        let z_best = touch(&dir, "z_best.mkv");
-        let other_codec = touch(&dir, "m_av1.mkv");
+        let a_worse = at(&dir, "a_worse.mkv");
+        let z_best = at(&dir, "z_best.mkv");
+        let other_codec = at(&dir, "m_av1.mkv");
 
         let fps = vec![
             mock_fp_sized(&a_worse, 60.0, "h264", 9_600_000),
             mock_fp_sized(&z_best, 60.0, "h264", 10_000_000),
             mock_fp_sized(&other_codec, 60.0, "av1", 4_000_000),
         ];
+        materialize_all(&fps);
+
         let groups = vec![vec![0, 1, 2]];
 
         output_results(
@@ -1162,15 +1334,16 @@ full_path;action";
         // The standoff rule keys on the contenders, not on the group. These two
         // are not tied: one is a minute longer, which is true regardless of what
         // encoded it, so the shorter one is deleted exactly as before.
-        let f_long = NamedTempFile::new().unwrap();
-        let f_short = NamedTempFile::new().unwrap();
-        let p_long = f_long.path().to_string_lossy().to_string();
-        let p_short = f_short.path().to_string_lossy().to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let p_long = at(&dir, "long_av1.mkv");
+        let p_short = at(&dir, "short_h264.mkv");
 
-        let fp_long = mock_fp_coded(&p_long, 120.0, "av1");
-        let fp_short = mock_fp_coded(&p_short, 60.0, "h264");
+        let fps = vec![
+            mock_fp_coded(&p_long, 120.0, "av1"),
+            mock_fp_coded(&p_short, 60.0, "h264"),
+        ];
+        materialize_all(&fps);
 
-        let fps = vec![fp_long, fp_short];
         let groups = vec![vec![0, 1]];
 
         output_results(
@@ -1184,11 +1357,17 @@ full_path;action";
 
     #[test]
     fn test_failed_deletion_is_recorded_for_the_summary_and_exit_code() {
-        let keep_file = NamedTempFile::new().unwrap();
-        let keep_path = keep_file.path().to_string_lossy().to_string();
+        // A path that cannot be stat'd proves nothing about what the file
+        // contained, so the re-check waves it through and the removal itself
+        // reports the truth: this is a deletion that could not happen, not a
+        // file that changed underneath us.
+        let dir = tempfile::tempdir().unwrap();
+        let keep_path = at(&dir, "keep.mkv");
         let missing = "/nonexistent/vid-fp/definitely-not-here.mp4".to_string();
 
         let fps = vec![mock_fp_at(&keep_path, 60.0), mock_fp_at(&missing, 10.0)];
+        materialize(&fps[0]);
+
         let groups = vec![vec![0, 1]];
         let stats = RunStats::default();
 
@@ -1197,6 +1376,10 @@ full_path;action";
         ).unwrap();
 
         assert_eq!(stats.delete_failed.count(), 1, "the failure must be tallied");
+        assert_eq!(
+            stats.delete_stale.count(), 0,
+            "an unreadable path is not evidence that the file changed"
+        );
         assert!(stats.had_problems(), "a failed deletion must fail the run");
         assert!(Path::new(&keep_path).exists(), "the KEEP pick is untouched either way");
         assert!(
