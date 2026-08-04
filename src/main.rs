@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
 use clap_complete::Shell;
 use compare::{find_all_matches, MatchIndex};
+use export::Disposal;
 use fingerprint::{fingerprint_video, VideoFingerprint, MAX_DECODE_THREADS};
 use indicatif::{ProgressBar, ProgressStyle};
 use log::info;
@@ -117,7 +118,9 @@ type CacheEntry = (Stamp, VideoFingerprint);
     long_about = "Fingerprints videos from their keyframes and groups files with the \
                   same content, even at different resolutions or containers, and even \
                   when one video is only a trimmed clip inside another.\n\n\
-                  Report-only by default: nothing is deleted unless --delete is given."
+                  Report-only by default: it tells you what is redundant and what that \
+                  is costing you. Files are touched only when --delete or --move-to is \
+                  given."
 )]
 
 struct Args {
@@ -213,14 +216,26 @@ struct Args {
     output: Option<String>,
 
     /// Delete the files marked DELETE. By default they are moved to the system
-    /// trash (recoverable). Files marked KEEP or REVIEW are never touched.
+    /// trash (recoverable); add --permanent to remove them for good. Files
+    /// marked KEEP or REVIEW are never touched.
     #[arg(long = "delete")]
     delete: bool,
 
     /// With --delete, remove files permanently instead of moving them to the
-    /// trash. Irreversible — use with care. Has no effect without --delete.
+    /// trash. Irreversible — use with care. Has no effect on its own.
     #[arg(long = "permanent")]
     permanent: bool,
+
+    /// Move the files marked DELETE under this folder, recreating each file's
+    /// absolute path inside it (/mnt/media/ep.mkv -> DIR/mnt/media/ep.mkv).
+    /// Nothing is overwritten and nothing is renamed, so the whole run can be
+    /// undone with a single copy back from DIR. Use this wherever the system
+    /// trash isn't available — external disks, NFS mounts, headless servers.
+    /// Acts on its own: it is not a deletion, so it needs no --delete, and it
+    /// supersedes --delete and --permanent if they are given.
+    #[arg(long = "move-to", value_name = "DIR",
+          value_hint = clap::ValueHint::DirPath)]
+    move_to: Option<String>,
 
     /// Delete ALL cache before running
     #[arg(long = "clear-cache")]
@@ -252,6 +267,50 @@ struct Args {
 enum Outcome {
     Completed,
     Interrupted,
+}
+
+/// What, if anything, the run is armed to do with the files marked DELETE.
+///
+/// `--move-to` outranks both of the others, and outranks them SILENTLY as far
+/// as the file's fate is concerned (the caller prints a note): a move is the
+/// most conservative outcome of the three by every measure -- the file still
+/// exists, at a path the user named, on a filesystem the user chose -- and
+/// there is no reading of `--move-to --permanent` where doing the permanent
+/// thing is what was meant. Precedence therefore runs toward the recoverable
+/// option, which is the direction a mistake in this function should fail.
+fn disposal_for(move_to: Option<PathBuf>, delete: bool, permanent: bool) -> Option<Disposal> {
+    match (move_to, delete, permanent) {
+        (Some(dir), _, _) => Some(Disposal::MoveTo(dir)),
+        (None, true, true) => Some(Disposal::Permanent),
+        (None, true, false) => Some(Disposal::Trash),
+        // --permanent alone is not an arming flag and never has been. The whole
+        // point of report-only-by-default is that exactly one of two named
+        // flags can take a file off its path.
+        (None, false, _) => None,
+    }
+}
+
+/// The scanned folder that contains `dest`, if any.
+///
+/// The question is deliberately this way round. A landing path is `dest` plus
+/// the source's own absolute path, so `dest` being inside a scanned folder makes
+/// EVERY landing path inside it too -- that is the loop worth refusing. The
+/// reverse arrangement is not: `--move-to ~/Documents` while scanning
+/// `~/Documents/AN` sends `~/Documents/AN/ep.mkv` to
+/// `~/Documents/home/you/Documents/AN/ep.mkv`, which no scan of `~/Documents/AN`
+/// will ever reach. Testing containment the other way round -- "is a scanned
+/// file under dest" -- is what made every parent folder look like a loop.
+///
+/// Folders are approximated by the parents of the files that were found, which
+/// is what the scan actually reached: an exclude, a non-recursive walk, or an
+/// extension filter can all mean a named folder contributed nothing, and a
+/// folder nothing came out of is not one a moved file can be re-ingested from.
+fn scan_encloses(dest: &Path, scanned: &[String]) -> Option<String> {
+    scanned.iter().find_map(|f| {
+        let parent = Path::new(f).parent()?;
+        dest.starts_with(parent)
+            .then(|| parent.display().to_string())
+    })
 }
 
 fn decode_threads_for(budget: usize, jobs: usize) -> usize {
@@ -399,13 +458,13 @@ fn cache_store(db: &Database, path: &str, stamp: Stamp, fp: &VideoFingerprint) -
 
 /// Forget the fingerprints of files that are no longer where they were.
 ///
-/// Called with what `--delete` actually removed. Those entries describe bytes
-/// that are in the trash or gone entirely, so nothing will ever match them
-/// again: keeping them means every cleanup run grows the cache a little and it
-/// only shrinks if the user happens to remember `--prune-cache`. Deleting
-/// duplicates is the one thing this tool does that makes an entry obsolete
-/// WITHOUT writing a replacement over it, so it is the one place that has to
-/// say so out loud.
+/// Called with what the run actually acted on -- trashed, unlinked, or moved
+/// under `--move-to`. Those entries describe bytes that are somewhere else or
+/// gone entirely, so nothing will ever match them at that path again: keeping
+/// them means every cleanup run grows the cache a little and it only shrinks if
+/// the user happens to remember `--prune-cache`. Acting on duplicates is the
+/// one thing this tool does that makes an entry obsolete WITHOUT writing a
+/// replacement over it, so it is the one place that has to say so out loud.
 ///
 /// One transaction for the whole list, unlike `cache_store`. There is no
 /// partial state worth protecting here -- the files are already gone, and a run
@@ -668,6 +727,49 @@ fn run(
         anyhow::bail!("--min-duration cannot be negative.");
     }
 
+    // --- Where the DELETE targets are going ----------------------------------
+    // Resolved BEFORE the scan on purpose: a destination that cannot be created
+    // is a typo, and finding a typo out after fingerprinting a library is
+    // finding it out several hours too late.
+    let move_to = match &args.move_to {
+        Some(dir) => {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("Failed to create the --move-to folder {}", dir))?;
+            // Canonical, so the containment check below and the mirrored paths
+            // built later are both working from the same absolute form the
+            // scanner produces.
+            let resolved = std::fs::canonicalize(dir)
+                .with_context(|| format!("Failed to resolve the --move-to folder {}", dir))?;
+            if !resolved.is_dir() {
+                anyhow::bail!("--move-to {} is not a folder.", dir);
+            }
+            Some(resolved)
+        }
+        None => None,
+    };
+
+    // Say out loud which flags are not doing anything. A user who passed
+    // --permanent and watched a report scroll by has to be told the files were
+    // moved rather than removed -- silence there is how someone comes away
+    // believing an irreversible run happened when it did not, and goes looking
+    // for the files in the wrong place.
+    if move_to.is_some() {
+        if args.delete {
+            info!(
+                "Note: --move-to supersedes --delete; the files marked DELETE will be moved, \
+                 not trashed."
+            );
+        }
+        if args.permanent {
+            info!(
+                "Note: --permanent has no effect alongside --move-to; the files will be moved, \
+                 not removed."
+            );
+        }
+    } else if args.permanent && !args.delete {
+        info!("Note: --permanent has no effect without --delete; running in report-only mode.");
+    }
+
     info!(
         "Settings -> Max Hamming: {}, Min Match: {}%, Min Duration: {}s, Priority: {:?}, Threads: {}, Recursive: {}",
         max_hamming, args.match_percent, min_duration, args.priority, active_threads, args.recursive
@@ -688,6 +790,41 @@ fn run(
         sources::Scan::Complete(files) => files,
         sources::Scan::Interrupted => return Ok(Outcome::Interrupted),
     };
+
+// Moving a duplicate into a folder that is itself being scanned puts the
+    // file straight back into the next run's input, where it is still a
+    // duplicate of the copy that was kept -- and the run after that would move
+    // it again, one directory deeper each time. Nothing is lost, but the one
+    // thing this mode is for (getting files OUT of the library, reversibly) is
+    // quietly not happening, so it is worth stopping over rather than warning
+    // about.
+    if let Some(dest) = &move_to {
+        if let Some(scanned) = scan_encloses(dest, &video_files) {
+            anyhow::bail!(
+                "The --move-to folder {} is inside {}, which this run scans, so the moved \
+                 files would be picked up again next time. Exclude it with -e {}, or choose \
+                 a destination outside the scanned folders.",
+                dest.display(),
+                scanned,
+                dest.display()
+            );
+        }
+
+        // The opposite arrangement, which is fine and common: the destination is
+        // an ANCESTOR of the scan. Landing paths mirror the source's absolute
+        // path, so they sit in a sibling subtree the current scan never reaches
+        // -- but a later recursive scan of the destination itself would find
+        // both copies, so it is worth a word.
+        if video_files.iter().any(|f| Path::new(f).starts_with(dest)) {
+            info!(
+                "Note: {} is above the folder(s) being scanned. The moved files land in a \
+                 separate subtree under it, so this run is unaffected -- but exclude it with \
+                 -e if you ever scan {} itself recursively.",
+                dest.display(),
+                dest.display()
+            );
+        }
+    }
 
     if args.prune_cache && !args.clear_cache {
         info!("Pruning cache for files not in the current scan...");
@@ -999,13 +1136,23 @@ fn run(
         return Ok(Outcome::Interrupted);
     }
 
-    // Announce destructive intent up front so it's visible above the per-file log.
-    if args.delete {
-        if args.permanent {
-            info!("\n--permanent enabled: files marked DELETE will be removed permanently.");
-        } else {
-            info!("\n--delete enabled: files marked DELETE will be moved to the trash.");
+    // The single place that turns flags into intent. Report-only runs produce
+    // None, and export.rs cannot touch a file without one of these.
+    let disposal = disposal_for(move_to, args.delete, args.permanent);
+
+    // Announce intent up front so it's visible above the per-file log.
+    match &disposal {
+        Some(Disposal::MoveTo(dir)) => info!(
+            "\n--move-to enabled: files marked DELETE will be moved under {}.",
+            dir.display()
+        ),
+        Some(Disposal::Permanent) => {
+            info!("\n--permanent enabled: files marked DELETE will be removed permanently.")
         }
+        Some(Disposal::Trash) => {
+            info!("\n--delete enabled: files marked DELETE will be moved to the trash.")
+        }
+        None => {}
     }
 
     let deleted_paths = export::output_results(
@@ -1015,22 +1162,22 @@ fn run(
         args.output.as_ref(),
         start_time.elapsed().as_secs(),
         args.priority,
-        args.delete,
-        args.permanent,
+        disposal.as_ref(),
         stats,
     )?;
 
-    // Those files are gone, so the fingerprints filed under their paths describe
-    // nothing at all. Deliberately BEFORE the interrupt check below: the
-    // deletions have already happened, and stopping is no reason to leave the
-    // cache claiming otherwise. It is one small transaction either way.
+    // Those files are no longer where they were, so the fingerprints filed
+    // under their paths describe nothing at all. Deliberately BEFORE the
+    // interrupt check below: the removals have already happened, and stopping is
+    // no reason to leave the cache claiming otherwise. It is one small
+    // transaction either way.
     if !deleted_paths.is_empty() {
         match cache_forget(db, &deleted_paths) {
             Ok(forgotten) => {
-                log::debug!("Dropped {} cache entry(ies) for deleted file(s).", forgotten)
+                log::debug!("Dropped {} cache entry(ies) for removed file(s).", forgotten)
             }
             Err(e) => {
-                log::error!("Failed to drop cache entries for deleted files: {:#}", e);
+                log::error!("Failed to drop cache entries for removed files: {:#}", e);
                 stats.cache_purge_failed.record(format!("{:#}", e));
             }
         }
@@ -1047,6 +1194,52 @@ fn run(
 mod tests {
     use super::*;
     use redb::ReadableTableMetadata;
+
+    fn dest() -> PathBuf {
+        PathBuf::from("/mnt/scratch/dupes")
+    }
+
+    #[test]
+    fn test_move_to_arms_the_run_on_its_own() {
+        // It is not a deletion, so it does not need --delete's permission. A
+        // user who has to type --delete to say "don't delete these" has been
+        // handed a flag whose name is a lie.
+        let d = disposal_for(Some(dest()), false, false);
+        assert!(matches!(d, Some(Disposal::MoveTo(p)) if p == dest()));
+    }
+
+    #[test]
+    fn test_move_to_outranks_both_deletion_flags() {
+        // Precedence runs toward the recoverable option: whatever else was on
+        // the command line, a run that mentions --move-to ends with the files
+        // sitting in that folder.
+        for (delete, permanent) in [(true, false), (false, true), (true, true)] {
+            let d = disposal_for(Some(dest()), delete, permanent);
+            assert!(
+                matches!(d, Some(Disposal::MoveTo(ref p)) if *p == dest()),
+                "--move-to with delete={} permanent={} must still move",
+                delete,
+                permanent
+            );
+        }
+    }
+
+    #[test]
+    fn test_delete_still_means_trash_unless_told_otherwise() {
+        assert!(matches!(disposal_for(None, true, false), Some(Disposal::Trash)));
+        assert!(matches!(disposal_for(None, true, true), Some(Disposal::Permanent)));
+    }
+
+    #[test]
+    fn test_nothing_is_armed_without_a_flag_that_says_so() {
+        // The promise the README makes, as a property: exactly two flags can
+        // take a file off its path, and --permanent is not one of them.
+        assert!(disposal_for(None, false, false).is_none());
+        assert!(
+            disposal_for(None, false, true).is_none(),
+            "--permanent alone must never act"
+        );
+    }
 
     #[test]
     fn test_budget_is_split_evenly_when_videos_are_scarce() {
@@ -1257,9 +1450,9 @@ mod tests {
     #[test]
     fn test_a_deleted_file_is_forgotten() {
         // The other half of keeping the cache bounded. A cleanup run takes the
-        // duplicate off disk and nothing will ever ask about that path again,
-        // so leaving the fingerprint would make every --delete run grow the
-        // cache by exactly what it just cleaned up.
+        // duplicate off disk (or moves it under --move-to) and nothing will ever
+        // ask about that path again, so leaving the fingerprint would make every
+        // armed run grow the cache by exactly what it just cleaned up.
         let dir = tempfile::tempdir().unwrap();
         let db = temp_db(&dir);
         let kept = "/videos/keep.mkv";
@@ -1272,14 +1465,14 @@ mod tests {
         let forgotten = cache_forget(&db, &[gone.to_string()]).unwrap();
 
         assert_eq!(forgotten, 1);
-        assert!(cache_lookup(&db, gone, &s).is_none(), "a deleted file keeps no fingerprint");
+        assert!(cache_lookup(&db, gone, &s).is_none(), "a removed file keeps no fingerprint");
         assert!(cache_lookup(&db, kept, &s).is_some(), "and its neighbours are untouched");
     }
 
     #[test]
     fn test_forgetting_something_uncached_is_not_an_error() {
         // A file whose cache write failed earlier in the run is still a
-        // perfectly good deletion target, and its absence here means nothing.
+        // perfectly good target, and its absence here means nothing.
         let dir = tempfile::tempdir().unwrap();
         let db = temp_db(&dir);
 

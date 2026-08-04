@@ -8,22 +8,45 @@ use crate::utils::{
     format_shared, format_size, shutdown_requested, GroupMaxima, Priority,
 };
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::fs::{FileTimes, OpenOptions};
+use std::path::{Path, PathBuf};
 
-/// Metrics that can justify a REVIEW flag, in default precedence order.
+/// What `--delete` does with a file marked DELETE.
 ///
-/// These are also exactly the metrics that mean the same thing regardless of
-/// codec, which is why the same list does double duty below as the definition
-/// of a group's genuine contenders.
-///
-/// Quality and size are absent, for different reasons. Size carries no quality
-/// information that quality and length don't already express (size IS quality x
-/// frame rate x length), so flagging on it would only ever repeat a flag one of
-/// those two already raised. Quality is absent because it is only meaningful
-/// within a single codec: across codecs it deliberately ties, so a REVIEW
-/// derived from it would be reporting a comparison this tool has just declared
-/// impossible. The cross-codec case gets its own rule instead.
-const REVIEW_METRICS: [Priority; 2] = [Priority::Length, Priority::Resolution];
+/// Report-only runs pass `None` and never construct one of these, so the type
+/// carries the promise the README makes: there is no value of any argument to
+/// this module that removes a file without the caller having decided to.
+#[derive(Clone, Debug)]
+pub enum Disposal {
+    /// The system trash, via the FreeDesktop.org spec. Recoverable, and the
+    /// default -- but it needs a trash directory on the file's own filesystem,
+    /// which external drives, NFS mounts and headless servers frequently do not
+    /// have. `MoveTo` is the answer when it doesn't.
+    Trash,
+    /// unlink(2). Irreversible.
+    Permanent,
+    /// Relocate under a folder, mirroring the file's absolute path.
+    MoveTo(PathBuf),
+}
+
+impl Disposal {
+    /// Label for the results table once the file has been dealt with.
+    fn done_label(&self) -> &'static str {
+        match self {
+            Disposal::Trash | Disposal::Permanent => "DELETED",
+            Disposal::MoveTo(_) => "MOVED",
+        }
+    }
+
+    /// Short name for the machine-readable summary.
+    fn mode(&self) -> &'static str {
+        match self {
+            Disposal::Trash => "trash",
+            Disposal::Permanent => "permanent",
+            Disposal::MoveTo(_) => "move",
+        }
+    }
+}
 
 /// A duration in seconds for the machine-readable outputs, rounded the same way
 /// the JSON rounds it, or an empty field when it was never measured.
@@ -67,33 +90,141 @@ fn changed_since_scan(fp: &VideoFingerprint) -> Option<String> {
     })
 }
 
-/// Remove a single file, either by moving it to the system trash (default,
-/// recoverable) or by deleting it permanently. Trash semantics are handled by
-/// the `trash` crate, which implements the FreeDesktop.org spec on Linux.
-fn remove_path(path: &str, permanent: bool) -> Result<()> {
-    if permanent {
-        std::fs::remove_file(path)
-            .with_context(|| format!("Failed to permanently delete {}", path))?;
-    } else {
-        trash::delete(path)
-            .map_err(|e| anyhow!("Failed to move {} to trash: {}", path, e))?;
+/// Get a single file out of the way, however the user asked for that to happen.
+fn dispose_of(path: &str, disposal: &Disposal) -> Result<()> {
+    match disposal {
+        Disposal::Permanent => std::fs::remove_file(path)
+            .with_context(|| format!("Failed to permanently delete {}", path)),
+        Disposal::Trash => {
+            trash::delete(path).map_err(|e| anyhow!("Failed to move {} to trash: {}", path, e))
+        }
+        Disposal::MoveTo(dest_root) => move_under(path, dest_root),
     }
+}
+
+/// Relocate `path` under `dest_root`, recreating its absolute path inside it.
+///
+/// `/mnt/media/show/ep.mkv` with `--move-to /backup/dupes` lands at
+/// `/backup/dupes/mnt/media/show/ep.mkv`. Mirroring rather than flattening is
+/// what makes the destination collision-free without inventing names: every
+/// scanned path is canonical and unique, so no two files can ever want the same
+/// slot, and a whole run can be undone with a single `cp -a` from the
+/// destination root. Flattening would need a disambiguation scheme, and a
+/// disambiguation scheme is a thing that can be got wrong while holding the
+/// only remaining copy of a file.
+fn move_under(path: &str, dest_root: &Path) -> Result<()> {
+    let src = Path::new(path);
+
+    // Scanned paths are always absolute (sources.rs canonicalizes every one), so
+    // this strip is what turns the mirror into a join rather than an overwrite
+    // of dest_root itself.
+    let relative = src.strip_prefix("/").unwrap_or(src);
+    let dest = dest_root.join(relative);
+
+    let parent = dest
+        .parent()
+        .ok_or_else(|| anyhow!("Failed to move {}: {} has no parent", path, dest.display()))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("Failed to create {}", parent.display()))?;
+
+    // rename(2) replaces an existing file without a word, which would destroy
+    // whatever an earlier run put there -- reachable whenever a path is moved
+    // away, recreated, and moved away again. symlink_metadata rather than
+    // exists() because a broken symlink occupying the slot is still something
+    // rename would silently consume.
+    if std::fs::symlink_metadata(&dest).is_ok() {
+        return Err(anyhow!(
+            "Failed to move {}: {} already exists (an earlier run moved a file from this path)",
+            path,
+            dest.display()
+        ));
+    }
+
+    match std::fs::rename(src, &dest) {
+        Ok(()) => Ok(()),
+        // The whole reason this mode is worth having on a NAS: the destination
+        // is routinely on a different filesystem from the library.
+        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => copy_then_unlink(src, &dest),
+        Err(e) => Err(anyhow!(
+            "Failed to move {} to {}: {}",
+            path,
+            dest.display(),
+            e
+        )),
+    }
+}
+
+/// The cross-filesystem fallback: copy, make it durable, then unlink.
+///
+/// Both failure paths put the filesystem back the way they found it. A copy
+/// that fails leaves a partial file that would make the next run's
+/// already-exists check fire for no reason; an unlink that fails leaves the
+/// original in place, which makes the copy the redundant one. Either way the
+/// caller is told the move failed, and that is exactly what happened.
+fn copy_then_unlink(src: &Path, dest: &Path) -> Result<()> {
+    let meta = std::fs::metadata(src)
+        .with_context(|| format!("Failed to stat {}", src.display()))?;
+
+    if let Err(e) = copy_durably(src, dest, &meta) {
+        let _ = std::fs::remove_file(dest);
+        return Err(e);
+    }
+
+    std::fs::remove_file(src).map_err(|e| {
+        let _ = std::fs::remove_file(dest);
+        anyhow!(
+            "Failed to remove {} after copying it to {}: {}",
+            src.display(),
+            dest.display(),
+            e
+        )
+    })
+}
+
+fn copy_durably(src: &Path, dest: &Path, meta: &std::fs::Metadata) -> Result<()> {
+    std::fs::copy(src, dest)
+        .with_context(|| format!("Failed to copy {} to {}", src.display(), dest.display()))?;
+
+    let file = OpenOptions::new()
+        .write(true)
+        .open(dest)
+        .with_context(|| format!("Failed to reopen {}", dest.display()))?;
+
+    // Best effort, deliberately. A destination that will not carry timestamps
+    // is not a reason to fail a move that has otherwise worked -- but carrying
+    // them matters, because a restored file with its original mtime is a cache
+    // hit rather than a re-decode of the whole library.
+    let mut times = FileTimes::new();
+    if let Ok(accessed) = meta.accessed() {
+        times = times.set_accessed(accessed);
+    }
+    if let Ok(modified) = meta.modified() {
+        times = times.set_modified(modified);
+    }
+    let _ = file.set_times(times);
+
+    // The unlink that follows is the point of no return, so the bytes have to
+    // be on the far disk before it happens -- not merely in the page cache of a
+    // machine that is about to be power-cycled.
+    file.sync_all()
+        .with_context(|| format!("Failed to flush {} to disk", dest.display()))?;
+
     Ok(())
 }
 
 /// Report every duplicate group, act on the deletion flags, and hand back the
-/// paths that are no longer on disk as a result.
+/// paths that are no longer where they were as a result.
 ///
 /// That list is the caller's cue to forget those files' cached fingerprints. It
 /// is deliberately a return value rather than a database handle passed in the
 /// other direction: this module decides which files die, and knowing nothing
 /// about the cache is what keeps that the only thing it decides.
 ///
-/// It carries only what was successfully removed. A file that failed to delete,
-/// or that was skipped because it changed under us, is still sitting there --
-/// and in the second case its cached fingerprint is already invalid by size, so
-/// the next run re-fingerprints it without being told anything here.
-/// Trashed files count as removed: the trash is somewhere else, and nothing
+/// It carries only what was successfully disposed of. A file that failed, or
+/// that was skipped because it changed under us, is still sitting there -- and
+/// in the second case its cached fingerprint is already invalid by size, so the
+/// next run re-fingerprints it without being told anything here. Trashed and
+/// moved files both count as gone: they are somewhere else now, and nothing
 /// will ever find this fingerprint under the path it was cached against.
 pub fn output_results(
     final_groups: &[Vec<usize>],
@@ -102,17 +233,10 @@ pub fn output_results(
     output_file: Option<&String>,
     total_elapsed_secs: u64,
     priority: Priority,
-    delete: bool,
-    permanent: bool,
+    disposal: Option<&Disposal>,
     stats: &RunStats,
 ) -> Result<Vec<String>> {
-
-    // `--permanent` only has meaning alongside `--delete`; on its own it must
-    // never trigger any destructive action.
-    if permanent && !delete {
-        info!("Note: --permanent has no effect without --delete; running in report-only mode.");
-    }
-    let permanent_delete = permanent && delete;
+    let acting = disposal.is_some();
 
     // --- Pass 1: resolve each file's fate across ALL groups ------------------
     // Clusters overlap, so a file can appear in several groups with different
@@ -238,30 +362,41 @@ pub fn output_results(
         delete_candidates.difference(&review_set).copied().collect();
     delete_indices.sort_unstable();
 
-    // --- Pass 2: delete each unique target exactly once ----------------------
-    let mut deleted_count = 0usize;
+    // --- Pass 2: act on each unique target exactly once ----------------------
+    let mut removed_count = 0usize;
     let mut failed_count = 0usize;
     let mut changed_count = 0usize;
-    let mut freed_bytes = 0u64;
+    let mut removed_bytes = 0u64;
     let delete_candidate_count = delete_indices.len();
 
-    // What this function returns. Only paths that are genuinely gone go in
-    // here, so it is built next to the counter rather than reconstructed from
-    // `delete_indices` afterwards -- the two would differ by every failure,
-    // every file that changed under us, and everything an interrupt left
-    // untouched.
+    // What a run WOULD reclaim, computed from the same set the loop below
+    // walks, so the dry run's figure and the real run's figure cannot disagree
+    // about which files they describe. Sizes come from the fingerprints, which
+    // the deletion pass re-checks against disk before touching anything, and
+    // the set is index-based -- so a file appearing in three groups, or reached
+    // through a hard link, contributes its bytes once.
+    let reclaimable_bytes: u64 = delete_indices
+        .iter()
+        .map(|&idx| fingerprints[idx].file_size)
+        .sum();
+
+    // What this function returns. Only paths that are genuinely no longer there
+    // go in here, so it is built next to the counter rather than reconstructed
+    // from `delete_indices` afterwards -- the two would differ by every
+    // failure, every file that changed under us, and everything an interrupt
+    // left untouched.
     let mut deleted_paths: Vec<String> = Vec::new();
 
     // Maps a file index to the outcome label to print in the results table.
     let mut delete_outcome: HashMap<usize, &'static str> = HashMap::new();
 
-    if delete {
+    if let Some(disposal) = disposal {
         for &idx in &delete_indices {
             if shutdown_requested() {
                 info!(
-                    "Interrupted: stopped after {} deletion(s); {} file(s) left untouched.",
-                    deleted_count,
-                    delete_candidate_count - deleted_count - failed_count - changed_count
+                    "Interrupted: stopped after {} file(s); {} left untouched.",
+                    removed_count,
+                    delete_candidate_count - removed_count - failed_count - changed_count
                 );
                 break;
             }
@@ -273,7 +408,7 @@ pub fn output_results(
             // that may be hours old.
             if let Some(detail) = changed_since_scan(fp) {
                 log::error!(
-                    "Not deleting {}: it changed on disk after it was scanned",
+                    "Not removing {}: it changed on disk after it was scanned",
                     fp.path
                 );
                 changed_count += 1;
@@ -282,12 +417,12 @@ pub fn output_results(
                 continue;
             }
 
-            match remove_path(&fp.path, permanent_delete) {
+            match dispose_of(&fp.path, disposal) {
                 Ok(()) => {
-                    deleted_count += 1;
-                    freed_bytes += fp.file_size;
+                    removed_count += 1;
+                    removed_bytes += fp.file_size;
                     deleted_paths.push(fp.path.clone());
-                    delete_outcome.insert(idx, "DELETED");
+                    delete_outcome.insert(idx, disposal.done_label());
                 }
                 Err(e) => {
                     log::error!("{:#}", e);
@@ -411,18 +546,18 @@ pub fn output_results(
             // A file that is redundant in an overlapping group is shown DELETE/
             // DELETED in every group, including one where it was the local best.
             // In a dry run the delete targets stay as the recommendation DELETE;
-            // with --delete they become DELETED, FAILED if the removal errored,
-            // or CHANGED if the file stopped matching its fingerprint before we
-            // got to it.
+            // once armed they become DELETED or MOVED, FAILED if that errored, or
+            // CHANGED if the file stopped matching its fingerprint before we got
+            // to it.
             let action_str = if review_set.contains(&idx) {
                 "REVIEW"
             } else if delete_candidates.contains(&idx) {
-                if delete {
+                if acting {
                     delete_outcome.get(&idx).copied().unwrap_or("SKIPPED")
                 } else {
                     "DELETE"
                 }
-            } else if delete {
+            } else if acting {
                 "KEPT"
             } else {
                 "KEEP"
@@ -521,20 +656,48 @@ pub fn output_results(
         total_secs
     );
 
-    if delete {
-        if permanent_delete {
+    match disposal {
+        // The figure a dry run exists to produce. Printing it only after the
+        // files are gone is printing it to the one person who no longer needs
+        // it -- the decision is made here, on the strength of this number.
+        None => {
+            if delete_candidate_count > 0 {
+                summary.push_str(&format!(
+                    "\nReclaimable: {} across {} file(s) marked DELETE (nothing was removed).",
+                    format_size(reclaimable_bytes),
+                    delete_candidate_count
+                ));
+            }
+        }
+        Some(Disposal::Permanent) => {
             summary.push_str(&format!(
                 "\nPermanently deleted {} file(s), {} freed.",
-                deleted_count,
-                format_size(freed_bytes)
-            ));
-        } else {
-            summary.push_str(&format!(
-                "\nMoved {} file(s) to trash ({} total).",
-                deleted_count,
-                format_size(freed_bytes)
+                removed_count,
+                format_size(removed_bytes)
             ));
         }
+        Some(Disposal::Trash) => {
+            summary.push_str(&format!(
+                "\nMoved {} file(s) to trash ({} total).",
+                removed_count,
+                format_size(removed_bytes)
+            ));
+        }
+        // Deliberately not "freed": if the destination is on the same
+        // filesystem the bytes have not gone anywhere, and claiming otherwise
+        // in the one mode where it might not be true is how a summary stops
+        // being trusted.
+        Some(Disposal::MoveTo(dir)) => {
+            summary.push_str(&format!(
+                "\nMoved {} file(s) ({} total) under {}.",
+                removed_count,
+                format_size(removed_bytes),
+                dir.display()
+            ));
+        }
+    }
+
+    if acting {
         if failed_count > 0 {
             summary.push_str(&format!(
                 "\n{} file(s) could not be removed (see errors above).",
@@ -553,11 +716,9 @@ pub fn output_results(
     info!("{}", summary);
 
     // Helpful nudge when there's something to clean up but nothing was touched.
-    if !delete && delete_candidate_count > 0 {
+    if !acting && delete_candidate_count > 0 {
         info!(
-            "\nRun with --delete to move the {} file(s) marked DELETE to the trash \
-             (add --permanent to remove them for good).",
-            delete_candidate_count
+            "\nRun with --delete to move the file(s) marked DELETE to the trash or with --move-to <DIR> to relocate them instead."
         );
     }
 
@@ -582,9 +743,21 @@ pub fn output_results(
                         "total_groups": final_groups.len(),
                         "total_files_matched": matched_file_count,
                         "time_elapsed_seconds": total_elapsed_secs,
-                        "deletion_enabled": delete,
-                        "permanent": permanent_delete,
-                        "files_deleted": deleted_count,
+                        "deletion_enabled": acting,
+                        "mode": disposal.map(|d| d.mode()).unwrap_or("report"),
+                        "move_to": match disposal {
+                            Some(Disposal::MoveTo(dir)) => {
+                                Some(dir.to_string_lossy().to_string())
+                            }
+                            _ => None,
+                        },
+                        // What the run would reclaim, present whether or not it
+                        // did anything: a dry run's whole output is a plan, and
+                        // a plan with no cost attached is not one.
+                        "files_marked_delete": delete_candidate_count,
+                        "reclaimable_bytes": reclaimable_bytes,
+                        "files_removed": removed_count,
+                        "bytes_removed": removed_bytes,
                         "files_failed": failed_count,
                         "files_changed": changed_count,
                     },
@@ -609,6 +782,21 @@ pub fn output_results(
 
     Ok(deleted_paths)
 }
+
+/// Metrics that can justify a REVIEW flag, in default precedence order.
+///
+/// These are also exactly the metrics that mean the same thing regardless of
+/// codec, which is why the same list does double duty above as the definition
+/// of a group's genuine contenders.
+///
+/// Quality and size are absent, for different reasons. Size carries no quality
+/// information that quality and length don't already express (size IS quality x
+/// frame rate x length), so flagging on it would only ever repeat a flag one of
+/// those two already raised. Quality is absent because it is only meaningful
+/// within a single codec: across codecs it deliberately ties, so a REVIEW
+/// derived from it would be reporting a comparison this tool has just declared
+/// impossible. The cross-codec case gets its own rule instead.
+const REVIEW_METRICS: [Priority; 2] = [Priority::Length, Priority::Resolution];
 
 #[cfg(test)]
 mod tests {
@@ -668,14 +856,19 @@ full_path;action";
         dir.path().join(name).to_string_lossy().to_string()
     }
 
+    /// Where `--move-to <root>` will put the file currently at `path`.
+    fn landing_spot(root: &Path, path: &str) -> PathBuf {
+        root.join(Path::new(path).strip_prefix("/").unwrap())
+    }
+
     /// Put a real file on disk at `fp.path`, exactly as long as the fingerprint
     /// claims it is.
     ///
-    /// Mandatory for anything running with `delete: true`: the deletion path
-    /// re-stats every target and refuses to remove one whose length no longer
-    /// matches, so a mock claiming 7.8 MB against an empty temp file is skipped
-    /// as CHANGED rather than deleted. `set_len` leaves the file sparse, so a
-    /// 24 MB mock costs one syscall and no blocks.
+    /// Mandatory for anything running armed: the deletion path re-stats every
+    /// target and refuses to touch one whose length no longer matches, so a
+    /// mock claiming 7.8 MB against an empty temp file is skipped as CHANGED
+    /// rather than removed. `set_len` leaves the file sparse, so a 24 MB mock
+    /// costs one syscall and no blocks.
     fn materialize(fp: &VideoFingerprint) {
         fs::File::create(&fp.path)
             .unwrap()
@@ -707,6 +900,10 @@ full_path;action";
             .to_string()
     }
 
+    fn read_json(path: &str) -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
     #[test]
     fn test_csv_output() {
         let fps = vec![mock_fp()];
@@ -716,7 +913,7 @@ full_path;action";
 
         // Report-only run: single item defaults to KEEP.
         let deleted = output_results(
-            &groups, &fps, &no_matches(), Some(&path_str), 120, Priority::Length, false, false,
+            &groups, &fps, &no_matches(), Some(&path_str), 120, Priority::Length, None,
             &RunStats::default(),
         ).unwrap();
 
@@ -735,6 +932,62 @@ full_path;action";
         ), "{}", contents);
 
         // Clean up
+        let _ = fs::remove_file(path_str);
+    }
+
+    #[test]
+    fn test_a_dry_run_says_what_it_would_reclaim() {
+        // The number the decision is actually made on. It has to be available
+        // BEFORE anything is removed, which is the one case where the old
+        // "freed" figure was never printed at all.
+        let fps = vec![
+            mock_fp_at("/fake/keep.mkv", 100.0),
+            mock_fp_at("/fake/dupe.mkv", 10.0),
+        ];
+        let groups = vec![vec![0, 1]];
+        let path_str = report_to("json");
+
+        output_results(
+            &groups, &fps, &no_matches(), Some(&path_str), 0, Priority::Length, None,
+            &RunStats::default(),
+        ).unwrap();
+
+        let summary = read_json(&path_str)["summary"].clone();
+
+        assert_eq!(summary["mode"], "report");
+        assert_eq!(summary["files_marked_delete"], 1);
+        assert_eq!(
+            summary["reclaimable_bytes"], 1_310_720u64,
+            "the DELETE target's bytes, and only those"
+        );
+        assert_eq!(summary["files_removed"], 0, "and nothing actually happened");
+        assert_eq!(summary["bytes_removed"], 0u64);
+
+        let _ = fs::remove_file(path_str);
+    }
+
+    #[test]
+    fn test_reclaimable_counts_a_file_shared_by_two_groups_once() {
+        // The same arithmetic trap total_files_matched has: file 2 is a DELETE
+        // target in both groups, and a figure that double-counted it would
+        // promise the user space that does not exist.
+        let fps = vec![
+            mock_fp_at("/fake/best_a.mkv", 60.0),
+            mock_fp_at("/fake/best_b.mkv", 60.0),
+            mock_fp_at("/fake/shared.mkv", 10.0),
+        ];
+        let groups = vec![vec![0, 2], vec![1, 2]];
+        let path_str = report_to("json");
+
+        output_results(
+            &groups, &fps, &no_matches(), Some(&path_str), 0, Priority::Length, None,
+            &RunStats::default(),
+        ).unwrap();
+
+        let summary = read_json(&path_str)["summary"].clone();
+        assert_eq!(summary["files_marked_delete"], 1);
+        assert_eq!(summary["reclaimable_bytes"], 1_310_720u64);
+
         let _ = fs::remove_file(path_str);
     }
 
@@ -759,17 +1012,16 @@ full_path;action";
         let json_path = report_to("json");
 
         output_results(
-            &groups, &fps, &matches, Some(&csv_path), 0, Priority::Length, false, false,
+            &groups, &fps, &matches, Some(&csv_path), 0, Priority::Length, None,
             &RunStats::default(),
         ).unwrap();
         output_results(
-            &groups, &fps, &matches, Some(&json_path), 0, Priority::Length, false, false,
+            &groups, &fps, &matches, Some(&json_path), 0, Priority::Length, None,
             &RunStats::default(),
         ).unwrap();
 
         let csv = fs::read_to_string(&csv_path).unwrap();
-        let report: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&json_path).unwrap()).unwrap();
+        let report = read_json(&json_path);
         let file = &report["results"][0]["files"][0];
 
         assert!(
@@ -813,7 +1065,7 @@ full_path;action";
         let path_str = report_to("csv");
 
         output_results(
-            &groups, &fps, &matches, Some(&path_str), 0, Priority::Length, false, false,
+            &groups, &fps, &matches, Some(&path_str), 0, Priority::Length, None,
             &RunStats::default(),
         ).unwrap();
 
@@ -845,7 +1097,7 @@ full_path;action";
         let path_str = report_to("csv");
 
         output_results(
-            &groups, &fps, &matches, Some(&path_str), 0, Priority::Length, false, false,
+            &groups, &fps, &matches, Some(&path_str), 0, Priority::Length, None,
             &RunStats::default(),
         ).unwrap();
 
@@ -875,12 +1127,11 @@ full_path;action";
         let path_str = report_to("json");
 
         output_results(
-            &groups, &fps, &no_matches(), Some(&path_str), 0, Priority::Length, false, false,
+            &groups, &fps, &no_matches(), Some(&path_str), 0, Priority::Length, None,
             &RunStats::default(),
         ).unwrap();
 
-        let report: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path_str).unwrap()).unwrap();
+        let report = read_json(&path_str);
 
         assert_eq!(report["summary"]["total_groups"], 2);
         assert_eq!(
@@ -908,12 +1159,11 @@ full_path;action";
         let path_str = report_to("json");
 
         output_results(
-            &groups, &fps, &matches, Some(&path_str), 0, Priority::Length, false, false,
+            &groups, &fps, &matches, Some(&path_str), 0, Priority::Length, None,
             &RunStats::default(),
         ).unwrap();
 
-        let report: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path_str).unwrap()).unwrap();
+        let report = read_json(&path_str);
         let group = &report["results"][0];
 
         assert_eq!(group["files"][0]["shared_seconds"], 80.0);
@@ -939,16 +1189,15 @@ full_path;action";
         let csv_path = report_to("csv");
 
         output_results(
-            &groups, &fps, &no_matches(), Some(&json_path), 0, Priority::Length, false, false,
+            &groups, &fps, &no_matches(), Some(&json_path), 0, Priority::Length, None,
             &RunStats::default(),
         ).unwrap();
         output_results(
-            &groups, &fps, &no_matches(), Some(&csv_path), 0, Priority::Length, false, false,
+            &groups, &fps, &no_matches(), Some(&csv_path), 0, Priority::Length, None,
             &RunStats::default(),
         ).unwrap();
 
-        let report: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&json_path).unwrap()).unwrap();
+        let report = read_json(&json_path);
         let file = &report["results"][0]["files"][0];
 
         assert!(file["framerate_fps"].is_null(), "unknown is not 0 fps");
@@ -985,7 +1234,8 @@ full_path;action";
         let stats = RunStats::default();
 
         let deleted = output_results(
-            &groups, &fps, &no_matches(), None, 0, Priority::Length, true, true, &stats,
+            &groups, &fps, &no_matches(), None, 0, Priority::Length,
+            Some(&Disposal::Permanent), &stats,
         ).unwrap();
 
         assert!(Path::new(&keep_path).exists(), "KEEP file must remain");
@@ -996,6 +1246,174 @@ full_path;action";
             vec![del_path],
             "the caller is told exactly which fingerprints to forget"
         );
+    }
+
+    #[test]
+    fn test_move_to_relocates_a_duplicate_under_a_mirrored_path() {
+        // The mode that exists because trash::delete fails on exactly the
+        // storage this tool is most useful on: an external disk with no
+        // .Trash-1000, an NFS export, a headless box with no XDG trash dir.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let keep_path = at(&dir, "keep.mkv");
+        let dup_path = at(&dir, "duplicate.mkv");
+
+        let fps = vec![
+            mock_fp_at(&keep_path, 60.0),
+            mock_fp_at(&dup_path, 10.0),
+        ];
+        materialize_all(&fps);
+
+        let groups = vec![vec![0, 1]];
+        let stats = RunStats::default();
+        let path_str = report_to("json");
+
+        let moved = output_results(
+            &groups, &fps, &no_matches(), Some(&path_str), 0, Priority::Length,
+            Some(&Disposal::MoveTo(dest.path().to_path_buf())), &stats,
+        ).unwrap();
+
+        let landed = landing_spot(dest.path(), &dup_path);
+
+        assert!(Path::new(&keep_path).exists(), "the KEEP pick is untouched");
+        assert!(!Path::new(&dup_path).exists(), "the duplicate left its original path");
+        assert!(landed.exists(), "and arrived at {}", landed.display());
+        assert_eq!(
+            fs::metadata(&landed).unwrap().len(),
+            fps[1].file_size,
+            "a move must not change the file"
+        );
+        assert!(!stats.had_problems());
+        assert_eq!(
+            moved,
+            vec![dup_path],
+            "a moved file is no longer at the path its fingerprint was cached under"
+        );
+
+        let report = read_json(&path_str);
+        assert_eq!(report["results"][0]["files"][1]["action"], "MOVED");
+        assert_eq!(report["summary"]["mode"], "move");
+        assert_eq!(report["summary"]["files_removed"], 1);
+        assert_eq!(report["summary"]["bytes_removed"], 1_310_720u64);
+
+        let _ = fs::remove_file(path_str);
+    }
+
+    #[test]
+    fn test_move_to_mirrors_the_source_tree_so_two_files_cannot_collide() {
+        // The reason the destination mirrors absolute paths instead of
+        // flattening basenames: `Season 1/ep01.mkv` and `Season 2/ep01.mkv` are
+        // routine, and a flat destination would need a naming scheme -- a thing
+        // that can be got wrong while holding the only remaining copy.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+
+        let keep_path = at(&dir, "keep.mkv");
+        let a_path = dir.path().join("season_1").join("ep01.mkv");
+        let b_path = dir.path().join("season_2").join("ep01.mkv");
+        fs::create_dir_all(a_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(b_path.parent().unwrap()).unwrap();
+
+        let a = a_path.to_string_lossy().to_string();
+        let b = b_path.to_string_lossy().to_string();
+
+        let fps = vec![
+            mock_fp_at(&keep_path, 60.0),
+            mock_fp_at(&a, 10.0),
+            mock_fp_at(&b, 10.0),
+        ];
+        materialize_all(&fps);
+
+        let groups = vec![vec![0, 1, 2]];
+        let stats = RunStats::default();
+
+        let mut moved = output_results(
+            &groups, &fps, &no_matches(), None, 0, Priority::Length,
+            Some(&Disposal::MoveTo(dest.path().to_path_buf())), &stats,
+        ).unwrap();
+        moved.sort();
+
+        assert!(landing_spot(dest.path(), &a).exists());
+        assert!(landing_spot(dest.path(), &b).exists());
+        assert_eq!(stats.delete_failed.count(), 0, "same basename, different slots");
+
+        let mut expected = vec![a, b];
+        expected.sort();
+        assert_eq!(moved, expected);
+    }
+
+    #[test]
+    fn test_move_to_never_overwrites_what_an_earlier_run_put_there() {
+        // rename(2) replaces an existing file silently. Reachable whenever a
+        // path is moved away, recreated, and moved away again -- and the file
+        // it would destroy is one the user deliberately kept out of the trash.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let keep_path = at(&dir, "keep.mkv");
+        let dup_path = at(&dir, "duplicate.mkv");
+
+        let fps = vec![
+            mock_fp_at(&keep_path, 60.0),
+            mock_fp_at(&dup_path, 10.0),
+        ];
+        materialize_all(&fps);
+
+        let landed = landing_spot(dest.path(), &dup_path);
+        fs::create_dir_all(landed.parent().unwrap()).unwrap();
+        fs::write(&landed, b"an earlier run's copy").unwrap();
+
+        let groups = vec![vec![0, 1]];
+        let stats = RunStats::default();
+
+        let moved = output_results(
+            &groups, &fps, &no_matches(), None, 0, Priority::Length,
+            Some(&Disposal::MoveTo(dest.path().to_path_buf())), &stats,
+        ).unwrap();
+
+        assert!(Path::new(&dup_path).exists(), "the source must survive a refused move");
+        assert_eq!(
+            fs::read(&landed).unwrap(),
+            b"an earlier run's copy",
+            "and the file already there must be exactly as it was"
+        );
+        assert_eq!(stats.delete_failed.count(), 1);
+        assert!(stats.had_problems(), "a move the run was told to make and did not make");
+        assert!(moved.is_empty(), "nothing moved, so no fingerprint may be forgotten");
+    }
+
+    #[test]
+    fn test_a_target_that_changed_since_the_scan_is_not_moved_either() {
+        // The staleness guard is about the decision, not about the disposal, so
+        // it has to hold in every mode. A file that grew is no longer the file
+        // that was judged redundant, whether it was about to be deleted or
+        // quarantined.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let keep_path = at(&dir, "keep.mkv");
+        let grew_path = at(&dir, "still_downloading.mkv");
+
+        let fps = vec![
+            mock_fp_at(&keep_path, 60.0),
+            mock_fp_at(&grew_path, 10.0),
+        ];
+        materialize_all(&fps);
+        fs::File::create(&grew_path)
+            .unwrap()
+            .set_len(fps[1].file_size + 4096)
+            .unwrap();
+
+        let groups = vec![vec![0, 1]];
+        let stats = RunStats::default();
+
+        let moved = output_results(
+            &groups, &fps, &no_matches(), None, 0, Priority::Length,
+            Some(&Disposal::MoveTo(dest.path().to_path_buf())), &stats,
+        ).unwrap();
+
+        assert!(Path::new(&grew_path).exists());
+        assert!(!landing_spot(dest.path(), &grew_path).exists());
+        assert_eq!(stats.delete_stale.count(), 1);
+        assert!(moved.is_empty());
     }
 
     #[test]
@@ -1025,8 +1443,8 @@ full_path;action";
         let path_str = report_to("json");
 
         let deleted = output_results(
-            &groups, &fps, &no_matches(), Some(&path_str), 0, Priority::Length, true, true,
-            &stats,
+            &groups, &fps, &no_matches(), Some(&path_str), 0, Priority::Length,
+            Some(&Disposal::Permanent), &stats,
         ).unwrap();
 
         assert!(Path::new(&grew_path).exists(), "a file that changed under us must survive");
@@ -1041,11 +1459,10 @@ full_path;action";
             "a deletion the run was told to make and did not make must fail the run"
         );
 
-        let report: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path_str).unwrap()).unwrap();
+        let report = read_json(&path_str);
         assert_eq!(report["results"][0]["files"][1]["action"], "CHANGED");
         assert_eq!(report["summary"]["files_changed"], 1);
-        assert_eq!(report["summary"]["files_deleted"], 0);
+        assert_eq!(report["summary"]["files_removed"], 0);
 
         let _ = fs::remove_file(path_str);
     }
@@ -1072,7 +1489,8 @@ full_path;action";
         let stats = RunStats::default();
 
         output_results(
-            &groups, &fps, &no_matches(), None, 0, Priority::Length, true, true, &stats,
+            &groups, &fps, &no_matches(), None, 0, Priority::Length,
+            Some(&Disposal::Permanent), &stats,
         ).unwrap();
 
         assert!(Path::new(&shrunk_path).exists());
@@ -1104,8 +1522,8 @@ full_path;action";
         let groups = vec![vec![0, 1], vec![1, 2]];
 
         let mut deleted = output_results(
-            &groups, &fps, &no_matches(), None, 0, Priority::Length, true, true,
-            &RunStats::default(),
+            &groups, &fps, &no_matches(), None, 0, Priority::Length,
+            Some(&Disposal::Permanent), &RunStats::default(),
         ).unwrap();
         deleted.sort();
 
@@ -1141,7 +1559,8 @@ full_path;action";
 
         // Previously errored on the second deletion attempt; must succeed now.
         let deleted = output_results(
-            &groups, &fps, &no_matches(), None, 0, Priority::Length, true, true, &stats,
+            &groups, &fps, &no_matches(), None, 0, Priority::Length,
+            Some(&Disposal::Permanent), &stats,
         ).unwrap();
 
         assert!(Path::new(&p0).exists(), "independent best A must remain");
@@ -1177,8 +1596,8 @@ full_path;action";
         let groups = vec![vec![0, 1]];
 
         output_results(
-            &groups, &fps, &no_matches(), None, 0, Priority::Length, true, true,
-            &RunStats::default(),
+            &groups, &fps, &no_matches(), None, 0, Priority::Length,
+            Some(&Disposal::Permanent), &RunStats::default(),
         ).unwrap();
 
         assert!(Path::new(&p_hi).exists(), "higher-quality copy must be kept");
@@ -1208,16 +1627,15 @@ full_path;action";
         let path_str = report_to("json");
 
         let deleted = output_results(
-            &groups, &fps, &no_matches(), Some(&path_str), 0, Priority::Length, true, true,
-            &RunStats::default(),
+            &groups, &fps, &no_matches(), Some(&path_str), 0, Priority::Length,
+            Some(&Disposal::Permanent), &RunStats::default(),
         ).unwrap();
 
         assert!(Path::new(&p_h264).exists(), "the h264 copy must survive");
         assert!(Path::new(&p_av1).exists(), "the av1 copy must survive");
         assert!(deleted.is_empty(), "a standoff deletes nothing, so it forgets nothing");
 
-        let report: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path_str).unwrap()).unwrap();
+        let report = read_json(&path_str);
         let files = &report["results"][0]["files"];
         assert_eq!(files[0]["action"], "REVIEW");
         assert_eq!(files[1]["action"], "REVIEW");
@@ -1247,8 +1665,8 @@ full_path;action";
         let groups = vec![vec![0, 1, 2]];
 
         output_results(
-            &groups, &fps, &no_matches(), None, 0, Priority::Length, true, true,
-            &RunStats::default(),
+            &groups, &fps, &no_matches(), None, 0, Priority::Length,
+            Some(&Disposal::Permanent), &RunStats::default(),
         ).unwrap();
 
         assert!(Path::new(&p_h264).exists(), "1080p h264 is a contender");
@@ -1283,8 +1701,8 @@ full_path;action";
         let groups = vec![vec![0, 1, 2, 3, 4]];
 
         output_results(
-            &groups, &fps, &no_matches(), None, 0, Priority::Length, true, true,
-            &RunStats::default(),
+            &groups, &fps, &no_matches(), None, 0, Priority::Length,
+            Some(&Disposal::Permanent), &RunStats::default(),
         ).unwrap();
 
         assert!(Path::new(&h264_best).exists(), "best h264 is its codec's champion");
@@ -1317,8 +1735,8 @@ full_path;action";
         let groups = vec![vec![0, 1, 2]];
 
         output_results(
-            &groups, &fps, &no_matches(), None, 0, Priority::Length, true, true,
-            &RunStats::default(),
+            &groups, &fps, &no_matches(), None, 0, Priority::Length,
+            Some(&Disposal::Permanent), &RunStats::default(),
         ).unwrap();
 
         assert!(Path::new(&z_best).exists(), "the denser h264 copy must win its codec");
@@ -1347,8 +1765,8 @@ full_path;action";
         let groups = vec![vec![0, 1]];
 
         output_results(
-            &groups, &fps, &no_matches(), None, 0, Priority::Length, true, true,
-            &RunStats::default(),
+            &groups, &fps, &no_matches(), None, 0, Priority::Length,
+            Some(&Disposal::Permanent), &RunStats::default(),
         ).unwrap();
 
         assert!(Path::new(&p_long).exists(), "the longer copy is the KEEP pick");
@@ -1372,7 +1790,8 @@ full_path;action";
         let stats = RunStats::default();
 
         let deleted = output_results(
-            &groups, &fps, &no_matches(), None, 0, Priority::Length, true, true, &stats,
+            &groups, &fps, &no_matches(), None, 0, Priority::Length,
+            Some(&Disposal::Permanent), &stats,
         ).unwrap();
 
         assert_eq!(stats.delete_failed.count(), 1, "the failure must be tallied");

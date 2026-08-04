@@ -184,6 +184,40 @@ vid-fp ~/Videos -r --delete
 vid-fp ~/Videos -r --delete --permanent
 ```
 
+### Moving instead of deleting
+
+The system trash needs a trash directory on the file's own filesystem, which
+external drives, NFS mounts and headless servers frequently don't have.
+In those cases try `--move-to` instead:
+
+```bash
+# Relocate the redundant copies instead of trashing them
+vid-fp /mnt/media -r --move-to /mnt/scratch/dupes
+```
+
+This isn't a deletion, so it doesn't need `--delete`'s permission — `--move-to`
+arms the run by itself. If `--delete` or `--permanent` is passed alongside it,
+the files are still moved and a note says so; nothing is removed.
+
+Each file's **absolute path is recreated inside the destination**:
+`/mnt/media/show/ep01.mkv` lands at `/mnt/scratch/dupes/mnt/media/show/ep01.mkv`.
+That means two files with the same name never collide, you can see where each one
+came from, and the whole run is undone with a single copy back:
+
+```bash
+cp -a /mnt/scratch/dupes/. /
+```
+
+Nothing is ever overwritten: if the destination slot is already occupied (an
+earlier run moved a file from that path, and the path was recreated since), the
+move is refused and reported as a problem rather than silently replacing what's
+there. A destination on another filesystem is copied, flushed to disk, and only
+then unlinked — and if either step fails, the original is left exactly where it
+was. Timestamps and permissions are preserved.
+
+The destination must sit outside the scanned folders; the run aborts if it
+doesn't, since moving files into the scan just feeds them back in next time.
+
 ## Options
 
 | Flag | Description | Default |
@@ -204,6 +238,7 @@ vid-fp ~/Videos -r --delete --permanent
 | `-o`, `--output <FILE>` | Optional path to save the report — `.txt`, `.csv`, or `.json` | — |
 | `--delete` | Move files marked DELETE to the trash | off |
 | `--permanent` | With `--delete`, permanently remove instead | off |
+| `--move-to <DIR>` | Move the files marked DELETE under `DIR`, recreating their absolute paths inside it. Arms the run on its own and supersedes `--delete`/`--permanent` | — |
 | `-t`, `--threads <N>` | Worker threads (`0` = uses all cores) | `0` |
 | `-q`, `--quiet` | Only print errors | off |
 | `--clear-cache` | Wipe ALL vid-fp cache before running | off |
@@ -278,11 +313,18 @@ file.
 Every file in a duplicate group is labeled with an action:
 
 - **KEEP** — the best copy in the group, chosen by your `--priority`.
-- **DELETE** — a redundant copy (removed only if you pass `--delete`).
+- **DELETE** — a redundant copy. Nothing happens to it without `--delete`; the
+  summary totals these into the reclaimable figure so you can see the cost of
+  the run before committing to it.
 - **REVIEW** — a copy worth a manual look before deleting; for example, the KEEP
   pick is the longest video but a *different* file has higher resolution, or the
   group holds the best copy of each of several codecs and nothing comparable can
   choose between them. REVIEW files are never deleted automatically.
+
+Once armed, DELETE rows report what actually happened: **DELETED** (trashed or
+removed), **MOVED** (relocated by `--move-to`), **FAILED**, or **CHANGED** — the
+last meaning the file changed on disk after it was scanned, so it's no longer
+the file that was judged redundant and was left alone.
 
 Fingerprints are cached (under `$XDG_CACHE_HOME/vid-fp`, falling back to
 `~/.cache/vid-fp`), so re-scanning the same library is near-instant. Use
@@ -300,8 +342,14 @@ Fingerprints are cached (under `$XDG_CACHE_HOME/vid-fp`, falling back to
 ## Safety
 
 - **Report-only by default.** Without `--delete`, nothing is ever removed.
+- **You see the cost before you pay it.** A dry run prints how much the DELETE
+  files would reclaim, computed from exactly the set `--delete` would act on.
 - **Trash, not permanent.** `--delete` moves files to the system trash via the
   FreeDesktop.org spec, so they're recoverable — unless you add `--permanent`.
+- **`--move-to` where the trash isn't.** On external drives, NFS mounts and
+  headless servers the trash often doesn't exist; moving the files under a
+  folder of your choosing is recoverable in the same way, always available, and
+  wins over `--delete`/`--permanent` whenever it's passed.
 - **Do a dry run first.** Look at the output (or a saved `--output` report) before
   running with `--delete`.
   - **No double-counting.** Hard links and symlinks to the same file collapse into
@@ -309,6 +357,9 @@ Fingerprints are cached (under `$XDG_CACHE_HOME/vid-fp`, falling back to
   - **Tab-complete your `-e` paths.** An exclude folder that can't be resolved
   excludes nothing. Letting the shell complete the path proves it exists before you
   start.
+  - **Nothing is acted on twice, or blind.** Every target is re-checked against
+  its fingerprint immediately before it's touched, and a file that changed since
+  the scan is left alone and reported.
   - **Mixed codecs are never guessed at.** When the only thing separating two
   copies is which encoder made them, both are left alone and flagged REVIEW —
   one survivor per codec, chosen against that codec's own copies.
