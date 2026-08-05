@@ -113,6 +113,124 @@ fn rational_f64(r: ffmpeg_next::Rational) -> f64 {
     r.numerator() as f64 / r.denominator() as f64
 }
 
+/// The runtime the container claims, in seconds, or <= 0 when it never said.
+///
+/// Lifted out of `fingerprint_video` unchanged so the header-completeness check
+/// below can ask the same question and get the same answer.
+fn duration_seconds(
+    stream: &ffmpeg_next::format::stream::Stream<'_>,
+    ictx: &ffmpeg_next::format::context::Input,
+) -> f64 {
+    let mut duration_sec = 0.0;
+
+    let stream_duration = stream.duration();
+    if stream_duration >= 0 {
+        let tb = stream.time_base();
+        if tb.denominator() > 0 {
+            duration_sec =
+                stream_duration as f64 * (tb.numerator() as f64 / tb.denominator() as f64);
+        }
+    }
+
+    if duration_sec <= 0.0 {
+        // FFmpeg's AV_TIME_BASE format duration.
+        duration_sec = ictx.duration() as f64 / 1_000_000.0;
+    }
+
+    duration_sec
+}
+
+/// Average frames per second, or 0.0 when the container never said.
+///
+/// The sample-count fallback is what makes the header sufficient for MP4:
+/// stts gives the frame count and mdhd the runtime, so the rate is knowable
+/// from the index alone without reading a single packet. It only fires where
+/// both rate fields are empty -- which today yields "unknown" -- so it can
+/// only add information, never change a figure that already existed.
+fn frame_rate_of(stream: &ffmpeg_next::format::stream::Stream<'_>, duration_sec: f64) -> f64 {
+    let mut frame_rate = rational_f64(stream.avg_frame_rate());
+    if frame_rate <= 0.0 {
+        frame_rate = rational_f64(stream.rate());
+    }
+    if frame_rate <= 0.0 && duration_sec > 0.0 {
+        let frames = stream.frames();
+        if frames > 0 {
+            frame_rate = frames as f64 / duration_sec;
+        }
+    }
+    if !frame_rate.is_finite() || frame_rate <= 0.0 || frame_rate > MAX_PLAUSIBLE_FRAME_RATE {
+        frame_rate = 0.0;
+    }
+    frame_rate
+}
+
+/// Open the container WITHOUT probing it.
+///
+/// `ffmpeg_next::format::input` is `avformat_open_input` followed by
+/// `avformat_find_stream_info`. The first reads the header; the second reads up
+/// to five seconds of EVERY stream, opens a decoder for each, decodes frames
+/// through them to discover what it is looking at, and closes them again -- and
+/// then we throw all of that away and open our own decoder.
+///
+/// For a container whose header already answers everything (see
+/// `header_is_complete`) that is an entire extra keyframe decode, an entire
+/// audio decoder, and a re-read of the head of the file, per file, per run.
+fn open_input(filepath: &str) -> Result<ffmpeg_next::format::context::Input> {
+    let path = std::ffi::CString::new(filepath)
+        .map_err(|_| anyhow!("Path contains an interior NUL byte: {}", filepath))?;
+
+    unsafe {
+        let mut ps: *mut ffmpeg_next::ffi::AVFormatContext = std::ptr::null_mut();
+        match ffmpeg_next::ffi::avformat_open_input(
+            &mut ps,
+            path.as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        ) {
+            0 => Ok(ffmpeg_next::format::context::Input::wrap(ps)),
+            e => Err(anyhow!(ffmpeg_next::Error::from(e))),
+        }
+    }
+}
+
+/// Whether the header alone answered every question this file will be asked.
+///
+/// Deliberately conservative: any gap at all falls back to the full probe, so
+/// the worst case is exactly today's behaviour. The extradata requirement is
+/// the subtle one -- for streams that need parsing (raw H.264 in TS, say) the
+/// probe is where the SPS gets extracted into the codec parameters, so a stream
+/// that has not already got extradata from its header must not skip it.
+fn header_is_complete(ictx: &ffmpeg_next::format::context::Input) -> bool {
+    let Some(stream) = ictx.streams().best(ffmpeg_next::media::Type::Video) else {
+        return false;
+    };
+
+    let (codec_id, width, height, extradata_size) = unsafe {
+        let par = (*stream.as_ptr()).codecpar;
+        if par.is_null() {
+            return false;
+        }
+        (
+            (*par).codec_id,
+            (*par).width,
+            (*par).height,
+            (*par).extradata_size,
+        )
+    };
+
+    if codec_id == ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_NONE
+        || width <= 0
+        || height <= 0
+        || extradata_size <= 0
+        || stream.time_base().denominator() <= 0
+    {
+        return false;
+    }
+
+    let duration = duration_seconds(&stream, ictx);
+    duration > 0.0 && frame_rate_of(&stream, duration) > 0.0
+}
+
 /// Fingerprint one video.
 ///
 /// `decode_threads` is this video's share of the process-wide thread budget,
@@ -133,25 +251,34 @@ pub fn fingerprint_video(
     min_duration: f64,
 ) -> Result<Option<VideoFingerprint>> {
     // 1. Native Zero-Copy Extraction (No Subprocess Overhead)
-    let mut ictx = ffmpeg_next::format::input(&filepath)
+    let mut ictx = open_input(filepath)
         .with_context(|| format!("Failed to open video file: {}", filepath))?;
 
-    let input = ictx.streams().best(ffmpeg_next::media::Type::Video)
+    // The probe is the expensive half of opening a file, and for an ordinary
+    // MP4/MKV it is answering questions the header already answered. Run it
+    // only when something is genuinely missing.
+    if !header_is_complete(&ictx) {
+        log::debug!("{}: header incomplete, probing streams.", filepath);
+        unsafe {
+            let e = ffmpeg_next::ffi::avformat_find_stream_info(
+                ictx.as_mut_ptr(),
+                std::ptr::null_mut(),
+            );
+            if e < 0 {
+                return Err(anyhow!(ffmpeg_next::Error::from(e)))
+                    .with_context(|| format!("Failed to read the streams of {}", filepath));
+            }
+        }
+    }
+
+    let input = ictx
+        .streams()
+        .best(ffmpeg_next::media::Type::Video)
         .ok_or_else(|| anyhow!("No video stream found in {}", filepath))?;
     let video_stream_index = input.index();
 
-    // Extract duration natively from stream or format context without delay
-    let mut duration_sec = 0.0;
-    let stream_duration = input.duration();
-    if stream_duration >= 0 {
-        let tb = input.time_base();
-        if tb.denominator() > 0 {
-            duration_sec = stream_duration as f64 * (tb.numerator() as f64 / tb.denominator() as f64);
-        }
-    }
-    if duration_sec <= 0.0 {
-        duration_sec = ictx.duration() as f64 / 1_000_000.0; // Fallback to FFmpeg's AV_TIME_BASE format duration
-    }
+    let duration_sec = duration_seconds(&input, &ictx);
+
     // Bail before the decoder, the scaler, and the 4 MiB frame buffer exist.
     // Only a positive, known duration can disqualify a file.
     if min_duration > 0.0 && duration_sec > 0.0 && duration_sec < min_duration {
@@ -159,10 +286,9 @@ pub fn fingerprint_video(
     }
 
     // --- Codec and frame rate ------------------------------------------------
-    // Both come straight out of the stream parameters the demuxer has already
-    // parsed, so they cost nothing beyond the header read that just happened --
-    // no extra decode, no second pass, and they are known even for a video that
-    // is about to be skipped for some other reason.
+    // Both come straight out of the stream parameters the demuxer parsed while
+    // reading the header, so they cost nothing beyond the open that just
+    // happened -- no probe, no decode, no second pass.
     //
     // The codec is stored by NAME rather than as a numeric id: the id is an
     // enum whose values are FFmpeg's business and could be renumbered, while
@@ -173,17 +299,7 @@ pub fn fingerprint_video(
         .map(|c| c.name().to_string())
         .unwrap_or_else(|| format!("{:?}", codec_id).to_lowercase());
 
-    // avg_frame_rate is the honest average over the file; r_frame_rate is the
-    // smallest rate that can represent every timestamp, which is the better
-    // guess when the average is missing but is an overestimate on variable
-    // frame rate content. Prefer the average, fall back to the other.
-    let mut frame_rate = rational_f64(input.avg_frame_rate());
-    if frame_rate <= 0.0 {
-        frame_rate = rational_f64(input.rate());
-    }
-    if !frame_rate.is_finite() || frame_rate <= 0.0 || frame_rate > MAX_PLAUSIBLE_FRAME_RATE {
-        frame_rate = 0.0;
-    }
+    let frame_rate = frame_rate_of(&input, duration_sec);
 
     let mut context_decoder = ffmpeg_next::codec::context::Context::from_parameters(input.parameters())
         .context("Failed to create codec context from parameters")?;
@@ -209,19 +325,14 @@ pub fn fingerprint_video(
     let mut decoder = context_decoder.decoder().video()
         .context("Failed to initialize video decoder")?;
 
-    let width = decoder.width();
-    let height = decoder.height();
     let file_size = std::fs::metadata(filepath).map(|m| m.len()).unwrap_or(0);
 
-    let mut scaler = ffmpeg_next::software::scaling::context::Context::get(
-        decoder.format(),
-        width,
-        height,
-        ffmpeg_next::format::Pixel::GRAY8,
-        64,
-        64,
-        ffmpeg_next::software::scaling::flag::Flags::FAST_BILINEAR,
-    ).context("Failed to initialize video scaler")?;
+    // Built from the first frame the decoder produces rather than from the
+    // header. Without the probe the container never reports a pixel format --
+    // and this was always the more honest source anyway, since the decoder, not
+    // the header, is the authority on what it is emitting.
+    let mut scaler: Option<ffmpeg_next::software::scaling::context::Context> = None;
+    let mut frame_dims: Option<(u32, u32)> = None;
 
     // All unique frames packed back-to-back, FRAME_STRIDE bytes each. One growable
     // allocation instead of N tiny ones -> no heap fragmentation/retention, and the
@@ -244,6 +355,20 @@ pub fn fingerprint_video(
     let mut current_frame = vec![0u8; 4096];
 
     let mut process_frame = |dec: &ffmpeg_next::frame::Video| -> Result<(), ffmpeg_next::Error> {
+        if scaler.is_none() {
+            scaler = Some(ffmpeg_next::software::scaling::context::Context::get(
+                dec.format(),
+                dec.width(),
+                dec.height(),
+                ffmpeg_next::format::Pixel::GRAY8,
+                64,
+                64,
+                ffmpeg_next::software::scaling::flag::Flags::FAST_BILINEAR,
+            )?);
+            frame_dims = Some((dec.width(), dec.height()));
+        }
+        let scaler = scaler.as_mut().unwrap();
+
         scaler.run(dec, &mut scaled)?;
 
         let data = scaled.data(0);
@@ -273,10 +398,20 @@ pub fn fingerprint_video(
         Ok(())
     };
 
+    // Non-key video packets are skipped, and the audio and subtitle streams are
+    // dropped outright: their payloads used to be read off disk, allocated and
+    // copied into a packet on every iteration of the demux loop below, purely
+    // so the `stream.index()` test could throw them away again.
     unsafe {
         let fmt_ctx = ictx.as_mut_ptr();
-        let stream_ptr = *(*fmt_ctx).streams.add(video_stream_index);
-        (*stream_ptr).discard = ffmpeg_next::ffi::AVDiscard::AVDISCARD_NONKEY;
+        for i in 0..(*fmt_ctx).nb_streams as usize {
+            let stream_ptr = *(*fmt_ctx).streams.add(i);
+            (*stream_ptr).discard = if i == video_stream_index {
+                ffmpeg_next::ffi::AVDiscard::AVDISCARD_NONKEY
+            } else {
+                ffmpeg_next::ffi::AVDiscard::AVDISCARD_ALL
+            };
+        }
     }
 
     // --- Length-aware keyframe subsampling -----------------------------------
@@ -337,6 +472,12 @@ pub fn fingerprint_video(
     if total_frames == 0 {
         return Err(anyhow!("No valid frames found or successfully decoded in {}", filepath));
     }
+
+    // From the frames the decoder actually produced. Identical to what the
+    // probe used to leave in the stream parameters -- it copies the decoder's
+    // view back into them -- and correct even where a header disagrees with its
+    // own bitstream.
+    let (width, height) = frame_dims.unwrap_or((decoder.width(), decoder.height()));
 
     // u_frames holds n_unique * FRAME_STRIDE bytes; the frame count is the index list.
     let n_unique = unique_frame_indices.len();
@@ -657,5 +798,16 @@ mod tests {
         // the user's -t budget.
         let fp = fingerprint_fixture(0);
         assert!(!fp.valid_hashes.is_empty());
+    }
+
+    #[test]
+    fn test_an_ordinary_container_needs_no_probe() {
+        // The whole point of the change: a normal MP4 answers everything from
+        // its header, so avformat_find_stream_info -- an extra keyframe decode
+        // and a whole audio decoder, per file -- is never called. If this ever
+        // fails, the fast path has silently stopped applying.
+        init_ffmpeg_for_tests();
+        let ictx = open_input(&fixture_path().to_string_lossy()).unwrap();
+        assert!(header_is_complete(&ictx), "an ordinary MP4 must not need probing");
     }
 }
