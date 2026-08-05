@@ -385,6 +385,38 @@ fn ensure_cache_table(db: &Database) -> Result<()> {
     Ok(())
 }
 
+/// Empty the cache, and hand the space back to the filesystem while doing so is
+/// still free.
+///
+/// Emptying a table frees its pages inside the file but does not shrink the
+/// file, so the space only comes back via a compaction -- and a compaction is a
+/// copy of every live page into a fresh, dense file. Right here there are no
+/// live pages, so it costs microseconds and returns the whole of whatever the
+/// cache had grown to.
+///
+/// This used to run at the END of the run instead, which is the one moment it
+/// is worth nothing: by then the clear has been followed by a full re-scan, so
+/// every page is live, the file is already dense (the inserts reused the very
+/// pages the clear freed), and the compaction rewrites the entire library's
+/// fingerprints to reclaim nothing.
+fn clear_cache(db: &mut Database) -> Result<()> {
+    let txn = db.begin_write().context("Failed to start a cache transaction")?;
+    txn.delete_table(CACHE_TABLE).context("Failed to clear cache database")?;
+    txn.commit().context("Failed to commit the cache clear")?;
+
+    // Dropping the table dropped its definition too; every later lookup needs
+    // something to open.
+    ensure_cache_table(db).context("Failed to recreate the cache table")?;
+
+    // Not fatal: a cache that could not be shrunk is still a correct, empty
+    // cache, and the run that follows works either way.
+    if let Err(e) = db.compact() {
+        log::error!("Could not compact the fingerprint cache: {}", e);
+    }
+
+    Ok(())
+}
+
 /// Drop the table this build's cache replaced, if it is still there.
 ///
 /// Returns whether there was one, so the caller can decide about reclaiming the
@@ -661,9 +693,14 @@ Interrupted with Ctrl-C.
         Err(e) => log::error!("{:#}", e),
     }
 
-    // Every non-fatal problem and every deliberate skip lands here, from any
-    // thread and any phase, so the run can account for itself at the end
-    // instead of leaving the user to reconstruct it from scrollback.
+    // Handled here rather than inside `run` because compaction needs an
+    // exclusive handle on the database, and because this is the only point in
+    // the run where compacting is free. See `clear_cache`.
+    if args.clear_cache {
+        info!("Clearing all cache...");
+        clear_cache(&mut db)?;
+    }
+
     let stats = RunStats::default();
 
     let outcome = run(&args, &db, start_time, active_threads, &stats);
@@ -681,7 +718,11 @@ Interrupted with Ctrl-C.
     // it peaked at. Compaction is the only thing that hands that space back, and
     // it is skipped after an interrupt: the user asked for this to stop, and
     // rewriting the database is the opposite of stopping.
-    if !shutdown_requested() && (args.clear_cache || args.prune_cache) {
+    //
+    // Only pruning can leave dead space behind at this point: it removes
+    // entries the run will not refill, by design. A cleared cache was already
+    // compacted while it was empty, and everything in the file now is live.
+    if !shutdown_requested() && args.prune_cache {
         match db.compact() {
             Ok(true) => info!("Compacted the fingerprint cache."),
             Ok(false) => {}
@@ -717,17 +758,6 @@ fn run(
     active_threads: usize,
     stats: &RunStats,
 ) -> Result<Outcome> {
-    if args.clear_cache {
-        info!("Clearing all cache...");
-        let txn = db.begin_write().context("Failed to start a cache transaction")?;
-        txn.delete_table(CACHE_TABLE).context("Failed to clear cache database")?;
-        txn.commit().context("Failed to commit the cache clear")?;
-
-        // Dropping the table dropped its definition too; every later lookup
-        // needs something to open.
-        ensure_cache_table(db).context("Failed to recreate the cache table")?;
-    }
-
     let max_hamming = args.hamming_distance;
     let min_match_pct = args.match_percent / 100.0;
     let min_duration = args.min_duration;
@@ -1527,5 +1557,27 @@ mod tests {
 
         assert_eq!(cache_forget(&db, &[]).unwrap(), 0);
         assert_eq!(cache_forget(&db, &["/videos/never-cached.mkv".to_string()]).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_clearing_the_cache_leaves_a_usable_empty_table() {
+        // The clear now compacts on its way past, which drops and recreates
+        // pages under the table definition. The run that follows immediately
+        // starts writing fingerprints into it, so "empty" must not mean "gone".
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = temp_db(&dir);
+        let path = "/videos/some_show_s01e01.mkv";
+        let s = stamp(1_700_000_000, 12_345);
+
+        cache_store(&db, path, s, &mock_fp(path)).unwrap();
+        clear_cache(&mut db).unwrap();
+
+        assert!(cache_lookup(&db, path, &s).is_none(), "nothing survives a clear");
+
+        cache_store(&db, path, s, &mock_fp(path)).unwrap();
+        assert!(
+            cache_lookup(&db, path, &s).is_some(),
+            "and the table is ready for the scan that follows"
+        );
     }
 }
