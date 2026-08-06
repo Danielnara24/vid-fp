@@ -23,7 +23,8 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
 use utils::{shutdown_requested, Priority};
 
 /// The one table in the cache: absolute file path -> bincode'd `CacheEntry`.
@@ -321,35 +322,173 @@ fn scan_encloses(dest: &Path, scanned: &[ScannedFile]) -> Option<String> {
     })
 }
 
-fn decode_threads_for(budget: usize, jobs: usize) -> usize {
-    let budget = budget.max(1);
-    let concurrent = jobs.clamp(1, budget);
-    (budget / concurrent).clamp(1, MAX_DECODE_THREADS)
+/// One video that has to be decoded, and everything needed to decide how much
+/// of the machine to give it.
+///
+/// `weight` is the file's size in bytes -- the same figure the scan already
+/// stat'ed and sorted on. It is a proxy for decode cost, not a measurement of
+/// it: a long, sparsely-keyframed file can be cheaper than its size suggests.
+/// It is the only estimate available before the file is opened, it is free, and
+/// it is right often enough that the schedule below is a large improvement over
+/// counting files, which is what the alternative amounts to.
+struct Job {
+    path: String,
+    stamp: Stamp,
+    weight: u64,
 }
 
-struct JobSlot<'a> {
-    running: &'a AtomicUsize,
+/// How many of `free` threads a video of `weight` bytes should decode with,
+/// given that `queued` bytes of work have not started yet.
+///
+/// This is the whole scheduling rule, and it comes out of asking what actually
+/// ends the run. A video decoded on `k` of the `A` free threads finishes in
+/// roughly `weight / k`; everything still queued gets the other `A - k` threads
+/// and finishes in roughly `queued / (A - k)`. The run is over when the later
+/// of the two is, so the best `k` is the one that makes them equal:
+///
+/// ```text
+///     weight / k = queued / (A - k)   =>   k = A * weight / (weight + queued)
+/// ```
+///
+/// A proportional share, in other words -- and note that it needs no special
+/// case for "big" files, because the same formula produces both behaviours that
+/// matter:
+///
+///   * Hundreds of similar videos: every share rounds to 1, which is correct.
+///     Decoder threading scales sublinearly, so spreading one video per thread
+///     extracts more total throughput than widening any single decode -- and
+///     with that much work queued, no one file's own decode can outlast it.
+///   * A handful of heavyweights, or one giant among small change: the giant's
+///     share is most of the budget, taken UP FRONT. That is the point. Threads
+///     cannot be added to a decode that has already started, so a file that
+///     will still be running when the queue empties has to be given its width
+///     at the moment it starts or never.
+///
+/// Rounding is to nearest rather than up: rounding up steals a thread from the
+/// queued work permanently, which just moves the straggler rather than removing
+/// it.
+fn share_for(weight: u64, queued: u128, free: usize) -> usize {
+    if free == 0 {
+        return 0;
+    }
+
+    // Nothing is waiting behind this video, so there is nobody to spread the
+    // budget for. Take everything a decoder can actually use.
+    if queued == 0 {
+        return free.min(MAX_DECODE_THREADS);
+    }
+
+    let mine = weight as f64;
+    let rest = queued as f64;
+
+    // `mine + rest` is strictly positive here: `rest` is, since `queued != 0`.
+    let share = (free as f64 * mine / (mine + rest)).round() as usize;
+
+    // Never zero (a decode always needs the thread it is running on), never
+    // more than is free, and never more than a decoder can use.
+    share.clamp(1, free.min(MAX_DECODE_THREADS))
+}
+
+/// The process-wide decoder thread budget.
+///
+/// A ledger rather than a calculation, because `share_for` needs two numbers
+/// that only a shared, serialized view can supply: how many threads are
+/// genuinely unclaimed right now, and how much work is still waiting behind
+/// this one. Holding them under one lock is also what makes the invariant
+/// enforceable rather than merely intended -- a decode RESERVES its threads, so
+/// the sum handed out can never exceed `--threads`, whatever order the claims
+/// arrive in.
+///
+/// A worker that finds the budget fully claimed blocks here instead of
+/// overcommitting. That is not lost time: every thread is already promised to a
+/// decode that is running, and one of them will hand its share back. It cannot
+/// deadlock, because `free == 0` means somebody is holding threads, and every
+/// holder is a live decode whose `Grant` releases them on the way out --
+/// including when it unwinds on an error or a Ctrl-C.
+struct ThreadBudget {
+    state: Mutex<BudgetState>,
+    released: Condvar,
+}
+
+struct BudgetState {
+    /// Threads not currently promised to a running decode.
+    free: usize,
+    /// Total weight of the videos that have not started decoding yet. Shrinks
+    /// as jobs are claimed, never as they finish -- a video that is already
+    /// running is accounted for by the threads it holds, not by its bytes.
+    queued: u128,
+}
+
+/// A reservation against the budget, returned to it on drop.
+struct Grant<'a> {
+    budget: &'a ThreadBudget,
     threads: usize,
 }
 
-impl<'a> JobSlot<'a> {
-    fn claim(budget: usize, running: &'a AtomicUsize, queued: &AtomicUsize) -> Self {
-        // fetch_* return the value from BEFORE the update, hence the +1 / -1:
-        // this job is part of the work still outstanding, and is no longer
-        // queued now that it has started.
-        let now_running = running.fetch_add(1, Ordering::SeqCst) + 1;
-        let still_queued = queued.fetch_sub(1, Ordering::SeqCst).saturating_sub(1);
-
-        JobSlot {
-            running,
-            threads: decode_threads_for(budget, now_running.saturating_add(still_queued)),
+impl Drop for Grant<'_> {
+    fn drop(&mut self) {
+        {
+            let mut state = self.budget.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.free += self.threads;
         }
+        // notify_all rather than notify_one: several threads may come back at
+        // once, and a single waiter waking to find one thread free when four
+        // were released is how a wide decode gets starved by a narrow one.
+        self.budget.released.notify_all();
     }
 }
 
-impl Drop for JobSlot<'_> {
-    fn drop(&mut self) {
-        self.running.fetch_sub(1, Ordering::SeqCst);
+impl ThreadBudget {
+    fn new(total: usize, queued: u128) -> Self {
+        ThreadBudget {
+            state: Mutex::new(BudgetState {
+                free: total.max(1),
+                queued,
+            }),
+            released: Condvar::new(),
+        }
+    }
+
+    /// Reserve this video's share of the budget, waiting if nothing is free.
+    ///
+    /// `None` means the run is shutting down and the caller should stop rather
+    /// than wait for threads it is not going to use.
+    fn claim(&self, weight: u64) -> Option<Grant<'_>> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+
+        while state.free == 0 {
+            if shutdown_requested() {
+                return None;
+            }
+            // A timeout rather than a bare wait purely so the shutdown check
+            // above is reached even if the notification is missed.
+            let (next, _) = self
+                .released
+                .wait_timeout(state, Duration::from_millis(50))
+                .unwrap_or_else(|e| e.into_inner());
+            state = next;
+        }
+
+        // No longer queued: from here on this video is represented by the
+        // threads it is about to take, not by its bytes. Doing this BEFORE
+        // computing the share is what keeps `queued` meaning "the work I am
+        // competing with" rather than "the work including me".
+        state.queued = state.queued.saturating_sub(weight as u128);
+
+        let threads = share_for(weight, state.queued, state.free);
+        state.free -= threads;
+
+        Some(Grant {
+            budget: self,
+            threads,
+        })
+    }
+}
+
+#[cfg(test)]
+impl ThreadBudget {
+    fn free(&self) -> usize {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).free
     }
 }
 
@@ -444,8 +583,8 @@ fn retire_superseded_table(db: &Database) -> Result<bool> {
 ///
 /// The read transaction is per-call on purpose. It is a snapshot handle rather
 /// than a lock, readers never block each other or the writer, and taking it
-/// here keeps the whole thing usable from a rayon worker without threading a
-/// borrow through the closure.
+/// here keeps the whole thing usable from a worker without threading a borrow
+/// through the closure.
 fn cache_lookup(db: &Database, path: &str, stamp: &Stamp) -> Option<VideoFingerprint> {
     let read = db.begin_read().ok()?;
     let table = read.open_table(CACHE_TABLE).ok()?;
@@ -477,7 +616,9 @@ fn cache_lookup(db: &Database, path: &str, stamp: &Stamp) -> Option<VideoFingerp
 ///
 /// Only one write transaction exists at a time, so concurrent callers queue
 /// here. The serialization happens outside the transaction so that queue is
-/// only ever holding a b-tree insert.
+/// only ever holding a b-tree insert -- and the caller hands its decoder
+/// threads back BEFORE calling this, so nothing waits on an fsync while
+/// holding a share of the budget.
 fn cache_store(db: &Database, path: &str, stamp: Stamp, fp: &VideoFingerprint) -> Result<()> {
     // `&(stamp, fp)` rather than an owned pair: serde follows the reference, so
     // this writes the exact bytes `CacheEntry` reads back without copying the
@@ -815,9 +956,10 @@ fn run(
 
     // Every file here has been stat'ed exactly once, and carries the size and
     // mtime that stat returned. Nothing below asks the filesystem about these
-    // files again unless it is going to decode one: the sort, the cache stamp
-    // and the prune all read from this list. On a network mount that is the
-    // difference between three round trips per file and one.
+    // files again unless it is going to decode one: the sort, the cache stamp,
+    // the thread budget's weights and the prune all read from this list. On a
+    // network mount that is the difference between three round trips per file
+    // and one.
     let mut video_files = match sources::collect(
         &sources::Sources {
             include: &args.include,
@@ -928,10 +1070,13 @@ fn run(
         return Ok(Outcome::Completed);
     }
 
-    // Largest first, so the heaviest decodes start while the widest thread
-    // allocations are still available. The size is the one the scan already
-    // read; this used to stat every file again to learn it, which on a cold
-    // network mount cost more than the sort saved.
+    // Largest first. That ordering is load-bearing twice over: the heaviest
+    // decodes start while the budget is still wide enough to give them a real
+    // share of it (see `share_for`), and the light ones are left over at the
+    // end, where they are perfect filler because they parallelise across
+    // whatever threads the heavyweights are not using. The size is the one the
+    // scan already read; this used to stat every file again to learn it, which
+    // on a cold network mount cost more than the sort saved.
     video_files.sort_by_key(|f| std::cmp::Reverse(f.size));
 
     let total_videos = video_files.len();
@@ -954,11 +1099,11 @@ fn run(
     // the stat it used to open with came out of the scan -- so this pass costs
     // no I/O against the library at all and finishes effectively instantly even
     // on a large one. By the time the bar appears we know exactly how much real
-    // work there is, and that count is load-bearing twice over: it also sets the
-    // per-video decoder thread budget.
+    // work there is, and that work is what the decoder thread budget is
+    // apportioned against.
     enum Lookup {
         Hit(VideoFingerprint),
-        Miss { path: String, stamp: Stamp },
+        Miss(Job),
     }
 
     let lookups: Vec<Lookup> = video_files
@@ -978,19 +1123,20 @@ fn run(
 
             match cache_lookup(db, &file.path, &stamp) {
                 Some(fp) => Lookup::Hit(fp),
-                None => Lookup::Miss {
+                None => Lookup::Miss(Job {
                     path: file.path.clone(),
                     stamp,
-                },
+                    weight: file.size,
+                }),
             }
         })
         .collect();
 
     // collect() preserves input order, so `todo` inherits the largest-first sort
-    // and the heaviest decodes still start first -- which also means the biggest
-    // files are the ones that claim the widest thread allocations.
+    // and the heaviest decodes are still claimed first -- which is exactly when
+    // the budget has the most to give them.
     let mut fingerprints: Vec<VideoFingerprint> = Vec::with_capacity(total_videos);
-    let mut todo: Vec<(String, Stamp)> = Vec::new();
+    let mut todo: Vec<Job> = Vec::new();
     for lookup in lookups {
         match lookup {
             Lookup::Hit(fp) => {
@@ -1004,7 +1150,7 @@ fn run(
                     fingerprints.push(fp);
                 }
             }
-            Lookup::Miss { path, stamp } => todo.push((path, stamp)),
+            Lookup::Miss(job) => todo.push(job),
         }
     }
     let cached_count = fingerprints.len();
@@ -1030,10 +1176,30 @@ fn run(
 
     if todo_count > 0 {
         // --- Thread budget ---------------------------------------------------
-        let queued = AtomicUsize::new(todo_count);
-        let running = AtomicUsize::new(0);
+        // The threads are apportioned by WORK, not by file count. Counting files
+        // is what left a 4 GB file decoding on a single thread: with hundreds of
+        // videos queued the per-file share rounds to 1, the biggest file
+        // (correctly) starts first, and by the time the queue has drained enough
+        // for the share to widen it is far too late -- FFmpeg's thread count is
+        // fixed when the decoder is opened, so a decode's width is decided once,
+        // at the moment it starts, and never again. See `share_for` for the
+        // rule that replaces it.
+        //
+        // Ownership of the loop moves off rayon for this reason too. Rayon's
+        // adaptive splitting hands each worker a region of the input, so claims
+        // do NOT arrive in size order -- and the whole schedule rests on the
+        // heaviest video claiming while the budget is still wide. An atomic
+        // cursor over the size-sorted list makes that ordering exact, and a
+        // worker per budgeted thread is the most decodes that can run at once
+        // anyway, since every decode reserves at least one.
+        let total_weight: u128 = todo.iter().map(|job| job.weight as u128).sum();
+        let budget = ThreadBudget::new(active_threads, total_weight);
 
-        // The bar now counts decodes and nothing else, so its denominator is the
+        let cursor = AtomicUsize::new(0);
+        let collected: Mutex<Vec<(usize, VideoFingerprint)>> =
+            Mutex::new(Vec::with_capacity(todo_count));
+
+        // The bar counts decodes and nothing else, so its denominator is the
         // work remaining rather than the size of the library.
         let pb = if args.quiet {
             ProgressBar::hidden()
@@ -1049,79 +1215,139 @@ fn run(
             pb
         };
 
-        let fresh: Vec<VideoFingerprint> = todo
-            .par_iter()
-            .filter_map(|(vf, stamp)| {
-                // Cheapest possible bail-out. Every video still queued costs one
-                // relaxed atomic load, so the tail of a 50k-file scan drains in
-                // microseconds; the videos actually being decoded right now stop
-                // via the identical check inside fingerprint_video's demux loop.
-                if shutdown_requested() {
-                    return None;
-                }
+        let workers = active_threads.min(todo_count).max(1);
+        let todo = &todo;
+        let budget = &budget;
+        let cursor = &cursor;
+        let collected = &collected;
+        let pb = &pb;
+        let newly_cached = &newly_cached;
 
-                // Claimed AFTER the bail-out, so a shutdown-abandoned job never
-                // takes a share of the budget it will not use. Held for exactly
-                // as long as the decode runs; the guard releases it on drop,
-                // including on the error path below.
-                let slot = JobSlot::claim(active_threads, &running, &queued);
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(move || {
+                    // Accumulated locally and merged once, so the shared lock is
+                    // taken a handful of times per run rather than once per
+                    // video. The index travels with the fingerprint purely so
+                    // the finished list can be put back into input order --
+                    // completion order is whatever the disk decided that day,
+                    // and a reproducible run should not depend on it.
+                    let mut local: Vec<(usize, VideoFingerprint)> = Vec::new();
 
-                let file_name = Path::new(vf).file_name().unwrap_or_default().to_string_lossy().into_owned();
-                pb.set_message(file_name);
-
-                let fp = match fingerprint_video(vf, kf_interval, min_kf_samples, slot.threads, min_duration) {
-                    Ok(Some(f)) => f,
-                    Ok(None) => {
-                        // Shorter than --min-duration. Not a failure, and nothing
-                        // to cache: the header read that decided this is cheap
-                        // enough to repeat next run.
-                        stats.skipped_short.bump();
-                        pb.inc(1);
-                        return None;
-                    }
-                    Err(e) => {
-                        // An interrupt unwinds through here as our own
-                        // "Interrupted while fingerprinting ..." error. That is
-                        // the user's doing rather than the file's, so it is
-                        // neither logged as a failure nor counted anywhere:
-                        // exit code 130 already says what happened.
-                        //
-                        // A file that vanished between the scan and now also
-                        // lands here rather than in a separate "unreadable"
-                        // bucket, which is the honest description: the run was
-                        // asked to fingerprint it and could not.
-                        if !shutdown_requested() {
-                            log::error!("Failed to process {}: {:#}", vf, e);
-                            stats
-                                .fingerprint_failed
-                                .record(format!("{}: {:#}", vf, e));
+                    loop {
+                        // Cheapest possible bail-out. Every video still queued
+                        // costs one relaxed atomic load, so the tail of a
+                        // 50k-file scan drains in microseconds; the videos
+                        // actually being decoded right now stop via the
+                        // identical check inside fingerprint_video's demux loop.
+                        if shutdown_requested() {
+                            break;
                         }
-                        pb.inc(1); // Keep the bar consistent with work attempted
-                        return None;
-                    }
-                };
 
-                // Committed the moment it exists, over whatever this path held
-                // before. See cache_store: this is one transaction per video on
-                // purpose, so an interrupt (or a kill, or a crash) can only ever
-                // cost the decode that was still in flight.
-                match cache_store(db, vf, *stamp, &fp) {
-                    Ok(()) => {
-                        newly_cached.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        log::error!("Failed to cache fingerprint for {}: {:#}", vf, e);
-                        stats.cache_write_failed.record(format!("{}: {:#}", vf, e));
-                    }
-                }
+                        let idx = cursor.fetch_add(1, Ordering::SeqCst);
+                        let Some(job) = todo.get(idx) else { break };
 
-                pb.inc(1);
-                Some(fp)
-            })
-            .collect();
+                        // Blocks if every thread is already promised to a decode
+                        // that is running -- which is precisely when there is
+                        // nothing useful for this worker to be doing. `None`
+                        // means the run is shutting down.
+                        let Some(grant) = budget.claim(job.weight) else { break };
+
+                        let file_name = Path::new(&job.path)
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned();
+                        pb.set_message(file_name);
+
+                        let decoded = fingerprint_video(
+                            &job.path,
+                            kf_interval,
+                            min_kf_samples,
+                            grant.threads,
+                            min_duration,
+                        );
+
+                        // Handed back before the cache write below: an fsync is
+                        // not decoding, and holding a wide share of the budget
+                        // across one is how the machine goes quiet at exactly
+                        // the wrong moment.
+                        drop(grant);
+
+                        let fp = match decoded {
+                            Ok(Some(f)) => f,
+                            Ok(None) => {
+                                // Shorter than --min-duration. Not a failure, and
+                                // nothing to cache: the header read that decided
+                                // this is cheap enough to repeat next run.
+                                stats.skipped_short.bump();
+                                pb.inc(1);
+                                continue;
+                            }
+                            Err(e) => {
+                                // An interrupt unwinds through here as our own
+                                // "Interrupted while fingerprinting ..." error.
+                                // That is the user's doing rather than the
+                                // file's, so it is neither logged as a failure
+                                // nor counted anywhere: exit code 130 already
+                                // says what happened.
+                                //
+                                // A file that vanished between the scan and now
+                                // also lands here rather than in a separate
+                                // "unreadable" bucket, which is the honest
+                                // description: the run was asked to fingerprint
+                                // it and could not.
+                                if !shutdown_requested() {
+                                    log::error!("Failed to process {}: {:#}", job.path, e);
+                                    stats
+                                        .fingerprint_failed
+                                        .record(format!("{}: {:#}", job.path, e));
+                                }
+                                pb.inc(1); // Keep the bar consistent with work attempted
+                                continue;
+                            }
+                        };
+
+                        // Committed the moment it exists, over whatever this path
+                        // held before. See cache_store: this is one transaction
+                        // per video on purpose, so an interrupt (or a kill, or a
+                        // crash) can only ever cost the decode still in flight.
+                        match cache_store(db, &job.path, job.stamp, &fp) {
+                            Ok(()) => {
+                                newly_cached.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(e) => {
+                                log::error!(
+                                    "Failed to cache fingerprint for {}: {:#}",
+                                    job.path,
+                                    e
+                                );
+                                stats
+                                    .cache_write_failed
+                                    .record(format!("{}: {:#}", job.path, e));
+                            }
+                        }
+
+                        local.push((idx, fp));
+                        pb.inc(1);
+                    }
+
+                    collected
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .extend(local);
+                });
+            }
+        });
 
         pb.finish_and_clear();
-        fingerprints.extend(fresh);
+
+        let mut fresh = collected
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .split_off(0);
+        fresh.sort_unstable_by_key(|(idx, _)| *idx);
+        fingerprints.extend(fresh.into_iter().map(|(_, fp)| fp));
     }
 
     let newly_cached = newly_cached.into_inner();
@@ -1306,95 +1532,162 @@ mod tests {
         assert!(scan_encloses(Path::new("/home/you/Documents"), &scanned).is_none());
     }
 
+    // --- The decoder thread schedule -----------------------------------------
+
+    const GB: u64 = 1 << 30;
+
     #[test]
-    fn test_budget_is_split_evenly_when_videos_are_scarce() {
-        // The cases from the spec: 8 threads, N videos.
-        assert_eq!(decode_threads_for(8, 4), 2);
-        assert_eq!(decode_threads_for(8, 2), 4);
-        assert_eq!(decode_threads_for(8, 1), 8);
+    fn test_plenty_of_similar_work_means_one_thread_each() {
+        // The common case, and the one the old count-based rule got right: with
+        // seven more gigabytes queued behind this one, widening this decode
+        // would only take threads away from work that will outlast it anyway.
+        assert_eq!(share_for(GB, 7 * GB as u128, 8), 1);
+        assert_eq!(share_for(GB, 99 * GB as u128, 8), 1);
     }
 
     #[test]
-    fn test_one_thread_each_once_videos_outnumber_threads() {
-        // Rayon runs at most `budget` decodes at once, so one thread each IS the
-        // whole budget here. Dividing further would leave cores idle.
-        assert_eq!(decode_threads_for(8, 8), 1);
-        assert_eq!(decode_threads_for(8, 9), 1);
-        assert_eq!(decode_threads_for(8, 5_000), 1);
+    fn test_a_heavyweight_claims_its_share_of_the_run_up_front() {
+        // The case the old rule got wrong. Eight gigabytes of the ten left, on
+        // eight threads: this file IS most of the run, so most of the machine
+        // goes to it -- at the moment it starts, which is the only moment
+        // FFmpeg will accept a thread count.
+        assert_eq!(share_for(8 * GB, 2 * GB as u128, 8), 6);
+
+        // Half the work gets half the threads.
+        assert_eq!(share_for(4 * GB, 4 * GB as u128, 8), 4);
     }
 
     #[test]
-    fn test_never_exceeds_the_budget() {
-        // The invariant that matters for -t: threads-per-video times videos
-        // running concurrently must never exceed what the user allowed.
-        for budget in 1..=64usize {
-            for jobs in 1..=200usize {
-                let per_video = decode_threads_for(budget, jobs);
-                let concurrent = jobs.min(budget);
-                assert!(per_video >= 1, "a decode must never get zero threads");
-                assert!(
-                    per_video * concurrent <= budget.max(1),
-                    "budget {} with {} jobs handed out {} x {}",
-                    budget, jobs, per_video, concurrent
-                );
+    fn test_the_last_video_standing_takes_everything_free() {
+        // Nothing queued behind it, so there is nobody to spread the budget
+        // for. This is the straggler the whole change exists to prevent, and
+        // the one place where the widest possible decode is unambiguously
+        // right.
+        assert_eq!(share_for(GB, 0, 8), 8);
+        assert_eq!(share_for(GB, 0, 3), 3, "only what is actually free");
+    }
+
+    #[test]
+    fn test_a_share_is_capped_at_what_a_decoder_can_use() {
+        // Past MAX_DECODE_THREADS the extra threads buy nothing and cost a
+        // full-resolution frame buffer each, so they are better left for the
+        // next video.
+        assert_eq!(share_for(GB, 0, 64), MAX_DECODE_THREADS);
+    }
+
+    #[test]
+    fn test_a_small_video_never_gets_zero_threads() {
+        // A decode always needs the thread it runs on, however little the file
+        // weighs against the rest of the queue.
+        assert_eq!(share_for(1, 100 * GB as u128, 8), 1);
+        assert_eq!(share_for(0, 100 * GB as u128, 8), 1, "and a zero-byte file still runs");
+    }
+
+    #[test]
+    fn test_the_budget_is_never_overcommitted() {
+        // The invariant `-t` is a promise about. Every claim here is made while
+        // every earlier one is still running, which is the worst case for it.
+        let shapes: [&[u64]; 4] = [
+            &[8 * GB, GB, GB, GB, GB],
+            &[GB, GB, GB, GB, GB, GB, GB, GB, GB, GB],
+            &[64 * GB, 1, 1, 1, 1, 1, 1, 1],
+            &[3 * GB, 2 * GB, GB],
+        ];
+
+        for total in 1..=16usize {
+            for weights in shapes {
+                let queued: u128 = weights.iter().map(|&w| w as u128).sum();
+                let budget = ThreadBudget::new(total, queued);
+
+                let mut held = 0usize;
+                let mut grants = Vec::new();
+
+                for &w in weights {
+                    // Claiming with nothing free would (correctly) block, so
+                    // this is where a single-threaded test has to stop.
+                    if budget.free() == 0 {
+                        break;
+                    }
+                    let grant = budget.claim(w).expect("not shutting down");
+                    held += grant.threads;
+                    grants.push(grant);
+
+                    assert!(
+                        held <= total,
+                        "budget {} handed out {} threads across {} concurrent decodes",
+                        total,
+                        held,
+                        grants.len()
+                    );
+                }
             }
         }
     }
 
     #[test]
-    fn test_uneven_split_rounds_down_rather_than_overcommitting() {
-        // 8 threads over 3 videos is 2 each and two threads left on the table.
-        // Rounding up would put 9 decoder threads on 8 cores.
-        assert_eq!(decode_threads_for(8, 3), 2);
-        assert_eq!(decode_threads_for(4, 3), 1);
-    }
+    fn test_shares_widen_as_the_queue_drains() {
+        // Four equal videos on eight threads. Two threads each while the queue
+        // is full, four when half of it is gone, and the whole budget for the
+        // last one -- which is exactly the ramp that was missing.
+        let budget = ThreadBudget::new(8, 4 * GB as u128);
 
-    #[test]
-    fn test_degenerate_budgets() {
-        assert_eq!(decode_threads_for(0, 4), 1, "a zero budget still runs, single-threaded");
-        assert_eq!(decode_threads_for(4, 0), 4, "no jobs left is not a division by zero");
-    }
+        let a = budget.claim(GB).unwrap();
+        let b = budget.claim(GB).unwrap();
+        assert_eq!((a.threads, b.threads), (2, 2));
 
-    #[test]
-    fn test_huge_budget_is_capped_at_what_a_decoder_can_use() {
-        assert_eq!(decode_threads_for(256, 1), MAX_DECODE_THREADS);
-    }
-
-    #[test]
-    fn test_slot_widens_as_the_queue_drains() {
-        let queued = AtomicUsize::new(4);
-        let running = AtomicUsize::new(0);
-
-        // Four outstanding on a budget of 8: two threads each.
-        let a = JobSlot::claim(8, &running, &queued);
-        assert_eq!(a.threads, 2);
-        let b = JobSlot::claim(8, &running, &queued);
-        assert_eq!(b.threads, 2);
-
-        // Two finish. Only two jobs remain outstanding, so the next to start
-        // claims half the budget instead of a quarter.
         drop(a);
         drop(b);
-        let c = JobSlot::claim(8, &running, &queued);
-        assert_eq!(c.threads, 4, "the tail of a scan must widen out");
 
-        // And the last one on its own gets everything.
+        let c = budget.claim(GB).unwrap();
+        assert_eq!(c.threads, 4);
+
         drop(c);
-        let d = JobSlot::claim(8, &running, &queued);
-        assert_eq!(d.threads, 8);
+
+        let d = budget.claim(GB).unwrap();
+        assert_eq!(d.threads, 8, "the tail of a scan must not decode single-threaded");
     }
 
     #[test]
-    fn test_slot_releases_its_claim_on_drop() {
-        let queued = AtomicUsize::new(1);
-        let running = AtomicUsize::new(0);
+    fn test_the_heaviest_video_is_provisioned_before_the_filler() {
+        // The exact shape that motivated this: one enormous file and a pile of
+        // small ones. The big one is claimed first (the todo list is sorted
+        // largest-first) and takes most of the machine; the small ones share
+        // what is left, one thread apiece, and finish alongside it instead of
+        // finishing an hour early and leaving seven cores idle.
+        let small = GB / 10;
+        let queued = 8 * GB as u128 + 20 * small as u128;
+        let budget = ThreadBudget::new(8, queued);
+
+        let heavy = budget.claim(8 * GB).unwrap();
+        assert_eq!(heavy.threads, 6);
+
+        let a = budget.claim(small).unwrap();
+        let b = budget.claim(small).unwrap();
+        assert_eq!((a.threads, b.threads), (1, 1));
+        assert_eq!(budget.free(), 0, "and the machine is fully committed");
+    }
+
+    #[test]
+    fn test_a_grant_is_returned_on_drop() {
+        // Including when a decode unwinds on an error: the release is the
+        // destructor, not a line at the end of the happy path.
+        let budget = ThreadBudget::new(8, GB as u128);
 
         {
-            let _slot = JobSlot::claim(8, &running, &queued);
-            assert_eq!(running.load(Ordering::SeqCst), 1);
+            let grant = budget.claim(GB).unwrap();
+            assert_eq!(grant.threads, 8);
+            assert_eq!(budget.free(), 0);
         }
 
-        assert_eq!(running.load(Ordering::SeqCst), 0, "a finished job must free its threads");
+        assert_eq!(budget.free(), 8, "a finished decode must free its threads");
+    }
+
+    #[test]
+    fn test_a_single_thread_budget_still_runs() {
+        let budget = ThreadBudget::new(1, 4 * GB as u128);
+        let grant = budget.claim(GB).unwrap();
+        assert_eq!(grant.threads, 1);
+        assert_eq!(budget.free(), 0);
     }
 
     fn stamp(mtime: i64, size: u64) -> Stamp {
