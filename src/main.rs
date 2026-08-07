@@ -34,7 +34,7 @@ use utils::{shutdown_requested, Policy, Priority};
 /// scanned rather than by the number of times they have changed: a file that is
 /// re-encoded, re-muxed, or scanned with different sampling settings replaces
 /// its own entry instead of growing a second one beside it.
-const CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("fingerprints_dct");
+const CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("fingerprints_dct_ct");
 
 /// Tables earlier builds wrote, all dead. They are dropped whole on the first
 /// run of this one.
@@ -54,9 +54,17 @@ const CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("fingerpr
 /// - `fingerprints_by_path` fixed the key, but holds difference hashes over an
 ///   8x9 thumbnail and sample times counted in keyframes. This build hashes
 ///   DCT coefficients and counts milliseconds; the two are not comparable.
-const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 2] = [
+/// - `fingerprints_dct` holds the right hashes against the wrong clock. Its
+///   sample times came from the presentation timestamps libavformat reported,
+///   and on MP4 those are skewed by up to a reorder delay because discarding
+///   the non-key samples desynchronises the demuxer's `ctts` cursor. This build
+///   measures decode time from the first keyframe instead. Same field, same
+///   units, different milliseconds -- exactly the case a layout check cannot
+///   catch.
+const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 3] = [
     TableDefinition::new("fingerprints"),
     TableDefinition::new("fingerprints_by_path"),
+    TableDefinition::new("fingerprints_dct"),
 ];
 
 /// Hard ceiling on the cache's page cache.

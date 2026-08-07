@@ -658,10 +658,13 @@ pub fn fingerprint_video(
             // Append into the single flat buffer instead of pushing a new Vec.
             u_frames.extend_from_slice(&current_frame);
 
-            // The decoder's own timestamp, not the demuxer's: with frame
+            // Read off the FRAME rather than the packet, because with frame
             // threading a frame surfaces several packets after the one that
-            // carried it, so the packet in hand when it arrives is somebody
-            // else's.
+            // carried it and the packet in hand when it arrives is somebody
+            // else's. What the frame carries is whatever the demux loop stamped
+            // onto its packet -- see `sample_ts` there -- so this is the
+            // container's own clock making the round trip, not the decoder's
+            // opinion of it.
             unique_frame_times.push(match dec.timestamp() {
                 Some(pts) if stream_time_base > 0.0 && pts >= 0 => {
                     Some((pts as f64 * stream_time_base * 1000.0) as u32)
@@ -714,31 +717,188 @@ pub fn fingerprint_video(
     };
     let mut last_kept_t: Option<f64> = None;
 
-    // Rapid Demuxing: Only push Key-frames (I-Frames) into decoder
-    for (stream, packet) in ictx.packets() {
+    // --- Rapid demuxing: only key packets ever reach the decoder --------------
+    //
+    // `AVDISCARD_NONKEY` on the stream asks the demuxer to drop everything else
+    // before it is ever assembled into a packet, and MP4/MOV honours that by
+    // walking its sample table and reading only the sync samples -- roughly a
+    // tenth of the file. Matroska has no such shortcut: it hands back every
+    // block in the file, payload and all, and we throw ~90% of the bytes away.
+    // On a 714 MB episode that is 615 MB read, allocated and copied for nothing,
+    // and it lands on the one thread that also has to feed the decoder.
+    //
+    // So when a demuxer proves it is going to do that -- by handing us a non-key
+    // packet we already asked it not to -- we stop reading forward and start
+    // SEEKING from one keyframe to the next instead. The seek costs an index
+    // lookup and lands on exactly the keyframe a linear scan would have reached,
+    // having read none of the bytes in between.
+    //
+    // Two properties keep this from changing what gets fingerprinted:
+    //
+    //   * A seek that lands short (or on a keyframe already decoded) is caught
+    //     by the `ts <= last` guard below, so no frame is ever hashed twice.
+    //   * Anything that goes wrong -- a container with no index, a stream with
+    //     no timestamps, a seek that simply fails -- sets `seeking_broken` and
+    //     the loop finishes as a plain linear scan, which is exactly the old
+    //     behaviour.
+    //
+    // The decoder is deliberately NOT flushed across a seek. Every packet it is
+    // fed is a keyframe and therefore self-contained, so there is no state to
+    // invalidate, and flushing would throw away frames still in flight.
+    let mut packet = ffmpeg_next::codec::packet::Packet::empty();
+    let mut last_key_ts: Option<i64> = None;
+    // The first keyframe's timestamp, which every later one is measured from.
+    let mut first_key_ts: Option<i64> = None;
+    let mut demuxer_ignores_discard = false;
+    let mut seeking_broken = false;
+
+    loop {
         if shutdown_requested() {
             return Err(anyhow!("Interrupted while fingerprinting {}", filepath));
         }
-        if stream.index() == video_stream_index && packet.is_key() {
-            if effective_interval > 0.0 {
-                let tb = stream.time_base();
-                let t = packet.pts().or_else(|| packet.dts()).map(|ts| {
-                    ts as f64 * tb.numerator() as f64 / tb.denominator() as f64
-                });
-                if let Some(t) = t {
-                    if let Some(last) = last_kept_t {
-                        if t - last < effective_interval {
-                            continue; // too close to the last kept keyframe; skip decode
-                        }
+
+        match packet.read(&mut ictx) {
+            Ok(()) => {}
+            Err(ffmpeg_next::Error::Eof) => break,
+            // Mirrors the packet iterator this loop replaces: a recoverable
+            // demux error skips the packet rather than ending the video.
+            Err(_) => continue,
+        }
+
+        if packet.stream() != video_stream_index {
+            continue;
+        }
+
+        if !packet.is_key() {
+            // The discard hint was ignored. Note it: from the next keyframe on
+            // we jump rather than read.
+            demuxer_ignores_discard = true;
+            continue;
+        }
+
+        // The timestamp the container's index is keyed on, which is what a seek
+        // target is measured against.
+        let index_ts = packet.dts().or_else(|| packet.pts());
+
+        // A seek may land on or before a keyframe already decoded. Skip those
+        // rather than hashing the same frame twice.
+        if let (Some(ts), Some(last)) = (index_ts, last_key_ts) {
+            if ts <= last {
+                continue;
+            }
+        }
+
+        // --- When this keyframe happens -------------------------------------
+        //
+        // Measured from the first keyframe rather than from zero, and taken
+        // from `index_ts` -- decode order -- rather than from the packet's
+        // presentation timestamp. Both of those are deliberate, and the reason
+        // is that `AVDISCARD_NONKEY` is not free.
+        //
+        // MP4 stores presentation time as a per-sample offset from decode time
+        // (the `ctts` table) and the demuxer walks that table with a cursor
+        // that only advances over samples it RETURNS. Discarding the non-key
+        // samples desynchronises it, so the pts we are handed is a real offset
+        // belonging to the wrong sample: on one 2-second clip the container
+        // says its keyframes are at 0 / 29029 / 58058 and libavformat reports
+        // 0 / 32032 / 57057 -- 100 ms late and then 34 ms early. Matroska has
+        // no such table and its pts is exact; AVI has no pts at all.
+        //
+        // Decode time is immune. It comes out of a plain cumulative sum
+        // (`stts`) with no cursor to lose, and it was correct in every
+        // container tested. It differs from presentation time by the codec's
+        // reorder delay, which is constant across a file's keyframes -- so
+        // subtracting the first sample's value cancels it exactly, and what is
+        // left reproduces the container's own presentation times. On the clip
+        // above it gives 0 / 29029 / 58058, to the tick.
+        //
+        // Anchoring also settles two things the raw clock got wrong: a first
+        // keyframe with a negative dts (an MP4 with B-frames opens at -1001)
+        // used to fail the `pts >= 0` test and drop the whole video to evenly
+        // spaced samples, and a stream whose clock does not start at zero used
+        // to measure its samples against a runtime that does.
+        let sample_ts = match (index_ts, first_key_ts) {
+            (Some(ts), Some(first)) => Some(ts.saturating_sub(first).max(0)),
+            (Some(ts), None) => {
+                first_key_ts = Some(ts);
+                Some(0)
+            }
+            (None, _) => None,
+        };
+
+        // Hand the corrected clock to the decoder, which copies a packet's pts
+        // onto the frame it produces. That is what carries it back out through
+        // frame threading, where nothing else can pair the two up.
+        if let Some(ts) = sample_ts {
+            packet.set_pts(Some(ts));
+        }
+
+        // Seconds, for the interval rule.
+        let show_t = if stream_time_base > 0.0 {
+            sample_ts.map(|ts| ts as f64 * stream_time_base)
+        } else {
+            None
+        };
+
+        let mut kept = true;
+        if effective_interval > 0.0 {
+            if let Some(t) = show_t {
+                if let Some(last) = last_kept_t {
+                    if t - last < effective_interval {
+                        kept = false; // too close to the last kept keyframe
                     }
+                }
+                if kept {
                     last_kept_t = Some(t);
                 }
-                // If PTS/DTS is missing we fall through and keep the frame (safe default).
             }
+            // If PTS/DTS is missing we fall through and keep the frame (safe default).
+        }
 
-            if decoder.send_packet(&packet).is_ok() {
-                while decoder.receive_frame(&mut decoded).is_ok() {
-                    let _ = process_frame(&decoded);
+        if kept && decoder.send_packet(&packet).is_ok() {
+            while decoder.receive_frame(&mut decoded).is_ok() {
+                let _ = process_frame(&decoded);
+            }
+        }
+
+        if let Some(ts) = index_ts {
+            last_key_ts = Some(ts);
+        }
+
+        // --- Jump to the next keyframe we actually want ----------------------
+        if demuxer_ignores_discard && !seeking_broken {
+            match index_ts {
+                // No clock to seek by. Reading forward is the only option left.
+                None => seeking_broken = true,
+                Some(ts) => {
+                    // One tick past the current keyframe is the least that can
+                    // land on a new one. When an interval is in force, skip the
+                    // whole rest of it in the same hop -- the keyframes in
+                    // between were going to be read and discarded.
+                    let mut step = 1i64;
+                    if effective_interval > 0.0 && stream_time_base > 0.0 {
+                        if let (Some(t), Some(last)) = (show_t, last_kept_t) {
+                            let remaining = last + effective_interval - t;
+                            if remaining > 0.0 {
+                                step = step.max((remaining / stream_time_base).ceil() as i64);
+                            }
+                        }
+                    }
+
+                    let ok = unsafe {
+                        ffmpeg_next::ffi::av_seek_frame(
+                            ictx.as_mut_ptr(),
+                            video_stream_index as i32,
+                            ts.saturating_add(step),
+                            0,
+                        ) >= 0
+                    };
+                    if !ok {
+                        // Past the last keyframe a forward seek fails, which is
+                        // indistinguishable from a container that cannot seek at
+                        // all. Either way, finish by reading.
+                        seeking_broken = true;
+                    }
                 }
             }
         }
