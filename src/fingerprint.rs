@@ -294,10 +294,22 @@ pub fn fingerprint_video(
     // enum whose values are FFmpeg's business and could be renumbered, while
     // "h264" is stable, is what the user sees in the report, and is what the
     // comparison rules key on.
-    let codec_id = input.parameters().id();
-    let codec = ffmpeg_next::codec::decoder::find(codec_id)
-        .map(|c| c.name().to_string())
-        .unwrap_or_else(|| format!("{:?}", codec_id).to_lowercase());
+    //
+    // `Id::name` is avcodec_get_name, which answers "what codec is this" from
+    // the id alone. It deliberately does NOT go through avcodec_find_decoder:
+    // that returns whichever DECODER the local FFmpeg prefers for the id, and
+    // reports its name -- "libdav1d" for AV1 on a build that has it, "av1" on
+    // one that doesn't, "libvpx-vp9" or "vp9" for the same file depending on
+    // how FFmpeg was compiled.
+    //
+    // That made the recorded codec a property of the machine rather than of the
+    // video, which is wrong three times over: the report named a decoder where
+    // the user expected a codec, the codec-standoff rule compared those names
+    // for equality (so the same AV1 file scanned on two builds looked like two
+    // different codecs and deadlocked a group that should have resolved), and
+    // the cache stores the string -- so entries written by one build disagreed
+    // with entries written by another.
+    let codec = input.parameters().id().name().to_string();
 
     let frame_rate = frame_rate_of(&input, duration_sec);
 
@@ -753,6 +765,34 @@ mod tests {
             "an implausible frame rate must be recorded as unknown, got {}",
             fp.frame_rate
         );
+    }
+
+    #[test]
+    fn test_a_codec_is_named_by_the_codec_not_by_the_local_decoder() {
+        // The regression this exists to prevent. Reading the name off
+        // avcodec_find_decoder reported "libdav1d" for AV1 on any build that
+        // ships dav1d, and "av1" on one that doesn't -- so the string recorded
+        // in the cache and compared by the standoff rule depended on how the
+        // machine's FFmpeg was compiled rather than on the file.
+        //
+        // Asserted over the ids most likely to have a differently-named
+        // preferred decoder, because those are exactly the ones that broke: AV1
+        // has libdav1d and libaom-av1, VP8/VP9 have the libvpx pair.
+        use ffmpeg_next::codec::Id;
+
+        for (id, expected) in [
+            (Id::AV1, "av1"),
+            (Id::VP9, "vp9"),
+            (Id::VP8, "vp8"),
+            (Id::H264, "h264"),
+            (Id::HEVC, "hevc"),
+        ] {
+            assert_eq!(
+                id.name(),
+                expected,
+                "a codec must be named after itself, whatever decodes it here"
+            );
+        }
     }
 
     #[test]

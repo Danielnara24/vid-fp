@@ -187,15 +187,23 @@ impl MatchIndex {
         estimate
     }
 
-    /// The least content `subject` shares with any other member of `group`.
+    /// The least content `subject` shares with any member of `group` it was
+    /// actually matched against.
     ///
-    /// Groups are maximal cliques, so every pair here was genuinely compared
-    /// and this is a measured floor rather than an average over unrelated
-    /// things: it reads as "this file shares at least this much with everything
-    /// it is grouped with". Printed beside the file's own length it makes a
-    /// group interpretable at a glance -- a nine-second clip sharing eight
-    /// seconds is a duplicate, and one sharing half a second is not, however
-    /// impressive that half second looks as a percentage.
+    /// Groups are connected components, so a member need not have been compared
+    /// with every other one -- it reached the group through a chain of matches.
+    /// Pairs with no measurement are therefore skipped rather than being read as
+    /// "no overlap" (they were never compared, which is a different statement)
+    /// or allowed to sink the whole figure to unknown (the links this file does
+    /// have are exactly the evidence that put it here). What survives is a
+    /// measured floor over the file's own links: "this file shares at least this
+    /// much with everything it directly matched".
+    ///
+    /// Printed beside the file's own length it makes a group interpretable at a
+    /// glance -- a nine-second clip sharing eight seconds is a duplicate, and
+    /// one sharing half a second is not, however impressive that half second
+    /// looks as a percentage. `None` means nothing about this file's links could
+    /// be measured at all.
     pub fn weakest_shared_in_group(
         &self,
         subject: usize,
@@ -207,7 +215,9 @@ impl MatchIndex {
             if other == subject {
                 continue;
             }
-            let shared = self.shared_seconds(subject, other, fps)?;
+            let Some(shared) = self.shared_seconds(subject, other, fps) else {
+                continue;
+            };
             weakest = Some(weakest.map_or(shared, |w: f64| w.min(shared)));
         }
         weakest
@@ -762,5 +772,37 @@ mod tests {
         assert_near(idx.weakest_shared_in_group(0, &group, &fps), 3.0);
         assert_near(idx.weakest_shared_in_group(1, &group, &fps), 3.0);
         assert_near(idx.weakest_shared_in_group(2, &group, &fps), 3.0);
+    }
+
+    #[test]
+    fn test_a_pair_that_was_never_compared_is_skipped_rather_than_erasing_the_figure() {
+        // A chain: 0-1 and 1-2 matched, 0 and 2 never did. They share a group
+        // because groups are connected components, so 0's row must report what
+        // it shares with 1 -- the link that put it there. Treating the absent
+        // 0-2 pair as unknown would blank the column for most of a chained
+        // group, and treating it as zero would claim a comparison nobody made.
+        let fps = vec![
+            mock_fp_lasting(600.0),
+            mock_fp_lasting(600.0),
+            mock_fp_lasting(600.0),
+        ];
+        let idx = MatchIndex::new(vec![
+            Match { a: 0, b: 1, coverage_a: 1.0, coverage_b: 1.0 }, // 600s
+            Match { a: 1, b: 2, coverage_a: 0.5, coverage_b: 0.5 }, // 300s
+        ]);
+        let group = [0, 1, 2];
+
+        assert_near(idx.weakest_shared_in_group(0, &group, &fps), 600.0);
+        assert_near(idx.weakest_shared_in_group(1, &group, &fps), 300.0);
+        assert_near(idx.weakest_shared_in_group(2, &group, &fps), 300.0);
+    }
+
+    #[test]
+    fn test_a_file_with_no_measurable_link_reports_unknown() {
+        // Not the same as sharing nothing: the figure was never obtained.
+        let fps = vec![mock_fp_lasting(600.0), mock_fp_lasting(600.0)];
+        let idx = MatchIndex::new(vec![]);
+
+        assert_eq!(idx.weakest_shared_in_group(0, &[0, 1], &fps), None);
     }
 }

@@ -233,6 +233,7 @@ doesn't, since moving files into the scan just feeds them back in next time.
 | `-p`, `--match-percent <F>` | Min % of overlap to count as a duplicate; Lower = Finds shorter matches (but can increase false positives) | `10.0` |
 | `--min-duration <SECS>` | Min shared clip length in seconds for a match. Videos shorter than this are skipped entirely. `0` = off | `0.0` |
 | `-k`, `--priority <P>` | Criteria for KEEPING files: `length`, `resolution`, `quality`, or `size`. The chosen one is compared first; the rest follow in the default order. See [Codecs and quality](#codecs-and-quality) | `length` |
+| `--trust-chains` | Mark a file DELETE even when it never matched the copy being kept, reaching its group only through a chain of matches; such files are flagged REVIEW by default. Changes labels only, deleting still needs `--delete` or `--move-to` | off |
 | `--keyframe-interval <F>` | Seconds between sampled keyframes (`0` = every keyframe); Higher = Faster processing (Increasing this can hinder the capability of finding short matches between videos) | `0.0` |
 | `--min-keyframes <F>` | Min keyframes kept for short videos (only relevant when keyframe-interval > 0) | `4.0` |
 | `-o`, `--output <FILE>` | Optional path to save the report — `.txt`, `.csv`, or `.json` | — |
@@ -313,9 +314,24 @@ file.
 
 ## How it reads the results
 
+**A group is everything related to everything else in it.** Files are grouped by
+following matches: if A matches B and B matches C, all three land in one group,
+whether or not A and C were ever directly compared with each other. This way
+every file appears in exactly one group, so a group is a self-contained unit 
+and each file gets one action decided inside it.
+
+That means a group is not a promise that all its members are copies of each
+other. Matching isn't transitive: three episodes sharing an opening sequence are
+linked without any two being duplicates, and one such link is enough to fuse
+everything it touches into a single group. Raise
+`--match-percent` or `--min-duration` if incidental links are pulling unrelated
+files together.
+
 Every file in a duplicate group is labeled with an action:
 
-- **KEEP** — the best copy in the group, chosen by your `--priority`.
+- **KEEP** — the best copy in the group, chosen by your `--priority`. There is
+  one per group, except in a codec standoff (below), where each codec's best is
+  held for REVIEW instead.
 - **DELETE** — a redundant copy. Nothing happens to it without `--delete`; the
   summary totals these into the reclaimable figure so you can see the cost of
   the run before committing to it.
@@ -323,6 +339,13 @@ Every file in a duplicate group is labeled with an action:
   pick is the longest video but a *different* file has higher resolution, or the
   group holds the best copy of each of several codecs and nothing comparable can
   choose between them. REVIEW files are never deleted automatically.
+
+  The third reason is the chain: **a file is only marked DELETE if it actually
+  matched a copy that's being kept.** A group is built by following matches, so
+  a member can lose the ranking without ever having been compared against the
+  survivor — it got there through some third file. Deleting on that basis
+  removes something nothing ever measured against the file replacing it, so it's
+  flagged REVIEW instead. Pass `--trust-chains` to mark those DELETE too.
 
 Once armed, DELETE rows report what actually happened: **DELETED** (trashed or
 removed), **MOVED** (relocated by `--move-to`), **FAILED**, or **CHANGED** — the
@@ -355,6 +378,10 @@ Fingerprints are cached (under `$XDG_CACHE_HOME/vid-fp`, falling back to
   wins over `--delete`/`--permanent` whenever it's passed.
 - **Do a dry run first.** Look at the output (or a saved `--output` report) before
   running with `--delete`.
+- **DELETE always rests on a measurement, not on an inference.** A file is only
+  marked DELETE if it directly matched a copy that survives its group; one that
+  reached the group through a chain is flagged REVIEW. `--trust-chains` opts out
+  of this.
   - **No double-counting.** Hard links and symlinks to the same file collapse into
   a single entry, so the reported space freed reflects bytes actually reclaimed.
   - **Tab-complete your `-e` paths.** An exclude folder that can't be resolved

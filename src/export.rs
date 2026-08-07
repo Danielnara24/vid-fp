@@ -5,7 +5,7 @@ use crate::fingerprint::VideoFingerprint;
 use crate::stats::RunStats;
 use crate::utils::{
     find_best, format_bitrate, format_codec, format_duration, format_frame_rate, format_quality,
-    format_shared, format_size, shutdown_requested, GroupMaxima, Priority,
+    format_shared, format_size, shutdown_requested, GroupMaxima, Policy, Priority,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs::{FileTimes, OpenOptions};
@@ -232,30 +232,29 @@ pub fn output_results(
     matches: &MatchIndex,
     output_file: Option<&String>,
     total_elapsed_secs: u64,
-    priority: Priority,
+    policy: Policy,
     disposal: Option<&Disposal>,
     stats: &RunStats,
 ) -> Result<Vec<String>> {
     let acting = disposal.is_some();
 
-    // --- Pass 1: resolve each file's fate across ALL groups ------------------
-    // Clusters overlap, so a file can appear in several groups with different
-    // per-group roles. Precedence is REVIEW > DELETE > KEEP:
-    //   * REVIEW anywhere -> always kept for manual inspection (never deleted).
-    //   * DELETE anywhere -> deleted, even if it is the KEEP pick of another
-    //     group. This is what lets a single run remove every redundant copy: a
-    //     file that is best in one group but redundant in an overlapping one is
-    //     still removed, so you don't have to re-run until the chain collapses.
-    //   * otherwise -> kept (it was the best in every group it appears in).
-    // Using sets also guarantees each file is considered exactly once, so a
-    // file shared by several groups is never queued for deletion twice.
+    // --- Pass 1: resolve each group ------------------------------------------
+    // Groups are connected components, so every file belongs to exactly one and
+    // its fate is settled entirely within that group: one KEEP, whatever the
+    // group flags REVIEW, and the rest DELETE. There is nothing to reconcile
+    // afterwards -- no file can be the KEEP pick of one group and a duplicate in
+    // another, and none can be queued for deletion twice.
     let mut review_set: HashSet<usize> = HashSet::new();
     let mut delete_candidates: HashSet<usize> = HashSet::new();
+
+    // Files this group would delete on the strength of a chain rather than a
+    // measurement. Reused across groups, so it is cleared at the end of each.
+    let mut indirect: HashSet<usize> = HashSet::new();
 
     for group in final_groups {
         let maxima = GroupMaxima::of(group, fingerprints);
 
-        let keep_idx = find_best(group, fingerprints, priority, &maxima);
+        let keep_idx = find_best(group, fingerprints, policy.priority, &maxima);
         let keep_fp = &fingerprints[keep_idx];
 
         // Everything this group wants held back from deletion. A group can now
@@ -270,7 +269,7 @@ pub fn output_results(
         if let Some(r) = REVIEW_METRICS
             .iter()
             .copied()
-            .filter(|&m| m != priority && maxima.tier(keep_fp, m) == 0)
+            .filter(|&m| m != policy.priority && maxima.tier(keep_fp, m) == 0)
             .map(|m| find_best(group, fingerprints, m, &maxima))
             .find(|&candidate| candidate != keep_idx)
         {
@@ -328,13 +327,12 @@ pub fn output_results(
                     .collect();
 
                 let codec_maxima = GroupMaxima::of(&same_codec, fingerprints);
-                group_review.insert(find_best(&same_codec, fingerprints, priority, &codec_maxima));
+                group_review.insert(find_best(&same_codec, fingerprints, policy.priority, &codec_maxima));
             }
         }
 
         // Everything in the group that isn't KEEP or REVIEW is a delete
-        // candidate. DELETE wins over KEEP globally, so we don't care whether
-        // the file is a KEEP pick in some other group.
+        // candidate.
         //
         // In a standoff the champions REPLACE the group's KEEP pick rather than
         // joining it: the pick is one of the contenders, and holding it as well
@@ -349,17 +347,43 @@ pub fn output_results(
         }
 
         for &idx in group {
-            if !protected.contains(&idx) {
-                delete_candidates.insert(idx);
+            if protected.contains(&idx) {
+                continue;
             }
+
+            // A file may only be deleted on the strength of a comparison that
+            // actually happened against a file that is staying on disk. A group
+            // is a chain of matches, so losing the group's ranking does not by
+            // itself mean the loser was ever measured against its survivor --
+            // and deleting on that basis is deleting something nobody looked at
+            // next to the thing replacing it.
+            //
+            // The anchor is the whole protected set rather than the KEEP pick
+            // alone, so a codec standoff still works: each champion survives,
+            // and a file directly matched against any of them has its evidence.
+            //
+            // --trust-chains says to accept the chain instead. It marks these
+            // DELETE rather than REVIEW; it does not delete anything, which
+            // still takes --delete or --move-to.
+            if !policy.trust_chains
+                && !protected.iter().any(|&s| matches.coverage(idx, s).is_some())
+            {
+                indirect.insert(idx);
+                continue;
+            }
+
+            delete_candidates.insert(idx);
         }
 
         review_set.extend(group_review);
+        review_set.extend(indirect.iter().copied());
+        indirect.clear();
     }
 
-    // REVIEW protection overrides DELETE. Sorted for deterministic ordering.
-    let mut delete_indices: Vec<usize> =
-        delete_candidates.difference(&review_set).copied().collect();
+    // Sorted for deterministic ordering. No subtraction of the REVIEW set is
+    // needed: a group's protected files are excluded before its remainder is
+    // added, and groups are disjoint, so the two sets cannot intersect.
+    let mut delete_indices: Vec<usize> = delete_candidates.iter().copied().collect();
     delete_indices.sort_unstable();
 
     // --- Pass 2: act on each unique target exactly once ----------------------
@@ -373,8 +397,8 @@ pub fn output_results(
     // walks, so the dry run's figure and the real run's figure cannot disagree
     // about which files they describe. Sizes come from the fingerprints, which
     // the deletion pass re-checks against disk before touching anything, and
-    // the set is index-based -- so a file appearing in three groups, or reached
-    // through a hard link, contributes its bytes once.
+    // the set is index-based -- so a file reached through a hard link
+    // contributes its bytes once.
     let reclaimable_bytes: u64 = delete_indices
         .iter()
         .map(|&idx| fingerprints[idx].file_size)
@@ -439,17 +463,10 @@ pub fn output_results(
     info!("             RESULTS");
     info!("========================================\n");
 
-    // Groups overlap, so summing their sizes counts a shared file once per
-    // group it appears in -- a figure that can exceed the number of videos
-    // scanned and means nothing to anyone. What is actually being reported is
-    // how many distinct files are implicated in a duplicate relationship at
-    // all, which is the same set the KEEP/DELETE/REVIEW labels below describe.
-    let matched_file_count = final_groups
-        .iter()
-        .flatten()
-        .copied()
-        .collect::<HashSet<usize>>()
-        .len();
+    // Every file is in exactly one group, so this is simply how many distinct
+    // files are implicated in a duplicate relationship at all -- the same set
+    // the KEEP/DELETE/REVIEW labels below describe.
+    let matched_file_count: usize = final_groups.iter().map(|g| g.len()).sum();
 
     let mut txt_out = String::new();
     let mut json_out_groups = Vec::new();
@@ -493,8 +510,12 @@ pub fn output_results(
 
         let mut json_files = Vec::new();
 
-        // How much footage each file has in common with the rest of its group,
-        // in seconds rather than as a percentage.
+        // How much footage each file has in common with the group members it
+        // was actually matched against, in seconds rather than as a percentage.
+        // A group is a chain of matches, not a set of mutual duplicates, so this
+        // column is what tells the two apart: a row reporting the whole of its
+        // runtime is a copy of something here, and one reporting eight seconds
+        // is a file that shares eight seconds with something here.
         //
         // A percentage was the obvious choice and the wrong one. It invites
         // comparison against --match-percent, which measures the opposite end of
@@ -542,9 +563,8 @@ pub fn output_results(
             let bitrate_bps_raw = fp.bitrate().to_string();
             let shared_seconds_raw = csv_seconds(shared);
 
-            // Label by the file's GLOBAL fate (precedence REVIEW > DELETE > KEEP).
-            // A file that is redundant in an overlapping group is shown DELETE/
-            // DELETED in every group, including one where it was the local best.
+            // Label by the fate the file's own group gave it -- the only one it
+            // has, since it appears nowhere else.
             // In a dry run the delete targets stay as the recommendation DELETE;
             // once armed they become DELETED or MOVED, FAILED if that errored, or
             // CHANGED if the file stopped matching its fingerprint before we got
@@ -802,7 +822,7 @@ const REVIEW_METRICS: [Priority; 2] = [Priority::Length, Priority::Resolution];
 mod tests {
     use super::*;
     use crate::compare::Match;
-    use crate::utils::Priority;
+    use crate::utils::{Policy, Priority};
     use tempfile::NamedTempFile;
     use std::fs;
 
@@ -882,10 +902,33 @@ full_path;action";
         }
     }
 
-    /// Tests about deletion precedence don't care about overlap; an empty index
-    /// reports every figure as unknown, which the report renders as "-".
-    fn no_matches() -> MatchIndex {
-        MatchIndex::new(vec![])
+    /// The default posture, which is what almost every test wants: rank by
+    /// `priority`, and hold a file that only reached its group through a chain
+    /// for review.
+    fn policy(priority: Priority) -> Policy {
+        Policy { priority, trust_chains: false }
+    }
+
+    /// An index in which every file was compared with every other and found to
+    /// contain it whole.
+    ///
+    /// Tests about deletion precedence are asking which copy wins, not how the
+    /// group got linked, so this states the simplest thing that makes the
+    /// question well-posed: everything here was measured against everything
+    /// else. Without it a DELETE would be resting on a chain rather than a
+    /// comparison, and the default policy holds those for REVIEW -- correctly,
+    /// but it is not what these tests are about.
+    ///
+    /// Degenerates to an empty index for a single file, which is what the
+    /// report-formatting tests want: no pair, so every overlap reads "-".
+    fn all_compared(n: usize) -> MatchIndex {
+        let mut matches = Vec::new();
+        for a in 0..n {
+            for b in (a + 1)..n {
+                matches.push(Match { a, b, coverage_a: 1.0, coverage_b: 1.0 });
+            }
+        }
+        MatchIndex::new(matches)
     }
 
     /// Run a report into a temp file of the given extension and hand back the
@@ -913,7 +956,7 @@ full_path;action";
 
         // Report-only run: single item defaults to KEEP.
         let deleted = output_results(
-            &groups, &fps, &no_matches(), Some(&path_str), 120, Priority::Length, None,
+            &groups, &fps, &all_compared(fps.len()), Some(&path_str), 120, policy(Priority::Length), None,
             &RunStats::default(),
         ).unwrap();
 
@@ -948,7 +991,7 @@ full_path;action";
         let path_str = report_to("json");
 
         output_results(
-            &groups, &fps, &no_matches(), Some(&path_str), 0, Priority::Length, None,
+            &groups, &fps, &all_compared(fps.len()), Some(&path_str), 0, policy(Priority::Length), None,
             &RunStats::default(),
         ).unwrap();
 
@@ -967,26 +1010,27 @@ full_path;action";
     }
 
     #[test]
-    fn test_reclaimable_counts_a_file_shared_by_two_groups_once() {
-        // The same arithmetic trap total_files_matched has: file 2 is a DELETE
-        // target in both groups, and a figure that double-counted it would
-        // promise the user space that does not exist.
+    fn test_reclaimable_totals_the_delete_targets_of_every_group() {
+        // Each group contributes its own redundant copies and nothing else. The
+        // figure is what the whole run would free, not what its largest group
+        // would.
         let fps = vec![
             mock_fp_at("/fake/best_a.mkv", 60.0),
+            mock_fp_at("/fake/dupe_a.mkv", 10.0),
             mock_fp_at("/fake/best_b.mkv", 60.0),
-            mock_fp_at("/fake/shared.mkv", 10.0),
+            mock_fp_at("/fake/dupe_b.mkv", 10.0),
         ];
-        let groups = vec![vec![0, 2], vec![1, 2]];
+        let groups = vec![vec![0, 1], vec![2, 3]];
         let path_str = report_to("json");
 
         output_results(
-            &groups, &fps, &no_matches(), Some(&path_str), 0, Priority::Length, None,
+            &groups, &fps, &all_compared(fps.len()), Some(&path_str), 0, policy(Priority::Length), None,
             &RunStats::default(),
         ).unwrap();
 
         let summary = read_json(&path_str)["summary"].clone();
-        assert_eq!(summary["files_marked_delete"], 1);
-        assert_eq!(summary["reclaimable_bytes"], 1_310_720u64);
+        assert_eq!(summary["files_marked_delete"], 2);
+        assert_eq!(summary["reclaimable_bytes"], 2_621_440u64);
 
         let _ = fs::remove_file(path_str);
     }
@@ -1012,11 +1056,11 @@ full_path;action";
         let json_path = report_to("json");
 
         output_results(
-            &groups, &fps, &matches, Some(&csv_path), 0, Priority::Length, None,
+            &groups, &fps, &matches, Some(&csv_path), 0, policy(Priority::Length), None,
             &RunStats::default(),
         ).unwrap();
         output_results(
-            &groups, &fps, &matches, Some(&json_path), 0, Priority::Length, None,
+            &groups, &fps, &matches, Some(&json_path), 0, policy(Priority::Length), None,
             &RunStats::default(),
         ).unwrap();
 
@@ -1065,7 +1109,7 @@ full_path;action";
         let path_str = report_to("csv");
 
         output_results(
-            &groups, &fps, &matches, Some(&path_str), 0, Priority::Length, None,
+            &groups, &fps, &matches, Some(&path_str), 0, policy(Priority::Length), None,
             &RunStats::default(),
         ).unwrap();
 
@@ -1097,7 +1141,7 @@ full_path;action";
         let path_str = report_to("csv");
 
         output_results(
-            &groups, &fps, &matches, Some(&path_str), 0, Priority::Length, None,
+            &groups, &fps, &matches, Some(&path_str), 0, policy(Priority::Length), None,
             &RunStats::default(),
         ).unwrap();
 
@@ -1113,31 +1157,29 @@ full_path;action";
     }
 
     #[test]
-    fn test_files_in_several_groups_are_counted_once() {
-        // File 1 belongs to both groups. Summing group sizes gives 4; there are
-        // only 3 files, and 4 would be a nonsense figure the moment a user
-        // compared it against the number of videos scanned.
+    fn test_total_files_matched_counts_every_grouped_file() {
+        // Groups partition the matched files, so the total is the sum of their
+        // sizes -- and it can be compared directly against the number of videos
+        // scanned without any caveat about shared members.
         let fps = vec![
             mock_fp_at("/fake/a.mp4", 100.0),
             mock_fp_at("/fake/b.mp4", 90.0),
-            mock_fp_at("/fake/c.mp4", 10.0),
+            mock_fp_at("/fake/c.mp4", 100.0),
+            mock_fp_at("/fake/d.mp4", 10.0),
         ];
-        let groups = vec![vec![0, 1], vec![1, 2]];
+        let groups = vec![vec![0, 1], vec![2, 3]];
 
         let path_str = report_to("json");
 
         output_results(
-            &groups, &fps, &no_matches(), Some(&path_str), 0, Priority::Length, None,
+            &groups, &fps, &all_compared(fps.len()), Some(&path_str), 0, policy(Priority::Length), None,
             &RunStats::default(),
         ).unwrap();
 
         let report = read_json(&path_str);
 
         assert_eq!(report["summary"]["total_groups"], 2);
-        assert_eq!(
-            report["summary"]["total_files_matched"], 3,
-            "a file in two groups is still one file"
-        );
+        assert_eq!(report["summary"]["total_files_matched"], 4);
 
         let _ = fs::remove_file(path_str);
     }
@@ -1159,7 +1201,7 @@ full_path;action";
         let path_str = report_to("json");
 
         output_results(
-            &groups, &fps, &matches, Some(&path_str), 0, Priority::Length, None,
+            &groups, &fps, &matches, Some(&path_str), 0, policy(Priority::Length), None,
             &RunStats::default(),
         ).unwrap();
 
@@ -1189,11 +1231,11 @@ full_path;action";
         let csv_path = report_to("csv");
 
         output_results(
-            &groups, &fps, &no_matches(), Some(&json_path), 0, Priority::Length, None,
+            &groups, &fps, &all_compared(fps.len()), Some(&json_path), 0, policy(Priority::Length), None,
             &RunStats::default(),
         ).unwrap();
         output_results(
-            &groups, &fps, &no_matches(), Some(&csv_path), 0, Priority::Length, None,
+            &groups, &fps, &all_compared(fps.len()), Some(&csv_path), 0, policy(Priority::Length), None,
             &RunStats::default(),
         ).unwrap();
 
@@ -1234,7 +1276,7 @@ full_path;action";
         let stats = RunStats::default();
 
         let deleted = output_results(
-            &groups, &fps, &no_matches(), None, 0, Priority::Length,
+            &groups, &fps, &all_compared(fps.len()), None, 0, policy(Priority::Length),
             Some(&Disposal::Permanent), &stats,
         ).unwrap();
 
@@ -1269,7 +1311,7 @@ full_path;action";
         let path_str = report_to("json");
 
         let moved = output_results(
-            &groups, &fps, &no_matches(), Some(&path_str), 0, Priority::Length,
+            &groups, &fps, &all_compared(fps.len()), Some(&path_str), 0, policy(Priority::Length),
             Some(&Disposal::MoveTo(dest.path().to_path_buf())), &stats,
         ).unwrap();
 
@@ -1328,7 +1370,7 @@ full_path;action";
         let stats = RunStats::default();
 
         let mut moved = output_results(
-            &groups, &fps, &no_matches(), None, 0, Priority::Length,
+            &groups, &fps, &all_compared(fps.len()), None, 0, policy(Priority::Length),
             Some(&Disposal::MoveTo(dest.path().to_path_buf())), &stats,
         ).unwrap();
         moved.sort();
@@ -1366,7 +1408,7 @@ full_path;action";
         let stats = RunStats::default();
 
         let moved = output_results(
-            &groups, &fps, &no_matches(), None, 0, Priority::Length,
+            &groups, &fps, &all_compared(fps.len()), None, 0, policy(Priority::Length),
             Some(&Disposal::MoveTo(dest.path().to_path_buf())), &stats,
         ).unwrap();
 
@@ -1406,7 +1448,7 @@ full_path;action";
         let stats = RunStats::default();
 
         let moved = output_results(
-            &groups, &fps, &no_matches(), None, 0, Priority::Length,
+            &groups, &fps, &all_compared(fps.len()), None, 0, policy(Priority::Length),
             Some(&Disposal::MoveTo(dest.path().to_path_buf())), &stats,
         ).unwrap();
 
@@ -1443,7 +1485,7 @@ full_path;action";
         let path_str = report_to("json");
 
         let deleted = output_results(
-            &groups, &fps, &no_matches(), Some(&path_str), 0, Priority::Length,
+            &groups, &fps, &all_compared(fps.len()), Some(&path_str), 0, policy(Priority::Length),
             Some(&Disposal::Permanent), &stats,
         ).unwrap();
 
@@ -1489,7 +1531,7 @@ full_path;action";
         let stats = RunStats::default();
 
         output_results(
-            &groups, &fps, &no_matches(), None, 0, Priority::Length,
+            &groups, &fps, &all_compared(fps.len()), None, 0, policy(Priority::Length),
             Some(&Disposal::Permanent), &stats,
         ).unwrap();
 
@@ -1502,32 +1544,32 @@ full_path;action";
     }
 
     #[test]
-    fn test_delete_wins_across_overlapping_groups() {
-        // A duplicate chain spread across overlapping groups must collapse in a
-        // SINGLE pass. File 1 is the bridge: it is the KEEP pick of group B but
-        // redundant in group A. Under DELETE-wins it is removed on the first run
-        // rather than surviving until a later run.
+    fn test_a_chain_collapses_in_a_single_pass() {
+        // A chain of matches arrives as one group, so the whole chain is settled
+        // at once: file 1 was a bridge between 0 and 2 and is redundant against
+        // the best copy of the lot. Nothing survives to be caught by a later
+        // run.
         let dir = tempfile::tempdir().unwrap();
         let p0 = at(&dir, "best.mkv");
         let p1 = at(&dir, "bridge.mkv");
         let p2 = at(&dir, "tail.mkv");
 
         let fps = vec![
-            mock_fp_at(&p0, 100.0), // global best
+            mock_fp_at(&p0, 100.0), // best of the component
             mock_fp_at(&p1, 90.0),  // bridge
             mock_fp_at(&p2, 10.0),
         ];
         materialize_all(&fps);
 
-        let groups = vec![vec![0, 1], vec![1, 2]];
+        let groups = vec![vec![0, 1, 2]];
 
         let mut deleted = output_results(
-            &groups, &fps, &no_matches(), None, 0, Priority::Length,
+            &groups, &fps, &all_compared(fps.len()), None, 0, policy(Priority::Length),
             Some(&Disposal::Permanent), &RunStats::default(),
         ).unwrap();
         deleted.sort();
 
-        assert!(Path::new(&p0).exists(), "global best must remain");
+        assert!(Path::new(&p0).exists(), "the component's best must remain");
         assert!(!Path::new(&p1).exists(), "bridge duplicate must be deleted in one pass");
         assert!(!Path::new(&p2).exists(), "tail duplicate must be deleted");
 
@@ -1536,16 +1578,183 @@ full_path;action";
         assert_eq!(deleted, expected);
     }
 
+    /// The chain the guard exists for: 0-1 and 1-2 matched, 0 and 2 never did.
+    /// One group of three, and 2 has no measurement against 0.
+    fn chain_of_three() -> MatchIndex {
+        MatchIndex::new(vec![
+            Match { a: 0, b: 1, coverage_a: 1.0, coverage_b: 1.0 },
+            Match { a: 1, b: 2, coverage_a: 1.0, coverage_b: 1.0 },
+        ])
+    }
+
     #[test]
-    fn test_shared_target_deleted_once_without_over_collapsing() {
-        // The shared duplicate (index 2) is a DELETE target in BOTH groups. It
-        // must be removed exactly once (the original double-delete bug), while
-        // the two independent "best" files are both retained -- DELETE-wins is
-        // not a blunt component-collapse.
+    fn test_a_file_that_never_matched_the_kept_copy_is_held_for_review() {
+        // File 2 loses the group's ranking, but the only file it was ever
+        // compared with is file 1, which is itself being deleted. Deleting 2 on
+        // that basis removes a file nobody ever measured against the copy
+        // replacing it -- so it is flagged for a human instead.
         let dir = tempfile::tempdir().unwrap();
-        let p0 = at(&dir, "best_a.mkv");
-        let p1 = at(&dir, "best_b.mkv");
-        let p2 = at(&dir, "shared.mkv");
+        let p0 = at(&dir, "best.mkv");
+        let p1 = at(&dir, "bridge.mkv");
+        let p2 = at(&dir, "tail.mkv");
+
+        let fps = vec![
+            mock_fp_at(&p0, 100.0),
+            mock_fp_at(&p1, 90.0),
+            mock_fp_at(&p2, 10.0),
+        ];
+        materialize_all(&fps);
+
+        let groups = vec![vec![0, 1, 2]];
+        let path_str = report_to("json");
+
+        let deleted = output_results(
+            &groups, &fps, &chain_of_three(), Some(&path_str), 0,
+            policy(Priority::Length), Some(&Disposal::Permanent), &RunStats::default(),
+        ).unwrap();
+
+        assert!(Path::new(&p0).exists(), "the KEEP pick stands");
+        assert!(!Path::new(&p1).exists(), "1 matched 0 directly, so its loss is measured");
+        assert!(Path::new(&p2).exists(), "2 never matched 0 and must survive");
+        assert_eq!(deleted, vec![p1], "and only the measured loss is reported gone");
+
+        let files = &read_json(&path_str)["results"][0]["files"];
+        assert_eq!(files[2]["action"], "REVIEW");
+
+        let _ = fs::remove_file(path_str);
+    }
+
+    #[test]
+    fn test_trust_chains_deletes_the_indirect_file_instead() {
+        // The same group with the guard off. The chain is accepted as evidence,
+        // so 2 goes with 1 -- which is the whole point of the flag, and why it
+        // is not the default.
+        let dir = tempfile::tempdir().unwrap();
+        let p0 = at(&dir, "best.mkv");
+        let p1 = at(&dir, "bridge.mkv");
+        let p2 = at(&dir, "tail.mkv");
+
+        let fps = vec![
+            mock_fp_at(&p0, 100.0),
+            mock_fp_at(&p1, 90.0),
+            mock_fp_at(&p2, 10.0),
+        ];
+        materialize_all(&fps);
+
+        let groups = vec![vec![0, 1, 2]];
+        let policy = Policy {
+            priority: Priority::Length,
+            trust_chains: true,
+        };
+
+        let mut deleted = output_results(
+            &groups, &fps, &chain_of_three(), None, 0, policy,
+            Some(&Disposal::Permanent), &RunStats::default(),
+        ).unwrap();
+        deleted.sort();
+
+        assert!(Path::new(&p0).exists());
+        assert!(!Path::new(&p1).exists());
+        assert!(!Path::new(&p2).exists(), "--trust-chains accepts the chain");
+
+        let mut expected = vec![p1, p2];
+        expected.sort();
+        assert_eq!(deleted, expected);
+    }
+
+    #[test]
+    fn test_trust_chains_does_not_arm_deletion_by_itself() {
+        // The naming hazard the flag was named around. It changes labels; it is
+        // not a deletion switch, and a report-only run stays report-only.
+        let dir = tempfile::tempdir().unwrap();
+        let p0 = at(&dir, "best.mkv");
+        let p1 = at(&dir, "bridge.mkv");
+        let p2 = at(&dir, "tail.mkv");
+
+        let fps = vec![
+            mock_fp_at(&p0, 100.0),
+            mock_fp_at(&p1, 90.0),
+            mock_fp_at(&p2, 10.0),
+        ];
+        materialize_all(&fps);
+
+        let groups = vec![vec![0, 1, 2]];
+        let policy = Policy {
+            priority: Priority::Length,
+            trust_chains: true,
+        };
+        let path_str = report_to("json");
+
+        let deleted = output_results(
+            &groups, &fps, &chain_of_three(), Some(&path_str), 0, policy,
+            None, &RunStats::default(),
+        ).unwrap();
+
+        assert!(Path::new(&p0).exists());
+        assert!(Path::new(&p1).exists(), "no disposal was passed, so nothing may go");
+        assert!(Path::new(&p2).exists());
+        assert!(deleted.is_empty());
+
+        let report = read_json(&path_str);
+        assert_eq!(report["summary"]["deletion_enabled"], false);
+        assert_eq!(report["summary"]["files_marked_delete"], 2, "labels still change");
+        assert_eq!(report["results"][0]["files"][2]["action"], "DELETE");
+
+        let _ = fs::remove_file(path_str);
+    }
+
+    #[test]
+    fn test_a_codec_standoff_anchors_the_guard_on_every_champion() {
+        // In a standoff there is no KEEP pick to match against -- each codec
+        // keeps its own champion. A file directly matched against ANY survivor
+        // has its evidence, so the 720p copy below is still deleted even though
+        // it never matched the av1 champion.
+        let dir = tempfile::tempdir().unwrap();
+        let p_h264 = at(&dir, "full_h264.mkv");
+        let p_av1 = at(&dir, "full_av1.mkv");
+        let p_small = at(&dir, "small_h264.mkv");
+
+        let fp_h264 = mock_fp_coded(&p_h264, 60.0, "h264");
+        let fp_av1 = mock_fp_coded(&p_av1, 60.0, "av1");
+        let mut fp_small = mock_fp_coded(&p_small, 60.0, "h264");
+        fp_small.width = 1280;
+        fp_small.height = 720;
+
+        let fps = vec![fp_h264, fp_av1, fp_small];
+        materialize_all(&fps);
+
+        // 2 matched only the h264 champion, never the av1 one.
+        let matches = MatchIndex::new(vec![
+            Match { a: 0, b: 1, coverage_a: 1.0, coverage_b: 1.0 },
+            Match { a: 0, b: 2, coverage_a: 1.0, coverage_b: 1.0 },
+        ]);
+
+        let groups = vec![vec![0, 1, 2]];
+
+        let deleted = output_results(
+            &groups, &fps, &matches, None, 0, policy(Priority::Length),
+            Some(&Disposal::Permanent), &RunStats::default(),
+        ).unwrap();
+
+        assert!(Path::new(&p_h264).exists(), "1080p h264 is a champion");
+        assert!(Path::new(&p_av1).exists(), "1080p av1 is a champion");
+        assert!(
+            !Path::new(&p_small).exists(),
+            "matching one surviving champion is evidence enough"
+        );
+        assert_eq!(deleted, vec![p_small]);
+    }
+
+    #[test]
+    fn test_a_group_keeps_exactly_one_file() {
+        // The rule the partition buys: one survivor per group. Files 0 and 1 are
+        // equally good and would each have won a group of their own under the
+        // old overlapping cliques; here they are related, so they are ranked
+        // against each other and only one is kept.
+        let dir = tempfile::tempdir().unwrap();
+        let p0 = at(&dir, "a_best.mkv");
+        let p1 = at(&dir, "b_equal.mkv");
+        let p2 = at(&dir, "c_short.mkv");
 
         let fps = vec![
             mock_fp_at(&p0, 60.0),
@@ -1554,27 +1763,39 @@ full_path;action";
         ];
         materialize_all(&fps);
 
-        let groups = vec![vec![0, 2], vec![1, 2]];
+        let groups = vec![vec![0, 1, 2]];
         let stats = RunStats::default();
+        let path_str = report_to("json");
 
-        // Previously errored on the second deletion attempt; must succeed now.
-        let deleted = output_results(
-            &groups, &fps, &no_matches(), None, 0, Priority::Length,
+        let mut deleted = output_results(
+            &groups, &fps, &all_compared(fps.len()), Some(&path_str), 0, policy(Priority::Length),
             Some(&Disposal::Permanent), &stats,
         ).unwrap();
+        deleted.sort();
 
-        assert!(Path::new(&p0).exists(), "independent best A must remain");
-        assert!(Path::new(&p1).exists(), "independent best B must remain");
-        assert!(!Path::new(&p2).exists(), "shared duplicate must be removed exactly once");
+        assert!(Path::new(&p0).exists(), "the tiebreak keeps the first path");
+        assert!(!Path::new(&p1).exists(), "an equal copy is still a redundant copy");
+        assert!(!Path::new(&p2).exists());
+        assert_eq!(stats.delete_failed.count(), 0);
+
+        let mut expected = vec![p1, p2];
+        expected.sort();
+        assert_eq!(deleted, expected, "each target is handed back exactly once");
+
+        let actions: Vec<String> = read_json(&path_str)["results"][0]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["action"].as_str().unwrap().to_string())
+            .collect();
         assert_eq!(
-            stats.delete_failed.count(), 0,
-            "a target queued by two groups must not report a second, failing attempt"
+            actions.iter().filter(|a| *a == "KEPT").count(),
+            1,
+            "exactly one survivor: {:?}",
+            actions
         );
-        assert_eq!(
-            deleted,
-            vec![p2],
-            "and it must be handed back once, not once per group"
-        );
+
+        let _ = fs::remove_file(path_str);
     }
 
     #[test]
@@ -1596,7 +1817,7 @@ full_path;action";
         let groups = vec![vec![0, 1]];
 
         output_results(
-            &groups, &fps, &no_matches(), None, 0, Priority::Length,
+            &groups, &fps, &all_compared(fps.len()), None, 0, policy(Priority::Length),
             Some(&Disposal::Permanent), &RunStats::default(),
         ).unwrap();
 
@@ -1627,7 +1848,7 @@ full_path;action";
         let path_str = report_to("json");
 
         let deleted = output_results(
-            &groups, &fps, &no_matches(), Some(&path_str), 0, Priority::Length,
+            &groups, &fps, &all_compared(fps.len()), Some(&path_str), 0, policy(Priority::Length),
             Some(&Disposal::Permanent), &RunStats::default(),
         ).unwrap();
 
@@ -1665,7 +1886,7 @@ full_path;action";
         let groups = vec![vec![0, 1, 2]];
 
         output_results(
-            &groups, &fps, &no_matches(), None, 0, Priority::Length,
+            &groups, &fps, &all_compared(fps.len()), None, 0, policy(Priority::Length),
             Some(&Disposal::Permanent), &RunStats::default(),
         ).unwrap();
 
@@ -1701,7 +1922,7 @@ full_path;action";
         let groups = vec![vec![0, 1, 2, 3, 4]];
 
         output_results(
-            &groups, &fps, &no_matches(), None, 0, Priority::Length,
+            &groups, &fps, &all_compared(fps.len()), None, 0, policy(Priority::Length),
             Some(&Disposal::Permanent), &RunStats::default(),
         ).unwrap();
 
@@ -1735,7 +1956,7 @@ full_path;action";
         let groups = vec![vec![0, 1, 2]];
 
         output_results(
-            &groups, &fps, &no_matches(), None, 0, Priority::Length,
+            &groups, &fps, &all_compared(fps.len()), None, 0, policy(Priority::Length),
             Some(&Disposal::Permanent), &RunStats::default(),
         ).unwrap();
 
@@ -1765,7 +1986,7 @@ full_path;action";
         let groups = vec![vec![0, 1]];
 
         output_results(
-            &groups, &fps, &no_matches(), None, 0, Priority::Length,
+            &groups, &fps, &all_compared(fps.len()), None, 0, policy(Priority::Length),
             Some(&Disposal::Permanent), &RunStats::default(),
         ).unwrap();
 
@@ -1790,7 +2011,7 @@ full_path;action";
         let stats = RunStats::default();
 
         let deleted = output_results(
-            &groups, &fps, &no_matches(), None, 0, Priority::Length,
+            &groups, &fps, &all_compared(fps.len()), None, 0, policy(Priority::Length),
             Some(&Disposal::Permanent), &stats,
         ).unwrap();
 

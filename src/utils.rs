@@ -48,6 +48,26 @@ pub enum Priority {
     Size,
 }
 
+/// The two decisions a group's labels depend on, travelling together because
+/// neither is meaningful without the other: which metric ranks the copies, and
+/// how much evidence a DELETE has to rest on.
+#[derive(Clone, Copy, Debug)]
+pub struct Policy {
+    pub priority: Priority,
+    /// Whether a chain of matches counts as evidence on its own.
+    ///
+    /// Groups are connected components, so a member can be ranked below the
+    /// copy being kept without the two ever having been compared -- it reached
+    /// the group through some third file. By default such a file is flagged
+    /// REVIEW rather than DELETE: the ranking that condemned it is sound, but
+    /// nothing ever measured it against the file that is staying on disk.
+    ///
+    /// Setting this marks it DELETE instead, which is to say: treat the match
+    /// relation as transitive. It is not (three episodes can share an opening
+    /// without any two being copies), which is why this is off by default.
+    pub trust_chains: bool,
+}
+
 /// Default precedence when ranking two copies of the same video:
 /// length > resolution > quality > size.
 ///
