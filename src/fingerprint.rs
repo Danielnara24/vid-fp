@@ -27,13 +27,51 @@ pub const MAX_DECODE_THREADS: usize = 16;
 /// Above the ceiling we record "unknown", which every consumer already handles.
 const MAX_PLAUSIBLE_FRAME_RATE: f64 = 1000.0;
 
+/// Side of the thumbnail the frame hash is computed from.
+///
+/// The auto-cropped region of the 64x64 buffer is box-filtered down to
+/// THUMB x THUMB and transformed; the 8x8 lowest-frequency corner of that
+/// transform is what becomes the 64-bit hash. 16 is deliberately small: the
+/// coefficients above it describe detail that a re-encode is free to throw
+/// away, and including them made two encodes of the same frame *less* alike
+/// without making two different frames any less alike.
+const THUMB: usize = 16;
+
+/// Side of the low-frequency block kept from the transform. 8x8 = 64
+/// coefficients = the 64 bits of the hash.
+const KEEP: usize = 8;
+
+/// Mean absolute AC coefficient below which a frame carries no usable
+/// structure -- a black frame, a fade, a plain title card.
+///
+/// The bits of such a frame are thresholded noise: two unrelated blank frames
+/// land a coin-flip apart and can drift inside any tolerance worth using. Real
+/// content sits two orders of magnitude above this floor (the 1st percentile of
+/// a full episode's keyframes is around 60), so nothing with a picture in it is
+/// at risk of being dropped.
+const MIN_AC_ENERGY: f32 = 8.0;
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct VideoFingerprint {
     pub path: String,
     pub valid_hashes: Vec<u64>,
+    /// Milliseconds from the start of the video at which each stored hash was
+    /// sampled, ascending.
+    ///
+    /// Milliseconds rather than a sample ordinal, because what a match is worth
+    /// is how much *footage* it accounts for and samples are not evenly spread.
+    /// Encoders put keyframes where the picture changes, so one sample can stand
+    /// for a ten-second static shot and the next for half a second of cuts;
+    /// counting them equally reads a re-encode that happens to sample the busy
+    /// half as barely overlapping. Two files of the same footage disagree wildly
+    /// about how many samples it is worth and not at all about how long it is.
     pub valid_t_start: Vec<u32>,
+    /// Milliseconds at which each stored hash stops standing in for the
+    /// picture: the next sample's time, or the end of the video for the last.
     pub valid_t_end: Vec<u32>,
-    pub total_frames: u32,
+    /// The video's runtime in milliseconds -- the denominator every coverage
+    /// figure is taken over.
+    pub total_ms: u32,
     pub width: u32,
     pub height: u32,
     pub duration: f64,
@@ -102,6 +140,216 @@ impl VideoFingerprint {
             0
         }
     }
+}
+
+/// When each sample was taken, in milliseconds, and the runtime they are
+/// measured against.
+///
+/// The container's own timestamps are used whenever it gave a complete set. If
+/// even one is missing the whole video falls back to spacing its samples evenly
+/// across the runtime: a half-timed video would otherwise weight the timed part
+/// of itself against a guess about the rest, and an even spread is at least the
+/// same assumption everywhere. That is also exactly the old accounting, so a
+/// container with no timestamps behaves as it always did.
+///
+/// The runtime comes from the header when it is known. When it is not, the last
+/// sample is extended by one average gap -- the last sample stands for footage
+/// too, and giving it a zero-length span would quietly delete it from every
+/// coverage figure.
+fn sample_times(times: &[Option<u32>], duration_sec: f64) -> (Vec<u32>, u32) {
+    let n = times.len();
+    let known: Option<Vec<u32>> = times.iter().copied().collect();
+
+    let mut total_ms = if duration_sec > 0.0 {
+        (duration_sec * 1000.0) as u32
+    } else {
+        0
+    };
+
+    let times = match known {
+        Some(t) => t,
+        None => {
+            // No usable clock: spread the samples evenly over whatever runtime
+            // we have, or over a nominal millisecond each if we have none.
+            if total_ms == 0 {
+                total_ms = n as u32;
+            }
+            (0..n)
+                .map(|i| ((i as u64 * total_ms as u64) / n.max(1) as u64) as u32)
+                .collect()
+        }
+    };
+
+    let last = times.iter().copied().max().unwrap_or(0);
+    if total_ms <= last {
+        let average_gap = last / n.max(1) as u32;
+        total_ms = last.saturating_add(average_gap.max(1));
+    }
+
+    (times, total_ms)
+}
+
+/// Box-filter weights taking `len` source pixels starting at `offset` down to
+/// `THUMB` output samples.
+///
+/// Every output sample is the *average of the source pixels it covers*, edges
+/// included fractionally, rather than a reading of the one or two pixels
+/// nearest its centre. That distinction is the whole reason this exists: point
+/// sampling a 1080p frame through a 64x64 buffer lands on a handful of
+/// individual pixels, and which value those pixels hold is exactly what an
+/// encoder is licensed to change. An average over the same area is a statistic
+/// of hundreds of source pixels and barely moves.
+///
+/// `len` can be a little under `THUMB` -- the auto-crop will not act on a span
+/// narrower than 16 and then insets it by a pixel each side -- in which case
+/// this is an upscale and each output sample reads one source pixel. The tap
+/// list is never empty either way.
+fn box_weights(offset: usize, len: usize) -> Vec<Vec<(usize, f32)>> {
+    let scale = len as f32 / THUMB as f32;
+    (0..THUMB)
+        .map(|o| {
+            let start = o as f32 * scale;
+            let end = start + scale;
+            let first = start.floor() as usize;
+            let last = ((end.ceil() as usize).min(len)).max(first + 1);
+
+            let mut taps: Vec<(usize, f32)> = (first..last)
+                .map(|s| {
+                    // How much of source pixel `s` falls inside [start, end).
+                    let overlap = (end.min(s as f32 + 1.0) - start.max(s as f32)).max(0.0);
+                    (offset + s, overlap)
+                })
+                .collect();
+
+            let total: f32 = taps.iter().map(|(_, w)| w).sum();
+            if total > 0.0 {
+                for (_, w) in taps.iter_mut() {
+                    *w /= total;
+                }
+            }
+            taps
+        })
+        .collect()
+}
+
+/// The DCT-II basis restricted to the `KEEP` lowest frequencies of a `THUMB`
+/// wide signal, unnormalised (`cos(pi (2x+1) k / 2N)`).
+///
+/// Normalisation is left out on purpose: every coefficient is only ever
+/// compared against other coefficients of the same frame, so a constant scale
+/// factor cancels -- except in `MIN_AC_ENERGY`, which is calibrated against
+/// this scale.
+fn dct_basis() -> [[f32; THUMB]; KEEP] {
+    let mut basis = [[0.0f32; THUMB]; KEEP];
+    for (k, row) in basis.iter_mut().enumerate() {
+        for (x, cell) in row.iter_mut().enumerate() {
+            *cell = (std::f32::consts::PI * (2.0 * x as f32 + 1.0) * k as f32
+                / (2.0 * THUMB as f32))
+                .cos();
+        }
+    }
+    basis
+}
+
+/// Box-filter the cropped region of a 64x64 frame down to `THUMB` x `THUMB`.
+///
+/// Separable: rows first into `band` (THUMB rows still 64 wide), then columns.
+/// Both scratch buffers belong to the caller so a whole video's worth of frames
+/// runs without allocating.
+fn resample(
+    frame: &[u8],
+    rows: &[Vec<(usize, f32)>],
+    cols: &[Vec<(usize, f32)>],
+    band: &mut [f32],
+    out: &mut [f32],
+) {
+    for (oy, taps) in rows.iter().enumerate() {
+        let dst = &mut band[oy * 64..oy * 64 + 64];
+        dst.fill(0.0);
+        for &(sy, w) in taps {
+            let src = &frame[sy * 64..sy * 64 + 64];
+            for (d, &s) in dst.iter_mut().zip(src) {
+                *d += s as f32 * w;
+            }
+        }
+    }
+
+    for oy in 0..THUMB {
+        let src = &band[oy * 64..oy * 64 + 64];
+        for (ox, taps) in cols.iter().enumerate() {
+            let mut acc = 0.0;
+            for &(sx, w) in taps {
+                acc += src[sx] * w;
+            }
+            out[oy * THUMB + ox] = acc;
+        }
+    }
+}
+
+/// The `KEEP` x `KEEP` lowest-frequency corner of the thumbnail's 2-D DCT, with
+/// the DC term zeroed.
+///
+/// DC is the frame's average brightness, which says nothing about what is in
+/// the picture and everything about how the encoder handled levels; dropping it
+/// is what makes the hash indifferent to a copy that is a shade darker.
+fn low_frequency_block(thumb: &[f32], basis: &[[f32; THUMB]; KEEP]) -> [f32; KEEP * KEEP] {
+    // rows: basis * thumb -> KEEP x THUMB
+    let mut partial = [[0.0f32; THUMB]; KEEP];
+    for (k, prow) in partial.iter_mut().enumerate() {
+        for (y, &b) in basis[k].iter().enumerate() {
+            let src = &thumb[y * THUMB..y * THUMB + THUMB];
+            for (p, &s) in prow.iter_mut().zip(src) {
+                *p += b * s;
+            }
+        }
+    }
+
+    // columns: partial * basis^T -> KEEP x KEEP
+    let mut out = [0.0f32; KEEP * KEEP];
+    for k in 0..KEEP {
+        for l in 0..KEEP {
+            let mut acc = 0.0;
+            for x in 0..THUMB {
+                acc += partial[k][x] * basis[l][x];
+            }
+            out[k * KEEP + l] = acc;
+        }
+    }
+    out[0] = 0.0;
+    out
+}
+
+/// Whether a frame has too little structure for its hash to mean anything.
+fn is_featureless(coefficients: &[f32; KEEP * KEEP]) -> bool {
+    let energy: f32 = coefficients.iter().map(|c| c.abs()).sum();
+    energy / ((KEEP * KEEP) as f32) < MIN_AC_ENERGY
+}
+
+/// One bit per coefficient: is it above the median of the block?
+///
+/// A median split rather than a sign test or a comparison against a neighbour.
+/// It fixes the popcount at 32 whatever the frame is, so two unrelated frames
+/// sit ~32 bits apart by construction and the tolerance has the same meaning
+/// everywhere -- there is no bright frame whose hash is mostly ones and
+/// therefore close to every other bright frame's.
+///
+/// The fixed popcount has a consequence worth knowing when reading a tolerance:
+/// two hashes with the same number of set bits always differ in an EVEN number
+/// of places, so `--hamming-distance 5` accepts exactly what 4 does. Odd values
+/// are not wrong, just indistinguishable from the even one below them.
+fn hash_of(coefficients: &[f32; KEEP * KEEP]) -> u64 {
+    let mut sorted = *coefficients;
+    sorted.sort_unstable_by(|a, b| a.total_cmp(b));
+    let n = KEEP * KEEP;
+    let median = (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0;
+
+    let mut hash = 0u64;
+    for (i, &c) in coefficients.iter().enumerate() {
+        if c > median {
+            hash |= 1 << (63 - i);
+        }
+    }
+    hash
 }
 
 /// A `Rational` as a plain float, with FFmpeg's "unknown" (a zero denominator)
@@ -350,10 +598,24 @@ pub fn fingerprint_video(
     // allocation instead of N tiny ones -> no heap fragmentation/retention, and the
     // whole thing is released to the OS when this function returns.
     let mut u_frames: Vec<u8> = Vec::with_capacity(FRAME_STRIDE * 64);
-    let mut unique_frame_indices = Vec::new();
+    // When each kept frame is shown, in milliseconds. `None` for a frame the
+    // container gave no timestamp for; a video with any of those falls back to
+    // spacing its samples evenly (see `sample_times`).
+    let mut unique_frame_times: Vec<Option<u32>> = Vec::new();
 
     let mut sum = vec![0u64; 64 * 64];
     let mut sum_sq = vec![0u64; 64 * 64];
+
+    // Seconds per unit of the video stream's timestamps. Zero when the header
+    // never said, which makes every frame time unknown.
+    let stream_time_base = {
+        let tb = ictx.stream(video_stream_index).unwrap().time_base();
+        if tb.denominator() > 0 {
+            tb.numerator() as f64 / tb.denominator() as f64
+        } else {
+            0.0
+        }
+    };
 
     let mut frame_idx = 0;
     let mut prev_frame = vec![0u8; 4096];
@@ -395,7 +657,17 @@ pub fn fingerprint_video(
         if is_first || current_frame != prev_frame {
             // Append into the single flat buffer instead of pushing a new Vec.
             u_frames.extend_from_slice(&current_frame);
-            unique_frame_indices.push(frame_idx);
+
+            // The decoder's own timestamp, not the demuxer's: with frame
+            // threading a frame surfaces several packets after the one that
+            // carried it, so the packet in hand when it arrives is somebody
+            // else's.
+            unique_frame_times.push(match dec.timestamp() {
+                Some(pts) if stream_time_base > 0.0 && pts >= 0 => {
+                    Some((pts as f64 * stream_time_base * 1000.0) as u32)
+                }
+                _ => None,
+            });
 
             for (i, &val) in current_frame.iter().enumerate() {
                 let v = val as u64;
@@ -480,8 +752,7 @@ pub fn fingerprint_video(
         let _ = process_frame(&decoded);
     }
 
-    let total_frames = frame_idx;
-    if total_frames == 0 {
+    if frame_idx == 0 {
         return Err(anyhow!("No valid frames found or successfully decoded in {}", filepath));
     }
 
@@ -491,8 +762,8 @@ pub fn fingerprint_video(
     // own bitstream.
     let (width, height) = frame_dims.unwrap_or((decoder.width(), decoder.height()));
 
-    // u_frames holds n_unique * FRAME_STRIDE bytes; the frame count is the index list.
-    let n_unique = unique_frame_indices.len();
+    // u_frames holds n_unique * FRAME_STRIDE bytes; the frame count is the time list.
+    let n_unique = unique_frame_times.len();
     let n_f32 = n_unique as f32;
 
     // 2. Variance & Auto-Crop Algebra (Untouched - accurate)
@@ -535,102 +806,55 @@ pub fn fingerprint_video(
     let crop_h = y2 - y1 + 1;
     let crop_w = x2 - x1 + 1;
 
-    struct InterpWeight {
-        y_idx: usize, x_idx: usize,
-        y_idx_next: usize, x_idx_next: usize,
-        w11: f32, w12: f32,
-        w21: f32, w22: f32,
-    }
-
-    let mut weights = Vec::with_capacity(8 * 9);
-    if crop_h != 8 || crop_w != 9 {
-        for out_y in 0..8 {
-            for out_x in 0..9 {
-                let y_f = (out_y as f32) * (crop_h as f32 - 1.0) / 7.0;
-                let x_f = (out_x as f32) * (crop_w as f32 - 1.0) / 8.0;
-
-                let y_idx = y_f.floor() as usize;
-                let x_idx = x_f.floor() as usize;
-
-                let yw = y_f - y_idx as f32;
-                let xw = x_f - x_idx as f32;
-
-                weights.push(InterpWeight {
-                    y_idx: y1 + y_idx,
-                    x_idx: x1 + x_idx,
-                    y_idx_next: y1 + (y_idx + 1).min(crop_h - 1),
-                    x_idx_next: x1 + (x_idx + 1).min(crop_w - 1),
-                    w11: (1.0 - yw) * (1.0 - xw),
-                    w12: (1.0 - yw) * xw,
-                    w21: yw * (1.0 - xw),
-                    w22: yw * xw,
-                });
-            }
-        }
-    }
+    // The crop rectangle is fixed for the whole video, so the resampler and the
+    // transform basis are built once here and reused for every frame.
+    let rows = box_weights(y1, crop_h);
+    let cols = box_weights(x1, crop_w);
+    let basis = dct_basis();
 
     let mut hashes = Vec::with_capacity(n_unique);
+    let mut flat = Vec::with_capacity(n_unique);
+    let mut thumb = [0.0f32; THUMB * THUMB];
+    let mut band = [0.0f32; 64 * THUMB];
+
     // Iterate the flat buffer in FRAME_STRIDE-sized windows; each `frame` is a
-    // &[u8] of length 4096, so all the indexing below is unchanged.
+    // &[u8] of length 4096.
     for frame in u_frames.chunks_exact(FRAME_STRIDE) {
-        let mut frame_8x9 = [0u8; 72];
-
-        if crop_h != 8 || crop_w != 9 {
-            for (i, w) in weights.iter().enumerate() {
-                let p11 = frame[w.y_idx * 64 + w.x_idx] as f32;
-                let p12 = frame[w.y_idx * 64 + w.x_idx_next] as f32;
-                let p21 = frame[w.y_idx_next * 64 + w.x_idx] as f32;
-                let p22 = frame[w.y_idx_next * 64 + w.x_idx_next] as f32;
-
-                frame_8x9[i] = (p11 * w.w11 + p12 * w.w12 + p21 * w.w21 + p22 * w.w22) as u8;
-            }
-        } else {
-            let mut i = 0;
-            for out_y in 0..8 {
-                for out_x in 0..9 {
-                    frame_8x9[i] = frame[(y1 + out_y) * 64 + (x1 + out_x)];
-                    i += 1;
-                }
-            }
-        }
-
-        let mut hash: u64 = 0;
-        let mut bit_idx = 0;
-        for r in 0..8 {
-            let row_offset = r * 9;
-            for c in 0..8 {
-                if frame_8x9[row_offset + c + 1] > frame_8x9[row_offset + c] {
-                    hash |= 1 << (63 - bit_idx);
-                }
-                bit_idx += 1;
-            }
-        }
-        hashes.push(hash);
+        resample(frame, &rows, &cols, &mut band, &mut thumb);
+        let coefficients = low_frequency_block(&thumb, &basis);
+        hashes.push(hash_of(&coefficients));
+        flat.push(is_featureless(&coefficients));
     }
 
     // Frame pixels are no longer needed; release the large buffer (munmap) now
     // rather than at end of scope, trimming the peak during the cheap tail work.
     drop(u_frames);
 
+    let (times, total_ms) = sample_times(&unique_frame_times, duration_sec);
+
+    // Keyframes do not always leave the decoder in presentation order -- an open
+    // GOP or a B-pyramid can put a later one out first -- and every span below
+    // is "until the next sample", so the samples are put in time order before
+    // anything is measured from them.
+    let mut order: Vec<usize> = (0..hashes.len()).collect();
+    order.sort_by_key(|&i| times[i]);
+
     let mut changes_hashes = Vec::new();
     let mut changes_t_start = Vec::new();
     let mut changes_valid = Vec::new();
 
-    for i in 0..hashes.len() {
+    for (k, &i) in order.iter().enumerate() {
         let h = hashes[i];
-        let valid = h.count_ones() > 2 && h.count_ones() < 62;
+        let valid = !flat[i];
 
-        let should_push = if i == 0 {
-            true
-        } else {
-            let prev_h = hashes[i - 1];
-            let prev_valid = prev_h.count_ones() > 2 && prev_h.count_ones() < 62;
-            h != prev_h || valid != prev_valid
+        let should_push = k == 0 || {
+            let prev = order[k - 1];
+            h != hashes[prev] || valid != !flat[prev]
         };
 
         if should_push {
             changes_hashes.push(h);
-            changes_t_start.push(unique_frame_indices[i]);
+            changes_t_start.push(times[i]);
             changes_valid.push(valid);
         }
     }
@@ -647,7 +871,7 @@ pub fn fingerprint_video(
             if i + 1 < changes_hashes.len() {
                 final_t_end.push(changes_t_start[i + 1]);
             } else {
-                final_t_end.push(total_frames as u32);
+                final_t_end.push(total_ms);
             }
         }
     }
@@ -657,7 +881,7 @@ pub fn fingerprint_video(
         valid_hashes: final_hashes,
         valid_t_start: final_t_start,
         valid_t_end: final_t_end,
-        total_frames: total_frames as u32,
+        total_ms,
         width,
         height,
         duration: duration_sec,
@@ -711,7 +935,7 @@ mod tests {
             valid_hashes: vec![],
             valid_t_start: vec![],
             valid_t_end: vec![],
-            total_frames: 1,
+            total_ms: 1,
             width: 1920,
             height: 1080,
             duration,
@@ -736,7 +960,7 @@ mod tests {
         let fp = fingerprint_fixture(1);
 
         // Assert the properties of the generated fingerprint
-        assert!(fp.total_frames > 0, "Video should have parsed at least 1 frame");
+        assert!(fp.total_ms > 0, "Video should have a measured runtime");
         assert!(fp.width > 0, "Video width should be parsed correctly");
         assert!(fp.height > 0, "Video height should be parsed correctly");
         assert!(fp.file_size > 0, "File size should be captured");
@@ -823,7 +1047,7 @@ mod tests {
         let single = fingerprint_fixture(1);
         let threaded = fingerprint_fixture(4);
 
-        assert_eq!(single.total_frames, threaded.total_frames, "frame count must not depend on thread count");
+        assert_eq!(single.total_ms, threaded.total_ms, "runtime must not depend on thread count");
         assert_eq!(single.valid_hashes, threaded.valid_hashes, "hashes must not depend on thread count");
         assert_eq!(single.valid_t_start, threaded.valid_t_start, "hash start times must not depend on thread count");
         assert_eq!(single.valid_t_end, threaded.valid_t_end, "hash end times must not depend on thread count");

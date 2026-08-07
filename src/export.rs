@@ -834,7 +834,7 @@ full_path;action";
         VideoFingerprint {
             path: "/fake/path/vid.mp4".to_string(),
             valid_hashes: vec![], valid_t_start: vec![], valid_t_end: vec![],
-            total_frames: 100, width: 1920, height: 1080, duration: 60.0, file_size: 1048576,
+            total_ms: 100_000, width: 1920, height: 1080, duration: 60.0, file_size: 1048576,
             codec: "h264".to_string(), frame_rate: 30.0,
         }
     }

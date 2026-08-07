@@ -34,17 +34,30 @@ use utils::{shutdown_requested, Policy, Priority};
 /// scanned rather than by the number of times they have changed: a file that is
 /// re-encoded, re-muxed, or scanned with different sampling settings replaces
 /// its own entry instead of growing a second one beside it.
-const CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("fingerprints_by_path");
+const CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("fingerprints_dct");
 
-/// The table this replaced, keyed by path AND mtime AND size AND the sampling
-/// knobs.
+/// Tables earlier builds wrote, all dead. They are dropped whole on the first
+/// run of this one.
 ///
-/// That key was the leak. Touching a file wrote a NEW key and left the old one
-/// behind for the life of the cache, and `--prune-cache` could not tell the two
-/// apart because it only ever compared the path portion of the key -- so the
-/// one tool for the job saw a live path and kept every dead entry under it.
-/// Nothing reads this table now, so it is dropped whole on the first run.
-const SUPERSEDED_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("fingerprints");
+/// Renaming the table is how a fingerprint that no longer MEANS the same thing
+/// is retired, and it is the only mechanism that works here. `VideoFingerprint`
+/// relies on a changed layout failing to deserialize, which catches a field
+/// being added but not a field changing units underneath the same `u32` -- an
+/// entry written when those numbers counted keyframes decodes perfectly as one
+/// that counts milliseconds, and quietly reports nonsense. A name no lookup
+/// will ever ask for cannot be misread.
+///
+/// - `fingerprints` was keyed by path AND mtime AND size AND the sampling
+///   knobs. That key was a leak: touching a file wrote a NEW key and left the
+///   old one behind for the life of the cache, and `--prune-cache` could not
+///   tell the two apart because it only compared the path portion.
+/// - `fingerprints_by_path` fixed the key, but holds difference hashes over an
+///   8x9 thumbnail and sample times counted in keyframes. This build hashes
+///   DCT coefficients and counts milliseconds; the two are not comparable.
+const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 2] = [
+    TableDefinition::new("fingerprints"),
+    TableDefinition::new("fingerprints_by_path"),
+];
 
 /// Hard ceiling on the cache's page cache.
 ///
@@ -81,7 +94,7 @@ const EXIT_WITH_PROBLEMS: i32 = 2;
 /// discipline `VideoFingerprint` already documents working: a field appended to
 /// the end of it makes older payloads run out of bytes, bincode fails, and the
 /// file is fingerprinted again. Changing THIS struct moves the offset and has
-/// no such guarantee, so it needs the same treatment `SUPERSEDED_TABLE` got.
+/// no such guarantee, so it needs the same treatment `SUPERSEDED_TABLES` got.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 struct Stamp {
     mtime: i64,
@@ -188,13 +201,15 @@ struct Args {
     )]
     extensions: Vec<String>,
 
-    /// Maximum Hamming distance.
-    /// Higher = looser matching, lower = stricter matching. Default is 3.
-    #[arg(short = 'd', long = "hamming-distance", default_value_t = 3)]
+    /// Maximum Hamming distance between two frame hashes, out of 64 bits.
+    /// Higher = looser matching, lower = stricter matching. Default is 4.
+    /// Two unrelated frames sit about 32 bits apart, so the useful range is
+    /// roughly 2 (only near-identical frames) to 14 (visibly the same shot).
+    #[arg(short = 'd', long = "hamming-distance", default_value_t = 4)]
     hamming_distance: u32,
 
-    /// Minimum match percentage required to be considered a duplicate. Default is 10.0 (10%).
-    #[arg(short = 'p', long = "match-percent", default_value_t = 10.0)]
+    /// Minimum match percentage required to be considered a duplicate. Default is 20.0 (20%).
+    #[arg(short = 'p', long = "match-percent", default_value_t = 20.0)]
     match_percent: f32,
 
     /// Minimum shared clip length, in seconds, for two videos to count as a
@@ -563,16 +578,19 @@ fn clear_cache(db: &mut Database) -> Result<()> {
     Ok(())
 }
 
-/// Drop the table this build's cache replaced, if it is still there.
+/// Drop every table this build's cache replaced, if any are still there.
 ///
-/// Returns whether there was one, so the caller can decide about reclaiming the
-/// space: deleting a table frees its pages inside the file but does not shrink
-/// the file, and only a compaction hands that back to the filesystem.
-fn retire_superseded_table(db: &Database) -> Result<bool> {
+/// Returns whether there were any, so the caller can decide about reclaiming
+/// the space: deleting a table frees its pages inside the file but does not
+/// shrink the file, and only a compaction hands that back to the filesystem.
+fn retire_superseded_tables(db: &Database) -> Result<bool> {
     let txn = db.begin_write().context("Failed to start a cache transaction")?;
-    let existed = txn
-        .delete_table(SUPERSEDED_TABLE)
-        .context("Failed to remove the superseded cache table")?;
+    let mut existed = false;
+    for table in SUPERSEDED_TABLES {
+        existed |= txn
+            .delete_table(table)
+            .context("Failed to remove a superseded cache table")?;
+    }
     txn.commit().context("Failed to commit the cache table removal")?;
     Ok(existed)
 }
@@ -825,12 +843,10 @@ Interrupted with Ctrl-C.
 
     ensure_cache_table(&db).context("Failed to initialize the fingerprint cache")?;
 
-    // Once, on the first run of this build. The old table is keyed by a string
-    // that no lookup will ever construct again, so every byte of it is dead --
-    // and by construction it is the bigger of the two, since it held an entry
-    // per version of every file rather than an entry per file. Compacting right
-    // afterwards is the only thing that returns those pages to the filesystem.
-    match retire_superseded_table(&db) {
+    // Once, on the first run of this build. Nothing will ever look in those
+    // tables again, so every byte of them is dead. Compacting right afterwards
+    // is the only thing that returns those pages to the filesystem.
+    match retire_superseded_tables(&db) {
         Ok(true) => {
             info!("Removed the superseded fingerprint cache; fingerprints will be rebuilt once.");
             if let Err(e) = db.compact() {
@@ -1772,7 +1788,7 @@ mod tests {
             valid_hashes: vec![1, 2, 3],
             valid_t_start: vec![0, 1, 2],
             valid_t_end: vec![1, 2, 3],
-            total_frames: 3,
+            total_ms: 3,
             width: 1920,
             height: 1080,
             duration: 60.0,

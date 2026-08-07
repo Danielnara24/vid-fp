@@ -152,7 +152,7 @@ mod tests {
             valid_hashes: vec![],
             valid_t_start: vec![],
             valid_t_end: vec![],
-            total_frames: 100,
+            total_ms: 100_000,
             width: 1920,
             height: 1080,
             duration: 10.0,

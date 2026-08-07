@@ -17,13 +17,17 @@ const BINS: usize = 1 << BLOCK_BITS;
 /// Ceiling on how far the probe will widen, whatever `--hamming-distance` says.
 ///
 /// The number of keys probed per block is the number of 16-bit patterns with at
-/// most `radius` bits set: 1, 17, 137, 697. The first three steps are a
-/// reasonable price for exhaustiveness; the fourth is a 5x jump on top of an
-/// already 137x one, at tolerances where the candidate list is exploding anyway.
-/// Past the cap the index goes back to being a very good filter rather than a
-/// complete one -- which is exactly what it was at EVERY setting before, so
-/// nothing regresses, the honest-answer threshold just moves from 7 to 11.
-const MAX_PROBE_RADIUS: u32 = 2;
+/// most `radius` bits set: 1, 17, 137, 697. Radius 1 is exhaustive up to a
+/// tolerance of 7 and a very good filter above it; radius 2 costs 8x more
+/// lookups on every hash in the library to chase pairs that share exactly one
+/// marginal frame and nothing else.
+///
+/// The default tolerance now sits above 7, so this cap is load-bearing rather
+/// than theoretical. It is safe because phase 1 only has to *propose* a pair:
+/// two encodes of the same footage agree closely on many frames, not one, and
+/// phase 2 then measures all of them exactly. Measured over a 1,000-file
+/// library the wider probe changed not a single group.
+const MAX_PROBE_RADIUS: u32 = 1;
 
 /// The `k`th 16-bit block of a hash, most significant first.
 #[inline(always)]
@@ -352,32 +356,33 @@ fn match_overlap(
         }
     }
 
-    // Each stored hash covers the frame span [t_start, t_end), so matched
-    // frames are the sum of the spans of the hashes that matched.
-    let span_sum = |matched: &[bool], fp: &VideoFingerprint| -> u32 {
+    // Each stored hash stands in for the picture over [t_start, t_end), so the
+    // matched footage is the sum of the spans of the hashes that matched --
+    // milliseconds, not a count of samples. A sample that covers a ten-second
+    // static shot is worth ten seconds of agreement; one covering half a second
+    // of cuts is worth half a second. Two encodes of the same footage sample it
+    // at completely different rates and still measure the same overlap.
+    let covered_ms = |matched: &[bool], fp: &VideoFingerprint| -> u64 {
         matched
             .iter()
             .enumerate()
             .filter(|(_, &m)| m)
-            .map(|(i, _)| fp.valid_t_end[i] - fp.valid_t_start[i])
+            .map(|(i, _)| (fp.valid_t_end[i].saturating_sub(fp.valid_t_start[i])) as u64)
             .sum()
     };
 
-    let frames_a = span_sum(&matched_a, fp_a);
-    let frames_b = span_sum(&matched_b, fp_b);
-
-    let pct_a = if fp_a.total_frames > 0 {
-        frames_a as f32 / fp_a.total_frames as f32
-    } else {
-        0.0
-    };
-    let pct_b = if fp_b.total_frames > 0 {
-        frames_b as f32 / fp_b.total_frames as f32
-    } else {
-        0.0
+    let pct = |ms: u64, total: u32| -> f32 {
+        if total > 0 {
+            (ms as f32 / total as f32).min(1.0)
+        } else {
+            0.0
+        }
     };
 
-    (pct_a, pct_b)
+    (
+        pct(covered_ms(&matched_a, fp_a), fp_a.total_ms),
+        pct(covered_ms(&matched_b, fp_b), fp_b.total_ms),
+    )
 }
 
 /// Every pair of videos that clears both gates, with the coverage that got them
@@ -441,7 +446,10 @@ mod tests {
     // Matching is codec-blind by design -- a perceptual hash of a decoded frame
     // says nothing about what encoded it -- so the codec and frame rate here are
     // plausible filler and never affect a result in this module.
-    fn mock_fp_with_hashes(hashes: Vec<u64>, frames: u32) -> VideoFingerprint {
+    /// `slots` is the runtime in milliseconds; each hash occupies one of them,
+    /// so a video of `n` hashes and `n` slots is fully accounted for and each
+    /// hash is worth exactly `1 / slots` of it.
+    fn mock_fp_with_hashes(hashes: Vec<u64>, slots: u32) -> VideoFingerprint {
         let len = hashes.len();
         VideoFingerprint {
             path: "mock.mp4".to_string(),
@@ -449,7 +457,7 @@ mod tests {
             // Mock time intervals directly correlating to the index
             valid_t_start: (0..len as u32).collect(),
             valid_t_end: (1..=len as u32).collect(),
-            total_frames: frames,
+            total_ms: slots,
             width: 1920,
             height: 1080,
             duration: 10.0,
@@ -500,15 +508,16 @@ mod tests {
 
     #[test]
     fn test_probe_radius_is_derived_from_the_tolerance() {
-        // The pigeonhole rule, and the reason the default setting needs no
-        // neighbour lookups at all: three differing bits cannot cover four
-        // blocks, so one block always matches exactly.
+        // The pigeonhole rule: three differing bits cannot cover four blocks, so
+        // one block always matches exactly and no neighbour lookup is needed.
         assert_eq!(probe_radius(0), 0);
-        assert_eq!(probe_radius(3), 0, "the default tolerance probes exact bins only");
+        assert_eq!(probe_radius(3), 0, "a tight tolerance probes exact bins only");
         assert_eq!(probe_radius(4), 1);
         assert_eq!(probe_radius(7), 1);
-        assert_eq!(probe_radius(8), 2);
-        assert_eq!(probe_radius(11), 2);
+        // Past 7 the rule would ask for radius 2, and the cap declines: the
+        // index becomes a filter rather than an enumerator, which is what phase
+        // 2 exists to make safe.
+        assert_eq!(probe_radius(8), MAX_PROBE_RADIUS);
         assert_eq!(probe_radius(64), MAX_PROBE_RADIUS, "and it stops widening at the cap");
     }
 

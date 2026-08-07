@@ -229,8 +229,8 @@ doesn't, since moving files into the scan just feeds them back in next time.
 | `--follow-symlinks` | Descend into symlinked folders | off |
 | `-e`, `--exclude <FOLDER>` | Exclude a folder; repeat for several | — |
 | `-x`, `--extensions <EXT>` | Video extensions to include, comma-separated or repeated | `mp4,mkv,avi,mov,flv,webm` |
-| `-d`, `--hamming-distance <N>` | Frame-match tolerance; higher = less strict matching. Raise to increase duplicates found (but can increase false positives). Values above `11` work but see [Tuning](#tuning) | `3` |
-| `-p`, `--match-percent <F>` | Min % of overlap to count as a duplicate; Lower = Finds shorter matches (but can increase false positives) | `10.0` |
+| `-d`, `--hamming-distance <N>` | Frame-match tolerance, in bits out of 64; higher = less strict matching. Raise to increase duplicates found (but can increase false positives). See [Tuning](#tuning) | `4` |
+| `-p`, `--match-percent <F>` | Min % of overlap to count as a duplicate; Lower = Includes shorter matches (but can increase false positives) | `20.0` |
 | `--min-duration <SECS>` | Min shared clip length in seconds for a match. Videos shorter than this are skipped entirely. `0` = off | `0.0` |
 | `-k`, `--priority <P>` | Criteria for KEEPING files: `length`, `resolution`, `quality`, or `size`. The chosen one is compared first; the rest follow in the default order. See [Codecs and quality](#codecs-and-quality) | `length` |
 | `--trust-chains` | Mark a file DELETE even when it never matched the copy being kept, reaching its group only through a chain of matches; such files are flagged REVIEW by default. Changes labels only, deleting still needs `--delete` or `--move-to` | off |
@@ -253,20 +253,45 @@ The two knobs that decide what counts as a duplicate are `-d` (how different two
 frames may be) and `-p` (how much of a video must match). They trade off against
 each other, so change one at a time.
 
-**Not finding duplicates you expect?** Raise `-d` to 5–7, or lower `-p` if the
-match is a short clip inside a long video.
+`-d` counts differing bits of a 64-bit frame hash. Two unrelated frames sit
+about 32 bits apart, so the whole useful range is roughly 2 to 14: below that
+only a bit-identical re-encode matches, above it unrelated footage starts to.
+
+**Only even values of `-d` do anything.** Every hash has exactly 32 of its 64
+bits set, so any two of them differ in an even number of places — `-d 5` accepts
+exactly what `-d 4` accepts, `-d 7` exactly what `-d 6` does. Step in twos.
+
+**Both knobs are monotone**, which is what makes tuning them predictable:
+
+- Raising `-d` (or lowering `-p`) only ever *adds* files to the report. Nothing
+  that matched at a tighter setting stops matching at a looser one.
+- Lowering `-d` (or raising `-p`) only ever *removes* them.
+
+So the report at any setting is a subset of the report at every looser one, and
+a file that shows up when you loosen the knobs was always a weaker match than
+the ones already there. Start at the defaults and walk one knob outward until
+you see something you don't recognise.
+
+**Not finding duplicates you expect?** Raise `-d` to 10–12, or lower `-p` if the
+match is a short clip inside a long video. Two encodes of the same footage only
+line up frame-for-frame when their keyframes do; when they don't — one encoder
+cutting on scene changes, another on a fixed interval — each file samples
+moments the other never looked at, and a looser `-d` is what bridges the gap.
+Expect a group like that to report roughly half the runtime as shared even
+though the files are identical end to end.
 
 **Getting false positives?** Lower `-d` first — it's the blunter of the two.
 Dark scenes, fades, and letterboxed content look alike to any perceptual hash,
-and a loose `-d` conflates them.
+and a loose `-d` conflates them. (Frames with no structure at all are dropped
+outright rather than hashed, so black frames and plain title cards can't link
+anything on their own.)
 
-The index that proposes candidate pairs widens automatically with `-d`, so it is
-exhaustive up to `-d 11`: every pair within the tolerance is proposed. Widening
-costs time, in steps — `-d 0`–`3` probes one index bin per frame per block,
-`-d 4`–`7` probes 17, and `-d 8`–`11` probes 137. Above `-d 11` the probe stops
-widening, so it may fail to *propose* a pair whose frames are all near the far
-edge of the tolerance. Once a pair is proposed it is always compared exactly, and
-genuine duplicates share many frames, so a miss is very unlikely.
+The index that proposes candidate pairs widens automatically with `-d`: `-d 0`–`3`
+probes one index bin per frame per block, and `-d 4` and above probes 17. It is
+exhaustive up to `-d 7`; past that it may fail to *propose* a pair whose frames
+are all near the far edge of the tolerance. Once a pair is proposed it is always
+compared exactly, and genuine duplicates share many frames, so a miss is very
+unlikely.
 
 `--min-duration` is an absolute floor, in seconds, on how much footage two files
 must share. It's the tool to reach for when `-p` alone can't express what you
@@ -326,6 +351,13 @@ linked without any two being duplicates, and one such link is enough to fuse
 everything it touches into a single group. Raise
 `--match-percent` or `--min-duration` if incidental links are pulling unrelated
 files together.
+
+**The "shared" column is footage, not frames.** It is the least a file shares
+with any group member it was directly compared against, in seconds of runtime —
+so a two-minute clip inside a twenty-two minute episode reads as two minutes
+from both ends, and a pair linked only by a common title card reads as the
+second or two that card lasts. Read it against the file's own length: that ratio
+is what separates a re-encode from a shared intro.
 
 Every file in a duplicate group is labeled with an action:
 
