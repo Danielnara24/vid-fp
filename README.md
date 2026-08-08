@@ -352,12 +352,55 @@ everything it touches into a single group. Raise
 `--match-percent` or `--min-duration` if incidental links are pulling unrelated
 files together.
 
-**The "shared" column is footage, not frames.** It is the least a file shares
+**The "shared" column is footage, not frames.** It is the most a file shares
 with any group member it was directly compared against, in seconds of runtime —
 so a two-minute clip inside a twenty-two minute episode reads as two minutes
 from both ends, and a pair linked only by a common title card reads as the
 second or two that card lasts. Read it against the file's own length: that ratio
 is what separates a re-encode from a shared intro.
+
+It reports the *best* link rather than the worst because a file only needs one
+solid match to be a duplicate. In a group fused together by an incidental link —
+three episodes sharing an opening sequence, one of which also has a real
+re-encode of itself present — the two genuine copies still read as sharing their
+full runtime with each other, instead of both being dragged down to the two
+seconds of intro they share with the third file. The consequence to keep in mind
+is the other direction: a high figure says this file matched *something* here
+closely, not that it matched *everything* here closely. In a group of three or
+more, check the pair you care about rather than assuming one number covers all
+of them.
+
+**The CSV and JSON say which file, and where.** The console and `.txt` report
+have one line per file and stay as they are, but the machine-readable formats
+carry three more things about that strongest link:
+
+| Column | Meaning |
+| --- | --- |
+| `shared_with` | The group member the `shared_seconds` figure on this row describes |
+| `shared_from`, `shared_to` | Where that footage sits **in this file's own runtime** |
+| `shared_from_seconds`, `shared_to_seconds` | The same two as raw seconds |
+
+The timestamps are per file, not per pair, and that is the point: a two-minute
+clip cut from the middle of an episode reads `00:00:00`–`00:02:01` on its own row
+and `00:19:59`–`00:22:40` on the episode's. The second one is the answer to
+"where in this episode is that clip", which nothing else in the report can tell
+you.
+
+Read the range as an **envelope, not a continuous stretch**: it runs from the
+start of the first matching moment to the end of the last, and matches in
+between can be scattered. Two episodes sharing an opening and a closing theme
+have an envelope covering the whole hour and a `shared_seconds` of about
+thirty. When the two figures agree, the match is one continuous run; when the
+envelope is much the wider, it isn't.
+
+New columns are appended after `action`, so existing column positions are
+unchanged.
+
+The JSON additionally gives every file a `matches` array — one entry per group
+member it was directly compared against, strongest first, each with its own
+`shared_seconds` and range. The top-level fields describe entry `[0]`. That is
+where a group of three or more stops needing a caveat: the whole set of
+measurements is there, pair by pair.
 
 Every file in a duplicate group is labeled with an action:
 

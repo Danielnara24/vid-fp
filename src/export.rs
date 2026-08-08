@@ -469,6 +469,23 @@ pub fn output_results(
     let matched_file_count: usize = final_groups.iter().map(|g| g.len()).sum();
 
     let mut txt_out = String::new();
+    // Whether the JSON tree is worth building at all.
+    //
+    // It was always built and then thrown away on a run that asked for text or
+    // CSV, which was a small waste while every file contributed a fixed handful
+    // of fields. The per-link list below is not fixed -- it is one object per
+    // pair, so a group of `g` members contributes `g * (g - 1)` of them, and on
+    // a library with one big group that is the largest allocation in the report.
+    // Nobody should pay it to write a .txt.
+    let wants_json = output_file
+        .map(|p| {
+            Path::new(p)
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.eq_ignore_ascii_case("json"))
+        })
+        .unwrap_or(false);
+
     let mut json_out_groups = Vec::new();
 
     // Use csv crate for robust and RFC-compliant CSV generation
@@ -499,6 +516,15 @@ pub fn output_results(
             "shared_seconds",
             "full_path",
             "action",
+            // Which member of the group the three figures above it describe, and
+            // where in THIS file the shared footage sits. Appended rather than
+            // slotted in beside shared_seconds so that every column a reader's
+            // existing script already indexes keeps its position.
+            "shared_with",
+            "shared_from",
+            "shared_to",
+            "shared_from_seconds",
+            "shared_to_seconds",
         ])
         .context("Failed to write CSV header")?;
 
@@ -527,7 +553,16 @@ pub fn output_results(
         // "00:00:03", and needs no explaining.
         for &idx in group {
             let fp = &fingerprints[idx];
-            let shared = matches.weakest_shared_in_group(idx, group, fingerprints);
+
+            // Computed once and read three ways: the strongest link fills the
+            // single-figure columns the console and the CSV show, and the whole
+            // list goes to the JSON so a group of three or more can be read pair
+            // by pair. Groups are small and this is the reporting pass, not the
+            // comparison one -- there is no measurement here, only lookups
+            // against figures phase 2 already took.
+            let links = matches.links_of(idx, fingerprints);
+            let best = links.first();
+            let shared = best.map(|l| l.shared_seconds);
 
             let size_str = format_size(fp.file_size);
             let bitrate_str = format_bitrate(fp.bitrate());
@@ -562,6 +597,24 @@ pub fn output_results(
             let size_bytes_raw = fp.file_size.to_string();
             let bitrate_bps_raw = fp.bitrate().to_string();
             let shared_seconds_raw = csv_seconds(shared);
+
+            // The file the figures above describe. Empty rather than "-" when
+            // there is none, for the same reason every other unknown is empty:
+            // a CSV consumer should see a blank cell, not a sentinel it has to
+            // know about.
+            let shared_with_raw = best
+                .map(|l| fingerprints[l.other].path.clone())
+                .unwrap_or_default();
+
+            // The envelope, in this file's own timeline. Both the clock form
+            // and the raw seconds, like every other figure here.
+            let best_span = best.and_then(|l| l.span);
+            let shared_from_str =
+                best_span.map(|s| format_duration(s.start_seconds())).unwrap_or_default();
+            let shared_to_str =
+                best_span.map(|s| format_duration(s.end_seconds())).unwrap_or_default();
+            let shared_from_raw = csv_seconds(best_span.map(|s| s.start_seconds()));
+            let shared_to_raw = csv_seconds(best_span.map(|s| s.end_seconds()));
 
             // Label by the fate the file's own group gave it -- the only one it
             // has, since it appears nowhere else.
@@ -633,9 +686,39 @@ pub fn output_results(
                 &shared_seconds_raw,
                 &fp.path,
                 action_str,
+                &shared_with_raw,
+                &shared_from_str,
+                &shared_to_str,
+                &shared_from_raw,
+                &shared_to_raw,
             ]).context("Failed to write CSV record")?;
 
             // 3. JSON File Output
+            //
+            // The JSON carries every link rather than only the strongest,
+            // because it is the format read by something that can hold a list.
+            // A group of three is where the single-figure columns stop being
+            // the whole story, and this is where the rest of it lives.
+            if !wants_json {
+                continue; // Nothing below this point but the JSON tree.
+            }
+
+            let json_matches: Vec<serde_json::Value> = links
+                .iter()
+                .map(|l| {
+                    serde_json::json!({
+                        "full_path": fingerprints[l.other].path,
+                        "shared_seconds": (l.shared_seconds * 100.0).round() / 100.0,
+                        "shared_from": l.span.map(|s| format_duration(s.start_seconds())),
+                        "shared_to": l.span.map(|s| format_duration(s.end_seconds())),
+                        "shared_from_seconds": l.span
+                            .map(|s| (s.start_seconds() * 100.0).round() / 100.0),
+                        "shared_to_seconds": l.span
+                            .map(|s| (s.end_seconds() * 100.0).round() / 100.0),
+                    })
+                })
+                .collect();
+
             json_files.push(serde_json::json!({
                 "resolution": res_str,
                 "codec": codec_str,
@@ -651,16 +734,30 @@ pub fn output_results(
                 "shared_seconds": shared.map(|s| (s * 100.0).round() / 100.0),
                 "full_path": fp.path,
                 "action": action_str,
+                // The strongest link, spelled out so the JSON says the same
+                // thing the CSV does without a consumer having to re-derive it
+                // from the list below.
+                "shared_with": best.map(|l| &fingerprints[l.other].path),
+                "shared_from": best_span.map(|s| format_duration(s.start_seconds())),
+                "shared_to": best_span.map(|s| format_duration(s.end_seconds())),
+                "shared_from_seconds": best_span
+                    .map(|s| (s.start_seconds() * 100.0).round() / 100.0),
+                "shared_to_seconds": best_span.map(|s| (s.end_seconds() * 100.0).round() / 100.0),
+                // Every measured link this file has in the group, strongest
+                // first. The entry at index 0 is the one described above.
+                "matches": json_matches,
             }));
         }
 
         info!(""); // Empty line for spacing
         txt_out.push_str("\n");
 
-        json_out_groups.push(serde_json::json!({
-            "group": group_name,
-            "files": json_files
-        }));
+        if wants_json {
+            json_out_groups.push(serde_json::json!({
+                "group": group_name,
+                "files": json_files
+            }));
+        }
     }
 
     let total_hours = total_elapsed_secs / 3600;
@@ -828,7 +925,7 @@ mod tests {
 
     const CSV_HEADER: &str = "group;resolution;codec;framerate;framerate_fps;\
 size;size_bytes;bitrate;bitrate_bps;quality;quality_bits_per_frame;length;shared_seconds;\
-full_path;action";
+full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to_seconds";
 
     fn mock_fp() -> VideoFingerprint {
         VideoFingerprint {
@@ -925,7 +1022,7 @@ full_path;action";
         let mut matches = Vec::new();
         for a in 0..n {
             for b in (a + 1)..n {
-                matches.push(Match { a, b, coverage_a: 1.0, coverage_b: 1.0 });
+                matches.push(Match::new(a, b, 1.0, 1.0));
             }
         }
         MatchIndex::new(matches)
@@ -969,9 +1066,11 @@ full_path;action";
         // 1 MiB over 60s = ~140kbps, which at 30fps is ~4.7kbit in each frame.
         // Assert data exists and defaults to KEEP. The overlap was never
         // measured, so both seconds fields are empty rather than 0.
+        // A group of one has nobody to be compared against, so every column
+        // that describes a link is empty too.
         assert!(contents.contains(
             "group_1;1920x1080;h264;30fps;30;1.0MB;1048576;140kbps;139810;4.7kb/f;4660;\
-00:01:00;;/fake/path/vid.mp4;KEEP"
+00:01:00;;/fake/path/vid.mp4;KEEP;;;;;"
         ), "{}", contents);
 
         // Clean up
@@ -1045,12 +1144,7 @@ full_path;action";
             mock_fp_at("/fake/b.mp4", 100.0),
         ];
         let groups = vec![vec![0, 1]];
-        let matches = MatchIndex::new(vec![Match {
-            a: 0,
-            b: 1,
-            coverage_a: 0.80,
-            coverage_b: 0.80,
-        }]);
+        let matches = MatchIndex::new(vec![Match::new(0, 1, 0.80, 0.80)]);
 
         let csv_path = report_to("csv");
         let json_path = report_to("json");
@@ -1099,12 +1193,7 @@ full_path;action";
         ];
         let groups = vec![vec![0, 1]];
 
-        let matches = MatchIndex::new(vec![Match {
-            a: 0,
-            b: 1,
-            coverage_a: 0.10,
-            coverage_b: 1.0,
-        }]);
+        let matches = MatchIndex::new(vec![Match::new(0, 1, 0.10, 1.0)]);
 
         let path_str = report_to("csv");
 
@@ -1121,6 +1210,134 @@ full_path;action";
     }
 
     #[test]
+    fn test_the_csv_names_the_file_each_row_is_talking_about() {
+        // The single-figure columns speak for ONE pair, so the CSV has to say
+        // which. Here the host's minute of shared footage sits 14 minutes into
+        // it and at the very start of the clip -- two different right answers to
+        // "where", which is why the column is per-row rather than per-group.
+        let fps = vec![
+            mock_fp_at("/fake/host.mp4", 600.0),
+            mock_fp_at("/fake/clip.mp4", 60.0),
+        ];
+        let groups = vec![vec![0, 1]];
+
+        let matches = MatchIndex::new(vec![
+            Match::new(0, 1, 0.10, 1.0).with_spans((840_000, 900_000), (0, 60_000)),
+        ]);
+
+        let path_str = report_to("csv");
+        output_results(
+            &groups, &fps, &matches, Some(&path_str), 0, policy(Priority::Length), None,
+            &RunStats::default(),
+        ).unwrap();
+
+        let contents = fs::read_to_string(&path_str).unwrap();
+
+        assert!(
+            contents.contains(
+                "/fake/host.mp4;KEEP;/fake/clip.mp4;00:14:00;00:15:00;840.00;900.00"
+            ),
+            "the host row should point into the host's own timeline: {}",
+            contents
+        );
+        assert!(
+            contents.contains(
+                "/fake/clip.mp4;DELETE;/fake/host.mp4;00:00:00;00:01:00;0.00;60.00"
+            ),
+            "the clip row should point into the clip's own timeline: {}",
+            contents
+        );
+
+        let _ = fs::remove_file(path_str);
+    }
+
+    #[test]
+    fn test_the_json_carries_every_link_not_only_the_strongest() {
+        // A three-file group is where one figure stops being the whole story: 0
+        // is a full copy of 1 and merely brushes 2. The top-level fields speak
+        // for the strongest link, and `matches` holds both so the weak one is
+        // still visible.
+        let fps = vec![
+            mock_fp_at("/fake/a.mp4", 600.0),
+            mock_fp_at("/fake/b.mp4", 600.0),
+            mock_fp_at("/fake/c.mp4", 600.0),
+        ];
+        let groups = vec![vec![0, 1, 2]];
+
+        let matches = MatchIndex::new(vec![
+            Match::new(0, 1, 1.0, 1.0).with_spans((0, 600_000), (0, 600_000)),
+            Match::new(0, 2, 0.01, 0.01).with_spans((0, 6_000), (594_000, 600_000)),
+            Match::new(1, 2, 0.01, 0.01).with_spans((0, 6_000), (594_000, 600_000)),
+        ]);
+
+        let path_str = report_to("json");
+        output_results(
+            &groups, &fps, &matches, Some(&path_str), 0, policy(Priority::Length), None,
+            &RunStats::default(),
+        ).unwrap();
+
+        let json = read_json(&path_str);
+        let file = &json["results"][0]["files"][0];
+        assert_eq!(file["full_path"], "/fake/a.mp4");
+
+        // The headline figures describe the strongest link, and name it.
+        assert_eq!(file["shared_with"], "/fake/b.mp4");
+        assert_eq!(file["shared_seconds"], 600.0);
+        assert_eq!(file["shared_from"], "00:00:00");
+        assert_eq!(file["shared_to"], "00:10:00");
+
+        // Both links are present, strongest first, and the weak one is not
+        // rounded away or merged into the strong one.
+        let links = file["matches"].as_array().expect("matches should be an array");
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0]["full_path"], "/fake/b.mp4");
+        assert_eq!(links[0]["shared_seconds"], 600.0);
+        assert_eq!(links[1]["full_path"], "/fake/c.mp4");
+        assert_eq!(links[1]["shared_seconds"], 6.0);
+        assert_eq!(links[1]["shared_from"], "00:00:00");
+        assert_eq!(links[1]["shared_to"], "00:00:06");
+
+        let _ = fs::remove_file(path_str);
+    }
+
+    #[test]
+    fn test_a_chained_member_reports_only_the_links_it_actually_has() {
+        // 0-1 and 1-2 were measured; 0 and 2 never were. 0's list must hold one
+        // entry, not two with a fabricated zero -- the absent pair is unmeasured,
+        // which is a different claim from "these two share nothing".
+        let fps = vec![
+            mock_fp_at("/fake/a.mp4", 600.0),
+            mock_fp_at("/fake/b.mp4", 600.0),
+            mock_fp_at("/fake/c.mp4", 600.0),
+        ];
+        let groups = vec![vec![0, 1, 2]];
+
+        let matches = MatchIndex::new(vec![
+            Match::new(0, 1, 1.0, 1.0).with_spans((0, 600_000), (0, 600_000)),
+            Match::new(1, 2, 0.5, 0.5).with_spans((0, 300_000), (300_000, 600_000)),
+        ]);
+
+        let path_str = report_to("json");
+        output_results(
+            &groups, &fps, &matches, Some(&path_str), 0, policy(Priority::Length), None,
+            &RunStats::default(),
+        ).unwrap();
+
+        let json = read_json(&path_str);
+        let files = json["results"][0]["files"].as_array().unwrap();
+
+        let a = files.iter().find(|f| f["full_path"] == "/fake/a.mp4").unwrap();
+        assert_eq!(a["matches"].as_array().unwrap().len(), 1);
+        assert_eq!(a["shared_with"], "/fake/b.mp4");
+
+        // b sits in the middle of the chain and has both links.
+        let b = files.iter().find(|f| f["full_path"] == "/fake/b.mp4").unwrap();
+        assert_eq!(b["matches"].as_array().unwrap().len(), 2);
+
+        let _ = fs::remove_file(path_str);
+    }
+
+    #[test]
     fn test_a_single_shared_keyframe_reports_as_a_fraction_of_a_second() {
         // Four short clips from the same camera sharing one incidental frame.
         // Every coverage figure here is a headline-looking 10-25%; every shared
@@ -1131,12 +1348,7 @@ full_path;action";
         ];
         let groups = vec![vec![0, 1]];
 
-        let matches = MatchIndex::new(vec![Match {
-            a: 0,
-            b: 1,
-            coverage_a: 0.0714, // 1 of 14 keyframes
-            coverage_b: 0.25,   // 1 of 4
-        }]);
+        let matches = MatchIndex::new(vec![Match::new(0, 1, 0.0714, 0.25)]);
 
         let path_str = report_to("csv");
 
@@ -1191,12 +1403,7 @@ full_path;action";
             mock_fp_at("/fake/b.mp4", 100.0),
         ];
         let groups = vec![vec![0, 1]];
-        let matches = MatchIndex::new(vec![Match {
-            a: 0,
-            b: 1,
-            coverage_a: 0.80,
-            coverage_b: 0.80,
-        }]);
+        let matches = MatchIndex::new(vec![Match::new(0, 1, 0.80, 0.80)]);
 
         let path_str = report_to("json");
 
@@ -1582,8 +1789,8 @@ full_path;action";
     /// One group of three, and 2 has no measurement against 0.
     fn chain_of_three() -> MatchIndex {
         MatchIndex::new(vec![
-            Match { a: 0, b: 1, coverage_a: 1.0, coverage_b: 1.0 },
-            Match { a: 1, b: 2, coverage_a: 1.0, coverage_b: 1.0 },
+            Match::new(0, 1, 1.0, 1.0),
+            Match::new(1, 2, 1.0, 1.0),
         ])
     }
 
@@ -1725,8 +1932,8 @@ full_path;action";
 
         // 2 matched only the h264 champion, never the av1 one.
         let matches = MatchIndex::new(vec![
-            Match { a: 0, b: 1, coverage_a: 1.0, coverage_b: 1.0 },
-            Match { a: 0, b: 2, coverage_a: 1.0, coverage_b: 1.0 },
+            Match::new(0, 1, 1.0, 1.0),
+            Match::new(0, 2, 1.0, 1.0),
         ]);
 
         let groups = vec![vec![0, 1, 2]];

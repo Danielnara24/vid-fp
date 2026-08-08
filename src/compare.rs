@@ -117,6 +117,49 @@ impl BlockIndex {
     }
 }
 
+/// Where in one file's own runtime its matched footage lies: the start of the
+/// first sample that matched and the end of the last, in milliseconds.
+///
+/// This is an ENVELOPE, not a contiguous run. Matched samples can be scattered
+/// -- two episodes sharing an opening and a closing theme match at both ends and
+/// nowhere in between, and the envelope then spans the whole episode while only
+/// a few seconds inside it actually matched. The envelope is therefore only
+/// meaningful read next to the shared duration: when the two agree the match is
+/// one continuous stretch, and when the envelope is much the wider of the two
+/// the match is scattered through it.
+///
+/// Kept per side, because the same shared footage sits at different times in
+/// each file -- that is the entire point of reporting it. A two-minute clip cut
+/// from the middle of an episode spans 0..2min of itself and 14min..16min of the
+/// episode.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Span {
+    pub start_ms: u32,
+    pub end_ms: u32,
+}
+
+impl Span {
+    /// The envelope of the samples flagged in `matched`, or `None` when none
+    /// were. Relies on the sample times being ascending, which `fingerprint`
+    /// guarantees.
+    fn of(matched: &[bool], fp: &VideoFingerprint) -> Option<Span> {
+        let first = matched.iter().position(|&m| m)?;
+        let last = matched.iter().rposition(|&m| m)?;
+        Some(Span {
+            start_ms: fp.valid_t_start[first],
+            end_ms: fp.valid_t_end[last],
+        })
+    }
+
+    pub fn start_seconds(&self) -> f64 {
+        self.start_ms as f64 / 1000.0
+    }
+
+    pub fn end_seconds(&self) -> f64 {
+        self.end_ms as f64 / 1000.0
+    }
+}
+
 /// Two videos that share enough content to be reported together, and by how
 /// much.
 ///
@@ -126,6 +169,9 @@ impl BlockIndex {
 /// describe completely different situations, and no single figure expresses
 /// either. They are kept apart here and reconciled only at the point of
 /// reporting -- see `shared_seconds`.
+///
+/// The spans are directional for the same reason and are never reconciled at
+/// all: "where the shared footage sits" has two different right answers.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Match {
     pub a: usize,
@@ -134,30 +180,79 @@ pub struct Match {
     pub coverage_a: f32,
     /// Fraction of `b`'s runtime that is also present in `a` (0.0 ..= 1.0).
     pub coverage_b: f32,
+    /// Where the matched footage lies in `a`'s own runtime.
+    pub span_a: Option<Span>,
+    /// Where the matched footage lies in `b`'s own runtime.
+    pub span_b: Option<Span>,
 }
 
-/// Coverage figures made lookup-friendly, keyed by (subject, other).
+impl Match {
+    /// A pair whose overlap was measured but whose position in either file was
+    /// not. Only tests build these; every real match carries its spans, because
+    /// the same pass that measures the overlap already knows where it is.
+    #[cfg(test)]
+    pub fn new(a: usize, b: usize, coverage_a: f32, coverage_b: f32) -> Self {
+        Match { a, b, coverage_a, coverage_b, span_a: None, span_b: None }
+    }
+
+    /// The same, positioned. Milliseconds, `(start, end)` per side.
+    #[cfg(test)]
+    pub fn with_spans(mut self, a: (u32, u32), b: (u32, u32)) -> Self {
+        self.span_a = Some(Span { start_ms: a.0, end_ms: a.1 });
+        self.span_b = Some(Span { start_ms: b.0, end_ms: b.1 });
+        self
+    }
+}
+
+/// One direction of one measured pair: how much of the subject the other file
+/// contains, and where in the subject that footage sits.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Link {
+    pub coverage: f32,
+    pub span: Option<Span>,
+}
+
+/// Match figures made lookup-friendly, keyed by (subject, other).
 ///
 /// Both directions of every pair are stored, so `coverage(i, j)` always answers
 /// "how much of i does j contain" without the caller having to know which way
 /// round the pair was originally emitted.
+///
+/// `neighbours` is the same information as an adjacency list, and it exists
+/// because the report asks a question the pair map answers badly: "everything
+/// this file matched". Answering that by probing the map for every other member
+/// of the group is quadratic in the group size, and a loose scan can produce one
+/// component with hundreds of members -- while the number of edges inside it
+/// stays proportional to the pairs actually measured, which is far smaller.
 pub struct MatchIndex {
-    coverage: HashMap<(usize, usize), f32>,
+    links: HashMap<(usize, usize), Link>,
+    neighbours: HashMap<usize, Vec<usize>>,
 }
 
 impl MatchIndex {
     pub fn new(matches: Vec<Match>) -> Self {
-        let mut coverage = HashMap::with_capacity(matches.len() * 2);
+        let mut links = HashMap::with_capacity(matches.len() * 2);
+        let mut neighbours: HashMap<usize, Vec<usize>> = HashMap::new();
+
         for m in matches {
-            coverage.insert((m.a, m.b), m.coverage_a);
-            coverage.insert((m.b, m.a), m.coverage_b);
+            links.insert((m.a, m.b), Link { coverage: m.coverage_a, span: m.span_a });
+            links.insert((m.b, m.a), Link { coverage: m.coverage_b, span: m.span_b });
+            neighbours.entry(m.a).or_default().push(m.b);
+            neighbours.entry(m.b).or_default().push(m.a);
         }
-        Self { coverage }
+
+        Self { links, neighbours }
     }
 
     /// How much of `subject` is contained in `other`, if the two were compared.
     pub fn coverage(&self, subject: usize, other: usize) -> Option<f32> {
-        self.coverage.get(&(subject, other)).copied()
+        self.links.get(&(subject, other)).map(|l| l.coverage)
+    }
+
+    /// Where the footage `subject` shares with `other` sits in `subject`'s own
+    /// runtime, if the two were compared and anything matched.
+    pub fn span(&self, subject: usize, other: usize) -> Option<Span> {
+        self.links.get(&(subject, other))?.span
     }
 
     /// Seconds of content two files have in common.
@@ -191,41 +286,92 @@ impl MatchIndex {
         estimate
     }
 
-    /// The least content `subject` shares with any member of `group` it was
-    /// actually matched against.
+    /// Every measured link `subject` has, strongest first.
     ///
-    /// Groups are connected components, so a member need not have been compared
-    /// with every other one -- it reached the group through a chain of matches.
-    /// Pairs with no measurement are therefore skipped rather than being read as
-    /// "no overlap" (they were never compared, which is a different statement)
-    /// or allowed to sink the whole figure to unknown (the links this file does
-    /// have are exactly the evidence that put it here). What survives is a
-    /// measured floor over the file's own links: "this file shares at least this
-    /// much with everything it directly matched".
+    /// No group has to be supplied, because every file `subject` matched is in
+    /// `subject`'s group by construction: clustering unions each matched pair,
+    /// so a neighbour and its subject always land in the same component. The
+    /// group is the transitive closure of this list, never smaller than it.
+    ///
+    /// Pairs that were never measured are absent rather than present with a
+    /// zero, because "never compared" and "compared and shares nothing" are
+    /// different statements and only the second one is evidence about the files.
+    /// That is why a chained group -- A-B and B-C measured, A-C never -- gives A
+    /// one link rather than two.
+    ///
+    /// Ordered by shared duration descending, ties broken on path, so the
+    /// report is reproducible run to run: the strongest link is `first()`, which
+    /// is what the single-figure columns show, and the whole list is what the
+    /// JSON carries so a three-file group can be read pair by pair.
+    pub fn links_of(&self, subject: usize, fps: &[VideoFingerprint]) -> Vec<GroupLink> {
+        let Some(others) = self.neighbours.get(&subject) else {
+            return Vec::new();
+        };
+
+        let mut links: Vec<GroupLink> = others
+            .iter()
+            .filter_map(|&other| {
+                Some(GroupLink {
+                    other,
+                    shared_seconds: self.shared_seconds(subject, other, fps)?,
+                    span: self.span(subject, other),
+                })
+            })
+            .collect();
+
+        links.sort_by(|x, y| {
+            y.shared_seconds
+                .partial_cmp(&x.shared_seconds)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| fps[x.other].path.cmp(&fps[y.other].path))
+        });
+
+        links
+    }
+
+    /// The single link that best answers "is this file a copy of something
+    /// here": the most content `subject` shares with anything it was actually
+    /// matched against. `links_of(..).first()`, named.
+    ///
+    /// The strongest link rather than the weakest, because one solid match makes
+    /// a file a duplicate however many incidental ones sit beside it. Taking the
+    /// minimum instead let a single thin edge -- a shared title card, an episode
+    /// that merely brushes the group -- rewrite the figure for files that are
+    /// perfect duplicates of each other, so a 22-minute re-encode pulled into a
+    /// group by a common intro reported the intro's two seconds and read as
+    /// though nothing in the group was a duplicate of anything. The cost is that
+    /// it speaks for one pair rather than all of them, which is exactly why the
+    /// report names the file it is talking about.
     ///
     /// Printed beside the file's own length it makes a group interpretable at a
     /// glance -- a nine-second clip sharing eight seconds is a duplicate, and
     /// one sharing half a second is not, however impressive that half second
     /// looks as a percentage. `None` means nothing about this file's links could
     /// be measured at all.
-    pub fn weakest_shared_in_group(
+    ///
+    /// Nothing is deleted on the strength of this figure. It is reported, and
+    /// the DELETE rule reads `coverage` directly -- see `export.rs`.
+    #[cfg(test)]
+    pub fn best_link_in_group(
         &self,
         subject: usize,
-        group: &[usize],
+        _group: &[usize],
         fps: &[VideoFingerprint],
-    ) -> Option<f64> {
-        let mut weakest: Option<f64> = None;
-        for &other in group {
-            if other == subject {
-                continue;
-            }
-            let Some(shared) = self.shared_seconds(subject, other, fps) else {
-                continue;
-            };
-            weakest = Some(weakest.map_or(shared, |w: f64| w.min(shared)));
-        }
-        weakest
+    ) -> Option<GroupLink> {
+        self.links_of(subject, fps).into_iter().next()
     }
+}
+
+/// One file's measured relationship with one other member of its group.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GroupLink {
+    /// Index into the fingerprint list of the file on the other end.
+    pub other: usize,
+    /// Seconds of footage the two have in common -- symmetric, so this reads
+    /// the same from either end of the pair.
+    pub shared_seconds: f64,
+    /// Where that footage sits in the SUBJECT's runtime, not the other file's.
+    pub span: Option<Span>,
 }
 
 /// --- Phase 1: candidate generation ---------------------------------------
@@ -336,14 +482,20 @@ fn candidate_pairs(
 /// is ~160k XOR+popcount operations -- microseconds -- and since genuine
 /// candidates are rare relative to the library size, this is close to free.
 ///
-/// Returns the fraction of each video's runtime that is matched by the other.
-/// Unlike the index-driven count it replaces, this sees *all* matching frames,
-/// including ones the probe cannot reach at a tolerance above the radius cap.
+/// Returns the fraction of each video's runtime that is matched by the other,
+/// and where in each of them the matched footage lies. Unlike the index-driven
+/// count it replaces, this sees *all* matching frames, including ones the probe
+/// cannot reach at a tolerance above the radius cap.
+///
+/// The spans cost two linear scans of an array of bools this function has
+/// already built and is still holding in cache, against the quadratic hash
+/// comparison above them. They are free in the only sense that matters here:
+/// nothing about which frames are examined, or which pairs survive, changes.
 fn match_overlap(
     fp_a: &VideoFingerprint,
     fp_b: &VideoFingerprint,
     max_hamming_dist: u32,
-) -> (f32, f32) {
+) -> (f32, f32, Option<Span>, Option<Span>) {
     let mut matched_a = vec![false; fp_a.valid_hashes.len()];
     let mut matched_b = vec![false; fp_b.valid_hashes.len()];
 
@@ -382,6 +534,8 @@ fn match_overlap(
     (
         pct(covered_ms(&matched_a, fp_a), fp_a.total_ms),
         pct(covered_ms(&matched_b, fp_b), fp_b.total_ms),
+        Span::of(&matched_a, fp_a),
+        Span::of(&matched_b, fp_b),
     )
 }
 
@@ -415,7 +569,7 @@ pub fn find_all_matches(
             let fp_a = &fingerprints[v_a];
             let fp_b = &fingerprints[v_b];
 
-            let (pct_a, pct_b) = match_overlap(fp_a, fp_b, max_hamming_dist);
+            let (pct_a, pct_b, span_a, span_b) = match_overlap(fp_a, fp_b, max_hamming_dist);
 
             if pct_a.max(pct_b) < min_match_percent {
                 return None;
@@ -434,6 +588,8 @@ pub fn find_all_matches(
                 b: v_b,
                 coverage_a: pct_a,
                 coverage_b: pct_b,
+                span_a,
+                span_b,
             })
         })
         .collect()
@@ -495,6 +651,25 @@ mod tests {
         let mut out: Vec<(usize, usize)> = matches.iter().map(|m| (m.a, m.b)).collect();
         out.sort_unstable();
         out
+    }
+
+    /// A video sampled at a fixed interval: hash `i` stands for the picture over
+    /// `[i * step_ms, (i + 1) * step_ms)`. Real keyframes are not evenly spaced,
+    /// but a span test needs to know exactly which millisecond each sample
+    /// claims, and nothing here depends on the spacing being irregular.
+    fn mock_fp_sampled(hashes: Vec<u64>, step_ms: u32) -> VideoFingerprint {
+        let len = hashes.len() as u32;
+        let mut fp = mock_fp_with_hashes(hashes, len * step_ms);
+        fp.valid_t_start = (0..len).map(|i| i * step_ms).collect();
+        fp.valid_t_end = (1..=len).map(|i| i * step_ms).collect();
+        fp.duration = (len * step_ms) as f64 / 1000.0;
+        fp
+    }
+
+    /// Distinct hashes far enough apart that only an exact pairing matches at a
+    /// tolerance of 0, so a test can say precisely which samples are shared.
+    fn distinct_hash(i: u64) -> u64 {
+        i.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x0F0F_0F0F_0F0F_0F0F
     }
 
     #[test]
@@ -683,7 +858,7 @@ mod tests {
 
     #[test]
     fn test_index_answers_both_directions_of_a_pair() {
-        let idx = MatchIndex::new(vec![Match { a: 0, b: 1, coverage_a: 0.25, coverage_b: 1.0 }]);
+        let idx = MatchIndex::new(vec![Match::new(0, 1, 0.25, 1.0)]);
 
         assert_eq!(idx.coverage(0, 1), Some(0.25));
         assert_eq!(idx.coverage(1, 0), Some(1.0));
@@ -696,12 +871,7 @@ mod tests {
         // minute host: 100% of 120s and 9.09% of 1320s are both 120 seconds.
         // Coverage disagrees wildly between the two files; duration does not.
         let fps = vec![mock_fp_lasting(1320.0), mock_fp_lasting(120.0)];
-        let idx = MatchIndex::new(vec![Match {
-            a: 0,
-            b: 1,
-            coverage_a: 120.0 / 1320.0,
-            coverage_b: 1.0,
-        }]);
+        let idx = MatchIndex::new(vec![Match::new(0, 1, 120.0 / 1320.0, 1.0)]);
 
         let from_host = idx.shared_seconds(0, 1, &fps).unwrap();
         let from_clip = idx.shared_seconds(1, 0, &fps).unwrap();
@@ -715,12 +885,7 @@ mod tests {
         // Keyframe density differs between the files, so the two estimates do
         // not land on the same value. The smaller is reported.
         let fps = vec![mock_fp_lasting(100.0), mock_fp_lasting(100.0)];
-        let idx = MatchIndex::new(vec![Match {
-            a: 0,
-            b: 1,
-            coverage_a: 0.50, // 50s
-            coverage_b: 0.40, // 40s
-        }]);
+        let idx = MatchIndex::new(vec![Match::new(0, 1, 0.50, 0.40)]);
 
         assert_near(idx.shared_seconds(0, 1, &fps), 40.0);
     }
@@ -732,12 +897,7 @@ mod tests {
         // is a headline 25%; in time it is under a second, which is what a
         // reader actually needs to know before deleting anything.
         let fps = vec![mock_fp_lasting(3.0), mock_fp_lasting(9.0)];
-        let idx = MatchIndex::new(vec![Match {
-            a: 0,
-            b: 1,
-            coverage_a: 0.25,   // 1 of 4 keyframes
-            coverage_b: 0.0714, // 1 of 14
-        }]);
+        let idx = MatchIndex::new(vec![Match::new(0, 1, 0.25, 0.0714)]);
 
         let shared = idx.shared_seconds(0, 1, &fps).unwrap();
         assert!(shared < 1.0, "one keyframe is well under a second, got {}", shared);
@@ -748,7 +908,7 @@ mod tests {
         // A container that never reported a duration cannot estimate, but the
         // other side still can, and one estimate beats reporting nothing.
         let fps = vec![mock_fp_lasting(0.0), mock_fp_lasting(60.0)];
-        let idx = MatchIndex::new(vec![Match { a: 0, b: 1, coverage_a: 1.0, coverage_b: 0.5 }]);
+        let idx = MatchIndex::new(vec![Match::new(0, 1, 1.0, 0.5)]);
 
         assert_eq!(idx.shared_seconds(0, 1, &fps), Some(30.0));
     }
@@ -756,31 +916,33 @@ mod tests {
     #[test]
     fn test_two_unknown_runtimes_report_unknown_rather_than_zero() {
         let fps = vec![mock_fp_lasting(0.0), mock_fp_lasting(0.0)];
-        let idx = MatchIndex::new(vec![Match { a: 0, b: 1, coverage_a: 1.0, coverage_b: 1.0 }]);
+        let idx = MatchIndex::new(vec![Match::new(0, 1, 1.0, 1.0)]);
 
         assert_eq!(idx.shared_seconds(0, 1, &fps), None);
     }
 
     #[test]
-    fn test_weakest_shared_in_group_finds_the_thinnest_link() {
-        // 0 and 1 are proper duplicates; 2 only brushes against both. Every
-        // member's figure reflects its worst link, so nothing in the group can
-        // look better supported than it is.
+    fn test_strongest_shared_in_group_finds_the_best_link() {
+        // 0 and 1 are proper duplicates; 2 only brushes against both. 0 and 1
+        // must report the ten minutes they share with each other, not the three
+        // seconds the interloper contributes -- a thin edge into the group says
+        // nothing about how well two other members match.
         let fps = vec![
             mock_fp_lasting(600.0),
             mock_fp_lasting(600.0),
             mock_fp_lasting(10.0),
         ];
         let idx = MatchIndex::new(vec![
-            Match { a: 0, b: 1, coverage_a: 1.0, coverage_b: 1.0 },   // 600s
-            Match { a: 0, b: 2, coverage_a: 0.005, coverage_b: 0.3 }, // 3s
-            Match { a: 1, b: 2, coverage_a: 0.005, coverage_b: 0.3 }, // 3s
+            Match::new(0, 1, 1.0, 1.0),   // 600s
+            Match::new(0, 2, 0.005, 0.3), // 3s
+            Match::new(1, 2, 0.005, 0.3), // 3s
         ]);
         let group = [0, 1, 2];
 
-        assert_near(idx.weakest_shared_in_group(0, &group, &fps), 3.0);
-        assert_near(idx.weakest_shared_in_group(1, &group, &fps), 3.0);
-        assert_near(idx.weakest_shared_in_group(2, &group, &fps), 3.0);
+        assert_near(idx.best_link_in_group(0, &group, &fps).map(|l| l.shared_seconds), 600.0);
+        assert_near(idx.best_link_in_group(1, &group, &fps).map(|l| l.shared_seconds), 600.0);
+        // 2 has nothing better than its three seconds, and still reports them.
+        assert_near(idx.best_link_in_group(2, &group, &fps).map(|l| l.shared_seconds), 3.0);
     }
 
     #[test]
@@ -796,14 +958,14 @@ mod tests {
             mock_fp_lasting(600.0),
         ];
         let idx = MatchIndex::new(vec![
-            Match { a: 0, b: 1, coverage_a: 1.0, coverage_b: 1.0 }, // 600s
-            Match { a: 1, b: 2, coverage_a: 0.5, coverage_b: 0.5 }, // 300s
+            Match::new(0, 1, 1.0, 1.0), // 600s
+            Match::new(1, 2, 0.5, 0.5), // 300s
         ]);
         let group = [0, 1, 2];
 
-        assert_near(idx.weakest_shared_in_group(0, &group, &fps), 600.0);
-        assert_near(idx.weakest_shared_in_group(1, &group, &fps), 300.0);
-        assert_near(idx.weakest_shared_in_group(2, &group, &fps), 300.0);
+        assert_near(idx.best_link_in_group(0, &group, &fps).map(|l| l.shared_seconds), 600.0);
+        assert_near(idx.best_link_in_group(1, &group, &fps).map(|l| l.shared_seconds), 600.0);
+        assert_near(idx.best_link_in_group(2, &group, &fps).map(|l| l.shared_seconds), 300.0);
     }
 
     #[test]
@@ -812,6 +974,139 @@ mod tests {
         let fps = vec![mock_fp_lasting(600.0), mock_fp_lasting(600.0)];
         let idx = MatchIndex::new(vec![]);
 
-        assert_eq!(idx.weakest_shared_in_group(0, &[0, 1], &fps), None);
+        assert_eq!(idx.best_link_in_group(0, &[0, 1], &fps).map(|l| l.shared_seconds), None);
+    }
+
+    #[test]
+    fn test_the_span_locates_a_clip_inside_its_host() {
+        // The headline case for the feature: a 3s clip cut from the middle of a
+        // 10s host. The clip is all of itself, so its own span is its whole
+        // runtime; the host's span is where the clip sits INSIDE it, which is
+        // the number that could not be read off any other column.
+        let host = mock_fp_sampled((0..10).map(distinct_hash).collect(), 1000);
+        let clip = mock_fp_sampled((4..7).map(distinct_hash).collect(), 1000);
+
+        let (_, _, span_clip, span_host) = match_overlap(&clip, &host, 0);
+
+        assert_eq!(span_clip, Some(Span { start_ms: 0, end_ms: 3000 }));
+        assert_eq!(
+            span_host,
+            Some(Span { start_ms: 4000, end_ms: 7000 }),
+            "the host's span must point at the clip's position in the host, not at the clip"
+        );
+    }
+
+    #[test]
+    fn test_the_span_is_an_envelope_and_says_so_next_to_the_shared_duration() {
+        // Two episodes sharing an opening and a closing theme and nothing in
+        // between. The envelope covers the whole runtime while only two of the
+        // ten seconds actually matched -- which is precisely why the report
+        // carries both figures and why the envelope alone must not be read as
+        // "this much footage is shared".
+        let a = mock_fp_sampled((0..10).map(distinct_hash).collect(), 1000);
+        let b = mock_fp_sampled(vec![distinct_hash(0), distinct_hash(9)], 1000);
+
+        let (coverage_a, _, span_a, _) = match_overlap(&a, &b, 0);
+
+        assert_eq!(span_a, Some(Span { start_ms: 0, end_ms: 10_000 }));
+        // Two samples of ten, i.e. two seconds of the ten the envelope spans.
+        assert!(
+            (coverage_a - 0.2).abs() < 1e-6,
+            "expected 20% shared inside a 100% envelope, got {}",
+            coverage_a
+        );
+    }
+
+    #[test]
+    fn test_spans_survive_the_trip_through_find_all_matches() {
+        // The unit above tests the measurement; this tests that it reaches the
+        // struct the report reads, through the phase-1 index and both gates.
+        let host = mock_fp_sampled((0..10).map(distinct_hash).collect(), 1000);
+        let clip = mock_fp_sampled((4..7).map(distinct_hash).collect(), 1000);
+        let fps = vec![host, clip];
+
+        let matches = find_all_matches(&fps, 0, 0.2, 0.0);
+        assert_eq!(matches.len(), 1, "the clip should match its host");
+
+        let m = matches[0];
+        assert_eq!((m.a, m.b), (0, 1));
+        assert_eq!(m.span_a, Some(Span { start_ms: 4000, end_ms: 7000 }), "position in the host");
+        assert_eq!(m.span_b, Some(Span { start_ms: 0, end_ms: 3000 }), "position in the clip");
+
+        // And that the index hands each side back its OWN span rather than the
+        // pair's, which is the one way this could be wired up backwards.
+        let idx = MatchIndex::new(matches);
+        assert_eq!(idx.span(0, 1), Some(Span { start_ms: 4000, end_ms: 7000 }));
+        assert_eq!(idx.span(1, 0), Some(Span { start_ms: 0, end_ms: 3000 }));
+    }
+
+    #[test]
+    fn test_links_in_group_are_ordered_strongest_first_and_name_the_other_file() {
+        // 0 is a full copy of 1 and brushes 2. Its row speaks for the link with
+        // 1, and the list behind it still records the weaker link with 2 -- the
+        // whole point of carrying every link into the JSON.
+        let mut fps = vec![
+            mock_fp_lasting(600.0),
+            mock_fp_lasting(600.0),
+            mock_fp_lasting(600.0),
+        ];
+        fps[0].path = "/a.mp4".into();
+        fps[1].path = "/b.mp4".into();
+        fps[2].path = "/c.mp4".into();
+
+        let idx = MatchIndex::new(vec![
+            Match::new(0, 1, 1.0, 1.0),   // 600s
+            Match::new(0, 2, 0.01, 0.01), // 6s
+        ]);
+        let links = idx.links_of(0, &fps);
+
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].other, 1);
+        assert_near(Some(links[0].shared_seconds), 600.0);
+        assert_eq!(links[1].other, 2);
+        assert_near(Some(links[1].shared_seconds), 6.0);
+    }
+
+    #[test]
+    fn test_equally_strong_links_are_ordered_by_path_so_the_report_is_reproducible() {
+        // Two identical-strength links. Without a tiebreak the winner would be
+        // whatever order the group happened to arrive in, and the "shared_with"
+        // column would change between runs over the same library.
+        let mut fps = vec![
+            mock_fp_lasting(600.0),
+            mock_fp_lasting(600.0),
+            mock_fp_lasting(600.0),
+        ];
+        fps[0].path = "/subject.mp4".into();
+        fps[1].path = "/zebra.mp4".into();
+        fps[2].path = "/aardvark.mp4".into();
+
+        // The neighbour list is built in the order the matches arrive, and that
+        // order is phase 2's, not anything a reader controls. Both arrival
+        // orders of the same tie must produce the same report.
+        for matches in [
+            vec![Match::new(0, 1, 1.0, 1.0), Match::new(0, 2, 1.0, 1.0)],
+            vec![Match::new(0, 2, 1.0, 1.0), Match::new(0, 1, 1.0, 1.0)],
+        ] {
+            let links = MatchIndex::new(matches).links_of(0, &fps);
+            assert_eq!(
+                fps[links[0].other].path, "/aardvark.mp4",
+                "an exact tie should fall to the alphabetically first path"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_link_with_no_matched_sample_reports_no_span() {
+        // `-p 0` accepts a pair that shares nothing at all. There is no position
+        // to report, and a zero-length span at 0 would look like a real match at
+        // the start of the file.
+        let a = mock_fp_sampled(vec![distinct_hash(1)], 1000);
+        let b = mock_fp_sampled(vec![distinct_hash(2)], 1000);
+
+        let (_, _, span_a, span_b) = match_overlap(&a, &b, 0);
+
+        assert_eq!(span_a, None);
+        assert_eq!(span_b, None);
     }
 }

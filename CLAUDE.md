@@ -51,6 +51,8 @@ cargo test --test local_accuracy_test -- --nocapture
 
 ## Keeping the docs honest
 
-`README.md`'s options table, the `Args` doc comments (which become the man page and `--help`), and the tuning/safety prose describe the same behaviour three times. Any flag or default that changes has to be updated in all three. Report formats are `.txt`/`.csv`/`.json`, dispatched on the `--output` extension in `export.rs`; the CSV column order is asserted by `tests/local_accuracy_test.rs` (it reads `full_path` at index 13).
+`README.md`'s options table, the `Args` doc comments (which become the man page and `--help`), and the tuning/safety prose describe the same behaviour three times. Any flag or default that changes has to be updated in all three. Report formats are `.txt`/`.csv`/`.json`, dispatched on the `--output` extension in `export.rs`; the CSV column order is asserted by `tests/local_accuracy_test.rs` (it reads `full_path` at index 13), and by the golden `vd_results_*.csv` baselines beside the corpus, which were written by older builds — **append new CSV columns at the end** rather than inserting them, or both sides of that comparison stop lining up.
+
+The JSON tree is built only when `--output` ends in `.json` (`wants_json` in `output_results`). It carries one object per measured link per file, so building it unconditionally made a report-only run pay for a structure it then discarded.
 
 Releases are cut by pushing a `v*` tag — `.github/workflows/release.yml` builds the dynamic glibc binary, generates completions and the man page from the binary itself, and uploads both a versioned and a stable-named artifact. There is no CI on pushes or PRs, so `cargo clippy` and `cargo test` are on you.
