@@ -1,5 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
+// `Packet::as_mut_ptr` lives on this trait; the demux loop below needs the raw
+// pointer to unref the packet it reuses.
+use ffmpeg_next::codec::packet::Mut as _;
 use crate::utils::shutdown_requested;
 
 // Every stored frame is a 64x64 GRAY8 buffer. Crucially we keep them all in ONE
@@ -755,6 +758,26 @@ pub fn fingerprint_video(
     loop {
         if shutdown_requested() {
             return Err(anyhow!("Interrupted while fingerprinting {}", filepath));
+        }
+
+        // `av_read_frame` fills the packet it is handed WITHOUT releasing what
+        // that packet already holds -- it moves a reference in over the top of
+        // the old one, which is then unreachable and never freed. The packet
+        // iterator this loop replaced hid that by allocating a fresh packet per
+        // read and dropping it (ffmpeg-next's `Drop` is the unref); reusing one
+        // packet, as this loop does to avoid that churn, has to say it out loud.
+        //
+        // Every key packet's payload leaked otherwise -- ~100 KB a frame, held
+        // for the life of the process -- which is a gigabyte across a few
+        // thousand keyframes and is why RSS climbed for the whole of a run
+        // instead of levelling off.
+        //
+        // Unreffing at the TOP rather than after `send_packet` is what makes it
+        // exhaustive: every `continue` below (wrong stream, non-key, a seek
+        // landing short, a demux error) leaves a packet in hand, and all of them
+        // come back through here.
+        unsafe {
+            ffmpeg_next::ffi::av_packet_unref(packet.as_mut_ptr());
         }
 
         match packet.read(&mut ictx) {
