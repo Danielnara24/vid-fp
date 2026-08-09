@@ -495,15 +495,18 @@ fn header_is_complete(ictx: &ffmpeg_next::format::context::Input) -> bool {
 /// not log it as one. A video whose duration cannot be determined is NOT
 /// skipped; unknown is not the same as short.
 ///
-/// `progress` is handed the demuxer's byte offset in this file as it advances,
-/// so a caller drawing a bar can move it DURING a decode rather than only when
-/// one ends. A single 8 GB file is minutes of work, and a bar that cannot move
-/// until it is over is indistinguishable from a hung one. Offsets are absolute
-/// and reported raw: they are not necessarily monotonic (a seek can land short)
-/// and a container that does not track them reports -1, which is filtered here,
-/// leaving that file to move the bar once at the end. Rate-limiting is the
-/// caller's job -- this fires per packet, and on a linear-scanning container
-/// that is thousands of times a second.
+/// `progress` is handed the byte offset of each packet of the VIDEO STREAM
+/// BEING FINGERPRINTED as the demuxer advances through it, so a caller drawing
+/// a bar can move it DURING a decode rather than only when one ends. A single
+/// 8 GB file is minutes of work, and a bar that cannot move until it is over is
+/// indistinguishable from a hung one. Other streams are deliberately not
+/// reported -- see the call site for the cover-art packet that made that
+/// distinction matter. Offsets are absolute and reported raw: they are not
+/// necessarily monotonic (a seek can land short) and a container that does not
+/// track them reports -1, which is filtered here, leaving that file to move the
+/// bar once at the end. Rate-limiting is the caller's job -- this fires per
+/// packet, and on a linear-scanning container that is thousands of times a
+/// second.
 pub fn fingerprint_video(
     filepath: &str,
     kf_interval: f64,
@@ -799,19 +802,30 @@ pub fn fingerprint_video(
             Err(_) => continue,
         }
 
-        // Reported here, before the stream and keyframe filters, because this is
-        // the only point that sees every byte the demuxer actually walks. On a
-        // container we seek through the offset leaps a keyframe at a time; on one
-        // we scan linearly it creeps, and either way it is the truthful answer to
-        // "how far into this file are we". Two pointer derefs and an indirect
-        // call -- the caller decides how much of that is worth drawing.
+        if packet.stream() != video_stream_index {
+            continue;
+        }
+
+        // Reported after the stream filter and before the keyframe one, so it
+        // follows the stream we are actually walking. On a container we seek
+        // through the offset leaps a keyframe at a time; on one we scan
+        // linearly it creeps, and either way it is the truthful answer to "how
+        // far into this file are we". Two pointer derefs and an indirect call
+        // -- the caller decides how much of that is worth drawing.
+        //
+        // Reporting EVERY packet's offset, which is what this used to do, is
+        // not a wider version of the same measurement: an attached picture
+        // (cover art, a poster frame) is a stream of its own whose single
+        // packet libavformat hands back FIRST, ahead of any demuxing, and it is
+        // stored at the END of the file. One 5 GB MP4 with cover art therefore
+        // opened by reporting offset 5321112043 of 5321218376 before a frame
+        // had been decoded, which credited the whole file to the bar in one
+        // step and then left it motionless for the 100 seconds the decode
+        // actually took. Any stream laid out away from the video's bytes does
+        // the same thing to a smaller degree.
         let pos = packet.position();
         if pos >= 0 {
             progress(pos as u64);
-        }
-
-        if packet.stream() != video_stream_index {
-            continue;
         }
 
         if !packet.is_key() {
@@ -1114,10 +1128,14 @@ mod tests {
     }
 
     fn fixture_path() -> PathBuf {
+        fixture_named("test_video.mp4")
+    }
+
+    fn fixture_named(name: &str) -> PathBuf {
         let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         p.push("tests");
         p.push("fixtures");
-        p.push("test_video.mp4");
+        p.push(name);
         p
     }
 
@@ -1187,6 +1205,49 @@ mod tests {
         assert!(!offsets.is_empty(), "the demuxer walked the file and reported nothing");
         // A caller sizes its bar by the file's length on disk, so an offset past
         // that would push the bar beyond full.
+        assert!(
+            offsets.iter().all(|&pos| pos < size),
+            "offsets must fall inside the {} byte file: {:?}",
+            size,
+            offsets
+        );
+    }
+
+    /// An attached picture -- cover art, a poster frame -- is a stream of its
+    /// own, libavformat hands its single packet back before it demuxes
+    /// anything, and MP4 writes it after the video's samples. Reporting every
+    /// packet's offset therefore opened such a file by announcing an offset
+    /// near its end, which credited the whole file to the caller's progress bar
+    /// before a frame had been decoded and left it motionless for the rest of
+    /// the decode. On one 5 GB MP4 that was offset 5321112043 of 5321218376,
+    /// reported 0.2 s into a 100 s decode.
+    ///
+    /// The fixture is `test_video.mp4` with a JPEG attached (`-map 1 -c copy
+    /// -disposition:v:1 attached_pic`); the cover sits at byte 5760 of 6434,
+    /// past every packet of the video stream.
+    #[test]
+    fn test_progress_ignores_streams_other_than_the_video() {
+        init_ffmpeg_for_tests();
+        let path = fixture_named("test_video_cover_art.mp4");
+        let size = std::fs::metadata(&path).unwrap().len();
+        let filepath = path.to_string_lossy().to_string();
+
+        let offsets = std::cell::RefCell::new(Vec::new());
+        fingerprint_video(&filepath, 0.0, 4.0, 1, 0.0, &|pos| {
+            offsets.borrow_mut().push(pos)
+        })
+        .unwrap()
+        .expect("the fixture fingerprints");
+
+        let offsets = offsets.into_inner();
+        assert!(!offsets.is_empty(), "the demuxer walked the file and reported nothing");
+        assert!(
+            offsets[0] < size / 2,
+            "the first offset reported for a {} byte file was {}, which is the \
+             cover art at the end of it rather than the video at the start",
+            size,
+            offsets[0]
+        );
         assert!(
             offsets.iter().all(|&pos| pos < size),
             "offsets must fall inside the {} byte file: {:?}",
