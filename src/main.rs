@@ -19,6 +19,7 @@ use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use sources::ScannedFile;
 use stats::RunStats;
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -83,6 +84,22 @@ const CACHE_SIZE_BYTES: usize = 64 * 1024 * 1024;
 /// fatal path, 130 is the shell convention for SIGINT. Scripts that don't care
 /// can ignore it; scripts that do finally have something to test.
 const EXIT_WITH_PROBLEMS: i32 = 2;
+
+/// How far the demuxer has to travel through a file before the progress bar is
+/// told about it.
+///
+/// The hook behind this fires once per demuxed packet, which on a container we
+/// scan linearly is thousands of times a second per decode, from every worker at
+/// once -- and each report that gets through takes indicatif's state lock. The
+/// bar redraws at most 20 times a second no matter how often it is nudged, so
+/// anything finer than this is contention bought for pixels that are never
+/// drawn.
+///
+/// 4 MiB is the coarsest step that still looks continuous on the file sizes that
+/// need it: it puts ~2000 updates across an 8 GB decode (several a second over
+/// minutes of work) while a file small enough to yield fewer than a handful is,
+/// by definition, one that finishes before anybody looks at the bar.
+const PROGRESS_STEP_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Everything other than the file's contents that decides whether a cached
 /// fingerprint is still the right answer for the file at a given path.
@@ -1230,19 +1247,64 @@ fn run(
         let collected: Mutex<Vec<(usize, VideoFingerprint)>> =
             Mutex::new(Vec::with_capacity(todo_count));
 
-        // The bar counts decodes and nothing else, so its denominator is the
-        // work remaining rather than the size of the library.
+        // Files finished. The bar's own position is bytes now, so it can no
+        // longer answer "how many videos is that?" -- and that is the number a
+        // user quotes back. It rides in `{prefix}` rather than sharing `{msg}`
+        // with the file name because the two change on different events: the
+        // name when a decode STARTS, the count when one ENDS. Formatting both at
+        // claim time pinned the count at 0/6 for an entire six-file run -- every
+        // worker had claimed before anything finished, so the only reads of the
+        // counter all happened while it was still zero.
+        let files_done = AtomicUsize::new(0);
+
+        // The bar measures BYTES of work, not files. Its denominator is the same
+        // `total_weight` the thread budget is apportioned against, so the bar and
+        // the scheduler agree about what half-done means; counting files did not,
+        // and with inputs spanning three orders of magnitude in size a count is
+        // close to meaningless -- a run can sit at 90% for most of its wall time.
+        //
+        // Neither the length nor the increments cost anything to obtain: the size
+        // is the one `sources::collect` already stat'ed and stored on the job as
+        // its scheduling weight, and `inc` is one atomic add plus a clock-based
+        // redraw check whatever the delta is, so this is the same handful of calls
+        // per run that counting files made.
+        //
+        // Bytes are a proxy, not a measurement. ~93% of fingerprinting time is
+        // intra decode, which tracks keyframes x pixels, so a high-bitrate file
+        // weighs more here than it costs. The honest weight is duration x
+        // resolution, and every file in `todo` is a cache miss by definition --
+        // there is no cached duration to read, so learning it means opening and
+        // probing all of them before the bar can appear. Bytes are the best weight
+        // available for free, which is exactly why `share_for` uses them too.
+        //
+        // No ETA: extrapolating a rate off a proxy that skews with bitrate would
+        // put a number on screen more precise than anything behind it. The
+        // throughput figure is the honest version of the same information.
         let pb = if args.quiet {
             ProgressBar::hidden()
         } else {
-            let pb = ProgressBar::new(todo_count as u64);
+            let pb = ProgressBar::new(total_weight.min(u64::MAX as u128) as u64);
             pb.set_style(
                 ProgressStyle::with_template(
-                    "[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) - {msg}",
+                    "{elapsed_precise} \u{2502} [{bar:28.cyan/blue}] \u{2502} {bytes}/{total_bytes} \u{2502} {bytes_per_sec} \u{2502} {prefix} \u{2502} {msg}",
                 )
                 .unwrap()
                 .progress_chars("=>-"),
             );
+            // Five fields of digits with only spaces between them read as one
+            // long number at a glance, so they are ruled apart. A box-drawing
+            // bar rather than an ASCII pipe: it cannot be confused with the `|`
+            // that shows up in file names, and the run already prints text that
+            // assumes a UTF-8 terminal.
+            //
+            // The bar is narrower than the 40 it used to be, because the size
+            // pair, the rate and the rules all have to fit on the same line as
+            // the file name -- a line that wraps redraws as two and flickers.
+            // `{wide_msg}` looked like the tidier answer, since it truncates the
+            // name to the space left instead of wrapping, but it renders the
+            // message empty once the bar has any colour in it and the name
+            // simply vanished a second into every run.
+            pb.set_prefix(format!("0/{}", todo_count));
             pb
         };
 
@@ -1252,6 +1314,7 @@ fn run(
         let cursor = &cursor;
         let collected = &collected;
         let pb = &pb;
+        let files_done = &files_done;
         let newly_cached = &newly_cached;
 
         std::thread::scope(|scope| {
@@ -1264,6 +1327,22 @@ fn run(
                     // completion order is whatever the disk decided that day,
                     // and a reproducible run should not depend on it.
                     let mut local: Vec<(usize, VideoFingerprint)> = Vec::new();
+
+                    // One video is off the queue, however it ended. `charged` is
+                    // what the demuxer already moved the bar by while the file
+                    // was open, so only the remainder is owed here -- the two
+                    // together are always exactly the file's size, which is what
+                    // makes the bar land on 100% and not near it.
+                    //
+                    // Called for a file that was skipped or that failed too:
+                    // neither will be attempted again, so their bytes have left
+                    // the queue and a bar that ended short of full would be the
+                    // lie the old per-file `inc` was already avoiding.
+                    let finish = |weight: u64, charged: u64| {
+                        let done = files_done.fetch_add(1, Ordering::Relaxed) + 1;
+                        pb.set_prefix(format!("{}/{}", done, todo_count));
+                        pb.inc(weight.saturating_sub(charged));
+                    };
 
                     loop {
                         // Cheapest possible bail-out. Every video still queued
@@ -1291,12 +1370,37 @@ fn run(
                             .into_owned();
                         pb.set_message(file_name);
 
+                        // How much of this file's weight the bar has already been
+                        // given. `fingerprint_video` reports the demuxer's offset
+                        // per packet, which on a linearly scanned container is
+                        // thousands of times a second and far more often than the
+                        // bar can redraw; PROGRESS_STEP_BYTES is what turns that
+                        // firehose into a bounded number of increments. A `Cell`
+                        // because the hook has to stay `Fn` and the total has to
+                        // outlive it -- this closure is built fresh per video and
+                        // never leaves this thread.
+                        let charged = Cell::new(0u64);
+                        let advance = |pos: u64| {
+                            // Clamped, never a delta from the raw offset: a seek
+                            // that lands short walks the offset BACKWARDS, and an
+                            // offset past the size we stat'ed (a file being
+                            // appended to as we read it) would overrun the bar.
+                            // Only forward movement inside the file counts.
+                            let reached = pos.min(job.weight);
+                            let already = charged.get();
+                            if reached.saturating_sub(already) >= PROGRESS_STEP_BYTES {
+                                charged.set(reached);
+                                pb.inc(reached - already);
+                            }
+                        };
+
                         let decoded = fingerprint_video(
                             &job.path,
                             kf_interval,
                             min_kf_samples,
                             grant.threads,
                             min_duration,
+                            &advance,
                         );
 
                         // Handed back before the cache write below: an fsync is
@@ -1312,7 +1416,7 @@ fn run(
                                 // nothing to cache: the header read that decided
                                 // this is cheap enough to repeat next run.
                                 stats.skipped_short.bump();
-                                pb.inc(1);
+                                finish(job.weight, charged.get());
                                 continue;
                             }
                             Err(e) => {
@@ -1334,7 +1438,7 @@ fn run(
                                         .fingerprint_failed
                                         .record(format!("{}: {:#}", job.path, e));
                                 }
-                                pb.inc(1); // Keep the bar consistent with work attempted
+                                finish(job.weight, charged.get()); // Work attempted
                                 continue;
                             }
                         };
@@ -1360,7 +1464,7 @@ fn run(
                         }
 
                         local.push((idx, fp));
-                        pb.inc(1);
+                        finish(job.weight, charged.get());
                     }
 
                     collected

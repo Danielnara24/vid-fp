@@ -494,12 +494,23 @@ fn header_is_complete(ictx: &ffmpeg_next::format::context::Input) -> bool {
 /// Returns `Ok(None)` in that case: a skip is not an error, and the caller must
 /// not log it as one. A video whose duration cannot be determined is NOT
 /// skipped; unknown is not the same as short.
+///
+/// `progress` is handed the demuxer's byte offset in this file as it advances,
+/// so a caller drawing a bar can move it DURING a decode rather than only when
+/// one ends. A single 8 GB file is minutes of work, and a bar that cannot move
+/// until it is over is indistinguishable from a hung one. Offsets are absolute
+/// and reported raw: they are not necessarily monotonic (a seek can land short)
+/// and a container that does not track them reports -1, which is filtered here,
+/// leaving that file to move the bar once at the end. Rate-limiting is the
+/// caller's job -- this fires per packet, and on a linear-scanning container
+/// that is thousands of times a second.
 pub fn fingerprint_video(
     filepath: &str,
     kf_interval: f64,
     min_kf_samples: f64,
     decode_threads: usize,
     min_duration: f64,
+    progress: &dyn Fn(u64),
 ) -> Result<Option<VideoFingerprint>> {
     // 1. Native Zero-Copy Extraction (No Subprocess Overhead)
     let mut ictx = open_input(filepath)
@@ -786,6 +797,17 @@ pub fn fingerprint_video(
             // Mirrors the packet iterator this loop replaces: a recoverable
             // demux error skips the packet rather than ending the video.
             Err(_) => continue,
+        }
+
+        // Reported here, before the stream and keyframe filters, because this is
+        // the only point that sees every byte the demuxer actually walks. On a
+        // container we seek through the offset leaps a keyframe at a time; on one
+        // we scan linearly it creeps, and either way it is the truthful answer to
+        // "how far into this file are we". Two pointer derefs and an indirect
+        // call -- the caller decides how much of that is worth drawing.
+        let pos = packet.position();
+        if pos >= 0 {
+            progress(pos as u64);
         }
 
         if packet.stream() != video_stream_index {
@@ -1106,7 +1128,7 @@ mod tests {
         let filepath = fixture_path.to_string_lossy().to_string();
         assert!(fixture_path.exists(), "Fixture video not found at: {}.", filepath);
 
-        let result = fingerprint_video(&filepath, 0.0, 4.0, threads, 0.0);
+        let result = fingerprint_video(&filepath, 0.0, 4.0, threads, 0.0, &|_| {});
         assert!(result.is_ok(), "Failed to fingerprint video: {:?}", result.err());
         result.unwrap().expect("min_duration is off, nothing should be skipped")
     }
@@ -1134,8 +1156,43 @@ mod tests {
         let filepath = fixture_path().to_string_lossy().to_string();
 
         // The fixture is ~1s; an hour-long floor must reject it without error.
-        let skipped = fingerprint_video(&filepath, 0.0, 4.0, 1, 3600.0).unwrap();
+        let skipped = fingerprint_video(&filepath, 0.0, 4.0, 1, 3600.0, &|_| {}).unwrap();
         assert!(skipped.is_none(), "a short video must be skipped, not fingerprinted");
+    }
+
+    /// The hook exists so a bar can move during a decode rather than only when
+    /// one ends, and the way that silently regresses is the hook never firing --
+    /// which looks identical from outside except that a long file appears hung.
+    ///
+    /// What this fixture can prove is that it fires from inside the demux loop
+    /// with real offsets into the file. It cannot prove the offsets ADVANCE: it
+    /// is a one-second clip with a single keyframe, so there is exactly one
+    /// packet to report. Movement across a multi-keyframe file is a property of
+    /// the demuxer's own position, not of this plumbing.
+    #[test]
+    fn test_progress_reports_real_file_offsets_during_the_decode() {
+        init_ffmpeg_for_tests();
+        let path = fixture_path();
+        let size = std::fs::metadata(&path).unwrap().len();
+        let filepath = path.to_string_lossy().to_string();
+
+        let offsets = std::cell::RefCell::new(Vec::new());
+        fingerprint_video(&filepath, 0.0, 4.0, 1, 0.0, &|pos| {
+            offsets.borrow_mut().push(pos)
+        })
+        .unwrap()
+        .expect("the fixture fingerprints");
+
+        let offsets = offsets.into_inner();
+        assert!(!offsets.is_empty(), "the demuxer walked the file and reported nothing");
+        // A caller sizes its bar by the file's length on disk, so an offset past
+        // that would push the bar beyond full.
+        assert!(
+            offsets.iter().all(|&pos| pos < size),
+            "offsets must fall inside the {} byte file: {:?}",
+            size,
+            offsets
+        );
     }
 
     #[test]
