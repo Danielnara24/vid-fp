@@ -230,6 +230,35 @@ was. Timestamps and permissions are preserved.
 The destination must sit outside the scanned folders; the run aborts if it
 doesn't, since moving files into the scan just feeds them back in next time.
 
+### Acting on a report you have reviewed
+
+Save a report, review it, edit it, then hand it back:
+
+```bash
+# 1. Look first
+vid-fp /mnt/media -r -o dupes.csv
+
+# 2. Edit the action column in dupes.csv, then act on exactly what it says
+vid-fp --from-report dupes.csv --delete
+```
+
+`--from-report` disposes of every row whose `action` column reads `DELETE` and
+touches nothing else.
+
+Change `REVIEW`/`KEEP` cells to `DELETE` and they're acted on. Change a `DELETE` to
+anything else and it isn't.
+
+Every file is still re-checked against the size the report recorded immediately
+before it's touched, and left alone if it has changed since. A report can sit for a week before you get to it.
+
+Columns are found **by name**, so a report that has had its columns reordered still works.
+Only the CSV report should be provided; `.txt` and
+`.json` reports are refused.
+
+If you mark every copy of something
+`DELETE`, every copy is deleted. The confirmation prompt still shows the count
+and the byte total before anything happens.
+
 ## Options
 
 | Flag | Description | Default |
@@ -252,6 +281,7 @@ doesn't, since moving files into the scan just feeds them back in next time.
 | `--delete` | Move files marked DELETE to the trash | off |
 | `--permanent` | With `--delete`, permanently remove instead | off |
 | `--move-to <DIR>` | Move the files marked DELETE under `DIR`, recreating their absolute paths inside it. Arms the run on its own and supersedes `--delete`/`--permanent` | — |
+| `--from-report <FILE>` | Act on a CSV report from an earlier run instead of scanning: dispose of every row whose `action` column reads `DELETE`, and nothing else. Requires `--delete` or `--move-to`. See [Acting on a report you have read](#acting-on-a-report-you-have-read) | — |
 | `-y`, `--yes` | Answer yes to the confirmation shown before any file is touched. The prompt only appears on an interactive terminal, so piped and redirected runs are never blocked either way | off |
 | `-t`, `--threads <N>` | Worker threads (`0` = uses all cores) | `0` |
 | `-q`, `--quiet` | Only print errors | off |
@@ -486,6 +516,12 @@ Fingerprints are cached (under `$XDG_CACHE_HOME/vid-fp`, falling back to
   - **Mixed codecs are never guessed at.** When the only thing separating two
   copies is which encoder made them, both are left alone and flagged REVIEW —
   one survivor per codec, chosen against that codec's own copies.
+  - **`--from-report` hands the judgement to you, and says so.** The rules above
+  are applied by the run that *writes* a report. Replaying an edited one keeps
+  the confirmation prompt and the pre-disposal size check, but nothing else: the
+  edited file is the decision, and it is not checked for leaving a survivor in
+  each group. A row it cannot understand is never guessed at — the file is left
+  alone and the run exits `2`.
 
 ## License
 

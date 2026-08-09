@@ -35,6 +35,31 @@ pub struct Target<'a> {
     pub size: u64,
 }
 
+/// What answering `n` gets you, which is not the same in both modes.
+///
+/// The reassurance matters more than it looks: a user who is unsure enough to
+/// hesitate should be told that hesitating costs nothing. But a grouped run
+/// prints its results table either way, and `--from-report` was handed that
+/// table to begin with -- promising it again would be offering the user the
+/// file they are already looking at.
+pub enum Decline {
+    /// The full report follows regardless of the answer.
+    ShowsReport,
+    /// Nothing further to show; the answer simply ends the run.
+    StopsHere,
+}
+
+impl Decline {
+    fn line(&self) -> &'static str {
+        match self {
+            Decline::ShowsReport => {
+                "Answer n to print the full report and leave every file alone."
+            }
+            Decline::StopsHere => "Answer n to leave every file alone.",
+        }
+    }
+}
+
 /// Whether the user is there to be asked at all.
 ///
 /// Both halves matter. Without a terminal on stdin there is nobody to type an
@@ -87,7 +112,12 @@ fn interpret(line: &str) -> Option<bool> {
 /// `--yes` was given. Every path that is not a clear yes returns false, so a
 /// closed stdin, an unreadable terminal, an interrupt, or three unusable
 /// answers all leave the files where they are.
-pub fn approve(disposal: &Disposal, targets: &[Target<'_>], assume_yes: bool) -> bool {
+pub fn approve(
+    disposal: &Disposal,
+    targets: &[Target<'_>],
+    assume_yes: bool,
+    decline: Decline,
+) -> bool {
     if targets.is_empty() || assume_yes || !interactive() {
         return true;
     }
@@ -113,10 +143,7 @@ pub fn approve(disposal: &Disposal, targets: &[Target<'_>], assume_yes: bool) ->
     if let Some(rest) = targets.len().checked_sub(PREVIEW_LIMIT).filter(|&r| r > 0) {
         let _ = writeln!(err, "  ... and {} more", rest);
     }
-    let _ = writeln!(
-        err,
-        "Answer n to print the full report and leave every file alone."
-    );
+    let _ = writeln!(err, "{}", decline.line());
 
     let stdin = std::io::stdin();
     let mut line = String::new();
@@ -214,7 +241,7 @@ mod tests {
         // No targets means the disposal pass has no work; a prompt there would
         // ask the user to authorise a no-op. Runs regardless of whether the test
         // binary has a terminal, since it returns before looking.
-        assert!(approve(&Disposal::Permanent, &[], false));
+        assert!(approve(&Disposal::Permanent, &[], false, Decline::ShowsReport));
     }
 
     #[test]
@@ -223,6 +250,6 @@ mod tests {
             path: "/tmp/a.mkv",
             size: 1,
         }];
-        assert!(approve(&Disposal::Permanent, &targets, true));
+        assert!(approve(&Disposal::Permanent, &targets, true, Decline::ShowsReport));
     }
 }

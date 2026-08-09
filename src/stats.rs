@@ -78,6 +78,7 @@ pub struct RunStats {
     pub cache_purge_failed: Tally,
     pub delete_stale: Tally,
     pub delete_failed: Tally,
+    pub report_unusable: Tally,
 
     // --- skips: intentional, and not a reason to fail the run ----------------
     pub skipped_short: Tally,
@@ -86,7 +87,7 @@ pub struct RunStats {
 }
 
 impl RunStats {
-    fn problems(&self) -> [(&Tally, &'static str); 9] {
+    fn problems(&self) -> [(&Tally, &'static str); 10] {
         [
             // "path" rather than "folder": a scan target can now be a single
             // file, or a line piped in from another tool.
@@ -123,6 +124,15 @@ impl RunStats {
                  and were NOT removed",
             ),
             (&self.delete_failed, "file(s) marked DELETE could not be removed"),
+            // A --from-report row this build could not make sense of. Squarely a
+            // problem rather than a skip: the user wrote that line meaning
+            // something by it, the likeliest something is a misspelt DELETE, and
+            // a file that quietly survived a run that was asked to remove it is
+            // exactly the outcome the exit code exists to report.
+            (
+                &self.report_unusable,
+                "row(s) of the report could not be understood -- the file(s) they name were NOT touched",
+            ),
         ]
     }
 
@@ -291,8 +301,9 @@ mod tests {
         s.cache_purge_failed.record("cache write failed");
         s.delete_stale.record("/d.mp4: 100 bytes when scanned, 200 bytes now");
         s.delete_failed.record("/e.mp4");
+        s.report_unusable.record("report.csv line 4");
 
-        assert_eq!(s.problem_count(), 9);
+        assert_eq!(s.problem_count(), 10);
         assert!(s.had_problems());
     }
 }

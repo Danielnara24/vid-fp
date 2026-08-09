@@ -3,6 +3,7 @@ mod compare;
 mod confirm;
 mod export;
 mod fingerprint;
+mod report;
 mod stats;
 mod utils;
 mod sources;
@@ -177,7 +178,7 @@ struct Args {
     /// --extensions is only a guess about what a FOLDER contains. Use `-` to
     /// read a list of paths from stdin, e.g. `fd -e mkv | vid-fp -`.
     #[arg(
-        required_unless_present_any = ["completions", "man", "from_file"],
+        required_unless_present_any = ["completions", "man", "from_file", "from_report"],
         num_args = 1..,
         value_name = "PATH",
         value_hint = clap::ValueHint::AnyPath
@@ -294,6 +295,27 @@ struct Args {
           value_hint = clap::ValueHint::DirPath)]
     move_to: Option<String>,
 
+    /// Act on a CSV report from an earlier run instead of scanning anything.
+    /// Every row whose action column reads DELETE is disposed of, and nothing
+    /// else is touched — so editing that column is how you act on the rows the
+    /// tool would not decide for you (REVIEW), or spare one it would. Nothing
+    /// is re-fingerprinted and no groups are recomputed: the report is the
+    /// decision. Each file is still re-checked against the size the report
+    /// recorded and left alone if it changed since. Requires --delete or
+    /// --move-to, and cannot be combined with scanning or matching options.
+    #[arg(
+        long = "from-report",
+        value_name = "FILE",
+        value_hint = clap::ValueHint::FilePath,
+        conflicts_with_all = [
+            "include", "exclude", "from_file", "null", "recursive", "follow_symlinks",
+            "extensions", "hamming_distance", "match_percent", "min_duration",
+            "kf_interval", "min_kf_samples", "priority", "trust_chains", "output",
+            "prune_cache", "threads",
+        ]
+    )]
+    from_report: Option<String>,
+
     /// Answer yes to the confirmation shown before any file is touched. That
     /// confirmation only appears on an interactive terminal -- a run whose
     /// input or output is piped or redirected is never prompted and never
@@ -329,6 +351,7 @@ struct Args {
 
 /// How the run ended. `Interrupted` carries the phase name purely so the final
 /// message can tell the user where it stopped.
+#[derive(Debug)]
 enum Outcome {
     Completed,
     Interrupted,
@@ -353,6 +376,101 @@ fn disposal_for(move_to: Option<PathBuf>, delete: bool, permanent: bool) -> Opti
         // flags can take a file off its path.
         (None, false, _) => None,
     }
+}
+
+/// Turn `--move-to DIR` into the absolute folder the files will land under.
+///
+/// Resolved BEFORE any work on purpose: a destination that cannot be created is
+/// a typo, and finding a typo out after fingerprinting a library is finding it
+/// out several hours too late. Canonical, so the containment check and the
+/// mirrored landing paths are both working from the same absolute form the
+/// scanner produces.
+fn resolve_move_to(dir: Option<&String>) -> Result<Option<PathBuf>> {
+    let Some(dir) = dir else { return Ok(None) };
+
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("Failed to create the --move-to folder {}", dir))?;
+    let resolved = std::fs::canonicalize(dir)
+        .with_context(|| format!("Failed to resolve the --move-to folder {}", dir))?;
+    if !resolved.is_dir() {
+        anyhow::bail!("--move-to {} is not a folder.", dir);
+    }
+    Ok(Some(resolved))
+}
+
+/// Say up front what is going to happen to the files marked DELETE, so it is
+/// visible above the per-file log rather than only in the summary underneath it.
+fn announce(disposal: Option<&Disposal>) {
+    match disposal {
+        Some(Disposal::MoveTo(dir)) => info!(
+            "\n--move-to enabled: files marked DELETE will be moved under {}.",
+            dir.display()
+        ),
+        Some(Disposal::Permanent) => {
+            info!("\n--permanent enabled: files marked DELETE will be removed permanently.")
+        }
+        Some(Disposal::Trash) => {
+            info!("\n--delete enabled: files marked DELETE will be moved to the trash.")
+        }
+        None => {}
+    }
+}
+
+/// `--from-report`: dispose of what a previous run's CSV marks DELETE, and
+/// nothing else.
+///
+/// A separate entry point rather than a branch threaded through `run`, because
+/// it shares almost nothing with it. There is no scan, no cache pass, no
+/// fingerprinting, no comparison and no clustering -- the report already holds
+/// every figure this needs, and the whole cost of the mode is reading it. What
+/// it does share is the part that matters: the same confirmation prompt, the
+/// same per-file staleness check, the same disposal code, and the same cache
+/// bookkeeping afterwards.
+///
+/// Refusing to run without an arming flag is the one piece of validation clap
+/// cannot express. It is not merely useless without one -- a report-only
+/// `--from-report` would read a file, decide nothing, and print nothing that
+/// the report does not already say.
+fn run_from_report(
+    args: &Args,
+    db: &Database,
+    report_path: &str,
+    stats: &RunStats,
+) -> Result<Outcome> {
+    let move_to = resolve_move_to(args.move_to.as_ref())?;
+
+    let Some(disposal) = disposal_for(move_to, args.delete, args.permanent) else {
+        anyhow::bail!(
+            "--from-report needs to be told what to do with the rows marked DELETE. Add --delete \
+             (to the trash), --delete --permanent, or --move-to <DIR>."
+        );
+    };
+
+    announce(Some(&disposal));
+
+    // No `scan_encloses` counterpart here: that check protects the NEXT run from
+    // re-scanning what this one moved, and it needs a scan to compare against.
+    // This mode has no scan roots, so there is nothing it could be checked
+    // against and nothing it could conclude.
+    let deleted_paths = report::apply(report_path, &disposal, args.yes, stats)?;
+
+    if !deleted_paths.is_empty() {
+        match cache_forget(db, &deleted_paths) {
+            Ok(forgotten) => {
+                log::debug!("Dropped {} cache entry(ies) for removed file(s).", forgotten)
+            }
+            Err(e) => {
+                log::error!("Failed to drop cache entries for removed files: {:#}", e);
+                stats.cache_purge_failed.record(format!("{:#}", e));
+            }
+        }
+    }
+
+    if shutdown_requested() {
+        return Ok(Outcome::Interrupted);
+    }
+
+    Ok(Outcome::Completed)
 }
 
 /// The scanned folder that contains `dest`, if any.
@@ -980,6 +1098,12 @@ fn run(
     active_threads: usize,
     stats: &RunStats,
 ) -> Result<Outcome> {
+    // Before anything that reads the filesystem: this mode's whole premise is
+    // that the decisions were made by an earlier run and are not being retaken.
+    if let Some(report_path) = &args.from_report {
+        return run_from_report(args, db, report_path, stats);
+    }
+
     let max_hamming = args.hamming_distance;
     let min_match_pct = args.match_percent / 100.0;
     let min_duration = args.min_duration;
@@ -987,26 +1111,7 @@ fn run(
         anyhow::bail!("--min-duration cannot be negative.");
     }
 
-    // --- Where the DELETE targets are going ----------------------------------
-    // Resolved BEFORE the scan on purpose: a destination that cannot be created
-    // is a typo, and finding a typo out after fingerprinting a library is
-    // finding it out several hours too late.
-    let move_to = match &args.move_to {
-        Some(dir) => {
-            std::fs::create_dir_all(dir)
-                .with_context(|| format!("Failed to create the --move-to folder {}", dir))?;
-            // Canonical, so the containment check below and the mirrored paths
-            // built later are both working from the same absolute form the
-            // scanner produces.
-            let resolved = std::fs::canonicalize(dir)
-                .with_context(|| format!("Failed to resolve the --move-to folder {}", dir))?;
-            if !resolved.is_dir() {
-                anyhow::bail!("--move-to {} is not a folder.", dir);
-            }
-            Some(resolved)
-        }
-        None => None,
-    };
+    let move_to = resolve_move_to(args.move_to.as_ref())?;
 
     // Say out loud which flags are not doing anything. A user who passed
     // --permanent and watched a report scroll by has to be told the files were
@@ -1602,21 +1707,7 @@ fn run(
     // The single place that turns flags into intent. Report-only runs produce
     // None, and export.rs cannot touch a file without one of these.
     let disposal = disposal_for(move_to, args.delete, args.permanent);
-
-    // Announce intent up front so it's visible above the per-file log.
-    match &disposal {
-        Some(Disposal::MoveTo(dir)) => info!(
-            "\n--move-to enabled: files marked DELETE will be moved under {}.",
-            dir.display()
-        ),
-        Some(Disposal::Permanent) => {
-            info!("\n--permanent enabled: files marked DELETE will be removed permanently.")
-        }
-        Some(Disposal::Trash) => {
-            info!("\n--delete enabled: files marked DELETE will be moved to the trash.")
-        }
-        None => {}
-    }
+    announce(disposal.as_ref());
 
     let deleted_paths = export::output_results(
         &final_groups,
@@ -2063,6 +2154,79 @@ mod tests {
         assert_eq!(forgotten, 1);
         assert!(cache_lookup(&db, gone, &s).is_none(), "a removed file keeps no fingerprint");
         assert!(cache_lookup(&db, kept, &s).is_some(), "and its neighbours are untouched");
+    }
+
+    /// A report and a real file to go with it, sized to agree with `mock_fp`.
+    fn armed_report(dir: &tempfile::TempDir) -> (String, String) {
+        let doomed = dir.path().join("dupe.mkv");
+        std::fs::write(&doomed, vec![b'x'; 12_345]).unwrap();
+        let doomed = doomed.to_string_lossy().to_string();
+
+        let report = dir.path().join("report.csv");
+        std::fs::write(
+            &report,
+            format!("full_path;size_bytes;action\n{};12345;DELETE\n", doomed),
+        )
+        .unwrap();
+
+        (doomed, report.to_string_lossy().to_string())
+    }
+
+    #[test]
+    fn test_a_report_run_forgets_what_it_removed() {
+        // --from-report reaches the cache by a different route from the grouped
+        // run, and the reason to keep it is the same: nothing will ever ask
+        // about that path again, so an entry left behind is one the cache grows
+        // by every time a cleanup succeeds.
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+        let (doomed, report) = armed_report(&dir);
+
+        let s = stamp(1_700_000_000, 12_345);
+        cache_store(&db, &doomed, s, &mock_fp(&doomed)).unwrap();
+        assert!(cache_lookup(&db, &doomed, &s).is_some(), "precondition");
+
+        let args = Args::parse_from([
+            "vid-fp",
+            "--from-report",
+            &report,
+            "--delete",
+            "--permanent",
+            "--yes",
+        ]);
+        let stats = RunStats::default();
+
+        assert!(matches!(
+            run(&args, &db, Instant::now(), 1, &stats),
+            Ok(Outcome::Completed)
+        ));
+        assert!(!Path::new(&doomed).exists(), "the file the report named is gone");
+        assert!(
+            cache_lookup(&db, &doomed, &s).is_none(),
+            "and so is the fingerprint filed under its path"
+        );
+        assert!(!stats.had_problems());
+    }
+
+    #[test]
+    fn test_a_report_run_refuses_to_start_unarmed() {
+        // The one piece of validation clap cannot express. Without it the mode
+        // would read a file, decide nothing, and print nothing the report does
+        // not already say -- while leaving the user believing it had acted.
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+        let (doomed, report) = armed_report(&dir);
+
+        let args = Args::parse_from(["vid-fp", "--from-report", &report]);
+        let stats = RunStats::default();
+
+        let err = run(&args, &db, Instant::now(), 1, &stats)
+            .expect_err("no disposal was ever constructed")
+            .to_string();
+
+        assert!(err.contains("--delete"), "{}", err);
+        assert!(err.contains("--move-to"), "{}", err);
+        assert!(Path::new(&doomed).exists(), "and nothing was touched");
     }
 
     #[test]

@@ -32,7 +32,7 @@ pub enum Disposal {
 
 impl Disposal {
     /// Label for the results table once the file has been dealt with.
-    fn done_label(&self) -> &'static str {
+    pub fn done_label(&self) -> &'static str {
         match self {
             Disposal::Trash | Disposal::Permanent => "DELETED",
             Disposal::MoveTo(_) => "MOVED",
@@ -59,15 +59,16 @@ fn csv_seconds(value: Option<f64>) -> String {
     value.map(|s| format!("{:.2}", s)).unwrap_or_default()
 }
 
-/// Whether the file at `fp.path` is still the length it was when it was
-/// fingerprinted, and a description of the discrepancy if not.
+/// Whether the file at `path` is still the length it was when it was measured,
+/// and a description of the discrepancy if not.
 ///
-/// Every DELETE decision in this module rests on measurements taken at the
-/// start of the scan, and a scan of a large library runs for hours. In that
-/// window a download finishes, a re-encode lands over the top, a copy is
-/// truncated -- and the file about to be removed is no longer the file that was
-/// judged redundant. Two syscalls immediately before an irreversible one is a
-/// cheap way to notice.
+/// Every DELETE decision rests on measurements taken at the start of the scan,
+/// and a scan of a large library runs for hours -- longer still when the
+/// decision is being replayed from a report written yesterday. In that window a
+/// download finishes, a re-encode lands over the top, a copy is truncated --
+/// and the file about to be removed is no longer the file that was judged
+/// redundant. Two syscalls immediately before an irreversible one is a cheap way
+/// to notice.
 ///
 /// Size is the only property compared, because it is the only one the
 /// fingerprint records. It catches everything that changes a file's length,
@@ -80,15 +81,65 @@ fn csv_seconds(value: Option<f64>) -> String {
 /// about the file's contents, and the removal that follows will fail with the
 /// real reason -- so a file that vanished mid-scan reads as a deletion that
 /// could not happen rather than as a file quietly left alone.
-fn changed_since_scan(fp: &VideoFingerprint) -> Option<String> {
-    let size = std::fs::metadata(&fp.path).ok()?.len();
+fn changed_since(path: &str, measured_size: u64) -> Option<String> {
+    let size = std::fs::metadata(path).ok()?.len();
 
-    (size != fp.file_size).then(|| {
+    (size != measured_size).then(|| {
         format!(
             "{}: {} bytes when scanned, {} bytes now",
-            fp.path, fp.file_size, size
+            path, measured_size, size
         )
     })
+}
+
+/// What became of one file the disposal pass reached.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Fate {
+    /// Gone from the path it was at -- trashed, unlinked or relocated.
+    Done,
+    /// It no longer matches the size it was measured at, so it was left alone.
+    Changed,
+    /// The disposal itself failed. The file is still there.
+    Failed,
+}
+
+/// Take one file off its path, with the staleness check that has to precede it.
+///
+/// This is the whole of the destructive step, and the only copy of it: the
+/// grouped run reaches it with a size it fingerprinted, `--from-report` with a
+/// size a report recorded, and neither gets a version of the check that the
+/// other does not. `measured_size` is the file's length at the moment the
+/// decision to remove it was made, whenever that was.
+///
+/// Errors are logged and tallied here rather than returned, because both callers
+/// want the same thing from a failure -- a line in the log, a line in the
+/// summary, a non-zero exit -- and none of them wants the loop to stop.
+pub fn dispose_one(
+    path: &str,
+    measured_size: u64,
+    disposal: &Disposal,
+    stats: &RunStats,
+) -> Fate {
+    // The last thing before the irreversible step, and the only check here that
+    // consults the disk rather than the measurement. See `changed_since`: the
+    // decision being acted on may be hours or days old.
+    if let Some(detail) = changed_since(path, measured_size) {
+        log::error!(
+            "Not removing {}: it changed on disk after it was scanned",
+            path
+        );
+        stats.delete_stale.record(detail);
+        return Fate::Changed;
+    }
+
+    match dispose_of(path, disposal) {
+        Ok(()) => Fate::Done,
+        Err(e) => {
+            log::error!("{:#}", e);
+            stats.delete_failed.record(path.to_string());
+            Fate::Failed
+        }
+    }
 }
 
 /// Get a single file out of the way, however the user asked for that to happen.
@@ -407,7 +458,7 @@ pub fn output_results(
                     size: fingerprints[idx].file_size,
                 })
                 .collect();
-            !confirm::approve(d, &targets, assume_yes)
+            !confirm::approve(d, &targets, assume_yes, confirm::Decline::ShowsReport)
         }
         None => false,
     };
@@ -458,32 +509,19 @@ pub fn output_results(
             }
             let fp = &fingerprints[idx];
 
-            // The last thing before the irreversible step, and the only check in
-            // this module that consults the disk rather than the scan. See
-            // changed_since_scan: the decision above was made from information
-            // that may be hours old.
-            if let Some(detail) = changed_since_scan(fp) {
-                log::error!(
-                    "Not removing {}: it changed on disk after it was scanned",
-                    fp.path
-                );
-                changed_count += 1;
-                stats.delete_stale.record(detail);
-                delete_outcome.insert(idx, "CHANGED");
-                continue;
-            }
-
-            match dispose_of(&fp.path, disposal) {
-                Ok(()) => {
+            match dispose_one(&fp.path, fp.file_size, disposal, stats) {
+                Fate::Done => {
                     removed_count += 1;
                     removed_bytes += fp.file_size;
                     deleted_paths.push(fp.path.clone());
                     delete_outcome.insert(idx, disposal.done_label());
                 }
-                Err(e) => {
-                    log::error!("{:#}", e);
+                Fate::Changed => {
+                    changed_count += 1;
+                    delete_outcome.insert(idx, "CHANGED");
+                }
+                Fate::Failed => {
                     failed_count += 1;
-                    stats.delete_failed.record(fp.path.clone());
                     delete_outcome.insert(idx, "FAILED");
                 }
             }
@@ -824,48 +862,11 @@ pub fn output_results(
                 summary.push_str("\nCancelled at the confirmation prompt.");
             }
         }
-        Some(Disposal::Permanent) => {
-            summary.push_str(&format!(
-                "\nPermanently deleted {} file(s), {} freed.",
-                removed_count,
-                format_size(removed_bytes)
-            ));
-        }
-        Some(Disposal::Trash) => {
-            summary.push_str(&format!(
-                "\nMoved {} file(s) to trash ({} total).",
-                removed_count,
-                format_size(removed_bytes)
-            ));
-        }
-        // Deliberately not "freed": if the destination is on the same
-        // filesystem the bytes have not gone anywhere, and claiming otherwise
-        // in the one mode where it might not be true is how a summary stops
-        // being trusted.
-        Some(Disposal::MoveTo(dir)) => {
-            summary.push_str(&format!(
-                "\nMoved {} file(s) ({} total) under {}.",
-                removed_count,
-                format_size(removed_bytes),
-                dir.display()
-            ));
-        }
+        Some(d) => summary.push_str(&format!("\n{}", disposed_line(d, removed_count, removed_bytes))),
     }
 
     if acting {
-        if failed_count > 0 {
-            summary.push_str(&format!(
-                "\n{} file(s) could not be removed (see errors above).",
-                failed_count
-            ));
-        }
-        if changed_count > 0 {
-            summary.push_str(&format!(
-                "\n{} file(s) changed on disk after they were scanned and were left alone \
-                 (re-run to judge them as they now stand).",
-                changed_count
-            ));
-        }
+        summary.push_str(&trouble_lines(failed_count, changed_count));
     }
 
     info!("{}", summary);
@@ -938,6 +939,56 @@ pub fn output_results(
     }
 
     Ok(deleted_paths)
+}
+
+/// What a disposal pass did, in the words of the mode that did it.
+///
+/// Shared with `--from-report`, which performs the same three operations on a
+/// list it read rather than one it computed, and should not describe them
+/// differently for it.
+pub fn disposed_line(disposal: &Disposal, count: usize, bytes: u64) -> String {
+    match disposal {
+        Disposal::Permanent => format!(
+            "Permanently deleted {} file(s), {} freed.",
+            count,
+            format_size(bytes)
+        ),
+        Disposal::Trash => format!(
+            "Moved {} file(s) to trash ({} total).",
+            count,
+            format_size(bytes)
+        ),
+        // Deliberately not "freed": if the destination is on the same
+        // filesystem the bytes have not gone anywhere, and claiming otherwise
+        // in the one mode where it might not be true is how a summary stops
+        // being trusted.
+        Disposal::MoveTo(dir) => format!(
+            "Moved {} file(s) ({} total) under {}.",
+            count,
+            format_size(bytes),
+            dir.display()
+        ),
+    }
+}
+
+/// The lines that follow it when the pass did not get everything, each omitted
+/// when its count is zero.
+pub fn trouble_lines(failed: usize, changed: usize) -> String {
+    let mut out = String::new();
+    if failed > 0 {
+        out.push_str(&format!(
+            "\n{} file(s) could not be removed (see errors above).",
+            failed
+        ));
+    }
+    if changed > 0 {
+        out.push_str(&format!(
+            "\n{} file(s) changed on disk after they were scanned and were left alone \
+             (re-run to judge them as they now stand).",
+            changed
+        ));
+    }
+    out
 }
 
 /// Metrics that can justify a REVIEW flag, in default precedence order.
