@@ -1,5 +1,6 @@
 mod clustering;
 mod compare;
+mod confirm;
 mod export;
 mod fingerprint;
 mod stats;
@@ -292,6 +293,14 @@ struct Args {
     #[arg(long = "move-to", value_name = "DIR",
           value_hint = clap::ValueHint::DirPath)]
     move_to: Option<String>,
+
+    /// Answer yes to the confirmation shown before any file is touched. That
+    /// confirmation only appears on an interactive terminal -- a run whose
+    /// input or output is piped or redirected is never prompted and never
+    /// blocks -- so this flag is for saying so out loud, and for the
+    /// interactive runs that would rather not be asked.
+    #[arg(short = 'y', long = "yes")]
+    yes: bool,
 
     /// Delete ALL cache before running
     #[arg(long = "clear-cache")]
@@ -1021,6 +1030,11 @@ fn run(
         info!("Note: --permanent has no effect without --delete; running in report-only mode.");
     }
 
+    // Same rule, for the flag that answers a question this run will not ask.
+    if move_to.is_none() && !args.delete && args.yes {
+        info!("Note: --yes has nothing to confirm without --delete or --move-to.");
+    }
+
     info!(
         "Settings -> Max Hamming: {}, Min Match: {}%, Min Duration: {}s, Priority: {:?}, Threads: {}, Recursive: {}",
         max_hamming, args.match_percent, min_duration, args.priority, active_threads, args.recursive
@@ -1615,6 +1629,7 @@ fn run(
             trust_chains: args.trust_chains,
         },
         disposal.as_ref(),
+        args.yes,
         stats,
     )?;
 

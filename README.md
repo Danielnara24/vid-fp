@@ -11,9 +11,9 @@ resolutions, or a video that was re-encoded. It reports duplicate groups and can
 optionally move the redundant copies to the trash.
 
 > **Note:** `vid-fp` can delete files. By default it does nothing destructive —
-> it only reports. Deletion happens *only* when you pass `--delete`, and even then
-> files go to the system trash (recoverable) unless you also pass `--permanent`.
-> See [Safety](#safety).
+> it only reports. Deletion happens *only* when you pass `--delete`, it asks you
+> to confirm before touching anything, and even then files go to the system trash
+> (recoverable) unless you also pass `--permanent`. See [Safety](#safety).
 
 ## Requirements
 
@@ -184,6 +184,18 @@ vid-fp ~/Videos -r --delete
 vid-fp ~/Videos -r --delete --permanent
 ```
 
+Once the scan is done and the groups are resolved, an armed run stops and asks
+before it touches anything.
+
+Return accepts. Answering `n` doesn't abort the run — it just demotes it to a
+report-only one, so you still get the full table and the reclaimable figure
+without re-scanning. Pass `-y`/`--yes` to skip the question.
+
+The prompt only appears when there's a terminal on both stdin and stderr, so it
+can never block a script, a cron job, or `fd … | vid-fp - --delete`; those runs
+proceed exactly as they did before it existed. Use `--yes` in scripts anyway if
+you'd rather have that in writing than inferred from the environment.
+
 ### Moving instead of deleting
 
 The system trash needs a trash directory on the file's own filesystem, which
@@ -240,6 +252,7 @@ doesn't, since moving files into the scan just feeds them back in next time.
 | `--delete` | Move files marked DELETE to the trash | off |
 | `--permanent` | With `--delete`, permanently remove instead | off |
 | `--move-to <DIR>` | Move the files marked DELETE under `DIR`, recreating their absolute paths inside it. Arms the run on its own and supersedes `--delete`/`--permanent` | — |
+| `-y`, `--yes` | Answer yes to the confirmation shown before any file is touched. The prompt only appears on an interactive terminal, so piped and redirected runs are never blocked either way | off |
 | `-t`, `--threads <N>` | Worker threads (`0` = uses all cores) | `0` |
 | `-q`, `--quiet` | Only print errors | off |
 | `--clear-cache` | Wipe ALL vid-fp cache before running | off |
@@ -445,6 +458,11 @@ Fingerprints are cached (under `$XDG_CACHE_HOME/vid-fp`, falling back to
 - **Report-only by default.** Without `--delete`, nothing is ever removed.
 - **You see the cost before you pay it.** A dry run prints how much the DELETE
   files would reclaim, computed from exactly the set `--delete` would act on.
+- **It asks first.** An armed run stops after the groups are resolved and shows
+  what it's about to touch — how many files, how many bytes, and the first ten
+  by name — before anything moves. Return accepts, `n` turns the run into a
+  report. The prompt is interactive-only and `--yes` skips it, so nothing can
+  hang unattended.
 - **Trash, not permanent.** `--delete` moves files to the system trash via the
   FreeDesktop.org spec, so they're recoverable — unless you add `--permanent`.
 - **`--move-to` where the trash isn't.** On external drives, NFS mounts and

@@ -49,6 +49,8 @@ cargo test --test local_accuracy_test -- --nocapture
 
 **Nothing is destructive without `Disposal`.** `export.rs` cannot touch a file unless `main::disposal_for` constructed one from `--delete` / `--permanent` / `--move-to`. Every target is re-checked against its fingerprint immediately before it's acted on; a file that changed on disk is reported as CHANGED and left alone.
 
+**The confirmation sits between the two passes of `output_results`, not at start-up.** `confirm::approve` is asked once the DELETE set is resolved, because that is the first moment there is a count and a byte total to show. Declining does not abort: it rebinds `disposal` to `None` for the rest of the function, so the labels, the summary and the JSON all describe the run the filesystem actually saw. It is interactive-only (`stdin` *and* `stderr` must be terminals) so a pipeline can never block on it, `--yes` skips it, and everything that isn't an explicit yes — EOF, a read error, an interrupt, three unparseable answers — leaves the files alone.
+
 ## Keeping the docs honest
 
 `README.md`'s options table, the `Args` doc comments (which become the man page and `--help`), and the tuning/safety prose describe the same behaviour three times. Any flag or default that changes has to be updated in all three. Report formats are `.txt`/`.csv`/`.json`, dispatched on the `--output` extension in `export.rs`; the CSV column order is asserted by `tests/local_accuracy_test.rs` (it reads `full_path` at index 13), and by the golden `vd_results_*.csv` baselines beside the corpus, which were written by older builds — **append new CSV columns at the end** rather than inserting them, or both sides of that comparison stop lining up.

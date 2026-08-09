@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use log::info;
 use crate::compare::MatchIndex;
+use crate::confirm::{self, Target};
 use crate::fingerprint::VideoFingerprint;
 use crate::stats::RunStats;
 use crate::utils::{
@@ -234,9 +235,9 @@ pub fn output_results(
     total_elapsed_secs: u64,
     policy: Policy,
     disposal: Option<&Disposal>,
+    assume_yes: bool,
     stats: &RunStats,
 ) -> Result<Vec<String>> {
-    let acting = disposal.is_some();
 
     // --- Pass 1: resolve each group ------------------------------------------
     // Groups are connected components, so every file belongs to exactly one and
@@ -385,6 +386,37 @@ pub fn output_results(
     // added, and groups are disjoint, so the two sets cannot intersect.
     let mut delete_indices: Vec<usize> = delete_candidates.iter().copied().collect();
     delete_indices.sort_unstable();
+
+    // --- The confirmation ----------------------------------------------------
+    // Here rather than at start-up because only now is there a question worth
+    // answering: how many files, and how many bytes. A prompt raised from the
+    // flags alone could ask nothing more useful than "you typed --delete, did
+    // you mean it?".
+    //
+    // Declining does not abort the run. It demotes it to exactly what a run
+    // without --delete would have been -- the same report, the same reclaimable
+    // figure -- because the user who says no is the user who wants to see the
+    // list before committing, and making them re-fingerprint the library to get
+    // it would teach them to answer yes.
+    let declined = match disposal {
+        Some(d) => {
+            let targets: Vec<Target> = delete_indices
+                .iter()
+                .map(|&idx| Target {
+                    path: &fingerprints[idx].path,
+                    size: fingerprints[idx].file_size,
+                })
+                .collect();
+            !confirm::approve(d, &targets, assume_yes)
+        }
+        None => false,
+    };
+
+    // From here down `disposal` is what the run is going to DO, not what its
+    // flags asked for, so the labels, the summary and the JSON all describe the
+    // same run the filesystem saw.
+    let disposal = if declined { None } else { disposal };
+    let acting = disposal.is_some();
 
     // --- Pass 2: act on each unique target exactly once ----------------------
     let mut removed_count = 0usize;
@@ -785,6 +817,12 @@ pub fn output_results(
                     delete_candidate_count
                 ));
             }
+            // Said plainly, because "nothing was removed" alone reads as a
+            // report-only run and the user who declined needs to know the
+            // difference between "I wasn't asked to" and "you told me not to".
+            if declined {
+                summary.push_str("\nCancelled at the confirmation prompt.");
+            }
         }
         Some(Disposal::Permanent) => {
             summary.push_str(&format!(
@@ -833,7 +871,9 @@ pub fn output_results(
     info!("{}", summary);
 
     // Helpful nudge when there's something to clean up but nothing was touched.
-    if !acting && delete_candidate_count > 0 {
+    // Not for someone who declined: they typed the flag, saw the question, and
+    // said no. Telling them to type it again would be answering back.
+    if !acting && !declined && delete_candidate_count > 0 {
         info!(
             "\nRun with --delete to move the file(s) marked DELETE to the trash or with --move-to <DIR> to relocate them instead."
         );
@@ -1054,7 +1094,7 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
         // Report-only run: single item defaults to KEEP.
         let deleted = output_results(
             &groups, &fps, &all_compared(fps.len()), Some(&path_str), 120, policy(Priority::Length), None,
-            &RunStats::default(),
+            true, &RunStats::default(),
         ).unwrap();
 
         assert!(deleted.is_empty(), "a report-only run removes nothing, so it forgets nothing");
@@ -1091,7 +1131,7 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
 
         output_results(
             &groups, &fps, &all_compared(fps.len()), Some(&path_str), 0, policy(Priority::Length), None,
-            &RunStats::default(),
+            true, &RunStats::default(),
         ).unwrap();
 
         let summary = read_json(&path_str)["summary"].clone();
@@ -1124,7 +1164,7 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
 
         output_results(
             &groups, &fps, &all_compared(fps.len()), Some(&path_str), 0, policy(Priority::Length), None,
-            &RunStats::default(),
+            true, &RunStats::default(),
         ).unwrap();
 
         let summary = read_json(&path_str)["summary"].clone();
@@ -1151,11 +1191,11 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
 
         output_results(
             &groups, &fps, &matches, Some(&csv_path), 0, policy(Priority::Length), None,
-            &RunStats::default(),
+            true, &RunStats::default(),
         ).unwrap();
         output_results(
             &groups, &fps, &matches, Some(&json_path), 0, policy(Priority::Length), None,
-            &RunStats::default(),
+            true, &RunStats::default(),
         ).unwrap();
 
         let csv = fs::read_to_string(&csv_path).unwrap();
@@ -1199,7 +1239,7 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
 
         output_results(
             &groups, &fps, &matches, Some(&path_str), 0, policy(Priority::Length), None,
-            &RunStats::default(),
+            true, &RunStats::default(),
         ).unwrap();
 
         let contents = fs::read_to_string(&path_str).unwrap();
@@ -1228,7 +1268,7 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
         let path_str = report_to("csv");
         output_results(
             &groups, &fps, &matches, Some(&path_str), 0, policy(Priority::Length), None,
-            &RunStats::default(),
+            true, &RunStats::default(),
         ).unwrap();
 
         let contents = fs::read_to_string(&path_str).unwrap();
@@ -1273,7 +1313,7 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
         let path_str = report_to("json");
         output_results(
             &groups, &fps, &matches, Some(&path_str), 0, policy(Priority::Length), None,
-            &RunStats::default(),
+            true, &RunStats::default(),
         ).unwrap();
 
         let json = read_json(&path_str);
@@ -1320,7 +1360,7 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
         let path_str = report_to("json");
         output_results(
             &groups, &fps, &matches, Some(&path_str), 0, policy(Priority::Length), None,
-            &RunStats::default(),
+            true, &RunStats::default(),
         ).unwrap();
 
         let json = read_json(&path_str);
@@ -1354,7 +1394,7 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
 
         output_results(
             &groups, &fps, &matches, Some(&path_str), 0, policy(Priority::Length), None,
-            &RunStats::default(),
+            true, &RunStats::default(),
         ).unwrap();
 
         let contents = fs::read_to_string(&path_str).unwrap();
@@ -1385,7 +1425,7 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
 
         output_results(
             &groups, &fps, &all_compared(fps.len()), Some(&path_str), 0, policy(Priority::Length), None,
-            &RunStats::default(),
+            true, &RunStats::default(),
         ).unwrap();
 
         let report = read_json(&path_str);
@@ -1409,7 +1449,7 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
 
         output_results(
             &groups, &fps, &matches, Some(&path_str), 0, policy(Priority::Length), None,
-            &RunStats::default(),
+            true, &RunStats::default(),
         ).unwrap();
 
         let report = read_json(&path_str);
@@ -1439,11 +1479,11 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
 
         output_results(
             &groups, &fps, &all_compared(fps.len()), Some(&json_path), 0, policy(Priority::Length), None,
-            &RunStats::default(),
+            true, &RunStats::default(),
         ).unwrap();
         output_results(
             &groups, &fps, &all_compared(fps.len()), Some(&csv_path), 0, policy(Priority::Length), None,
-            &RunStats::default(),
+            true, &RunStats::default(),
         ).unwrap();
 
         let report = read_json(&json_path);
@@ -1484,7 +1524,7 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
 
         let deleted = output_results(
             &groups, &fps, &all_compared(fps.len()), None, 0, policy(Priority::Length),
-            Some(&Disposal::Permanent), &stats,
+            Some(&Disposal::Permanent), true, &stats,
         ).unwrap();
 
         assert!(Path::new(&keep_path).exists(), "KEEP file must remain");
@@ -1519,7 +1559,7 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
 
         let moved = output_results(
             &groups, &fps, &all_compared(fps.len()), Some(&path_str), 0, policy(Priority::Length),
-            Some(&Disposal::MoveTo(dest.path().to_path_buf())), &stats,
+            Some(&Disposal::MoveTo(dest.path().to_path_buf())), true, &stats,
         ).unwrap();
 
         let landed = landing_spot(dest.path(), &dup_path);
@@ -1578,7 +1618,7 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
 
         let mut moved = output_results(
             &groups, &fps, &all_compared(fps.len()), None, 0, policy(Priority::Length),
-            Some(&Disposal::MoveTo(dest.path().to_path_buf())), &stats,
+            Some(&Disposal::MoveTo(dest.path().to_path_buf())), true, &stats,
         ).unwrap();
         moved.sort();
 
@@ -1616,7 +1656,7 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
 
         let moved = output_results(
             &groups, &fps, &all_compared(fps.len()), None, 0, policy(Priority::Length),
-            Some(&Disposal::MoveTo(dest.path().to_path_buf())), &stats,
+            Some(&Disposal::MoveTo(dest.path().to_path_buf())), true, &stats,
         ).unwrap();
 
         assert!(Path::new(&dup_path).exists(), "the source must survive a refused move");
@@ -1656,7 +1696,7 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
 
         let moved = output_results(
             &groups, &fps, &all_compared(fps.len()), None, 0, policy(Priority::Length),
-            Some(&Disposal::MoveTo(dest.path().to_path_buf())), &stats,
+            Some(&Disposal::MoveTo(dest.path().to_path_buf())), true, &stats,
         ).unwrap();
 
         assert!(Path::new(&grew_path).exists());
@@ -1693,7 +1733,7 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
 
         let deleted = output_results(
             &groups, &fps, &all_compared(fps.len()), Some(&path_str), 0, policy(Priority::Length),
-            Some(&Disposal::Permanent), &stats,
+            Some(&Disposal::Permanent), true, &stats,
         ).unwrap();
 
         assert!(Path::new(&grew_path).exists(), "a file that changed under us must survive");
@@ -1739,7 +1779,7 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
 
         output_results(
             &groups, &fps, &all_compared(fps.len()), None, 0, policy(Priority::Length),
-            Some(&Disposal::Permanent), &stats,
+            Some(&Disposal::Permanent), true, &stats,
         ).unwrap();
 
         assert!(Path::new(&shrunk_path).exists());
@@ -1772,7 +1812,7 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
 
         let mut deleted = output_results(
             &groups, &fps, &all_compared(fps.len()), None, 0, policy(Priority::Length),
-            Some(&Disposal::Permanent), &RunStats::default(),
+            Some(&Disposal::Permanent), true, &RunStats::default(),
         ).unwrap();
         deleted.sort();
 
@@ -1817,7 +1857,7 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
 
         let deleted = output_results(
             &groups, &fps, &chain_of_three(), Some(&path_str), 0,
-            policy(Priority::Length), Some(&Disposal::Permanent), &RunStats::default(),
+            policy(Priority::Length), Some(&Disposal::Permanent), true, &RunStats::default(),
         ).unwrap();
 
         assert!(Path::new(&p0).exists(), "the KEEP pick stands");
@@ -1856,7 +1896,7 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
 
         let mut deleted = output_results(
             &groups, &fps, &chain_of_three(), None, 0, policy,
-            Some(&Disposal::Permanent), &RunStats::default(),
+            Some(&Disposal::Permanent), true, &RunStats::default(),
         ).unwrap();
         deleted.sort();
 
@@ -1894,7 +1934,7 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
 
         let deleted = output_results(
             &groups, &fps, &chain_of_three(), Some(&path_str), 0, policy,
-            None, &RunStats::default(),
+            None, true, &RunStats::default(),
         ).unwrap();
 
         assert!(Path::new(&p0).exists());
@@ -1940,7 +1980,7 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
 
         let deleted = output_results(
             &groups, &fps, &matches, None, 0, policy(Priority::Length),
-            Some(&Disposal::Permanent), &RunStats::default(),
+            Some(&Disposal::Permanent), true, &RunStats::default(),
         ).unwrap();
 
         assert!(Path::new(&p_h264).exists(), "1080p h264 is a champion");
@@ -1976,7 +2016,7 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
 
         let mut deleted = output_results(
             &groups, &fps, &all_compared(fps.len()), Some(&path_str), 0, policy(Priority::Length),
-            Some(&Disposal::Permanent), &stats,
+            Some(&Disposal::Permanent), true, &stats,
         ).unwrap();
         deleted.sort();
 
@@ -2025,7 +2065,7 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
 
         output_results(
             &groups, &fps, &all_compared(fps.len()), None, 0, policy(Priority::Length),
-            Some(&Disposal::Permanent), &RunStats::default(),
+            Some(&Disposal::Permanent), true, &RunStats::default(),
         ).unwrap();
 
         assert!(Path::new(&p_hi).exists(), "higher-quality copy must be kept");
@@ -2056,7 +2096,7 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
 
         let deleted = output_results(
             &groups, &fps, &all_compared(fps.len()), Some(&path_str), 0, policy(Priority::Length),
-            Some(&Disposal::Permanent), &RunStats::default(),
+            Some(&Disposal::Permanent), true, &RunStats::default(),
         ).unwrap();
 
         assert!(Path::new(&p_h264).exists(), "the h264 copy must survive");
@@ -2094,7 +2134,7 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
 
         output_results(
             &groups, &fps, &all_compared(fps.len()), None, 0, policy(Priority::Length),
-            Some(&Disposal::Permanent), &RunStats::default(),
+            Some(&Disposal::Permanent), true, &RunStats::default(),
         ).unwrap();
 
         assert!(Path::new(&p_h264).exists(), "1080p h264 is a contender");
@@ -2130,7 +2170,7 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
 
         output_results(
             &groups, &fps, &all_compared(fps.len()), None, 0, policy(Priority::Length),
-            Some(&Disposal::Permanent), &RunStats::default(),
+            Some(&Disposal::Permanent), true, &RunStats::default(),
         ).unwrap();
 
         assert!(Path::new(&h264_best).exists(), "best h264 is its codec's champion");
@@ -2164,7 +2204,7 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
 
         output_results(
             &groups, &fps, &all_compared(fps.len()), None, 0, policy(Priority::Length),
-            Some(&Disposal::Permanent), &RunStats::default(),
+            Some(&Disposal::Permanent), true, &RunStats::default(),
         ).unwrap();
 
         assert!(Path::new(&z_best).exists(), "the denser h264 copy must win its codec");
@@ -2194,7 +2234,7 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
 
         output_results(
             &groups, &fps, &all_compared(fps.len()), None, 0, policy(Priority::Length),
-            Some(&Disposal::Permanent), &RunStats::default(),
+            Some(&Disposal::Permanent), true, &RunStats::default(),
         ).unwrap();
 
         assert!(Path::new(&p_long).exists(), "the longer copy is the KEEP pick");
@@ -2219,7 +2259,7 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
 
         let deleted = output_results(
             &groups, &fps, &all_compared(fps.len()), None, 0, policy(Priority::Length),
-            Some(&Disposal::Permanent), &stats,
+            Some(&Disposal::Permanent), true, &stats,
         ).unwrap();
 
         assert_eq!(stats.delete_failed.count(), 1, "the failure must be tallied");
