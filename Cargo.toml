@@ -1,6 +1,6 @@
 [package]
 name = "vid-fp"
-version = "0.18.0"
+version = "0.19.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Fast video duplicate and clip finder using perceptual keyframe fingerprints"
@@ -18,7 +18,16 @@ name = "vid-fp"
 path = "src/main.rs"
 
 [features]
-static-ffmpeg = ["ffmpeg-next/build"]
+# Link FFmpeg and dav1d statically, from the prefix named by FFMPEG_DIR.
+#
+# Deliberately NOT ffmpeg-next/build. That feature git-clones FFmpeg into
+# OUT_DIR and builds it with a configure line we cannot influence -- which is
+# how it ends up with the hwaccel-only AV1 decoder and no libdav1d, producing a
+# binary that cannot fingerprint a single AV1 file. `static` instead links a
+# prefix that scripts/build-ffmpeg-static.sh built to our specification; build.rs
+# refuses the build if FFMPEG_DIR is unset rather than silently falling back to
+# the system's shared FFmpeg.
+static-ffmpeg = ["ffmpeg-next/static"]
 
 [dependencies]
 # CLI Argument Parser
@@ -38,8 +47,25 @@ rayon = "1.8"
 # Direct libc access for glibc allocator tuning (mallopt) on Linux
 libc = "0.2"
 
-# FFmpeg bindings (Safe wrapper around libav*)
-ffmpeg-next = "6.0"
+# FFmpeg bindings (Safe wrapper around libav*).
+#
+# The crate's major.minor tracks FFmpeg's, but only its FORWARD compatibility is
+# broken: 8.1 builds and runs correctly against system FFmpeg 6, 7 and 8 headers
+# (ffmpeg-sys-next detects the version and gates the wrapper on cfgs), while the
+# 6.x crate fails to compile against FFmpeg 7 headers with ~30 errors inside the
+# dependency itself. Pinning the newest therefore widens the range of hosts a
+# `cargo install` works on rather than narrowing it -- do not "fix" this back
+# down to match whatever the release binary vendors.
+#
+# Only codec, format and swscale are used. The default feature set also pulls in
+# avdevice and avfilter, which drag libavdevice/libavfilter (and their own tails:
+# libavc1394, libncursesw) into DT_NEEDED for nothing. ffmpeg-next's
+# init_device/init_filter are cfg-gated no-ops when the features are off.
+ffmpeg-next = { version = "8.1", default-features = false, features = [
+    "codec",
+    "format",
+    "software-scaling",
+] }
 
 # Embedded key-value database for caching signatures
 redb = "2"
@@ -60,6 +86,12 @@ csv = "1.3"
 
 # Recoverable deletion via the FreeDesktop.org trash spec (Linux)
 trash = "5"
+
+[build-dependencies]
+# Only used by the static-ffmpeg path, to read the link flags (libdav1d, libz)
+# off the static prefix's own .pc files. Already in the tree as an
+# ffmpeg-sys-next build dependency, so it costs no extra download.
+pkg-config = "0.3"
 
 [dev-dependencies]
 tempfile = "3.8"

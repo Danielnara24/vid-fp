@@ -17,27 +17,13 @@ optionally move the redundant copies to the trash.
 
 ## Requirements
 
-`vid-fp` links against FFmpeg, so you need **FFmpeg 6.x** installed at runtime:
-
-```bash
-# Debian / Ubuntu
-sudo apt install ffmpeg
-
-# Arch
-sudo pacman -S ffmpeg
-
-# Fedora
-sudo dnf install ffmpeg
-```
-
-Linux, x86_64 only.
+Linux, x86_64, **glibc 2.35 or newer** (Ubuntu 22.04+, Debian 12+, Fedora 36+,
+current Arch and Mint). Nothing else — the release binary bundles its own FFmpeg,
+so you do **not** need FFmpeg installed.
 
 ## Installation
 
 ### Prebuilt binary (recommended)
-
-Install FFmpeg (above), then download the latest release binary. This URL always
-points at the newest version:
 
 ```bash
 curl -L -o vid-fp \
@@ -45,6 +31,10 @@ curl -L -o vid-fp \
 chmod +x vid-fp
 sudo install -m 755 vid-fp /usr/local/bin/vid-fp
 ```
+
+That URL always points at the newest version.
+
+The binary carries FFmpeg 8 and dav1d inside it.
 
 Now `vid-fp` runs from anywhere:
 
@@ -63,13 +53,44 @@ sha256sum -c vid-fp-x86_64-linux-gnu.sha256
 
 ### From source
 
-Requires the Rust toolchain plus the FFmpeg **development** libraries
-(`libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev libavdevice-dev
-libswscale-dev libswresample-dev`, `clang`, and `pkg-config` on Debian/Ubuntu):
+Requires the Rust toolchain plus the FFmpeg **development** libraries. FFmpeg 6,
+7 and 8 all work:
+
+```bash
+# Debian / Ubuntu / Mint
+sudo apt install libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+                 clang pkg-config
+
+# Fedora
+sudo dnf install ffmpeg-devel clang pkgconf-pkg-config
+
+# Arch
+sudo pacman -S ffmpeg clang pkgconf
+```
 
 ```bash
 cargo install --git https://github.com/Danielnara24/vid-fp
 ```
+
+This links your system's shared FFmpeg, so the binary is small but tied to that
+FFmpeg — and its fingerprints may differ very slightly from the released
+binary's, since the release pins FFmpeg 8. Different fingerprints mean a
+different cache, and `vid-fp` cannot tell the two apart, so don't point a
+source build and a release build at the same cache expecting agreement.
+
+To reproduce the release exactly instead — self-contained, AV1 included:
+
+```bash
+git clone https://github.com/Danielnara24/vid-fp && cd vid-fp
+./scripts/build-ffmpeg-static.sh                  # ~10 min, once
+cargo build --release --features static-ffmpeg    # -> target/release/vid-fp
+```
+
+Needs `git make nasm pkg-config python3 python3-venv build-essential`; the
+script fetches and builds pinned FFmpeg and dav1d releases into `./ffmpeg-static`
+and is a no-op on later runs. Set `FFMPEG_DIR` to use a prefix somewhere else —
+but pass it per command rather than exporting it, since it also changes how an
+ordinary non-static build links.
 ### Shell completions and man page
 
 Each release ships `vid-fp-<version>-extras.tar.gz` with completions for bash,
@@ -110,12 +131,11 @@ vid-fp ~/Videos -k <TAB>         # length  resolution  quality  size
 
 ## Updating
 
-Use same command as installing, it will overwrite the last version.
+Use the same commands as installing, it will overwrite the last version.
 
 Run `vid-fp --version` to see what you have installed and compare it against the
-[latest release](https://github.com/Danielnara24/vid-fp/releases/latest). FFmpeg is
-separate and doesn't need reinstalling. Installed from source? Re-run the
-`cargo install` command above with `--force`.
+[latest release](https://github.com/Danielnara24/vid-fp/releases/latest). Installed
+from source? Re-run the `cargo install` command above with `--force`.
 The completions and man page should be reinstalled too to have the latest documentation.
 
 ## Usage
@@ -527,3 +547,15 @@ Fingerprints are cached (under `$XDG_CACHE_HOME/vid-fp`, falling back to
 
 Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at your
 option.
+
+The **released binary** additionally contains FFmpeg (LGPL 2.1+) and dav1d
+(BSD-2-Clause), statically linked. That does not affect the licence above — you
+may use `vid-fp` under MIT or Apache-2.0 either way — but because the FFmpeg link
+is static, LGPL 2.1 §6 entitles you to relink the program against your own build
+of FFmpeg. Every release therefore ships
+`vid-fp-<version>-ffmpeg-static-libs.tar.gz` with the exact archives, headers,
+build script and instructions needed to do that. The FFmpeg in it is configured
+`--disable-gpl --disable-nonfree`, so it is LGPL only.
+
+A `cargo install` build links your system's shared FFmpeg and none of this
+applies to it. See [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md).

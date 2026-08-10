@@ -8,7 +8,24 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build and test
 
-Building links against FFmpeg 6.x. On Debian/Ubuntu: `libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev libavdevice-dev libswscale-dev libswresample-dev clang pkg-config`. `ffmpeg-next` is pinned to 6.x, so a host with FFmpeg 7 will fail to link.
+A plain build links the system's **shared** FFmpeg. On Debian/Ubuntu: `libavcodec-dev libavformat-dev libavutil-dev libswscale-dev clang pkg-config` — only those four libav\* libraries, since `ffmpeg-next` is pinned with `default-features = false` (avdevice and avfilter are unused and were dragging libavc1394 and libncursesw into `DT_NEEDED`).
+
+`ffmpeg-next` is pinned to **8.1**, and that is deliberately newer than any FFmpeg you are likely to have. Only the crate's *forward* compatibility is broken: 8.1 compiles and runs correctly against FFmpeg 6, 7 and 8 headers because `ffmpeg-sys-next` detects the version and gates the wrapper on cfgs, whereas the 6.x crate fails against FFmpeg 7 headers with ~30 errors inside the dependency. Pinning the newest widens the host range; do not lower it to match what the release vendors.
+
+The **released** binary is different: it statically links a vendored FFmpeg 8 + dav1d, so it needs no FFmpeg at all at runtime.
+
+```bash
+./scripts/build-ffmpeg-static.sh   # ~10 min, once; -> ./ffmpeg-static (gitignored)
+
+cargo build --release --features static-ffmpeg              # what ships
+cargo test  --release --features static-ffmpeg -- --nocapture
+```
+
+`build.rs` defaults to `./ffmpeg-static`, so no env var is needed day to day; `FFMPEG_DIR` overrides it for CI and for anyone relinking. **Do not export `FFMPEG_DIR` from a shell profile** — `ffmpeg-sys-next` reads it whether or not the feature is on, so a plain `cargo build` would then try to link the static archives and fail at `ld`.
+
+**Pass `--features static-ffmpeg` to `cargo test` as well as `cargo build`.** `cargo test` builds the bin target too, so a bare `cargo test --release` silently overwrites `target/release/vid-fp` with a *dynamic* binary and then measures it against the static baselines — which shows up as a `4-20` failure reading 75/186 that looks exactly like a real regression. The harness prints a warning when it detects this, but the warning is easy to scroll past.
+
+**Accuracy numbers only mean something from the static build**, because the golden CSVs were taken with it — see the accuracy-test note below.
 
 ```bash
 cargo build --release --locked     # release profile: lto + codegen-units=1; use it for any timing
@@ -19,6 +36,8 @@ cargo test --test local_accuracy_test -- --nocapture
 ```
 
 `tests/local_accuracy_test.rs` is a machine-local regression harness: it shells out to `./target/release/vid-fp` against `/home/daniel/Documents/AN` with a ladder of `-d`/`-p` settings and asserts exact group/file counts against baseline CSVs stored in that folder. It **returns early and passes** when the directory is absent, so a green `cargo test` on another machine proves nothing about accuracy. Build release first — it runs the binary, not the crate.
+
+**Build it with `--features static-ffmpeg` before trusting the result.** The baselines were re-taken against the vendored FFmpeg 8, and the `4-20` profile is genuinely FFmpeg-version-sensitive: a dynamic build against FFmpeg 6 reports 75/186 there where the static one reports 74/184, because one pair's coverage falls by a single 0.5 s hash sample and drops under the 20% gate. The other two profiles agree across both. That profile has always sat within a percent or two of its gate — it is the same one that moved for the PTS→DTS fix — so treat a lone `4-20` diff as a question about which FFmpeg produced it before treating it as a regression.
 
 `src/fingerprint.rs` tests decode `tests/fixtures/test_video.mp4`, so unit tests need a working FFmpeg at runtime too.
 
@@ -39,7 +58,9 @@ cargo test --test local_accuracy_test -- --nocapture
 
 ## Invariants worth knowing before you change things
 
-**Cache correctness is enforced by the table name.** `CACHE_TABLE` in `main.rs` is currently `fingerprints_dct_ct`; `SUPERSEDED_TABLES` lists the dead ones, dropped whole on first run. Appending a field to the end of `VideoFingerprint` is self-invalidating — old entries run out of bytes and bincode fails cleanly. **Changing what an existing field *means* (units, clock, hash algorithm) is not caught by anything**, so it requires renaming `CACHE_TABLE` and pushing the old name into `SUPERSEDED_TABLES`. Read the comment above those constants; each past rename records the bug that forced it.
+**Cache correctness is enforced by the table name.** `CACHE_TABLE` in `main.rs` is currently `fingerprints_dct_ct_ff8`; `SUPERSEDED_TABLES` lists the dead ones, dropped whole on first run. Appending a field to the end of `VideoFingerprint` is self-invalidating — old entries run out of bytes and bincode fails cleanly. **Changing what an existing field *means* (units, clock, hash algorithm) is not caught by anything**, so it requires renaming `CACHE_TABLE` and pushing the old name into `SUPERSEDED_TABLES`. Read the comment above those constants; each past rename records the bug that forced it.
+
+**The vendored FFmpeg version is one of those meanings.** The `_ff8` suffix is the last rename: decoder output is not bit-identical across FFmpeg majors, and the `Stamp` records mtime, size and the sampling knobs but deliberately *not* an FFmpeg version — so entries written either side of a version change are indistinguishable to a lookup. Bumping `FFMPEG_VERSION` in `scripts/build-ffmpeg-static.sh` across a major therefore costs a `CACHE_TABLE` rename and a re-taken accuracy baseline, exactly like changing the hash algorithm would. It is not a routine dependency bump.
 
 **What belongs in the cache `Stamp`.** mtime (with nsec), size, and the sampling knobs (`--keyframe-interval`, `--min-keyframes`) — anything that changes *which frames get hashed*. Thread count is excluded on purpose (it changes only speed). `-d`, `-p` and `--min-duration` are comparison-time and must never enter the stamp.
 
@@ -63,4 +84,8 @@ cargo test --test local_accuracy_test -- --nocapture
 
 The JSON tree is built only when `--output` ends in `.json` (`wants_json` in `output_results`). It carries one object per measured link per file, so building it unconditionally made a report-only run pay for a structure it then discarded.
 
-Releases are cut by pushing a `v*` tag — `.github/workflows/release.yml` builds the dynamic glibc binary, generates completions and the man page from the binary itself, and uploads both a versioned and a stable-named artifact. There is no CI on pushes or PRs, so `cargo clippy` and `cargo test` are on you.
+Releases are cut by pushing a `v*` tag — `.github/workflows/release.yml` runs `scripts/build-ffmpeg-static.sh`, builds the static binary against it, generates completions and the man page from the binary itself, and uploads a versioned copy, a stable-named copy, the extras tarball and the LGPL relink kit. There is no CI on pushes or PRs, so `cargo clippy` and `cargo test` are on you.
+
+Two release steps are load-bearing rather than decorative, and both guard failures that are silent in ordinary testing: one greps `DT_NEEDED` for `libav*`/`libsw*` and fails if the binary linked FFmpeg dynamically after all, the other fingerprints a generated AV1 clip. FFmpeg's built-in AV1 decoder is hwaccel-only, so a configure that quietly drops `libdav1d` yields a binary that passes every other test and cannot fingerprint a single AV1 file.
+
+**The LGPL relink kit is a licence obligation, not an extra.** FFmpeg is LGPL 2.1+ and the link is static, so §6 requires shipping the means to relink — hence the `.a` archives, headers, build script and `RELINKING.md`. Keep `--disable-gpl --disable-nonfree` in the configure line: `vid-fp` is offered under Apache-2.0, which is incompatible with GPL-2. See `THIRD-PARTY-LICENSES.md`.

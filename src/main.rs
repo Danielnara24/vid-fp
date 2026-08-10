@@ -37,7 +37,7 @@ use utils::{shutdown_requested, Policy, Priority};
 /// scanned rather than by the number of times they have changed: a file that is
 /// re-encoded, re-muxed, or scanned with different sampling settings replaces
 /// its own entry instead of growing a second one beside it.
-const CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("fingerprints_dct_ct");
+const CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("fingerprints_dct_ct_ff8");
 
 /// Tables earlier builds wrote, all dead. They are dropped whole on the first
 /// run of this one.
@@ -64,10 +64,22 @@ const CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("fingerpr
 ///   measures decode time from the first keyframe instead. Same field, same
 ///   units, different milliseconds -- exactly the case a layout check cannot
 ///   catch.
-const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 3] = [
+/// - `fingerprints_dct_ct` holds the right hashes off a different decoder. The
+///   released binary now links a vendored FFmpeg 8 (see
+///   scripts/build-ffmpeg-static.sh) where it used to link whatever the host
+///   shipped, in practice FFmpeg 6. Decoder output is not bit-identical across
+///   major versions and measurably is not here: on the `-d 4 -p 20` accuracy
+///   profile one pair's coverage falls by a single 0.5s sample and drops under
+///   the gate. That is a smaller change than the ones above, which is exactly
+///   why it needed the rename -- the `Stamp` records mtime, size and the
+///   sampling knobs but deliberately not an FFmpeg version, so entries written
+///   either side of the switch are indistinguishable to a lookup and would have
+///   mixed silently, forever.
+const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 4] = [
     TableDefinition::new("fingerprints"),
     TableDefinition::new("fingerprints_by_path"),
     TableDefinition::new("fingerprints_dct"),
+    TableDefinition::new("fingerprints_dct_ct"),
 ];
 
 /// Hard ceiling on the cache's page cache.

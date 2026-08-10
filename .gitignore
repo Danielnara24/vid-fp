@@ -2,5 +2,10 @@
 *.db
 *.xml
 
+# Static FFmpeg + dav1d prefix built by scripts/build-ffmpeg-static.sh.
+# Several hundred MB of archives, headers and upstream checkouts, all
+# reproducible from the pinned versions in that script.
+/ffmpeg-static
+
 # Ignore local accuracy test file
 /tests/local_accuracy_test.rs

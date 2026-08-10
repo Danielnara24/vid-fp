@@ -3,13 +3,21 @@
 # Builds a release binary and attaches it to a GitHub Release when you push a
 # version tag (e.g. `git tag v0.1.0 && git push origin v0.1.0`).
 #
-# Each release publishes the same binary under TWO names:
+# The binary is STATIC with respect to FFmpeg: it carries its own FFmpeg 8 and
+# dav1d and needs nothing installed on the target beyond glibc. That is what
+# makes one artifact enough. A dynamically linked build would record
+# libavcodec.so.<N> in DT_NEEDED and refuse to start on any host whose FFmpeg
+# major differs -- and the field spans sonames 58 through 62, so "just ship a
+# few" would mean five builds, five base images, and five subtly different
+# tools, since decoder output is not identical across FFmpeg majors.
+#
+# Each release publishes:
 #   vid-fp-<version>-x86_64-linux-gnu  -> archival, one per release
 #   vid-fp-x86_64-linux-gnu            -> stable name, so this URL always works:
 #     https://github.com/Danielnara24/vid-fp/releases/latest/download/vid-fp-x86_64-linux-gnu
-#
-# The binary is dynamically linked and requires FFmpeg 6.x installed on the
-# target machine (`apt install ffmpeg`, `pacman -S ffmpeg`, etc).
+#   vid-fp-<version>-extras.tar.gz     -> completions + man page
+#   vid-fp-<version>-ffmpeg-static-libs.tar.gz
+#     -> the LGPL relink kit; see the "LGPL" step below. Not optional.
 
 name: release
 
@@ -22,22 +30,24 @@ permissions:
   contents: write # required to create/update the GitHub Release
 
 jobs:
-  build-gnu:
-    name: Dynamic glibc binary (needs FFmpeg installed)
-    runs-on: ubuntu-24.04 # 24.04 ships FFmpeg 6.x, matching ffmpeg-next 6.x
+  build-static:
+    name: Static binary (bundles FFmpeg 8 + dav1d)
+    # Oldest glibc we are willing to require. The binary links glibc
+    # dynamically, and glibc is backward compatible but not forward compatible,
+    # so the runner's glibc becomes the floor for every user. 22.04 is 2.35.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install FFmpeg dev libraries
-        # ffmpeg-sys-next links the FULL family; missing any one makes pkg-config
-        # fail with "Package 'libav...' not found".
+      - name: Install build tools
+        # No libav*-dev here on purpose: this build must not be able to find a
+        # system FFmpeg, so that a mistake in the FFMPEG_DIR wiring fails the
+        # build instead of quietly producing a dynamically linked binary.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libavcodec-dev libavformat-dev libavutil-dev \
-            libavfilter-dev libavdevice-dev \
-            libswscale-dev libswresample-dev \
-            clang pkg-config
+            build-essential git make nasm pkg-config \
+            python3 python3-venv clang
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -45,10 +55,56 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: gnu-dynamic
+          key: static
+
+      # The prefix is ~10 minutes of build, and it only changes when the pinned
+      # versions in the script do -- so the script itself is the cache key.
+      - name: Cache static FFmpeg prefix
+        id: ffmpeg-cache
+        uses: actions/cache@v4
+        with:
+          path: ffmpeg-static
+          key: ffmpeg-static-${{ runner.os }}-${{ hashFiles('scripts/build-ffmpeg-static.sh') }}
+
+      - name: Build static FFmpeg + dav1d
+        run: ./scripts/build-ffmpeg-static.sh "$PWD/ffmpeg-static"
 
       - name: Build
-        run: cargo build --release --locked
+        env:
+          FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-static
+        run: cargo build --release --locked --features static-ffmpeg
+
+      - name: Verify the binary is actually self-contained
+        # Each of these has been a real failure mode: linking the system FFmpeg
+        # by accident, and configuring FFmpeg without dav1d so that every AV1
+        # file fails to fingerprint while everything else still passes.
+        run: |
+          BIN=target/release/vid-fp
+          if objdump -p "$BIN" | grep -qE 'NEEDED.*lib(av|sw)'; then
+            echo "::error::binary links FFmpeg dynamically:"
+            objdump -p "$BIN" | grep NEEDED
+            exit 1
+          fi
+          if ! "$BIN" --version >/dev/null; then
+            echo "::error::binary does not run"; exit 1
+          fi
+          echo "DT_NEEDED:"; objdump -p "$BIN" | grep NEEDED
+
+      - name: Verify AV1 decoding works
+        # Generated rather than committed: a few frames of noise in AV1 is
+        # enough to prove libdav1d is wired in, and it keeps a binary fixture
+        # out of the repo. libaom here is only the ENCODER used to make the
+        # sample -- it has nothing to do with what vid-fp links.
+        run: |
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          mkdir -p /tmp/av1check
+          ffmpeg -v error -f lavfi -i "testsrc=size=320x240:rate=10:duration=6" \
+            -c:v libaom-av1 -cpu-used 8 -g 10 /tmp/av1check/a.mkv
+          cp /tmp/av1check/a.mkv /tmp/av1check/b.mkv
+          if ! ./target/release/vid-fp /tmp/av1check -q; then
+            echo "::error::vid-fp failed on AV1 input -- dav1d is probably not linked"
+            exit 1
+          fi
 
       - name: Package artifacts
         run: |
@@ -61,17 +117,145 @@ jobs:
           "$BIN" --man              > dist/extras/man/vid-fp.1
           tar -C dist/extras -czf "dist/vid-fp-${VERSION}-extras.tar.gz" completions man
           rm -rf dist/extras
-          mkdir -p dist
           # Same binary, two names: a versioned copy for history and a stable
           # copy so the /releases/latest/download/ URL never changes.
-          cp "target/release/vid-fp" "dist/vid-fp-${VERSION}-x86_64-linux-gnu"
-          cp "target/release/vid-fp" "dist/vid-fp-x86_64-linux-gnu"
-          ( cd dist
-            for f in "vid-fp-${VERSION}-x86_64-linux-gnu" "vid-fp-x86_64-linux-gnu"; do
-              sha256sum "$f" > "$f.sha256"
-            done )
+          cp "$BIN" "dist/vid-fp-${VERSION}-x86_64-linux-gnu"
+          cp "$BIN" "dist/vid-fp-x86_64-linux-gnu"
+
+      - name: Package the LGPL relink kit
+        # FFmpeg is LGPL 2.1+, and vid-fp links it statically. LGPL 2.1 section 6
+        # lets us ship that only if recipients can relink the executable against
+        # their own modified FFmpeg, so the archives, headers and the exact
+        # recipe go out with every release. This is what keeps vid-fp itself
+        # under MIT OR Apache-2.0; it is not a nice-to-have, and a release
+        # missing it is not compliant.
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          KIT="vid-fp-${VERSION}-ffmpeg-static-libs"
+          mkdir -p "dist/$KIT"
+          cp -r ffmpeg-static/lib "dist/$KIT/lib"
+          cp -r ffmpeg-static/include "dist/$KIT/include"
+          cp scripts/build-ffmpeg-static.sh "dist/$KIT/"
+          # The .pc files record this runner's absolute paths, which exist on no
+          # other machine. Rewriting them to the ${pcfiledir} form -- which
+          # pkg-config resolves relative to the .pc file itself -- makes the
+          # unpacked kit usable as an FFMPEG_DIR wherever it lands, which is the
+          # whole point of shipping it, since build.rs reads its link flags from
+          # exactly these files.
+          #
+          # Every occurrence is replaced, not just the prefix/libdir/includedir
+          # variables: FFmpeg bakes the --extra-ldflags we passed it into
+          # Libs.private as a literal -L<abs>/lib, so rewriting only the
+          # variables leaves dav1d resolving to a path on this runner. The
+          # prefix= line is rewritten last, since the first expression would
+          # otherwise turn it into a self-reference.
+          # The path to rewrite is read out of the .pc file rather than assumed
+          # to be $PWD/ffmpeg-static: the two are the same in CI, but a silent
+          # mismatch produces a kit that looks fine and resolves to a directory
+          # the user does not have.
+          FFPREFIX="$(sed -n 's|^prefix=||p' \
+            "dist/$KIT/lib/pkgconfig/libavcodec.pc" | head -1)"
+          if [ -z "$FFPREFIX" ]; then
+            echo "::error::could not read prefix= from libavcodec.pc"; exit 1
+          fi
+          sed -i \
+            -e "s|$FFPREFIX|\${prefix}|g" \
+            -e 's|^prefix=.*|prefix=${pcfiledir}/../..|' \
+            "dist/$KIT"/lib/pkgconfig/*.pc
+          # Prove it before shipping it. Both halves earned their place: the
+          # grep for a leftover absolute path caught Libs.private, and resolving
+          # from the unpacked copy caught libdir.
+          if grep -rq -- "$FFPREFIX" "dist/$KIT"/lib/pkgconfig/; then
+            echo "::error::relink kit still refers to the runner's build prefix:"
+            grep -rn -- "$FFPREFIX" "dist/$KIT"/lib/pkgconfig/ || true
+            exit 1
+          fi
+          KITDIR="$PWD/dist/$KIT"
+          KITLIBS="$(PKG_CONFIG_PATH="$KITDIR/lib/pkgconfig" \
+                       pkg-config --libs --static libavcodec)"
+          echo "relink kit link flags: $KITLIBS"
+          case "$KITLIBS" in
+            *-ldav1d*) ;;
+            *) echo "::error::relink kit does not link dav1d"; exit 1 ;;
+          esac
+          # Every -L must land inside the kit. This is the assertion that
+          # actually proves relocation, rather than merely that the strings
+          # changed shape.
+          for flag in $KITLIBS; do
+            case "$flag" in
+              -L*)
+                case "${flag#-L}" in
+                  "$KITDIR"/*) ;;
+                  *) echo "::error::kit points outside itself: $flag"; exit 1 ;;
+                esac ;;
+            esac
+          done
+          cp THIRD-PARTY-LICENSES.md "dist/$KIT/"
+          cat > "dist/$KIT/RELINKING.md" <<EOF
+          # Relinking vid-fp against your own FFmpeg
+
+          vid-fp ${VERSION} statically links FFmpeg (LGPL 2.1+) and dav1d
+          (BSD-2-Clause). LGPL 2.1 section 6 entitles you to modify FFmpeg and
+          relink this program against your version. Everything you need is here.
+
+          \`lib/\` holds the exact static archives this release was linked
+          against, \`include/\` their headers, and \`lib/pkgconfig/\` the
+          descriptions the build reads its link flags from. The .pc files have
+          been made relocatable, so this directory works as an FFMPEG_DIR from
+          wherever you unpack it.
+
+          ## Relinking against a modified FFmpeg
+
+              git clone https://github.com/Danielnara24/vid-fp
+              cd vid-fp && git checkout v${VERSION}
+
+              # Reproduce our FFmpeg, edit it, rebuild:
+              ./scripts/build-ffmpeg-static.sh "\$PWD/ffmpeg-static"
+              #   ... patch \$PWD/ffmpeg-static/.build/ffmpeg, then:
+              #   make -C "\$PWD/ffmpeg-static/.build/ffmpeg" install
+
+              FFMPEG_DIR="\$PWD/ffmpeg-static" \\
+                cargo build --release --features static-ffmpeg
+
+          Any prefix laid out like this one will do, so a wholly separate FFmpeg
+          build can be substituted instead:
+
+              <prefix>/lib/lib{avcodec,avformat,avutil,swscale,dav1d}.a
+              <prefix>/lib/pkgconfig/*.pc
+              <prefix>/include/lib{avcodec,avformat,avutil,swscale}/...
+
+          ## Verifying the result
+
+              objdump -p target/release/vid-fp | grep NEEDED   # no libav*/libsw*
+
+          The build this release came from used FFmpeg and dav1d at the versions
+          pinned at the top of build-ffmpeg-static.sh, configured with the exact
+          flags in that file.
+          EOF
+          tar -C dist -czf "dist/${KIT}.tar.gz" "$KIT"
+          rm -rf "dist/$KIT"
+
+      - name: Checksums
+        run: |
+          cd dist
+          for f in *; do [ -f "$f" ] && sha256sum "$f" > "$f.sha256"; done
+          ls -la
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+          body: |
+            Static x86_64 Linux binary. No FFmpeg installation required --
+            FFmpeg 8 and dav1d (for AV1) are bundled.
+
+            ```bash
+            curl -L -o vid-fp \
+              https://github.com/Danielnara24/vid-fp/releases/latest/download/vid-fp-x86_64-linux-gnu
+            chmod +x vid-fp && sudo install -m 755 vid-fp /usr/local/bin/vid-fp
+            ```
+
+            Requires glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+, Fedora 36+).
+
+            `*-ffmpeg-static-libs.tar.gz` is the LGPL relink kit -- see
+            `RELINKING.md` inside it. vid-fp itself remains MIT OR Apache-2.0.
