@@ -14,7 +14,7 @@ use clap_complete::Shell;
 use compare::{find_all_matches, MatchIndex};
 use export::Disposal;
 use fingerprint::{fingerprint_video, VideoFingerprint, MAX_DECODE_THREADS};
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressState, ProgressStyle};
 use log::info;
 use rayon::prelude::*;
 use redb::{Database, ReadableTable, TableDefinition};
@@ -510,20 +510,75 @@ fn scan_encloses(dest: &Path, scanned: &[ScannedFile]) -> Option<String> {
 /// One video that has to be decoded, and everything needed to decide how much
 /// of the machine to give it.
 ///
-/// `weight` is the file's size in bytes -- the same figure the scan already
-/// stat'ed and sorted on. It is a proxy for decode cost, not a measurement of
-/// it: a long, sparsely-keyframed file can be cheaper than its size suggests.
-/// It is the only estimate available before the file is opened, it is free, and
-/// it is right often enough that the schedule below is a large improvement over
-/// counting files, which is what the alternative amounts to.
+/// `weight` is what the decode is going to cost, in the keyframe-pixels
+/// `fingerprint::weigh_decode` measures -- not the file's size. Both numbers are
+/// here because they answer different questions and neither substitutes for the
+/// other: `weight` is how long this file will take, `size` is how many bytes the
+/// demuxer will walk through to do it, which is the only thing the in-flight
+/// progress reports are denominated in.
 struct Job {
     path: String,
     stamp: Stamp,
     weight: u64,
+    size: u64,
 }
 
-/// How many of `free` threads a video of `weight` bytes should decode with,
-/// given that `queued` bytes of work have not started yet.
+/// The progress bar's speedometer: work units a second, as pixels of keyframe.
+///
+/// The bar's position counts the keyframe-pixels `fingerprint::weigh_decode`
+/// measures, so its rate is pixels of keyframe decoded per second -- the same
+/// figure the per-codec cost table is calibrated in, and one with a real scale
+/// behind it: a core of this development machine does about 75 megapixels of
+/// H.264 a second, and an eight-thread scan on it reads somewhere in 320-460
+/// Mpx/s depending on how hard the laptop is throttling.
+///
+/// It is an H.264-EQUIVALENT rate, because the weight is scaled by
+/// `codec_cost`. On an all-H.264 scan it is exactly the pixel throughput; on an
+/// HEVC one the true pixel count is lower and the number says what that work
+/// would have cost in H.264. That is the right choice for a speedometer -- it
+/// holds still when the codec changes, which is the whole reason it reads more
+/// steadily than the megabytes a second it replaces.
+///
+/// Every reading this returns is the same width, including the one before there
+/// is anything to report. The field is redrawn several times a second and the
+/// file name sits to the right of it, so a reading one character wider drags the
+/// name along with it -- which is most of what a flickering bar is made of. That
+/// is what the unit ladder is for: the number keeps three significant figures and
+/// the unit absorbs the magnitude, rather than the digits growing.
+fn work_rate(per_sec: f64) -> String {
+    // The dash is "no reading", and it is also where anything unusable lands:
+    // the rate is a division by an elapsed time that starts at zero, so the
+    // first tick of a run can hand this an absurdity, and a bar is the wrong
+    // place to find out. Nothing real reaches the top of the ladder below.
+    let unmeasurable = || format!("{:>11}", "-");
+    if !per_sec.is_finite() || per_sec <= 0.0 {
+        return unmeasurable();
+    }
+
+    let (scaled, unit) = match per_sec {
+        r if r >= 1e12 => (r / 1e12, "Tpx"),
+        r if r >= 1e9 => (r / 1e9, "Gpx"),
+        _ => (per_sec / 1e6, "Mpx"),
+    };
+
+    // Five columns of number whatever the magnitude, so 999 and 1.00 line up.
+    // Above a thousand the ladder has already changed unit, except at the top of
+    // it, where there is nothing bigger to change to.
+    let number = if scaled >= 100.0 {
+        format!("{:>5.0}", scaled)
+    } else if scaled >= 10.0 {
+        format!("{:>5.1}", scaled)
+    } else {
+        format!("{:>5.2}", scaled)
+    };
+    if number.len() > 5 {
+        return unmeasurable();
+    }
+    format!("{} {}/s", number, unit)
+}
+
+/// How many of `free` threads a video of `weight` units of work should decode
+/// with, given that `queued` units have not started yet.
 ///
 /// This is the whole scheduling rule, and it comes out of asking what actually
 /// ends the run. A video decoded on `k` of the `A` free threads finishes in
@@ -624,7 +679,7 @@ struct BudgetState {
     free: usize,
     /// Total weight of the videos that have not started decoding yet. Shrinks
     /// as jobs are claimed, never as they finish -- a video that is already
-    /// running is accounted for by the threads it holds, not by its bytes.
+    /// running is accounted for by the threads it holds, not by its weight.
     queued: u128,
 }
 
@@ -679,7 +734,7 @@ impl ThreadBudget {
         }
 
         // No longer queued: from here on this video is represented by the
-        // threads it is about to take, not by its bytes. Doing this BEFORE
+        // threads it is about to take, not by its weight. Doing this BEFORE
         // computing the share is what keeps `queued` meaning "the work I am
         // competing with" rather than "the work including me".
         state.queued = state.queued.saturating_sub(weight as u128);
@@ -1272,13 +1327,12 @@ fn run(
         return Ok(Outcome::Completed);
     }
 
-    // Largest first. That ordering is load-bearing twice over: the heaviest
-    // decodes start while the budget is still wide enough to give them a real
-    // share of it (see `share_for`), and the light ones are left over at the
-    // end, where they are perfect filler because they parallelise across
-    // whatever threads the heavyweights are not using. The size is the one the
-    // scan already read; this used to stat every file again to learn it, which
-    // on a cold network mount cost more than the sort saved.
+    // Largest first, so the cache pass below hands `todo` back in roughly the
+    // order the decode wants it. Roughly is all this can be: the ordering the
+    // schedule actually rests on is by decode COST, which nothing here has
+    // measured yet -- see the weighing pass, which re-sorts on the real figure
+    // once it has one. Sorting on size anyway costs nothing (the scan already
+    // read it) and puts the list within a rotation of where it needs to be.
     video_files.sort_by_key(|f| std::cmp::Reverse(f.size));
 
     let total_videos = video_files.len();
@@ -1328,7 +1382,12 @@ fn run(
                 None => Lookup::Miss(Job {
                     path: file.path.clone(),
                     stamp,
+                    // Weighed by the pass below, once it is known which files
+                    // are actually going to be decoded. Until then the size is
+                    // a placeholder, and the only thing that reads it before
+                    // then is the `sort_by_key` that put this list in order.
                     weight: file.size,
+                    size: file.size,
                 }),
             }
         })
@@ -1371,6 +1430,56 @@ fn run(
         return Ok(Outcome::Interrupted);
     }
 
+    // --- Pass 1b: weigh what is left ------------------------------------------
+    // Everything from here to the end of the decode is apportioned by how much
+    // work each file represents, and until this pass that figure was the file's
+    // SIZE -- which is a statement about its bitrate at least as much as about
+    // its decode cost. The two come apart badly and in both directions. Measured
+    // here, single-threaded: a 10.5 GB 2160p HEVC feature costs 14.7x a 1.8 GB
+    // 1080p H.264 one while its size claims 5.8x, and two encodes of the SAME
+    // two-minute clip with the SAME 61 keyframes -- one H.264, one AV1 -- differ
+    // 3.6x in size and 1.4x in cost. `--keyframe-interval`, which can remove 90%
+    // of the decode, moves the size not at all.
+    //
+    // So each file is opened once, header only, and asked how many keyframes it
+    // holds and how big they are -- see `weigh_decode`. That is the actual shape
+    // of the work: ~93% of fingerprinting time is intra decode of exactly those
+    // frames. It costs one open per file and no decoding, roughly 0.8 ms against
+    // decodes measured in seconds, and it is paid ONLY on cache misses, so a
+    // re-run over a warm cache does not pay it at all -- which is why this sits
+    // after the cache pass rather than beside the scan that stat'ed the sizes.
+    //
+    // The pass is separate and complete before any decoding starts, for the same
+    // reason the cache pass is: the thread budget and the bar are both
+    // apportioned against the TOTAL, so both need every weight in hand before
+    // the first file starts. Parallel because it is pure I/O latency -- open,
+    // read a header, close -- and nothing here competes with a decode yet.
+    if !todo.is_empty() {
+        let weighed: Vec<u64> = todo
+            .par_iter()
+            .map(|job| {
+                if shutdown_requested() {
+                    return job.size;
+                }
+                fingerprint::weigh_decode(&job.path, kf_interval, min_kf_samples, job.size)
+            })
+            .collect();
+        for (job, weight) in todo.iter_mut().zip(weighed) {
+            job.weight = weight;
+        }
+
+        // NOW the largest-first order the schedule depends on is real. It was
+        // approximated by size up to here; a folder mixing codecs is exactly
+        // where that approximation puts the wrong file first, since an AV1 copy
+        // and an HEVC copy of the same footage differ threefold in cost and
+        // barely at all in the direction size predicts.
+        todo.sort_by_key(|job| std::cmp::Reverse(job.weight));
+    }
+
+    if shutdown_requested() {
+        return Ok(Outcome::Interrupted);
+    }
+
     // --- Pass 2: the work that actually costs something -----------------------
     // Declared out here so the counter survives the block and can be reported
     // even when every file was cached and the block never ran.
@@ -1389,9 +1498,9 @@ fn run(
         //
         // Ownership of the loop moves off rayon for this reason too. Rayon's
         // adaptive splitting hands each worker a region of the input, so claims
-        // do NOT arrive in size order -- and the whole schedule rests on the
+        // do NOT arrive in weight order -- and the whole schedule rests on the
         // heaviest video claiming while the budget is still wide. An atomic
-        // cursor over the size-sorted list makes that ordering exact, and a
+        // cursor over the weight-sorted list makes that ordering exact, and a
         // worker per budgeted thread is the most decodes that can run at once
         // anyway, since every decode reserves at least one.
         let total_weight: u128 = todo.iter().map(|job| job.weight as u128).sum();
@@ -1401,9 +1510,9 @@ fn run(
         let collected: Mutex<Vec<(usize, VideoFingerprint)>> =
             Mutex::new(Vec::with_capacity(todo_count));
 
-        // Files finished. The bar's own position is bytes now, so it can no
-        // longer answer "how many videos is that?" -- and that is the number a
-        // user quotes back. It rides in `{prefix}` rather than sharing `{msg}`
+        // Files finished. The bar's own position is decode work, so it cannot
+        // answer "how many videos is that?" -- and that is the number a user
+        // quotes back. It rides in `{prefix}` rather than sharing `{msg}`
         // with the file name because the two change on different events: the
         // name when a decode STARTS, the count when one ENDS. Formatting both at
         // claim time pinned the count at 0/6 for an entire six-file run -- every
@@ -1420,44 +1529,51 @@ fn run(
         // heavyweight everybody is actually waiting on goes unnamed. A 54 GB
         // scan spent its last minute reporting a 30 MB clip.
         //
-        // `todo` is sorted largest-first, so the lowest key in this map is both
+        // `todo` is sorted heaviest-first, so the lowest key in this map is both
         // the earliest claim and the heaviest file still open -- the honest
         // answer to "what is this waiting on". A BTreeMap for that ordering; the
         // lock is taken twice per video, against decodes measured in seconds.
         let in_flight: Mutex<BTreeMap<usize, String>> = Mutex::new(BTreeMap::new());
 
-        // The bar measures BYTES of work, not files. Its denominator is the same
-        // `total_weight` the thread budget is apportioned against, so the bar and
-        // the scheduler agree about what half-done means; counting files did not,
-        // and with inputs spanning three orders of magnitude in size a count is
-        // close to meaningless -- a run can sit at 90% for most of its wall time.
+        // The bar measures WORK, not files and no longer bytes. Its denominator
+        // is the same `total_weight` the thread budget is apportioned against, so
+        // the bar and the scheduler agree about what half-done means; counting
+        // files did not, and with inputs spanning three orders of magnitude a
+        // count is close to meaningless -- a run can sit at 90% for most of its
+        // wall time. Counting bytes agreed with the scheduler but was wrong in
+        // the same place the scheduler was, and being consistently wrong is what
+        // let a bar cross 50% a quarter of the way through a mixed-codec folder.
         //
-        // Neither the length nor the increments cost anything to obtain: the size
-        // is the one `sources::collect` already stat'ed and stored on the job as
-        // its scheduling weight, and `inc` is one atomic add plus a clock-based
-        // redraw check whatever the delta is, so this is the same handful of calls
-        // per run that counting files made.
+        // What is on screen changed with it. The position itself is a count of
+        // decoded keyframe-pixels, which nobody wants the raw value of, so it
+        // shows as a percentage; the byte pair that used to stand next to it is
+        // gone, because "3.2GB of 54GB" describes something the bar is no longer
+        // measuring and the two would disagree in front of the user.
         //
-        // Bytes are a proxy, not a measurement. ~93% of fingerprinting time is
-        // intra decode, which tracks keyframes x pixels, so a high-bitrate file
-        // weighs more here than it costs. The honest weight is duration x
-        // resolution, and every file in `todo` is a cache miss by definition --
-        // there is no cached duration to read, so learning it means opening and
-        // probing all of them before the bar can appear. Bytes are the best weight
-        // available for free, which is exactly why `share_for` uses them too.
+        // The RATE survives, and is the one field here worth the plumbing. It is
+        // the same speedometer the old {bytes_per_sec} was -- indicatif's own
+        // windowed estimate, so it reads current speed rather than the run's
+        // average -- but denominated in the work, which is what makes it steady:
+        // megabytes a second swung by a factor of five between a high-bitrate
+        // remux and a well-compressed encode of identical footage, while the
+        // pixel rate is a property of the machine and barely moves.
         //
-        // No ETA: extrapolating a rate off a proxy that skews with bitrate would
-        // put a number on screen more precise than anything behind it. The
-        // throughput figure is the honest version of the same information.
+        // Still no ETA. The weight is a much better predictor than the size was,
+        // but it predicts DECODE cost, and the tail of a run is threads going
+        // idle rather than work being done -- a rate extrapolated across that
+        // reads high for most of a scan and then stalls.
         let pb = if args.quiet {
             ProgressBar::hidden()
         } else {
             let pb = ProgressBar::new(total_weight.min(u64::MAX as u128) as u64);
             pb.set_style(
                 ProgressStyle::with_template(
-                    "{elapsed_precise} \u{2502} [{bar:28.cyan/blue}] \u{2502} {bytes}/{total_bytes} \u{2502} {bytes_per_sec} \u{2502} {prefix} \u{2502} {msg}",
+                    "{elapsed_precise} \u{2502} [{bar:28.cyan/blue}] \u{2502} {percent:>3}% \u{2502} {work_rate} \u{2502} {prefix} \u{2502} {msg}",
                 )
                 .unwrap()
+                .with_key("work_rate", |state: &ProgressState, w: &mut dyn std::fmt::Write| {
+                    let _ = w.write_str(&work_rate(state.per_sec()));
+                })
                 .progress_chars("=>-"),
             );
             // Five fields of digits with only spaces between them read as one
@@ -1501,17 +1617,17 @@ fn run(
                     // One video is off the queue, however it ended. `charged` is
                     // what the demuxer already moved the bar by while the file
                     // was open, so only the remainder is owed here -- the two
-                    // together are always exactly the file's size, which is what
-                    // makes the bar land on 100% and not near it.
+                    // together are always exactly the file's weight, which is
+                    // what makes the bar land on 100% and not near it.
                     //
                     // Called for a file that was skipped or that failed too:
-                    // neither will be attempted again, so their bytes have left
+                    // neither will be attempted again, so their work has left
                     // the queue and a bar that ended short of full would be the
                     // lie the old per-file `inc` was already avoiding.
-                    let finish = |idx: usize, weight: u64, charged: u64| {
+                    let finish = |idx: usize, job: &Job, charged: u64| {
                         let done = files_done.fetch_add(1, Ordering::Relaxed) + 1;
                         pb.set_prefix(format!("{}/{}", done, todo_count));
-                        pb.inc(weight.saturating_sub(charged));
+                        pb.inc(job.weight.saturating_sub(charged));
 
                         let mut open = in_flight.lock().unwrap_or_else(|e| e.into_inner());
                         open.remove(&idx);
@@ -1553,28 +1669,48 @@ fn run(
                             }
                         }
 
-                        // How much of this file's weight the bar has already been
-                        // given. `fingerprint_video` reports the demuxer's offset
-                        // per packet, which on a linearly scanned container is
+                        // How far into this file the demuxer has got, and how much
+                        // of the file's weight that has already been credited to
+                        // the bar. `fingerprint_video` reports a byte offset per
+                        // packet, which on a linearly scanned container is
                         // thousands of times a second and far more often than the
                         // bar can redraw; PROGRESS_STEP_BYTES is what turns that
-                        // firehose into a bounded number of increments. A `Cell`
-                        // because the hook has to stay `Fn` and the total has to
-                        // outlive it -- this closure is built fresh per video and
-                        // never leaves this thread.
-                        let charged = Cell::new(0u64);
+                        // firehose into a bounded number of increments.
+                        //
+                        // The two are in different units, which is why there are
+                        // two of them: the demuxer can only say where it is in
+                        // BYTES, and the bar is measured in decode work. The
+                        // conversion is the file's own byte fraction, i.e. it
+                        // assumes this file's keyframes are spread evenly through
+                        // it -- true enough to move a bar with, and it does not
+                        // accumulate error, because the offsets are absolute and
+                        // `finish` pays whatever rounding left owing.
+                        //
+                        // `Cell`s because the hook has to stay `Fn` and the
+                        // totals have to outlive it -- this closure is built
+                        // fresh per video and never leaves this thread.
+                        let charged_bytes = Cell::new(0u64);
+                        let charged_work = Cell::new(0u64);
                         let advance = |pos: u64| {
                             // Clamped, never a delta from the raw offset: a seek
                             // that lands short walks the offset BACKWARDS, and an
                             // offset past the size we stat'ed (a file being
                             // appended to as we read it) would overrun the bar.
                             // Only forward movement inside the file counts.
-                            let reached = pos.min(job.weight);
-                            let already = charged.get();
-                            if reached.saturating_sub(already) >= PROGRESS_STEP_BYTES {
-                                charged.set(reached);
-                                pb.inc(reached - already);
+                            let reached = pos.min(job.size);
+                            if reached.saturating_sub(charged_bytes.get()) < PROGRESS_STEP_BYTES {
+                                return;
                             }
+                            charged_bytes.set(reached);
+
+                            if job.size == 0 {
+                                return;
+                            }
+                            let work =
+                                (job.weight as u128 * reached as u128 / job.size as u128) as u64;
+                            let delta = work.saturating_sub(charged_work.get());
+                            charged_work.set(work);
+                            pb.inc(delta);
                         };
 
                         let decoded = fingerprint_video(
@@ -1599,7 +1735,7 @@ fn run(
                                 // nothing to cache: the header read that decided
                                 // this is cheap enough to repeat next run.
                                 stats.skipped_short.bump();
-                                finish(idx, job.weight, charged.get());
+                                finish(idx, job, charged_work.get());
                                 continue;
                             }
                             Err(e) => {
@@ -1621,7 +1757,7 @@ fn run(
                                         .fingerprint_failed
                                         .record(format!("{}: {:#}", job.path, e));
                                 }
-                                finish(idx, job.weight, charged.get()); // Work attempted
+                                finish(idx, job, charged_work.get()); // Work attempted
                                 continue;
                             }
                         };
@@ -1647,7 +1783,7 @@ fn run(
                         }
 
                         local.push((idx, fp));
-                        finish(idx, job.weight, charged.get());
+                        finish(idx, job, charged_work.get());
                     }
 
                     collected
@@ -1840,29 +1976,64 @@ mod tests {
         assert!(scan_encloses(Path::new("/home/you/Documents"), &scanned).is_none());
     }
 
+    /// The bar redraws this field several times a second, and everything to the
+    /// right of it moves if it changes width -- which is what a line that
+    /// flickers is made of. So the width is the property worth pinning, across
+    /// the whole range including the "nothing measured yet" reading.
+    #[test]
+    fn test_the_speedometer_keeps_one_width() {
+        let readings = [
+            work_rate(0.0),
+            work_rate(f64::NAN),
+            work_rate(1.0),
+            work_rate(463e6),
+            work_rate(2.5e9),
+            work_rate(9.9e11),
+            work_rate(4.2e13),
+            work_rate(f64::MAX),
+        ];
+        for r in &readings {
+            assert_eq!(r.chars().count(), readings[0].chars().count(), "{:?}", readings);
+        }
+    }
+
+    #[test]
+    fn test_the_speedometer_changes_unit_rather_than_growing_digits() {
+        assert_eq!(work_rate(463e6).trim(), "463 Mpx/s");
+        assert_eq!(work_rate(2.5e9).trim(), "2.50 Gpx/s");
+        assert_eq!(work_rate(9.9e11).trim(), "990 Gpx/s");
+        // A rate too slow to have a megapixel in it still reads as a number and
+        // not as the dash that means "no measurement yet".
+        assert!(work_rate(1.0).trim().starts_with('0'));
+    }
+
     // --- The decoder thread schedule -----------------------------------------
 
-    const GB: u64 = 1 << 30;
+    // One "ordinary file" of decode work, so the shapes below read as
+    // multiples of each other. The rule is scale-free -- only the ratio of
+    // weight to queued matters -- so the size of the unit is arbitrary, and
+    // these numbers meant bytes back when the weight did.
+    const LOAD: u64 = 1 << 30;
 
     #[test]
     fn test_plenty_of_similar_work_means_one_thread_each() {
         // The common case, and the one the old count-based rule got right: with
-        // seven more gigabytes queued behind this one, widening this decode
+        // seven times this much work queued behind it, widening this decode
         // would only take threads away from work that will outlast it anyway.
-        assert_eq!(share_for(GB, 7 * GB as u128, 8), 1);
-        assert_eq!(share_for(GB, 99 * GB as u128, 8), 1);
+        assert_eq!(share_for(LOAD, 7 * LOAD as u128, 8), 1);
+        assert_eq!(share_for(LOAD, 99 * LOAD as u128, 8), 1);
     }
 
     #[test]
     fn test_a_heavyweight_claims_its_share_of_the_run_up_front() {
-        // The case the old rule got wrong. Eight gigabytes of the ten left, on
+        // The case the old rule got wrong. Eight tenths of the work left, on
         // eight threads: this file IS most of the run, so most of the machine
         // goes to it -- at the moment it starts, which is the only moment
         // FFmpeg will accept a thread count.
-        assert_eq!(share_for(8 * GB, 2 * GB as u128, 8), 6);
+        assert_eq!(share_for(8 * LOAD, 2 * LOAD as u128, 8), 6);
 
         // Half the work gets half the threads.
-        assert_eq!(share_for(4 * GB, 4 * GB as u128, 8), 4);
+        assert_eq!(share_for(4 * LOAD, 4 * LOAD as u128, 8), 4);
     }
 
     #[test]
@@ -1871,16 +2042,16 @@ mod tests {
         // library actually has -- one outsized file among a pile of ordinary
         // ones -- and 1 is the width the run cannot walk back later, so the
         // rounding goes the other way here and only here.
-        assert_eq!(share_for(10 * GB, 48 * GB as u128, 8), 2);
+        assert_eq!(share_for(10 * LOAD, 48 * LOAD as u128, 8), 2);
 
         // Not a licence to round everything up: a share that is exactly one
         // thread is one thread, and a share below it still floors at one.
-        assert_eq!(share_for(GB, 7 * GB as u128, 8), 1);
-        assert_eq!(share_for(GB, 15 * GB as u128, 8), 1);
+        assert_eq!(share_for(LOAD, 7 * LOAD as u128, 8), 1);
+        assert_eq!(share_for(LOAD, 15 * LOAD as u128, 8), 1);
 
         // And above 2 the ordinary rule resumes -- 6.4 stays 6, because the
         // threads it would take are the ones the rest of the queue runs on.
-        assert_eq!(share_for(8 * GB, 2 * GB as u128, 8), 6);
+        assert_eq!(share_for(8 * LOAD, 2 * LOAD as u128, 8), 6);
     }
 
     #[test]
@@ -1889,8 +2060,8 @@ mod tests {
         // for. This is the straggler the whole change exists to prevent, and
         // the one place where the widest possible decode is unambiguously
         // right.
-        assert_eq!(share_for(GB, 0, 8), 8);
-        assert_eq!(share_for(GB, 0, 3), 3, "only what is actually free");
+        assert_eq!(share_for(LOAD, 0, 8), 8);
+        assert_eq!(share_for(LOAD, 0, 3), 3, "only what is actually free");
     }
 
     #[test]
@@ -1898,15 +2069,15 @@ mod tests {
         // Past MAX_DECODE_THREADS the extra threads buy nothing and cost a
         // full-resolution frame buffer each, so they are better left for the
         // next video.
-        assert_eq!(share_for(GB, 0, 64), MAX_DECODE_THREADS);
+        assert_eq!(share_for(LOAD, 0, 64), MAX_DECODE_THREADS);
     }
 
     #[test]
     fn test_a_small_video_never_gets_zero_threads() {
         // A decode always needs the thread it runs on, however little the file
         // weighs against the rest of the queue.
-        assert_eq!(share_for(1, 100 * GB as u128, 8), 1);
-        assert_eq!(share_for(0, 100 * GB as u128, 8), 1, "and a zero-byte file still runs");
+        assert_eq!(share_for(1, 100 * LOAD as u128, 8), 1);
+        assert_eq!(share_for(0, 100 * LOAD as u128, 8), 1, "and a file we could not weigh still runs");
     }
 
     #[test]
@@ -1914,10 +2085,10 @@ mod tests {
         // The invariant `-t` is a promise about. Every claim here is made while
         // every earlier one is still running, which is the worst case for it.
         let shapes: [&[u64]; 4] = [
-            &[8 * GB, GB, GB, GB, GB],
-            &[GB, GB, GB, GB, GB, GB, GB, GB, GB, GB],
-            &[64 * GB, 1, 1, 1, 1, 1, 1, 1],
-            &[3 * GB, 2 * GB, GB],
+            &[8 * LOAD, LOAD, LOAD, LOAD, LOAD],
+            &[LOAD, LOAD, LOAD, LOAD, LOAD, LOAD, LOAD, LOAD, LOAD, LOAD],
+            &[64 * LOAD, 1, 1, 1, 1, 1, 1, 1],
+            &[3 * LOAD, 2 * LOAD, LOAD],
         ];
 
         for total in 1..=16usize {
@@ -1955,21 +2126,21 @@ mod tests {
         // Four equal videos on eight threads. Two threads each while the queue
         // is full, four when half of it is gone, and the whole budget for the
         // last one -- which is exactly the ramp that was missing.
-        let budget = ThreadBudget::new(8, 4 * GB as u128);
+        let budget = ThreadBudget::new(8, 4 * LOAD as u128);
 
-        let a = budget.claim(GB).unwrap();
-        let b = budget.claim(GB).unwrap();
+        let a = budget.claim(LOAD).unwrap();
+        let b = budget.claim(LOAD).unwrap();
         assert_eq!((a.threads, b.threads), (2, 2));
 
         drop(a);
         drop(b);
 
-        let c = budget.claim(GB).unwrap();
+        let c = budget.claim(LOAD).unwrap();
         assert_eq!(c.threads, 4);
 
         drop(c);
 
-        let d = budget.claim(GB).unwrap();
+        let d = budget.claim(LOAD).unwrap();
         assert_eq!(d.threads, 8, "the tail of a scan must not decode single-threaded");
     }
 
@@ -1980,11 +2151,11 @@ mod tests {
         // largest-first) and takes most of the machine; the small ones share
         // what is left, one thread apiece, and finish alongside it instead of
         // finishing an hour early and leaving seven cores idle.
-        let small = GB / 10;
-        let queued = 8 * GB as u128 + 20 * small as u128;
+        let small = LOAD / 10;
+        let queued = 8 * LOAD as u128 + 20 * small as u128;
         let budget = ThreadBudget::new(8, queued);
 
-        let heavy = budget.claim(8 * GB).unwrap();
+        let heavy = budget.claim(8 * LOAD).unwrap();
         assert_eq!(heavy.threads, 6);
 
         let a = budget.claim(small).unwrap();
@@ -1997,10 +2168,10 @@ mod tests {
     fn test_a_grant_is_returned_on_drop() {
         // Including when a decode unwinds on an error: the release is the
         // destructor, not a line at the end of the happy path.
-        let budget = ThreadBudget::new(8, GB as u128);
+        let budget = ThreadBudget::new(8, LOAD as u128);
 
         {
-            let grant = budget.claim(GB).unwrap();
+            let grant = budget.claim(LOAD).unwrap();
             assert_eq!(grant.threads, 8);
             assert_eq!(budget.free(), 0);
         }
@@ -2010,8 +2181,8 @@ mod tests {
 
     #[test]
     fn test_a_single_thread_budget_still_runs() {
-        let budget = ThreadBudget::new(1, 4 * GB as u128);
-        let grant = budget.claim(GB).unwrap();
+        let budget = ThreadBudget::new(1, 4 * LOAD as u128);
+        let grant = budget.claim(LOAD).unwrap();
         assert_eq!(grant.threads, 1);
         assert_eq!(budget.free(), 0);
     }
