@@ -183,9 +183,8 @@ type CacheEntry = (Stamp, VideoFingerprint);
                   is costing you. Files are touched only when --delete or --move-to is \
                   given."
 )]
-
 struct Args {
-        /// Folders and video files to scan (one or more). A folder is searched for
+    /// Folders and video files to scan (one or more). A folder is searched for
     /// videos; a file you name is scanned whatever its extension, since
     /// --extensions is only a guess about what a FOLDER contains. Use `-` to
     /// read a list of paths from stdin, e.g. `fd -e mkv | vid-fp -`.

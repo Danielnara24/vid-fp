@@ -278,6 +278,13 @@ fn copy_durably(src: &Path, dest: &Path, meta: &std::fs::Metadata) -> Result<()>
 /// next run re-fingerprints it without being told anything here. Trashed and
 /// moved files both count as gone: they are somewhere else now, and nothing
 /// will ever find this fingerprint under the path it was cached against.
+///
+/// Nine arguments, and clippy is right to count them -- but they are nine
+/// distinct facts with no grouping that isn't arbitrary. The two that did share
+/// an axis are already the `Policy` struct. Wrapping the rest in a parameter
+/// bag would move the same nine values one line up at the call site and hide
+/// which of them the destructive pass actually reads, so the count stands.
+#[allow(clippy::too_many_arguments)]
 pub fn output_results(
     final_groups: &[Vec<usize>],
     fingerprints: &[VideoFingerprint],
@@ -587,7 +594,7 @@ pub fn output_results(
     //                link: which file, how much footage, and where in THIS file
     //                it sits.
     csv_wtr
-        .write_record(&[
+        .write_record([
             "group",
             "action",
             "full_path",
@@ -761,7 +768,7 @@ pub fn output_results(
             txt_out.push('\n');
 
             // 2. CSV Output
-            csv_wtr.write_record(&[
+            csv_wtr.write_record([
                 &group_name,
                 action_str,
                 &fp.path,
@@ -849,7 +856,7 @@ pub fn output_results(
         }
 
         info!(""); // Empty line for spacing
-        txt_out.push_str("\n");
+        txt_out.push('\n');
 
         if wants_json {
             json_out_groups.push(serde_json::json!({
@@ -964,7 +971,7 @@ pub fn output_results(
                 let mut full_txt = String::new();
                 full_txt.push_str(&txt_out);
                 full_txt.push_str(&summary);
-                full_txt.push_str("\n");
+                full_txt.push('\n');
 
                 std::fs::write(path, full_txt)
                     .context(format!("Failed to write Text to {}", out_path))?;

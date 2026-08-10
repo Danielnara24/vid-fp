@@ -159,8 +159,16 @@ pub fn format_quality(bits_per_frame: u64) -> String {
 ///
 /// Whole rates print whole (`30fps`, not `30.00fps`) so the common case stays
 /// short, while 29.97 and friends keep the two decimals that distinguish them.
+///
+/// The guard tests finiteness explicitly rather than leaning on `!(rate > 0.0)`
+/// to catch NaN as a side effect of the comparison being false either way. That
+/// form covered NaN but let infinity straight through to the `as u64` cast
+/// below, which saturates -- so an infinite rate printed as a twenty-digit fps.
+/// `fingerprint::frame_rate_of` flattens anything non-finite to 0.0 before it
+/// gets here, but this is the last stop before a number is printed and neither
+/// value has a rendering that beats "the container never said".
 pub fn format_frame_rate(frame_rate: f64) -> String {
-    if !(frame_rate > 0.0) {
+    if !frame_rate.is_finite() || frame_rate <= 0.0 {
         return "-".to_string();
     }
 
@@ -488,6 +496,13 @@ mod tests {
         assert_eq!(format_frame_rate(30.0), "30fps");
         assert_eq!(format_frame_rate(29.97), "29.97fps");
         assert_eq!(format_frame_rate(23.976), "23.98fps");
+
+        // A rate that isn't a number isn't a rate. NaN was always caught;
+        // infinity was not, and reached the saturating `as u64` cast, which
+        // rendered it as `18446744073709551615fps`.
+        assert_eq!(format_frame_rate(f64::NAN), "-");
+        assert_eq!(format_frame_rate(f64::INFINITY), "-");
+        assert_eq!(format_frame_rate(-30.0), "-");
     }
 
     #[test]

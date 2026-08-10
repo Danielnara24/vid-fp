@@ -587,7 +587,17 @@ pub fn fingerprint_video(
         let ctx = context_decoder.as_mut_ptr();
         (*ctx).thread_count = decode_threads as i32;
         (*ctx).skip_loop_filter = ffmpeg_next::ffi::AVDiscard::AVDISCARD_ALL;
-        (*ctx).flags2 |= ffmpeg_next::ffi::AV_CODEC_FLAG2_FAST as i32;
+        // The cast is redundant against the headers we build on today and is
+        // kept anyway: these constants have no declared type in FFmpeg, so
+        // bindgen infers one per #define from the literal's width and sign, and
+        // the results are not uniform. In the very same header AV_CODEC_FLAG2_*
+        // comes out c_int except ICC_PROFILES (bit 31) which is u32, and the
+        // whole AV_CODEC_FLAG_* family is c_uint -- which is why LOW_DELAY
+        // below needs a cast that really does convert. Both fields are c_int.
+        #[allow(clippy::unnecessary_cast)]
+        {
+            (*ctx).flags2 |= ffmpeg_next::ffi::AV_CODEC_FLAG2_FAST as i32;
+        }
         if decode_threads > 1 {
             // Frame threading preferred; slice threading is the fallback for
             // codecs that don't advertise AV_CODEC_CAP_FRAME_THREADS. FFmpeg
@@ -989,6 +999,13 @@ pub fn fingerprint_video(
     let mut row_max_var = [0.0f32; 64];
     let mut col_max_var = [0.0f32; 64];
 
+    // Indexed rather than iterated on purpose, and clippy's needless_range_loop
+    // is wrong about it: each cell reads two flat 64x64 buffers and updates two
+    // 64-entry projections, so the iterator form is a zip of chunks_exact(64)
+    // over sum and sum_sq nested inside a zip against row_max_var -- and
+    // col_max_var is walked afresh on every row rather than consumed once.
+    // y and x are coordinates here, not stand-ins for a cursor.
+    #[allow(clippy::needless_range_loop)]
     for y in 0..64 {
         for x in 0..64 {
             let i = y * 64 + x;
