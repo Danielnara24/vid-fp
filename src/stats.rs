@@ -79,6 +79,7 @@ pub struct RunStats {
     pub delete_stale: Tally,
     pub delete_failed: Tally,
     pub report_unusable: Tally,
+    pub report_write_failed: Tally,
 
     // --- skips: intentional, and not a reason to fail the run ----------------
     pub skipped_short: Tally,
@@ -87,7 +88,7 @@ pub struct RunStats {
 }
 
 impl RunStats {
-    fn problems(&self) -> [(&Tally, &'static str); 10] {
+    fn problems(&self) -> [(&Tally, &'static str); 11] {
         [
             // "path" rather than "folder": a scan target can now be a single
             // file, or a line piped in from another tool.
@@ -132,6 +133,16 @@ impl RunStats {
             (
                 &self.report_unusable,
                 "row(s) of the report could not be understood -- the file(s) they name were NOT touched",
+            ),
+            // The run itself succeeded and any deletions really happened; what
+            // was lost is the account of them. That is squarely a problem: the
+            // one artefact the user asked to keep is missing, and on an armed
+            // run it is the only record of what went. It is NOT fatal, because
+            // returning an error here used to discard the list of removed files
+            // before their cache entries could be dropped.
+            (
+                &self.report_write_failed,
+                "report(s) could not be saved -- the run itself completed, but its output was lost",
             ),
         ]
     }

@@ -916,69 +916,90 @@ pub fn output_results(
         );
     }
 
-    // Save outputs cleanly returning Result<()>
+    // --- Writing the report ---------------------------------------------------
+    // Logged and tallied rather than returned, which is the same treatment
+    // `dispose_one` gives a failed deletion and for a stronger reason. By this
+    // line the destructive pass has already run: propagating an error here threw
+    // away `deleted_paths` on the way out, so the caller never got to drop those
+    // files' cache entries and the cache went on claiming fingerprints for files
+    // this run had just removed. A report that could not be saved is a problem
+    // (exit 2, and a line in the Problems summary) -- it is not a reason to
+    // forget what the run did to the filesystem.
+    //
+    // `check_output_path` has already rejected the mistyped paths before any
+    // work started, so what reaches here is a permission or a full disk.
     if let Some(out_path) = output_file {
-        let path = Path::new(&out_path);
-        let ext = path
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_lowercase();
+        let written = (move || -> Result<()> {
+            let path = Path::new(&out_path);
+            let ext = path
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_lowercase();
 
-        match ext.as_str() {
-            "csv" => {
-                let csv_bytes = csv_wtr.into_inner().context("Failed to finalize CSV buffer")?;
-                std::fs::write(path, csv_bytes)
-                    .context(format!("Failed to write CSV to {}", out_path))?;
-            }
-            "json" => {
-                // Summary first, then the groups. It is the part a human opens
-                // the file to read, and burying it under an array with a row per
-                // duplicate makes it something you have to go looking for.
-                //
-                // Its own three blocks run what was found -> what was decided ->
-                // what was done, so a dry run's keys stop after the second one
-                // has said everything it can.
-                let json_final = serde_json::json!({
-                    "summary": {
-                        "total_groups": final_groups.len(),
-                        "total_files_matched": matched_file_count,
-                        "time_elapsed_seconds": total_elapsed_secs,
-                        // What the run would reclaim, present whether or not it
-                        // did anything: a dry run's whole output is a plan, and
-                        // a plan with no cost attached is not one.
-                        "files_marked_delete": delete_candidate_count,
-                        "reclaimable_bytes": reclaimable_bytes,
-                        "deletion_enabled": acting,
-                        "mode": disposal.map(|d| d.mode()).unwrap_or("report"),
-                        "move_to": match disposal {
-                            Some(Disposal::MoveTo(dir)) => {
-                                Some(dir.to_string_lossy().to_string())
-                            }
-                            _ => None,
+            match ext.as_str() {
+                "csv" => {
+                    let csv_bytes = csv_wtr.into_inner().context("Failed to finalize CSV buffer")?;
+                    std::fs::write(path, csv_bytes)
+                        .context(format!("Failed to write CSV to {}", out_path))?;
+                }
+                "json" => {
+                    // Summary first, then the groups. It is the part a human opens
+                    // the file to read, and burying it under an array with a row per
+                    // duplicate makes it something you have to go looking for.
+                    //
+                    // Its own three blocks run what was found -> what was decided ->
+                    // what was done, so a dry run's keys stop after the second one
+                    // has said everything it can.
+                    let json_final = serde_json::json!({
+                        "summary": {
+                            "total_groups": final_groups.len(),
+                            "total_files_matched": matched_file_count,
+                            "time_elapsed_seconds": total_elapsed_secs,
+                            // What the run would reclaim, present whether or not it
+                            // did anything: a dry run's whole output is a plan, and
+                            // a plan with no cost attached is not one.
+                            "files_marked_delete": delete_candidate_count,
+                            "reclaimable_bytes": reclaimable_bytes,
+                            "deletion_enabled": acting,
+                            "mode": disposal.map(|d| d.mode()).unwrap_or("report"),
+                            "move_to": match disposal {
+                                Some(Disposal::MoveTo(dir)) => {
+                                    Some(dir.to_string_lossy().to_string())
+                                }
+                                _ => None,
+                            },
+                            "files_removed": removed_count,
+                            "bytes_removed": removed_bytes,
+                            "files_failed": failed_count,
+                            "files_changed": changed_count,
                         },
-                        "files_removed": removed_count,
-                        "bytes_removed": removed_bytes,
-                        "files_failed": failed_count,
-                        "files_changed": changed_count,
-                    },
-                    "results": json_out_groups
-                });
-                std::fs::write(path, serde_json::to_string_pretty(&json_final).unwrap())
-                    .context(format!("Failed to write JSON to {}", out_path))?;
-            }
-            _ => {
-                let mut full_txt = String::new();
-                full_txt.push_str(&txt_out);
-                full_txt.push_str(&summary);
-                full_txt.push('\n');
+                        "results": json_out_groups
+                    });
+                    std::fs::write(path, serde_json::to_string_pretty(&json_final).unwrap())
+                        .context(format!("Failed to write JSON to {}", out_path))?;
+                }
+                _ => {
+                    let mut full_txt = String::new();
+                    full_txt.push_str(&txt_out);
+                    full_txt.push_str(&summary);
+                    full_txt.push('\n');
 
-                std::fs::write(path, full_txt)
-                    .context(format!("Failed to write Text to {}", out_path))?;
+                    std::fs::write(path, full_txt)
+                        .context(format!("Failed to write Text to {}", out_path))?;
+                }
             }
-        };
 
-        info!("\nResults saved to {}", out_path);
+            Ok(())
+        })();
+
+        match written {
+            Ok(()) => info!("\nResults saved to {}", out_path),
+            Err(e) => {
+                log::error!("{:#}", e);
+                stats.report_write_failed.record(format!("{:#}", e));
+            }
+        }
     }
 
     Ok(deleted_paths)

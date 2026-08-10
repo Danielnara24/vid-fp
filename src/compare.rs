@@ -22,11 +22,13 @@ const BINS: usize = 1 << BLOCK_BITS;
 /// lookups on every hash in the library to chase pairs that share exactly one
 /// marginal frame and nothing else.
 ///
-/// The default tolerance now sits above 7, so this cap is load-bearing rather
-/// than theoretical. It is safe because phase 1 only has to *propose* a pair:
-/// two encodes of the same footage agree closely on many frames, not one, and
-/// phase 2 then measures all of them exactly. Measured over a 1,000-file
-/// library the wider probe changed not a single group.
+/// The default tolerance of 4 sits inside that exhaustive range, so the cap
+/// costs a default run nothing; it starts binding at `-d 8`, which the accuracy
+/// ladder and any deliberately loose scan reach. It is safe there because phase
+/// 1 only has to *propose* a pair: two encodes of the same footage agree closely
+/// on many frames, not one, and phase 2 then measures all of them exactly.
+/// Measured over a 1,000-file library the wider probe changed not a single
+/// group.
 const MAX_PROBE_RADIUS: u32 = 1;
 
 /// The `k`th 16-bit block of a hash, most significant first.
@@ -38,10 +40,12 @@ fn block_of(hash: u64, k: usize) -> usize {
 /// How far around each block key the index must look to be exhaustive at
 /// `max_hamming_dist`.
 ///
-/// Integer division is the whole rule. At the default tolerance of 3 this is 0:
-/// three differing bits cannot be spread across four blocks without leaving one
-/// of them untouched, so probing the exact bins alone finds every pair, and the
-/// 68 lookups per hash this code used to do were 64 lookups of pure ceremony.
+/// Integer division is the whole rule, and it is what makes a tight tolerance
+/// cheap: below `-d 4` this is 0, because three differing bits cannot be spread
+/// across four blocks without leaving one of them untouched, so probing the
+/// exact bins alone finds every pair. The default tolerance of 4 is the first
+/// value that needs a neighbour lookup, which costs 17 bins per block instead
+/// of 1; the cap keeps it there however high `-d` goes.
 fn probe_radius(max_hamming_dist: u32) -> u32 {
     (max_hamming_dist / BLOCKS as u32).min(MAX_PROBE_RADIUS)
 }
@@ -255,35 +259,18 @@ impl MatchIndex {
         self.links.get(&(subject, other))?.span
     }
 
-    /// Seconds of content two files have in common.
+    /// Seconds of content two files have in common -- the figure every report
+    /// prints, and the one `--min-duration` gates on.
     ///
-    /// Each file gives its own estimate -- its coverage times its runtime --
-    /// and for genuinely shared footage the two agree, because the shared
-    /// segment has one real duration no matter which file you measure it in.
-    /// The clip's `100% x 2min` and the host's `9% x 22min` are both two
-    /// minutes.
-    ///
-    /// That agreement is the whole point. Coverage is asymmetric, and its
-    /// asymmetry is what makes a report confusing; duration is symmetric and
-    /// reads the same from either end. Where the two estimates disagree --
-    /// different keyframe densities, tolerance landing differently on each side
-    /// -- the lower is taken, the conservative reading for a tool that deletes
-    /// things.
-    ///
-    /// A file whose runtime the container never reported contributes no
-    /// estimate. If neither file has a known runtime the answer is `None`: the
-    /// overlap is unknown, which is not the same as zero.
+    /// The arithmetic and the reasoning behind it live in `overlap_seconds`,
+    /// which the gate calls directly because it runs before any `MatchIndex`
+    /// exists. This is that function reached by index: it looks the pair's two
+    /// directional coverages up and hands them over. `None` when the pair was
+    /// never compared, which is not the same as compared and sharing nothing.
     pub fn shared_seconds(&self, a: usize, b: usize, fps: &[VideoFingerprint]) -> Option<f64> {
-        let mut estimate: Option<f64> = None;
-        for (subject, other) in [(a, b), (b, a)] {
-            let runtime = fps[subject].duration;
-            if runtime <= 0.0 {
-                continue;
-            }
-            let seconds = self.coverage(subject, other)? as f64 * runtime;
-            estimate = Some(estimate.map_or(seconds, |e: f64| e.min(seconds)));
-        }
-        estimate
+        let cov_a = self.coverage(a, b)?;
+        let cov_b = self.coverage(b, a)?;
+        overlap_seconds(cov_a, fps[a].duration, cov_b, fps[b].duration)
     }
 
     /// Every measured link `subject` has, strongest first.
@@ -362,6 +349,41 @@ impl MatchIndex {
     }
 }
 
+/// Seconds of footage one measured pair has in common.
+///
+/// Each side estimates it as its own coverage times its own runtime, and for
+/// genuinely shared footage the two agree, because the shared segment has one
+/// real duration no matter which file you measure it in: a clip's `100% x 2min`
+/// and its host's `9% x 22min` are both two minutes.
+///
+/// That agreement is the whole point. Coverage is asymmetric, and its asymmetry
+/// is what makes a report confusing; duration is symmetric and reads the same
+/// from either end. Where the two estimates disagree -- different keyframe
+/// densities, tolerance landing differently on each side -- the LOWER is taken,
+/// the conservative reading for a tool that deletes things.
+///
+/// A file whose runtime the container never reported contributes no estimate.
+/// If neither file has a known runtime the answer is `None`: the overlap is
+/// unknown, which is not the same as zero.
+///
+/// A free function rather than a method because `--min-duration` gates on this
+/// figure in `find_all_matches`, long before a `MatchIndex` exists, and the
+/// report prints it afterwards. Those two used to compute it separately and
+/// disagreed: the gate took the HIGHER of the two estimates while the report
+/// took the lower, so `--min-duration 5` admitted -- and marked DELETE -- pairs
+/// whose own reported overlap read 2.9s. One definition, one answer.
+fn overlap_seconds(cov_a: f32, duration_a: f64, cov_b: f32, duration_b: f64) -> Option<f64> {
+    let mut estimate: Option<f64> = None;
+    for (coverage, runtime) in [(cov_a, duration_a), (cov_b, duration_b)] {
+        if runtime <= 0.0 {
+            continue;
+        }
+        let seconds = coverage as f64 * runtime;
+        estimate = Some(estimate.map_or(seconds, |e: f64| e.min(seconds)));
+    }
+    estimate
+}
+
 /// One file's measured relationship with one other member of its group.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GroupLink {
@@ -383,7 +405,7 @@ pub struct GroupLink {
 ///
 /// The probe radius is derived from the tolerance rather than fixed (see
 /// `probe_radius`), which makes the index exhaustive for every `max_hamming_dist`
-/// up to `BLOCKS * MAX_PROBE_RADIUS + BLOCKS - 1` = 11: every pair within the
+/// up to `BLOCKS * MAX_PROBE_RADIUS + BLOCKS - 1` = 7: every pair within the
 /// tolerance is proposed. Above that the radius stops widening and an individual
 /// frame pair can be missed, but real duplicates share hundreds of frames, so
 /// missing *every* one of them is vanishingly unlikely -- and phase 2 then
@@ -418,48 +440,61 @@ fn candidate_pairs(
 
         let index = BlockIndex::build(k, fingerprints);
 
+        // Once a video is a known candidate for THIS subject, further hits
+        // against it are pure waste -- `seen` lets us skip the popcount
+        // entirely. It is a scratch buffer belonging to the rayon worker rather
+        // than to the subject, and it is stamped with the subject's own id
+        // instead of being cleared: a fresh `vec![false; n]` per subject cost an
+        // allocation and `n` bytes of memset every time round, so a pass was
+        // O(n^2) in bookkeeping before it compared a single hash. That is
+        // invisible at a thousand files and roughly 1.6e11 byte-writes at two
+        // hundred thousand.
+        //
+        // 0 is "never touched by anybody", so the stamp is `v_a + 1` and cannot
+        // collide with it.
         let found: Vec<(usize, usize)> = (0..n)
             .into_par_iter()
-            .flat_map(|v_a| {
-                if shutdown_requested() {
-                    return Vec::new();
-                }
-                let fp_a = &fingerprints[v_a];
-
-                // Once a video is a known candidate in this pass, further hits
-                // against it are pure waste -- `seen` lets us skip the popcount
-                // entirely.
-                let mut seen = vec![false; n];
-                let mut local: Vec<(usize, usize)> = Vec::new();
-
-                for &h_a in fp_a.valid_hashes.iter() {
+            .map_init(
+                || vec![0u32; n],
+                |seen, v_a| {
                     if shutdown_requested() {
                         return Vec::new();
                     }
-                    let key = block_of(h_a, k);
+                    let fp_a = &fingerprints[v_a];
+                    let mark = v_a as u32 + 1;
+                    let mut local: Vec<(usize, usize)> = Vec::new();
 
-                    for &mask in masks.iter() {
-                        let (hashes, videos) = index.bin(key ^ mask as usize);
+                    for &h_a in fp_a.valid_hashes.iter() {
+                        if shutdown_requested() {
+                            return Vec::new();
+                        }
+                        let key = block_of(h_a, k);
 
-                        // Entries are built in video order, so a binary search
-                        // skips every already-processed video in one step.
-                        let start = videos.partition_point(|&v| (v as usize) <= v_a);
+                        for &mask in masks.iter() {
+                            let (hashes, videos) = index.bin(key ^ mask as usize);
 
-                        for (&v_b, &h_b) in videos[start..].iter().zip(&hashes[start..]) {
-                            let v_b = v_b as usize;
-                            if seen[v_b] {
-                                continue;
-                            }
-                            if (h_a ^ h_b).count_ones() <= max_hamming_dist {
-                                seen[v_b] = true;
-                                local.push((v_a, v_b));
+                            // Entries are built in video order, so a binary
+                            // search skips every already-processed video in one
+                            // step.
+                            let start = videos.partition_point(|&v| (v as usize) <= v_a);
+
+                            for (&v_b, &h_b) in videos[start..].iter().zip(&hashes[start..]) {
+                                let v_b = v_b as usize;
+                                if seen[v_b] == mark {
+                                    continue;
+                                }
+                                if (h_a ^ h_b).count_ones() <= max_hamming_dist {
+                                    seen[v_b] = mark;
+                                    local.push((v_a, v_b));
+                                }
                             }
                         }
                     }
-                }
 
-                local
-            })
+                    local
+                },
+            )
+            .flatten()
             .collect();
 
         candidates.extend(found);
@@ -576,9 +611,14 @@ pub fn find_all_matches(
             }
 
             if min_duration > 0.0 {
-                let matched_secs =
-                    (pct_a as f64 * fp_a.duration).max(pct_b as f64 * fp_b.duration);
-                if matched_secs < min_duration {
+                // Measured exactly the way the report measures it -- see
+                // `overlap_seconds`, which both sides now share. A pair whose
+                // overlap cannot be measured at all (neither file reported a
+                // runtime) cannot clear a floor stated in seconds, so `None`
+                // fails the gate rather than passing it.
+                let cleared = overlap_seconds(pct_a, fp_a.duration, pct_b, fp_b.duration)
+                    .is_some_and(|secs| secs >= min_duration);
+                if !cleared {
                     return None;
                 }
             }
@@ -794,7 +834,7 @@ mod tests {
     fn test_two_phase_recovers_frames_the_index_cannot_propose() {
         // Only reachable above the radius cap, which is the entire remaining
         // gap in the index. Frame 2 differs by 3 bits in EVERY block (total 12)
-        // and the radius is capped at 2, so no probe can see it. Frame 1 is
+        // and the radius is capped at 1, so no probe can see it. Frame 1 is
         // identical, so the PAIR still becomes a candidate -- and phase 2's
         // brute force then counts frame 2 as well.
         let shared = 0x0000_0000_0000_0000u64;
@@ -816,6 +856,49 @@ mod tests {
             pairs(&matches),
             vec![(0, 1)],
             "phase 2 must recover the frame the probe could not reach"
+        );
+    }
+
+    #[test]
+    fn test_min_duration_gates_on_the_figure_the_report_will_print() {
+        // The gate used to take the HIGHER of the two directional estimates
+        // while `shared_seconds` printed the lower, so `--min-duration 5`
+        // admitted -- and marked DELETE -- pairs whose own reported overlap read
+        // well under five seconds. On the 727-file corpus that was seven rows,
+        // the thinnest reporting 0.50s against a 5s floor.
+        //
+        // Two files of the same runtime whose coverages disagree: 60% of 10s
+        // from one side, 20% from the other. The honest overlap is 2s, and a 3s
+        // floor has to reject it however impressive the other side looks.
+        let fps = vec![mock_fp_lasting(10.0), mock_fp_lasting(10.0)];
+        let idx = MatchIndex::new(vec![Match::new(0, 1, 0.6, 0.2)]);
+
+        assert_near(idx.shared_seconds(0, 1, &fps), 2.0);
+
+        // And the gate agrees, because both now read `overlap_seconds`.
+        assert_near(overlap_seconds(0.6, 10.0, 0.2, 10.0), 2.0);
+        assert!(
+            overlap_seconds(0.6, 10.0, 0.2, 10.0).is_some_and(|s| s < 3.0),
+            "a 3s floor must reject a 2s overlap, whatever the louder side claims"
+        );
+    }
+
+    #[test]
+    fn test_a_pair_with_no_measurable_runtime_cannot_clear_a_seconds_floor() {
+        // `--min-duration` is stated in seconds, so a pair whose overlap cannot
+        // be expressed in seconds at all has not cleared it. `None` fails the
+        // gate rather than passing it.
+        assert_eq!(overlap_seconds(1.0, 0.0, 1.0, 0.0), None);
+
+        let hash = 0xABCD_1234_ABCD_1234u64;
+        let mut a = mock_fp_with_hashes(vec![hash, hash], 2);
+        let mut b = mock_fp_with_hashes(vec![hash, hash], 2);
+        a.duration = 0.0;
+        b.duration = 0.0;
+
+        assert!(
+            find_all_matches(&[a, b], 0, 1.0, 5.0).is_empty(),
+            "an unmeasurable overlap must not satisfy a floor stated in seconds"
         );
     }
 

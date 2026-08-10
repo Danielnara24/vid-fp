@@ -384,8 +384,19 @@ fn duration_seconds(
     }
 
     if duration_sec <= 0.0 {
-        // FFmpeg's AV_TIME_BASE format duration.
-        duration_sec = ictx.duration() as f64 / 1_000_000.0;
+        // FFmpeg's AV_TIME_BASE format duration. "Unknown" is AV_NOPTS_VALUE,
+        // i.e. i64::MIN, and dividing that out yields -9223372036854.78
+        // seconds -- a number that every consumer downstream happens to reject,
+        // but only by failing a `> 0.0` guard, and which reached the report's
+        // sortable `length_seconds` column and the JSON verbatim before it got
+        // there. Anything not positive says the same thing the fallback exists
+        // to detect: the container never reported a runtime.
+        let reported = ictx.duration();
+        duration_sec = if reported > 0 {
+            reported as f64 / 1_000_000.0
+        } else {
+            0.0
+        };
     }
 
     duration_sec
@@ -731,6 +742,16 @@ fn index_keyframes(ictx: &ffmpeg_next::format::context::Input, stream_index: usi
 /// not log it as one. A video whose duration cannot be determined is NOT
 /// skipped; unknown is not the same as short.
 ///
+/// `file_size` is the length the caller measured, and is recorded on the
+/// fingerprint as given rather than re-derived here. `sources::collect` stats
+/// every file exactly once and everything downstream reads that figure; this
+/// function used to be the one exception, calling `std::fs::metadata` again
+/// purely to fill this field. Taking it as an argument removes a syscall per
+/// decode and, more usefully, makes the fingerprint's `file_size` and the cache
+/// `Stamp`'s `size` the same measurement from the same moment -- so a file that
+/// grew between the scan and its decode now reads as CHANGED at disposal time
+/// instead of being deleted against a size nothing else in the run agreed with.
+///
 /// `progress` is handed the byte offset of each packet of the VIDEO STREAM
 /// BEING FINGERPRINTED as the demuxer advances through it, so a caller drawing
 /// a bar can move it DURING a decode rather than only when one ends. A single
@@ -749,6 +770,7 @@ pub fn fingerprint_video(
     min_kf_samples: f64,
     decode_threads: usize,
     min_duration: f64,
+    file_size: u64,
     progress: &dyn Fn(u64),
 ) -> Result<Option<VideoFingerprint>> {
     // 1. Native Zero-Copy Extraction (No Subprocess Overhead)
@@ -847,8 +869,6 @@ pub fn fingerprint_video(
 
     let mut decoder = context_decoder.decoder().video()
         .context("Failed to initialize video decoder")?;
-
-    let file_size = std::fs::metadata(filepath).map(|m| m.len()).unwrap_or(0);
 
     // Built from the first frame the decoder produces rather than from the
     // header. Without the probe the container never reports a pixel format --
@@ -1399,7 +1419,8 @@ mod tests {
         let filepath = fixture_path.to_string_lossy().to_string();
         assert!(fixture_path.exists(), "Fixture video not found at: {}.", filepath);
 
-        let result = fingerprint_video(&filepath, 0.0, 4.0, threads, 0.0, &|_| {});
+        let size = std::fs::metadata(&fixture_path).map(|m| m.len()).unwrap_or(0);
+        let result = fingerprint_video(&filepath, 0.0, 4.0, threads, 0.0, size, &|_| {});
         assert!(result.is_ok(), "Failed to fingerprint video: {:?}", result.err());
         result.unwrap().expect("min_duration is off, nothing should be skipped")
     }
@@ -1427,7 +1448,8 @@ mod tests {
         let filepath = fixture_path().to_string_lossy().to_string();
 
         // The fixture is ~1s; an hour-long floor must reject it without error.
-        let skipped = fingerprint_video(&filepath, 0.0, 4.0, 1, 3600.0, &|_| {}).unwrap();
+        let size = std::fs::metadata(fixture_path()).map(|m| m.len()).unwrap_or(0);
+        let skipped = fingerprint_video(&filepath, 0.0, 4.0, 1, 3600.0, size, &|_| {}).unwrap();
         assert!(skipped.is_none(), "a short video must be skipped, not fingerprinted");
     }
 
@@ -1448,7 +1470,7 @@ mod tests {
         let filepath = path.to_string_lossy().to_string();
 
         let offsets = std::cell::RefCell::new(Vec::new());
-        fingerprint_video(&filepath, 0.0, 4.0, 1, 0.0, &|pos| {
+        fingerprint_video(&filepath, 0.0, 4.0, 1, 0.0, size, &|pos| {
             offsets.borrow_mut().push(pos)
         })
         .unwrap()
@@ -1486,7 +1508,7 @@ mod tests {
         let filepath = path.to_string_lossy().to_string();
 
         let offsets = std::cell::RefCell::new(Vec::new());
-        fingerprint_video(&filepath, 0.0, 4.0, 1, 0.0, &|pos| {
+        fingerprint_video(&filepath, 0.0, 4.0, 1, 0.0, size, &|pos| {
             offsets.borrow_mut().push(pos)
         })
         .unwrap()
@@ -1688,6 +1710,54 @@ mod tests {
         // the user's -t budget.
         let fp = fingerprint_fixture(0);
         assert!(!fp.valid_hashes.is_empty());
+    }
+
+    /// A container that never says how long it is must report that as 0, not as
+    /// FFmpeg's sentinel divided by a million.
+    ///
+    /// `ictx.duration()` is AV_NOPTS_VALUE (i64::MIN) for a raw elementary
+    /// stream, and the old fallback divided it straight through into
+    /// -9223372036854.78 seconds. Every consumer downstream happened to reject
+    /// that -- but only by failing a `> 0.0` guard, which is luck rather than
+    /// design -- and it reached the report's sortable `length_seconds` column
+    /// and the JSON verbatim, where a spreadsheet sorting on runtime got it at
+    /// the top.
+    ///
+    /// The fixture is `test_video.mp4` remuxed to Annex-B H.264, which is the
+    /// cheapest container with no duration field at all.
+    #[test]
+    fn test_a_container_with_no_duration_reports_zero_rather_than_a_sentinel() {
+        init_ffmpeg_for_tests();
+        let path = fixture_named("test_video_no_duration.h264");
+        let filepath = path.to_string_lossy().to_string();
+        let size = std::fs::metadata(&path).unwrap().len();
+
+        let fp = fingerprint_video(&filepath, 0.0, 4.0, 1, 0.0, size, &|_| {})
+            .unwrap()
+            .expect("min_duration is off, nothing should be skipped");
+
+        assert_eq!(fp.duration, 0.0, "unknown runtime must read as unknown, not as -9.2e12");
+        // And the figures derived from it stay honest rather than inheriting a
+        // sign from the sentinel.
+        assert_eq!(fp.bitrate(), 0);
+        assert_eq!(fp.quality(), 0);
+        assert!(!fp.valid_hashes.is_empty(), "the stream still fingerprints");
+    }
+
+    #[test]
+    fn test_the_recorded_size_is_the_one_the_caller_measured() {
+        // The field is no longer re-stat'ed here: it is the scan's own figure,
+        // which is also what the cache stamp is built from. A caller that
+        // measured 12345 bytes gets 12345 back, so the staleness check at
+        // disposal time compares against the size the decision was made on.
+        init_ffmpeg_for_tests();
+        let filepath = fixture_path().to_string_lossy().to_string();
+
+        let fp = fingerprint_video(&filepath, 0.0, 4.0, 1, 0.0, 12_345, &|_| {})
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(fp.file_size, 12_345);
     }
 
     #[test]

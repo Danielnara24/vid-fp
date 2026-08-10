@@ -291,8 +291,8 @@ and the byte total before anything happens.
 | `-e`, `--exclude <FOLDER>` | Exclude a folder; repeat for several | — |
 | `-x`, `--extensions <EXT>` | Video extensions to include, comma-separated or repeated | `mp4,mkv,avi,mov,flv,webm` |
 | `-d`, `--hamming-distance <N>` | Frame-match tolerance, in bits out of 64; higher = less strict matching. Raise to increase duplicates found (but can increase false positives). See [Tuning](#tuning) | `4` |
-| `-p`, `--match-percent <F>` | Min % of overlap to count as a duplicate; Lower = Includes shorter matches (but can increase false positives) | `20.0` |
-| `--min-duration <SECS>` | Min shared clip length in seconds for a match. Videos shorter than this are skipped entirely. `0` = off | `0.0` |
+| `-p`, `--match-percent <F>` | Min % of overlap to count as a duplicate, from `0` to `100`; Lower = Includes shorter matches (but can increase false positives). Values outside the range are refused | `20.0` |
+| `--min-duration <SECS>` | Min shared clip length in seconds for a match. Videos shorter than this are skipped entirely. `0` = off; negative values are refused | `0.0` |
 | `-k`, `--priority <P>` | Criteria for KEEPING files: `length`, `resolution`, `quality`, or `size`. The chosen one is compared first; the rest follow in the default order. See [Codecs and quality](#codecs-and-quality) | `length` |
 | `--trust-chains` | Mark a file DELETE even when it never matched the copy being kept, reaching its group only through a chain of matches; such files are flagged REVIEW by default. Changes labels only, deleting still needs `--delete` or `--move-to` | off |
 | `--keyframe-interval <F>` | Seconds between sampled keyframes (`0` = every keyframe); Higher = Faster processing (Increasing this can hinder the capability of finding short matches between videos) | `0.0` |
@@ -360,6 +360,11 @@ unlikely.
 must share. It's the tool to reach for when `-p` alone can't express what you
 want. Both gates apply, so `-p 5 --min-duration 60`
 means "at least 5% overlap *and* at least a minute of it".
+
+The seconds it compares against are exactly the figure the report's **shared**
+column prints — the lower of the two files' estimates, which is the conservative
+one. A pair the report describes as sharing 3 seconds cannot get past
+`--min-duration 5`.
 
 It also skips fingerprinting anything shorter than the floor outright — such a
 file can't contain a long enough shared clip, so there's nothing to gain by
@@ -507,6 +512,14 @@ the file that was judged redundant and was left alone.
 Fingerprints are cached (under `$XDG_CACHE_HOME/vid-fp`, falling back to
 `~/.cache/vid-fp`), so re-scanning the same library is near-instant. Use
 `--clear-cache` or `--prune-cache` to manage it.
+
+An entry is invalidated by the file changing (size or modification time) and by
+the two flags that decide which frames get sampled — `--keyframe-interval` and,
+while an interval is actually in force, `--min-keyframes`. With sampling off,
+which is the default, `--min-keyframes` floors nothing and moving it costs you
+nothing. The comparison flags (`-d`, `-p`, `--min-duration`) are applied to
+cached fingerprints and never invalidate them, which is why re-running a scan at
+a different tolerance is instant.
 
 ## Exit codes
 

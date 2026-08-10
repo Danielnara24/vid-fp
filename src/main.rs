@@ -157,12 +157,31 @@ impl Stamp {
             && self.mtime_nsec == other.mtime_nsec
             && self.size == other.size
             && same_setting(self.kf_interval, other.kf_interval)
-            && same_setting(self.min_kf_samples, other.min_kf_samples)
+            // `--min-keyframes` is a FLOOR on the sampling interval, and with no
+            // interval in force there is nothing for it to floor -- see
+            // `effective_interval`, which requires a real interval before it
+            // reads this at all. Comparing it regardless threw away a whole
+            // library's fingerprints for a flag that provably changed not one
+            // frame. The two intervals are already known equal here, so testing
+            // either side's is the same test.
+            && (!sampling_is_on(other.kf_interval)
+                || same_setting(self.min_kf_samples, other.min_kf_samples))
     }
 }
 
 fn same_setting(a: f64, b: f64) -> bool {
     a == b || (a.is_nan() && b.is_nan())
+}
+
+/// Whether keyframe subsampling actually happens at this interval.
+///
+/// Mirrors `fingerprint::fingerprint_video`'s own `effective_interval` guard
+/// exactly, NaN and all: a nonsense interval subsamples nothing, so nothing is
+/// floored by `--min-keyframes` either. Spelled as a named predicate rather
+/// than inlined so the negation in `Stamp::matches` reads as "sampling is off"
+/// instead of as a comparison against a float that might not be comparable.
+fn sampling_is_on(kf_interval: f64) -> bool {
+    kf_interval > 0.0
 }
 
 /// What one cache value holds.
@@ -246,13 +265,17 @@ struct Args {
     #[arg(short = 'd', long = "hamming-distance", default_value_t = 4)]
     hamming_distance: u32,
 
-    /// Minimum match percentage required to be considered a duplicate. Default is 20.0 (20%).
+    /// Minimum match percentage required to be considered a duplicate, from 0
+    /// to 100. Default is 20.0 (20%). Values outside that range are rejected
+    /// before the scan starts: coverage is capped at 100%, so a higher floor is
+    /// one no pair could ever clear.
     #[arg(short = 'p', long = "match-percent", default_value_t = 20.0)]
     match_percent: f32,
 
     /// Minimum shared clip length, in seconds, for two videos to count as a
-    /// match. Also skips fingerprinting any video shorter than this. 0 = off.
-    /// Independent of --match-percent; both must be satisfied.
+    /// match. Also skips fingerprinting any video shorter than this. 0 = off,
+    /// and negative values are rejected before the scan starts. Independent of
+    /// --match-percent; both must be satisfied.
     #[arg(long = "min-duration", default_value_t = 0.0)]
     min_duration: f64,
 
@@ -407,6 +430,53 @@ fn resolve_move_to(dir: Option<&String>) -> Result<Option<PathBuf>> {
         anyhow::bail!("--move-to {} is not a folder.", dir);
     }
     Ok(Some(resolved))
+}
+
+/// Refuse a `--output` path that plainly cannot be written, before any work
+/// starts.
+///
+/// The same reasoning `resolve_move_to` is built on, applied to the other
+/// argument naming a path: a destination that cannot exist is a typo, and
+/// finding a typo out after fingerprinting a library is finding it out several
+/// hours too late. The report used to be the one path checked only at the point
+/// of writing it, which is the last statement of the run -- so `-o
+/// /nonexistant/report.csv` did the entire scan and then threw the results
+/// away, and with `--delete` armed it did so *after* the files were gone.
+///
+/// Deliberately does not create anything. `--move-to` names a folder the user
+/// wants files put in, so creating it is the request; `-o` names a file, and
+/// conjuring parent directories for it is not. Nor does it touch the target
+/// itself -- an existing report stays intact until the new one replaces it, and
+/// an interrupted run leaves no empty file behind.
+///
+/// What it cannot see is permissions, which still surface at the end. That is
+/// now the only late failure, and it is the rare one: a mistyped path is a
+/// typo, an unwritable directory you own is a decision.
+fn check_output_path(output: Option<&String>) -> Result<()> {
+    let Some(out) = output else { return Ok(()) };
+    let path = Path::new(out);
+
+    if path.is_dir() {
+        anyhow::bail!("--output {} is a folder, not a file to write.", out);
+    }
+
+    let parent = match path.parent() {
+        // A bare "report.csv" has an empty parent, which is the working
+        // directory rather than nowhere.
+        Some(p) if p.as_os_str().is_empty() => Path::new("."),
+        Some(p) => p,
+        None => Path::new("/"),
+    };
+
+    if !parent.is_dir() {
+        anyhow::bail!(
+            "--output {} cannot be written: {} is not an existing folder.",
+            out,
+            parent.display()
+        );
+    }
+
+    Ok(())
 }
 
 /// Say up front what is going to happen to the files marked DELETE, so it is
@@ -1173,11 +1243,32 @@ fn run(
     let max_hamming = args.hamming_distance;
     let min_match_pct = args.match_percent / 100.0;
     let min_duration = args.min_duration;
-    if min_duration < 0.0 {
-        anyhow::bail!("--min-duration cannot be negative.");
+
+    // Both of these are range tests rather than the `< 0.0` this used to be,
+    // and the reason is NaN: every comparison against it is false whichever way
+    // it is written, and clap parses `--min-duration=nan` without complaint. A
+    // NaN floor would disable the gate silently; a NaN percentage is worse,
+    // because `pct_a.max(pct_b) < min_match_percent` is then false for every
+    // pair and the run accepts everything the index proposed -- which with
+    // --delete armed can only ever ADD files to the DELETE set.
+    // `RangeInclusive::contains` is false for NaN, so one form catches the lot.
+    if !(0.0..).contains(&min_duration) {
+        anyhow::bail!("--min-duration must be zero or more seconds (0 turns it off).");
+    }
+    // The upper bound is not a matter of taste. `match_overlap` clamps every
+    // coverage figure to 1.0, so a floor above 100% is one no pair can ever
+    // clear: the run would fingerprint the whole library and be structurally
+    // incapable of reporting a single group. 0 stays legal and means "report
+    // every pair the index proposes".
+    if !(0.0..=100.0).contains(&args.match_percent) {
+        anyhow::bail!(
+            "--match-percent must be between 0 and 100 (coverage is capped at 100%, so a \
+             higher floor could never be met)."
+        );
     }
 
     let move_to = resolve_move_to(args.move_to.as_ref())?;
+    check_output_path(args.output.as_ref())?;
 
     // Say out loud which flags are not doing anything. A user who passed
     // --permanent and watched a report scroll by has to be told the files were
@@ -1719,6 +1810,10 @@ fn run(
                             min_kf_samples,
                             grant.threads,
                             min_duration,
+                            // The scan's own stat, the same figure this job's
+                            // cache stamp was built from -- see the note on
+                            // `fingerprint_video`.
+                            job.size,
                             &advance,
                         );
 
@@ -2233,12 +2328,32 @@ mod tests {
         // one setting is not an answer for a run using another.
         let base = stamp(1_700_000_000, 12_345);
 
-        let coarser = Stamp { kf_interval: 5.0, ..base };
+        let sampled = Stamp { kf_interval: 5.0, ..base };
+        assert!(!base.matches(&sampled));
+        assert!(sampled.matches(&sampled));
+    }
+
+    #[test]
+    fn test_min_keyframes_only_invalidates_while_it_is_flooring_something() {
+        // `--min-keyframes` is a floor on the sampling interval. With sampling
+        // off -- which is the DEFAULT -- there is no interval for it to floor
+        // and it changes not one decoded frame, so an entry cannot stop being
+        // valid because it moved. Comparing it regardless re-fingerprinted whole
+        // libraries for a flag that did nothing.
+        let base = stamp(1_700_000_000, 12_345);
         let fewer = Stamp { min_kf_samples: 2.0, ..base };
 
-        assert!(!base.matches(&coarser));
-        assert!(!base.matches(&fewer));
-        assert!(coarser.matches(&coarser));
+        assert!(
+            base.matches(&fewer),
+            "with no interval in force this flag decides nothing and must not invalidate"
+        );
+
+        // Turn sampling on and it is load-bearing again, so it counts.
+        let sampled = Stamp { kf_interval: 5.0, ..base };
+        let sampled_fewer = Stamp { kf_interval: 5.0, ..fewer };
+
+        assert!(!sampled.matches(&sampled_fewer), "now it changes which frames are kept");
+        assert!(sampled_fewer.matches(&sampled_fewer));
     }
 
     #[test]
@@ -2409,6 +2524,96 @@ mod tests {
         assert!(err.contains("--delete"), "{}", err);
         assert!(err.contains("--move-to"), "{}", err);
         assert!(Path::new(&doomed).exists(), "and nothing was touched");
+    }
+
+    /// Everything the run needs to reach the argument checks: a real scan root
+    /// so nothing earlier can fail for an unrelated reason.
+    fn args_over(dir: &tempfile::TempDir, extra: &[&str]) -> Args {
+        let root = dir.path().to_string_lossy().to_string();
+        let mut argv = vec!["vid-fp".to_string(), root];
+        argv.extend(extra.iter().map(|s| s.to_string()));
+        Args::parse_from(argv)
+    }
+
+    fn run_error(dir: &tempfile::TempDir, db: &Database, extra: &[&str]) -> String {
+        let stats = RunStats::default();
+        run(&args_over(dir, extra), db, Instant::now(), 1, &stats)
+            .expect_err("this run should have been refused")
+            .to_string()
+    }
+
+    #[test]
+    fn test_a_percentage_outside_zero_to_a_hundred_is_refused_before_any_work() {
+        // Above 100 is the case worth catching: `match_overlap` clamps coverage
+        // to 1.0, so such a floor is one no pair can ever clear -- the run would
+        // fingerprint the whole library and be structurally incapable of
+        // reporting a group. Below 0 is the same typo in the other direction,
+        // and it only ever LOOSENS the run, which with --delete armed can add
+        // files to the DELETE set.
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+
+        for bad in ["--match-percent=500", "--match-percent=-50", "--match-percent=nan"] {
+            let err = run_error(&dir, &db, &[bad]);
+            assert!(err.contains("--match-percent"), "{}: {}", bad, err);
+        }
+
+        // The ends of the range are legal: 0 means "report every pair the index
+        // proposes", which is a supported way to run this.
+        for ok in ["--match-percent=0", "--match-percent=100"] {
+            let stats = RunStats::default();
+            assert!(
+                run(&args_over(&dir, &[ok]), &db, Instant::now(), 1, &stats).is_ok(),
+                "{} is inside the range and must be accepted",
+                ok
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_negative_or_unparseable_duration_floor_is_refused() {
+        // NaN is the reason this is a range test rather than `< 0.0`: every
+        // comparison against it is false, so a NaN floor slipped through and
+        // silently disabled the gate it was meant to tighten.
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+
+        for bad in ["--min-duration=-5", "--min-duration=nan"] {
+            let err = run_error(&dir, &db, &[bad]);
+            assert!(err.contains("--min-duration"), "{}: {}", bad, err);
+        }
+    }
+
+    #[test]
+    fn test_an_unwritable_report_path_is_refused_before_the_scan() {
+        // The whole point is WHEN this fires. Checked only at the point of
+        // writing, a mistyped -o did the entire scan and then threw the results
+        // away -- and with --delete armed, it did that after the files were
+        // already gone.
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+
+        let err = run_error(&dir, &db, &["-o", "/nonexistent/vid-fp/report.csv"]);
+        assert!(err.contains("--output"), "{}", err);
+        assert!(err.contains("/nonexistent/vid-fp"), "{}", err);
+
+        // A folder is not a file to write either.
+        let as_dir = dir.path().to_string_lossy().to_string();
+        let err = run_error(&dir, &db, &["-o", &as_dir]);
+        assert!(err.contains("folder"), "{}", err);
+    }
+
+    #[test]
+    fn test_an_ordinary_report_path_is_accepted() {
+        // Including the bare relative name, whose parent is the empty string
+        // rather than a directory -- the one shape this check could plausibly
+        // get wrong in the direction that refuses a perfectly good run.
+        assert!(check_output_path(None).is_ok());
+        assert!(check_output_path(Some(&"report.csv".to_string())).is_ok());
+
+        let dir = tempfile::tempdir().unwrap();
+        let inside = dir.path().join("report.csv").to_string_lossy().to_string();
+        assert!(check_output_path(Some(&inside)).is_ok());
     }
 
     #[test]

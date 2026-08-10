@@ -178,8 +178,20 @@ fn read(path: &str, stats: &RunStats) -> Result<Report> {
             continue;
         }
 
-        let file = record.get(path_col).unwrap_or("").trim();
-        if file.is_empty() {
+        // Deliberately NOT trimmed, unlike every other cell this function reads.
+        // Leading and trailing spaces are legal in a Linux filename, and the
+        // report writes one out verbatim -- a trailing space does not make a
+        // CSV field need quoting -- so trimming here means the tool cannot even
+        // replay its own report. What it does instead is look up a DIFFERENT
+        // path: `dupe.mkv ` becomes `dupe.mkv`, and if that neighbour happens to
+        // be the size the row recorded, the staleness check passes and the wrong
+        // file is deleted. The check cannot catch it, because it is taken against
+        // whatever path survived the trim.
+        //
+        // Whitespace is still not a file name, so a cell holding only spaces is
+        // treated as the empty one it plainly is.
+        let file = record.get(path_col).unwrap_or("");
+        if file.trim().is_empty() {
             log::error!("{}: line {} is marked DELETE but names no file.", path, line);
             stats
                 .report_unusable
@@ -382,6 +394,48 @@ shared_with;shared_seconds;shared_from;shared_to;shared_from_seconds;shared_to_s
         assert_eq!(report.marked[0].path, "/b.mkv");
         assert_eq!(report.marked[0].size, 20);
         assert_eq!(stats.report_unusable.count(), 0);
+    }
+
+    #[test]
+    fn test_a_path_keeps_the_whitespace_that_is_part_of_its_name() {
+        // Leading and trailing spaces are legal in a Linux filename and the CSV
+        // writer emits them verbatim, so trimming here meant the tool could not
+        // replay its own report -- it looked up a DIFFERENT path. With a
+        // same-sized neighbour beside it (`dupe.mkv` next to `dupe.mkv `) the
+        // size check passes against the wrong file and the wrong file is
+        // deleted, which is the one outcome this mode must never produce.
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "{}\n{}\n{}\n",
+            HEADER,
+            row("/videos/dupe.mkv ", 20, "DELETE"),
+            row("/videos/ leading.mkv", 30, "DELETE"),
+        );
+        let path = write_report(&dir, &body);
+
+        let stats = RunStats::default();
+        let report = read(&path, &stats).unwrap();
+
+        assert_eq!(report.marked.len(), 2);
+        assert_eq!(report.marked[0].path, "/videos/dupe.mkv ", "the trailing space is the name");
+        assert_eq!(report.marked[1].path, "/videos/ leading.mkv");
+        assert_eq!(stats.report_unusable.count(), 0);
+    }
+
+    #[test]
+    fn test_a_cell_holding_only_whitespace_still_names_no_file() {
+        // The other half of not trimming: spaces are part of a name, but a cell
+        // that is nothing BUT spaces is the empty cell it plainly is, and acting
+        // on it would mean disposing of a path made of blanks.
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!("{}\n{}\n", HEADER, row("   ", 20, "DELETE"));
+        let path = write_report(&dir, &body);
+
+        let stats = RunStats::default();
+        let report = read(&path, &stats).unwrap();
+
+        assert!(report.marked.is_empty());
+        assert_eq!(stats.report_unusable.count(), 1);
     }
 
     #[test]
