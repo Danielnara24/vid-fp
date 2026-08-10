@@ -563,34 +563,50 @@ pub fn output_results(
         .delimiter(b';')
         .from_writer(Vec::new());
 
-    // The CSV carries exactly what the JSON carries, field for field. Anything
-    // shown in a formatted column also appears as the raw number it was
-    // formatted from, because the formatted one is for reading and the raw one
-    // is for sorting and filtering -- a spreadsheet cannot sort "1.0MB" against
-    // "900.0KB", and no consumer of a CSV should have to parse a unit suffix to
-    // get a figure this tool already has.
+    // The CSV carries exactly what the JSON carries, field for field, in the
+    // same order. Anything shown in a formatted column is immediately followed
+    // by the raw number it was formatted from, because the formatted one is for
+    // reading and the raw one is for sorting and filtering -- a spreadsheet
+    // cannot sort "1.0MB" against "900.0KB", nor "1920x1080" against "640x480",
+    // and no consumer of a CSV should have to parse a unit suffix or split a
+    // label to get a figure this tool already has.
+    //
+    // The columns run in three blocks, each answering one question:
+    //
+    //   who        group, action, full_path -- the row's identity and its fate.
+    //                Action sits beside the path because --from-report exists to
+    //                have it edited, and an action column you have to scroll to
+    //                is one that gets edited on the wrong row.
+    //   what       length .. quality_bits_per_frame -- the file's own properties,
+    //                ordered the way the ranking reads them: footage first
+    //                (length, resolution, frame rate), then the codec, then the
+    //                three bit-derived figures the codec governs. Codec leads
+    //                that trio deliberately: it is the reason two rows' size,
+    //                bitrate and quality may not be compared with each other.
+    //   against what   shared_with .. shared_to_seconds -- the strongest measured
+    //                link: which file, how much footage, and where in THIS file
+    //                it sits.
     csv_wtr
         .write_record(&[
             "group",
+            "action",
+            "full_path",
+            "length",
+            "length_seconds",
             "resolution",
-            "codec",
+            "width",
+            "height",
             "framerate",
             "framerate_fps",
+            "codec",
             "size",
             "size_bytes",
             "bitrate",
             "bitrate_bps",
             "quality",
             "quality_bits_per_frame",
-            "length",
-            "shared_seconds",
-            "full_path",
-            "action",
-            // Which member of the group the three figures above it describe, and
-            // where in THIS file the shared footage sits. Appended rather than
-            // slotted in beside shared_seconds so that every column a reader's
-            // existing script already indexes keeps its position.
             "shared_with",
+            "shared_seconds",
             "shared_from",
             "shared_to",
             "shared_from_seconds",
@@ -667,6 +683,13 @@ pub fn output_results(
             let size_bytes_raw = fp.file_size.to_string();
             let bitrate_bps_raw = fp.bitrate().to_string();
             let shared_seconds_raw = csv_seconds(shared);
+            // Runtime and frame geometry as plain numbers, so every figure the
+            // ranking uses can be sorted on. Resolution's raw form is the two
+            // sides rather than their product: the product is one multiplication
+            // away in any spreadsheet, and the sides are what was measured.
+            let length_seconds_raw = format!("{:.2}", fp.duration);
+            let width_raw = fp.width.to_string();
+            let height_raw = fp.height.to_string();
 
             // The file the figures above describe. Empty rather than "-" when
             // there is none, for the same reason every other unknown is empty:
@@ -708,55 +731,56 @@ pub fn output_results(
 
             // 1. Console / Text Output
             //
-            // "shared" is spelled out on every row because the console has no
-            // header, and two time values side by side ("00:00:09, 0.8s") would
-            // otherwise be ambiguous about which is which. The frame rate and
-            // the bits-per-frame figure carry their units for the same reason.
-            info!(
-                "\t{}, {}, {}, {}, {}, {}, {}, {} shared, {}, {}",
+            // The same three blocks as the CSV, minus the raw duplicates and the
+            // path of the matched file -- both are noise at a glance and neither
+            // fits on a terminal line.
+            //
+            // The action leads and is padded to a fixed width so it forms a
+            // column the eye can run down; the path trails because it is the one
+            // field with no bounded length, and anything after it would be
+            // ragged. "shared" is spelled out on every row because the console
+            // has no header, and two time values side by side ("00:00:09, 0.8s")
+            // would otherwise be ambiguous about which is which. The frame rate
+            // and the bits-per-frame figure carry their units for the same
+            // reason.
+            let line = format!(
+                "\t{:<8} {}, {}, {}, {}, {}, {}, {}, {} shared, {}",
+                format!("{},", action_str),
+                duration_str,
                 res_str,
-                codec_str,
                 frame_rate_str,
+                codec_str,
                 size_str,
                 bitrate_str,
                 quality_str,
-                duration_str,
                 shared_str,
-                fp.path,
-                action_str
+                fp.path
             );
-            txt_out.push_str(&format!(
-                "\t{}, {}, {}, {}, {}, {}, {}, {} shared, {}, {}\n",
-                res_str,
-                codec_str,
-                frame_rate_str,
-                size_str,
-                bitrate_str,
-                quality_str,
-                duration_str,
-                shared_str,
-                fp.path,
-                action_str
-            ));
+            info!("{}", line);
+            txt_out.push_str(&line);
+            txt_out.push('\n');
 
             // 2. CSV Output
             csv_wtr.write_record(&[
                 &group_name,
+                action_str,
+                &fp.path,
+                &duration_str,
+                &length_seconds_raw,
                 &res_str,
-                &codec_str,
+                &width_raw,
+                &height_raw,
                 &frame_rate_str,
                 &frame_rate_raw,
+                &codec_str,
                 &size_str,
                 &size_bytes_raw,
                 &bitrate_str,
                 &bitrate_bps_raw,
                 &quality_str,
                 &quality_raw,
-                &duration_str,
-                &shared_seconds_raw,
-                &fp.path,
-                action_str,
                 &shared_with_raw,
+                &shared_seconds_raw,
                 &shared_from_str,
                 &shared_to_str,
                 &shared_from_raw,
@@ -789,25 +813,30 @@ pub fn output_results(
                 })
                 .collect();
 
+            // Key for key and block for block, the CSV row above. Written in
+            // that order and kept in it by serde_json's `preserve_order`.
             json_files.push(serde_json::json!({
+                "action": action_str,
+                "full_path": fp.path,
+                "length": duration_str,
+                "length_seconds": (fp.duration * 100.0).round() / 100.0,
                 "resolution": res_str,
-                "codec": codec_str,
+                "width": fp.width,
+                "height": fp.height,
                 "framerate": frame_rate_str,
                 "framerate_fps": frame_rate_num,
+                "codec": codec_str,
                 "size": size_str,
                 "size_bytes": fp.file_size,
                 "bitrate": bitrate_str,
                 "bitrate_bps": fp.bitrate(),
                 "quality": quality_str,
                 "quality_bits_per_frame": quality_num,
-                "length": duration_str,
-                "shared_seconds": shared.map(|s| (s * 100.0).round() / 100.0),
-                "full_path": fp.path,
-                "action": action_str,
                 // The strongest link, spelled out so the JSON says the same
                 // thing the CSV does without a consumer having to re-derive it
                 // from the list below.
                 "shared_with": best.map(|l| &fingerprints[l.other].path),
+                "shared_seconds": shared.map(|s| (s * 100.0).round() / 100.0),
                 "shared_from": best_span.map(|s| format_duration(s.start_seconds())),
                 "shared_to": best_span.map(|s| format_duration(s.end_seconds())),
                 "shared_from_seconds": best_span
@@ -896,11 +925,23 @@ pub fn output_results(
                     .context(format!("Failed to write CSV to {}", out_path))?;
             }
             "json" => {
+                // Summary first, then the groups. It is the part a human opens
+                // the file to read, and burying it under an array with a row per
+                // duplicate makes it something you have to go looking for.
+                //
+                // Its own three blocks run what was found -> what was decided ->
+                // what was done, so a dry run's keys stop after the second one
+                // has said everything it can.
                 let json_final = serde_json::json!({
                     "summary": {
                         "total_groups": final_groups.len(),
                         "total_files_matched": matched_file_count,
                         "time_elapsed_seconds": total_elapsed_secs,
+                        // What the run would reclaim, present whether or not it
+                        // did anything: a dry run's whole output is a plan, and
+                        // a plan with no cost attached is not one.
+                        "files_marked_delete": delete_candidate_count,
+                        "reclaimable_bytes": reclaimable_bytes,
                         "deletion_enabled": acting,
                         "mode": disposal.map(|d| d.mode()).unwrap_or("report"),
                         "move_to": match disposal {
@@ -909,11 +950,6 @@ pub fn output_results(
                             }
                             _ => None,
                         },
-                        // What the run would reclaim, present whether or not it
-                        // did anything: a dry run's whole output is a plan, and
-                        // a plan with no cost attached is not one.
-                        "files_marked_delete": delete_candidate_count,
-                        "reclaimable_bytes": reclaimable_bytes,
                         "files_removed": removed_count,
                         "bytes_removed": removed_bytes,
                         "files_failed": failed_count,
@@ -1014,9 +1050,10 @@ mod tests {
     use tempfile::NamedTempFile;
     use std::fs;
 
-    const CSV_HEADER: &str = "group;resolution;codec;framerate;framerate_fps;\
-size;size_bytes;bitrate;bitrate_bps;quality;quality_bits_per_frame;length;shared_seconds;\
-full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to_seconds";
+    const CSV_HEADER: &str = "group;action;full_path;length;length_seconds;resolution;width;\
+height;framerate;framerate_fps;codec;size;size_bytes;bitrate;bitrate_bps;quality;\
+quality_bits_per_frame;shared_with;shared_seconds;shared_from;shared_to;shared_from_seconds;\
+shared_to_seconds";
 
     fn mock_fp() -> VideoFingerprint {
         VideoFingerprint {
@@ -1160,8 +1197,8 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
         // A group of one has nobody to be compared against, so every column
         // that describes a link is empty too.
         assert!(contents.contains(
-            "group_1;1920x1080;h264;30fps;30;1.0MB;1048576;140kbps;139810;4.7kb/f;4660;\
-00:01:00;;/fake/path/vid.mp4;KEEP;;;;;"
+            "group_1;KEEP;/fake/path/vid.mp4;00:01:00;60.00;1920x1080;1920;1080;30fps;30;h264;\
+1.0MB;1048576;140kbps;139810;4.7kb/f;4660;;;;;;"
         ), "{}", contents);
 
         // Clean up
@@ -1255,14 +1292,17 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
 
         assert!(
             csv.contains(
-                "group_1;1920x1080;h264;30fps;30;12.5MB;13107200;1.0Mbps;1048576;\
-35.0kb/f;34952;00:01:40;80.00;/fake/a.mp4;KEEP"
+                "group_1;KEEP;/fake/a.mp4;00:01:40;100.00;1920x1080;1920;1080;30fps;30;h264;\
+12.5MB;13107200;1.0Mbps;1048576;35.0kb/f;34952;/fake/b.mp4;80.00;"
             ),
             "{}",
             csv
         );
 
         // Every raw figure in the row above is the one the JSON reports.
+        assert_eq!(file["length_seconds"], 100.0);
+        assert_eq!(file["width"], 1920);
+        assert_eq!(file["height"], 1080);
         assert_eq!(file["framerate_fps"], 30.0);
         assert_eq!(file["size_bytes"], 13_107_200u64);
         assert_eq!(file["bitrate_bps"], 1_048_576u64);
@@ -1293,9 +1333,11 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
             true, &RunStats::default(),
         ).unwrap();
 
+        // Read as `shared_with;shared_seconds`: each row names the other file
+        // and reports the same minute of footage.
         let contents = fs::read_to_string(&path_str).unwrap();
-        assert!(contents.contains(";60.00;/fake/host.mp4;"), "host row: {}", contents);
-        assert!(contents.contains(";60.00;/fake/clip.mp4;"), "clip row: {}", contents);
+        assert!(contents.contains(";/fake/clip.mp4;60.00;"), "host row: {}", contents);
+        assert!(contents.contains(";/fake/host.mp4;60.00;"), "clip row: {}", contents);
 
         let _ = fs::remove_file(path_str);
     }
@@ -1325,16 +1367,14 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
         let contents = fs::read_to_string(&path_str).unwrap();
 
         assert!(
-            contents.contains(
-                "/fake/host.mp4;KEEP;/fake/clip.mp4;00:14:00;00:15:00;840.00;900.00"
-            ),
+            contents.contains("group_1;KEEP;/fake/host.mp4;")
+                && contents.contains("/fake/clip.mp4;60.00;00:14:00;00:15:00;840.00;900.00"),
             "the host row should point into the host's own timeline: {}",
             contents
         );
         assert!(
-            contents.contains(
-                "/fake/clip.mp4;DELETE;/fake/host.mp4;00:00:00;00:01:00;0.00;60.00"
-            ),
+            contents.contains("group_1;DELETE;/fake/clip.mp4;")
+                && contents.contains("/fake/host.mp4;60.00;00:00:00;00:01:00;0.00;60.00"),
             "the clip row should point into the clip's own timeline: {}",
             contents
         );
@@ -1548,7 +1588,11 @@ full_path;action;shared_with;shared_from;shared_to;shared_from_seconds;shared_to
         // The CSV says the same thing with empty fields rather than nulls: a
         // dash in the formatted column, nothing at all in the raw one.
         let csv = fs::read_to_string(&csv_path).unwrap();
-        assert!(csv.contains(";-;;7.5MB;7864320;1.0Mbps;1048576;-;;"), "{}", csv);
+        assert!(
+            csv.contains(";1920;1080;-;;h264;7.5MB;7864320;1.0Mbps;1048576;-;;"),
+            "{}",
+            csv
+        );
 
         let _ = fs::remove_file(json_path);
         let _ = fs::remove_file(csv_path);

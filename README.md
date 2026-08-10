@@ -434,8 +434,8 @@ more, check the pair you care about rather than assuming one number covers all
 of them.
 
 **The CSV and JSON say which file, and where.** The console and `.txt` report
-have one line per file and stay as they are, but the machine-readable formats
-carry three more things about that strongest link:
+have one line per file, but the machine-readable formats carry three more things
+about that strongest link:
 
 | Column | Meaning |
 | --- | --- |
@@ -456,8 +456,22 @@ have an envelope covering the whole hour and a `shared_seconds` of about
 thirty. When the two figures agree, the match is one continuous run; when the
 envelope is much the wider, it isn't.
 
-New columns are appended after `action`, so existing column positions are
-unchanged.
+**Every column runs in the same order in both formats**, in three blocks: what
+the row *is* (`group`, `action`, `full_path`), what the file *is* (`length`
+through `quality_bits_per_frame`), and what it was measured *against*
+(`shared_with` through `shared_to_seconds`). `action` sits second because
+`--from-report` exists to have it edited, and an action column you have to
+scroll sideways to find is one that gets edited on the wrong row.
+
+Anything shown formatted is immediately followed by the raw number it was
+formatted from — `length`/`length_seconds`, `resolution`/`width`/`height`,
+`size`/`size_bytes`, and so on — because a spreadsheet cannot sort `1.0MB`
+against `900.0KB`, nor `1920x1080` against `640x480`. Sort and filter on the raw
+column; read the other one.
+
+Column positions are not stable across versions, and nothing needs them to be:
+`--from-report` finds columns by name, so a report from an older build still
+replays, and so does one a spreadsheet handed back reordered.
 
 The JSON additionally gives every file a `matches` array — one entry per group
 member it was directly compared against, strongest first, each with its own

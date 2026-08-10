@@ -74,11 +74,12 @@ struct Report {
 
 /// The index of the column called `name`.
 ///
-/// By name rather than by position on purpose. The CSV's columns are appended
-/// to over time (the layout note in CLAUDE.md exists because of it), and a
-/// report that has been through a spreadsheet may come back with them reordered
-/// or with extras inserted. Nothing here cares where the three columns it needs
-/// are sitting, only that they exist.
+/// By name rather than by position on purpose, and it is what lets the column
+/// layout be chosen for whoever reads it rather than for whatever last parsed
+/// it: a report written by an older build, or one that has been through a
+/// spreadsheet and come back reordered or padded with extra columns, replays
+/// identically. Nothing here cares where the three columns it needs are
+/// sitting, only that they exist.
 fn column(headers: &csv::StringRecord, name: &str) -> Result<usize> {
     headers
         .iter()
@@ -305,7 +306,9 @@ pub fn apply(
             }
         };
 
-        info!("\t{}, {}, {}", format_size(m.size), m.path, label);
+        // Laid out like the grouped run's results table: outcome first as a
+        // column, path last because it is the one field of unbounded width.
+        info!("\t{:<8} {}, {}", format!("{},", label), format_size(m.size), m.path);
     }
 
     let mut summary = export::disposed_line(disposal, removed_count, removed_bytes);
@@ -320,18 +323,28 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    const HEADER: &str = "group;resolution;codec;framerate;framerate_fps;size;size_bytes;\
-bitrate;bitrate_bps;quality;quality_bits_per_frame;length;shared_seconds;full_path;action;\
-shared_with;shared_from;shared_to;shared_from_seconds;shared_to_seconds";
+    const HEADER: &str = "group;action;full_path;length;length_seconds;resolution;width;height;\
+framerate;framerate_fps;codec;size;size_bytes;bitrate;bitrate_bps;quality;quality_bits_per_frame;\
+shared_with;shared_seconds;shared_from;shared_to;shared_from_seconds;shared_to_seconds";
 
     /// A CSV row in the real column layout, with only the three fields this
     /// module reads filled in.
+    ///
+    /// Positions are looked up in HEADER rather than hard-coded, so a change to
+    /// the column order shows up here as nothing at all -- which is the property
+    /// `column()` gives the parser, and these tests should not be the one place
+    /// that quietly stops exercising it.
     fn row(path: &str, size: u64, action: &str) -> String {
-        let mut fields = vec![String::new(); 20];
-        fields[0] = "group_1".to_string();
-        fields[6] = size.to_string();
-        fields[13] = path.to_string();
-        fields[14] = action.to_string();
+        let columns: Vec<&str> = HEADER.split(';').collect();
+        let mut fields = vec![String::new(); columns.len()];
+        let mut set = |name: &str, value: String| {
+            fields[columns.iter().position(|c| *c == name).unwrap()] = value;
+        };
+
+        set("group", "group_1".to_string());
+        set("size_bytes", size.to_string());
+        set("full_path", path.to_string());
+        set("action", action.to_string());
         fields.join(";")
     }
 
