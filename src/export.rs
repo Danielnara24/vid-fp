@@ -590,9 +590,30 @@ pub fn output_results(
     //                three bit-derived figures the codec governs. Codec leads
     //                that trio deliberately: it is the reason two rows' size,
     //                bitrate and quality may not be compared with each other.
-    //   against what   shared_with .. shared_to_seconds -- the strongest measured
-    //                link: which file, how much footage, and where in THIS file
-    //                it sits.
+    //   against what   matched_with .. matched_to_seconds -- the strongest
+    //                measured link: which file, how much footage, and where in
+    //                THIS file it sits.
+    //
+    // Every column in that last block answers for the row's OWN file, which is
+    // what the `matched_` prefix is there to promise. It replaced a `shared_`
+    // block that broke the promise: `shared_seconds` was the pair's reconciled
+    // figure while the range beside it was this file's, so a row whose matched
+    // footage ran 0.00-8.84 reported 1.88 seconds of it and read as a
+    // malfunction. Nothing in the row said one of the numbers had changed
+    // subject, and nothing could -- the fix was to stop mixing them.
+    //
+    // `samples` is the number of hashes this file's fingerprint holds. It is a
+    // property of the file rather than of the link, but it sits immediately
+    // before `matched_seconds` because that is the figure it qualifies: a range
+    // much wider than the footage means either a scattered match or a file too
+    // coarsely sampled to know, and only the sample count tells those apart --
+    // at the limit, a file with ONE sample has that sample standing for its
+    // whole runtime, so its matched footage can only ever come out as all of it
+    // or none of it, and no --match-percent can gate it.
+    //
+    // `framerate` is the one figure with no formatted twin, by request: the
+    // formatted form is still on the console line, where a human reads it, and
+    // the reports keep only `framerate_fps` to sort on.
     csv_wtr
         .write_record([
             "group",
@@ -603,7 +624,6 @@ pub fn output_results(
             "resolution",
             "width",
             "height",
-            "framerate",
             "framerate_fps",
             "codec",
             "size",
@@ -612,12 +632,13 @@ pub fn output_results(
             "bitrate_bps",
             "quality",
             "quality_bits_per_frame",
-            "shared_with",
-            "shared_seconds",
-            "shared_from",
-            "shared_to",
-            "shared_from_seconds",
-            "shared_to_seconds",
+            "matched_with",
+            "samples",
+            "matched_seconds",
+            "matched_from",
+            "matched_to",
+            "matched_from_seconds",
+            "matched_to_seconds",
         ])
         .context("Failed to write CSV header")?;
 
@@ -655,7 +676,7 @@ pub fn output_results(
             // against figures phase 2 already took.
             let links = matches.links_of(idx, fingerprints);
             let best = links.first();
-            let shared = best.map(|l| l.shared_seconds);
+            let matched = best.map(|l| l.matched_seconds);
 
             let size_str = format_size(fp.file_size);
             let bitrate_str = format_bitrate(fp.bitrate());
@@ -674,7 +695,11 @@ pub fn output_results(
             let quality_str = format_quality(fp.quality());
             // The console and text report show only the formatted figure,
             // because a human is reading it at a glance.
-            let shared_str = format_shared(shared);
+            let matched_str = format_shared(matched);
+            // Hashes held, not keyframes decoded: featureless frames are dropped
+            // below MIN_AC_ENERGY, so this is what the comparison actually had
+            // to work with, which is the number that explains the row.
+            let samples_raw = fp.valid_hashes.len().to_string();
 
             // The same values as numbers, for the CSV and JSON. An unknown one
             // is an empty field / a null rather than a zero: a container that
@@ -689,7 +714,7 @@ pub fn output_results(
             let quality_raw = quality_num.map(|q| q.to_string()).unwrap_or_default();
             let size_bytes_raw = fp.file_size.to_string();
             let bitrate_bps_raw = fp.bitrate().to_string();
-            let shared_seconds_raw = csv_seconds(shared);
+            let matched_seconds_raw = csv_seconds(matched);
             // Runtime and frame geometry as plain numbers, so every figure the
             // ranking uses can be sorted on. Resolution's raw form is the two
             // sides rather than their product: the product is one multiplication
@@ -702,19 +727,21 @@ pub fn output_results(
             // there is none, for the same reason every other unknown is empty:
             // a CSV consumer should see a blank cell, not a sentinel it has to
             // know about.
-            let shared_with_raw = best
+            let matched_with_raw = best
                 .map(|l| fingerprints[l.other].path.clone())
                 .unwrap_or_default();
 
-            // The envelope, in this file's own timeline. Both the clock form
-            // and the raw seconds, like every other figure here.
+            // The envelope, in this file's own timeline -- the same timeline
+            // `matched_seconds` is stated in, so the two can be read against
+            // each other. Both the clock form and the raw seconds, like every
+            // other figure here.
             let best_span = best.and_then(|l| l.span);
-            let shared_from_str =
+            let matched_from_str =
                 best_span.map(|s| format_duration(s.start_seconds())).unwrap_or_default();
-            let shared_to_str =
+            let matched_to_str =
                 best_span.map(|s| format_duration(s.end_seconds())).unwrap_or_default();
-            let shared_from_raw = csv_seconds(best_span.map(|s| s.start_seconds()));
-            let shared_to_raw = csv_seconds(best_span.map(|s| s.end_seconds()));
+            let matched_from_raw = csv_seconds(best_span.map(|s| s.start_seconds()));
+            let matched_to_raw = csv_seconds(best_span.map(|s| s.end_seconds()));
 
             // Label by the fate the file's own group gave it -- the only one it
             // has, since it appears nowhere else.
@@ -745,13 +772,17 @@ pub fn output_results(
             // The action leads and is padded to a fixed width so it forms a
             // column the eye can run down; the path trails because it is the one
             // field with no bounded length, and anything after it would be
-            // ragged. "shared" is spelled out on every row because the console
+            // ragged. "matched" is spelled out on every row because the console
             // has no header, and two time values side by side ("00:00:09, 0.8s")
-            // would otherwise be ambiguous about which is which. The frame rate
-            // and the bits-per-frame figure carry their units for the same
-            // reason.
+            // would otherwise be ambiguous about which is which. It reads
+            // "matched" rather than the older "shared" because the figure is now
+            // this file's own footage rather than the pair's -- "8.8s matched"
+            // against a length of 00:00:09 says copy, and says it without the
+            // reader having to know which end of the pair it was measured from.
+            // The frame rate, the sample count and the bits-per-frame figure
+            // carry their units for the same reason.
             let line = format!(
-                "\t{:<8} {}, {}, {}, {}, {}, {}, {}, {} shared, {}",
+                "\t{:<8} {}, {}, {}, {}, {}, {}, {}, {} samples, {} matched, {}",
                 format!("{},", action_str),
                 duration_str,
                 res_str,
@@ -760,7 +791,8 @@ pub fn output_results(
                 size_str,
                 bitrate_str,
                 quality_str,
-                shared_str,
+                samples_raw,
+                matched_str,
                 fp.path
             );
             info!("{}", line);
@@ -777,7 +809,6 @@ pub fn output_results(
                 &res_str,
                 &width_raw,
                 &height_raw,
-                &frame_rate_str,
                 &frame_rate_raw,
                 &codec_str,
                 &size_str,
@@ -786,12 +817,13 @@ pub fn output_results(
                 &bitrate_bps_raw,
                 &quality_str,
                 &quality_raw,
-                &shared_with_raw,
-                &shared_seconds_raw,
-                &shared_from_str,
-                &shared_to_str,
-                &shared_from_raw,
-                &shared_to_raw,
+                &matched_with_raw,
+                &samples_raw,
+                &matched_seconds_raw,
+                &matched_from_str,
+                &matched_to_str,
+                &matched_from_raw,
+                &matched_to_raw,
             ]).context("Failed to write CSV record")?;
 
             // 3. JSON File Output
@@ -809,12 +841,12 @@ pub fn output_results(
                 .map(|l| {
                     serde_json::json!({
                         "full_path": fingerprints[l.other].path,
-                        "shared_seconds": (l.shared_seconds * 100.0).round() / 100.0,
-                        "shared_from": l.span.map(|s| format_duration(s.start_seconds())),
-                        "shared_to": l.span.map(|s| format_duration(s.end_seconds())),
-                        "shared_from_seconds": l.span
+                        "matched_seconds": (l.matched_seconds * 100.0).round() / 100.0,
+                        "matched_from": l.span.map(|s| format_duration(s.start_seconds())),
+                        "matched_to": l.span.map(|s| format_duration(s.end_seconds())),
+                        "matched_from_seconds": l.span
                             .map(|s| (s.start_seconds() * 100.0).round() / 100.0),
-                        "shared_to_seconds": l.span
+                        "matched_to_seconds": l.span
                             .map(|s| (s.end_seconds() * 100.0).round() / 100.0),
                     })
                 })
@@ -830,7 +862,6 @@ pub fn output_results(
                 "resolution": res_str,
                 "width": fp.width,
                 "height": fp.height,
-                "framerate": frame_rate_str,
                 "framerate_fps": frame_rate_num,
                 "codec": codec_str,
                 "size": size_str,
@@ -842,13 +873,14 @@ pub fn output_results(
                 // The strongest link, spelled out so the JSON says the same
                 // thing the CSV does without a consumer having to re-derive it
                 // from the list below.
-                "shared_with": best.map(|l| &fingerprints[l.other].path),
-                "shared_seconds": shared.map(|s| (s * 100.0).round() / 100.0),
-                "shared_from": best_span.map(|s| format_duration(s.start_seconds())),
-                "shared_to": best_span.map(|s| format_duration(s.end_seconds())),
-                "shared_from_seconds": best_span
+                "matched_with": best.map(|l| &fingerprints[l.other].path),
+                "samples": fp.valid_hashes.len(),
+                "matched_seconds": matched.map(|s| (s * 100.0).round() / 100.0),
+                "matched_from": best_span.map(|s| format_duration(s.start_seconds())),
+                "matched_to": best_span.map(|s| format_duration(s.end_seconds())),
+                "matched_from_seconds": best_span
                     .map(|s| (s.start_seconds() * 100.0).round() / 100.0),
-                "shared_to_seconds": best_span.map(|s| (s.end_seconds() * 100.0).round() / 100.0),
+                "matched_to_seconds": best_span.map(|s| (s.end_seconds() * 100.0).round() / 100.0),
                 // Every measured link this file has in the group, strongest
                 // first. The entry at index 0 is the one described above.
                 "matches": json_matches,
@@ -1079,9 +1111,9 @@ mod tests {
     use std::fs;
 
     const CSV_HEADER: &str = "group;action;full_path;length;length_seconds;resolution;width;\
-height;framerate;framerate_fps;codec;size;size_bytes;bitrate;bitrate_bps;quality;\
-quality_bits_per_frame;shared_with;shared_seconds;shared_from;shared_to;shared_from_seconds;\
-shared_to_seconds";
+height;framerate_fps;codec;size;size_bytes;bitrate;bitrate_bps;quality;\
+quality_bits_per_frame;matched_with;samples;matched_seconds;matched_from;matched_to;\
+matched_from_seconds;matched_to_seconds";
 
     fn mock_fp() -> VideoFingerprint {
         VideoFingerprint {
@@ -1225,8 +1257,8 @@ shared_to_seconds";
         // A group of one has nobody to be compared against, so every column
         // that describes a link is empty too.
         assert!(contents.contains(
-            "group_1;KEEP;/fake/path/vid.mp4;00:01:00;60.00;1920x1080;1920;1080;30fps;30;h264;\
-1.0MB;1048576;140kbps;139810;4.7kb/f;4660;;;;;;"
+            "group_1;KEEP;/fake/path/vid.mp4;00:01:00;60.00;1920x1080;1920;1080;30;h264;\
+1.0MB;1048576;140kbps;139810;4.7kb/f;4660;;0;;;;;"
         ), "{}", contents);
 
         // Clean up
@@ -1320,8 +1352,8 @@ shared_to_seconds";
 
         assert!(
             csv.contains(
-                "group_1;KEEP;/fake/a.mp4;00:01:40;100.00;1920x1080;1920;1080;30fps;30;h264;\
-12.5MB;13107200;1.0Mbps;1048576;35.0kb/f;34952;/fake/b.mp4;80.00;"
+                "group_1;KEEP;/fake/a.mp4;00:01:40;100.00;1920x1080;1920;1080;30;h264;\
+12.5MB;13107200;1.0Mbps;1048576;35.0kb/f;34952;/fake/b.mp4;0;80.00;"
             ),
             "{}",
             csv
@@ -1335,17 +1367,74 @@ shared_to_seconds";
         assert_eq!(file["size_bytes"], 13_107_200u64);
         assert_eq!(file["bitrate_bps"], 1_048_576u64);
         assert_eq!(file["quality_bits_per_frame"], 34_952u64);
-        assert_eq!(file["shared_seconds"], 80.0);
+        assert_eq!(file["matched_seconds"], 80.0);
 
         let _ = fs::remove_file(csv_path);
         let _ = fs::remove_file(json_path);
     }
 
     #[test]
-    fn test_shared_duration_reads_the_same_on_a_clip_and_its_host() {
+    fn test_a_lopsided_pair_reports_each_row_against_its_own_envelope() {
+        // The bug this column layout exists to fix, from the case that found it:
+        // `leg raises_19.mp4` holds a single keyframe, so its one hash stands
+        // for its whole 8.84s runtime and any match at all covers 100% of it,
+        // while only 1.88s of the 6.01s `_18` matched back.
+        //
+        // Reconciled to one figure both rows read 1.88s -- and on _19's row that
+        // sat beside an envelope running 0.00-8.84, a range 4.7x wider than the
+        // duration printed next to it, with nothing to say the two numbers were
+        // measured from different ends. Each row now answers for its own file,
+        // so each row's duration fits inside its own envelope.
+        let mut host = mock_fp_at("/fake/_18.mp4", 6.01);
+        let mut lone = mock_fp_at("/fake/_19.mp4", 8.84);
+        host.valid_hashes = vec![0; 10];
+        lone.valid_hashes = vec![0; 1];
+        let fps = vec![host, lone];
+        let groups = vec![vec![0, 1]];
+
+        // 1.877 / 6.01 = 31.2% of _18; all of _19.
+        let matches = MatchIndex::new(vec![
+            Match::new(0, 1, 0.3123, 1.0).with_spans((3753, 5630), (0, 8842)),
+        ]);
+
+        let path_str = report_to("csv");
+        output_results(
+            &groups, &fps, &matches, Some(&path_str), 0, policy(Priority::Length), None,
+            true, &RunStats::default(),
+        ).unwrap();
+
+        let contents = fs::read_to_string(&path_str).unwrap();
+        for line in contents.lines().skip(1) {
+            let cells: Vec<&str> = line.split(';').collect();
+            let matched: f64 = cells[18].parse().unwrap();
+            let from: f64 = cells[21].parse().unwrap();
+            let to: f64 = cells[22].parse().unwrap();
+            assert!(
+                matched <= to - from + 1e-9,
+                "matched footage must fit inside its own envelope: {}",
+                line
+            );
+        }
+
+        // And the two rows now differ, which is the signal the minimum hid.
+        assert!(contents.contains(";/fake/_19.mp4;10;1.88;"), "_18 row: {}", contents);
+        assert!(contents.contains(";/fake/_18.mp4;1;8.84;"), "_19 row: {}", contents);
+
+        let _ = fs::remove_file(path_str);
+    }
+
+    #[test]
+    fn test_matched_duration_reads_the_same_on_a_clip_and_its_host() {
         // The reason this column is a duration. As coverage these two rows read
         // 10% and 100% and look like a malfunction next to any --match-percent;
         // as seconds they both read a minute, which is the truth.
+        //
+        // It is also why going directional cost nothing here. The figure is now
+        // each row's OWN footage rather than the pair's reconciled minimum, and
+        // on an honest match that is the same number from both ends: the host's
+        // `10% x 600s` and the clip's `100% x 60s` are both a minute. The
+        // minimum only ever did work when the two sides disagreed, which is
+        // exactly the case worth showing rather than hiding.
         let fps = vec![
             mock_fp_at("/fake/host.mp4", 600.0),
             mock_fp_at("/fake/clip.mp4", 60.0),
@@ -1361,11 +1450,11 @@ shared_to_seconds";
             true, &RunStats::default(),
         ).unwrap();
 
-        // Read as `shared_with;shared_seconds`: each row names the other file
+        // Read as `matched_with;matched_seconds`: each row names the other file
         // and reports the same minute of footage.
         let contents = fs::read_to_string(&path_str).unwrap();
-        assert!(contents.contains(";/fake/clip.mp4;60.00;"), "host row: {}", contents);
-        assert!(contents.contains(";/fake/host.mp4;60.00;"), "clip row: {}", contents);
+        assert!(contents.contains(";/fake/clip.mp4;0;60.00;"), "host row: {}", contents);
+        assert!(contents.contains(";/fake/host.mp4;0;60.00;"), "clip row: {}", contents);
 
         let _ = fs::remove_file(path_str);
     }
@@ -1396,13 +1485,13 @@ shared_to_seconds";
 
         assert!(
             contents.contains("group_1;KEEP;/fake/host.mp4;")
-                && contents.contains("/fake/clip.mp4;60.00;00:14:00;00:15:00;840.00;900.00"),
+                && contents.contains("/fake/clip.mp4;0;60.00;00:14:00;00:15:00;840.00;900.00"),
             "the host row should point into the host's own timeline: {}",
             contents
         );
         assert!(
             contents.contains("group_1;DELETE;/fake/clip.mp4;")
-                && contents.contains("/fake/host.mp4;60.00;00:00:00;00:01:00;0.00;60.00"),
+                && contents.contains("/fake/host.mp4;0;60.00;00:00:00;00:01:00;0.00;60.00"),
             "the clip row should point into the clip's own timeline: {}",
             contents
         );
@@ -1440,21 +1529,21 @@ shared_to_seconds";
         assert_eq!(file["full_path"], "/fake/a.mp4");
 
         // The headline figures describe the strongest link, and name it.
-        assert_eq!(file["shared_with"], "/fake/b.mp4");
-        assert_eq!(file["shared_seconds"], 600.0);
-        assert_eq!(file["shared_from"], "00:00:00");
-        assert_eq!(file["shared_to"], "00:10:00");
+        assert_eq!(file["matched_with"], "/fake/b.mp4");
+        assert_eq!(file["matched_seconds"], 600.0);
+        assert_eq!(file["matched_from"], "00:00:00");
+        assert_eq!(file["matched_to"], "00:10:00");
 
         // Both links are present, strongest first, and the weak one is not
         // rounded away or merged into the strong one.
         let links = file["matches"].as_array().expect("matches should be an array");
         assert_eq!(links.len(), 2);
         assert_eq!(links[0]["full_path"], "/fake/b.mp4");
-        assert_eq!(links[0]["shared_seconds"], 600.0);
+        assert_eq!(links[0]["matched_seconds"], 600.0);
         assert_eq!(links[1]["full_path"], "/fake/c.mp4");
-        assert_eq!(links[1]["shared_seconds"], 6.0);
-        assert_eq!(links[1]["shared_from"], "00:00:00");
-        assert_eq!(links[1]["shared_to"], "00:00:06");
+        assert_eq!(links[1]["matched_seconds"], 6.0);
+        assert_eq!(links[1]["matched_from"], "00:00:00");
+        assert_eq!(links[1]["matched_to"], "00:00:06");
 
         let _ = fs::remove_file(path_str);
     }
@@ -1487,7 +1576,7 @@ shared_to_seconds";
 
         let a = files.iter().find(|f| f["full_path"] == "/fake/a.mp4").unwrap();
         assert_eq!(a["matches"].as_array().unwrap().len(), 1);
-        assert_eq!(a["shared_with"], "/fake/b.mp4");
+        assert_eq!(a["matched_with"], "/fake/b.mp4");
 
         // b sits in the middle of the chain and has both links.
         let b = files.iter().find(|f| f["full_path"] == "/fake/b.mp4").unwrap();
@@ -1574,11 +1663,12 @@ shared_to_seconds";
         let report = read_json(&path_str);
         let group = &report["results"][0];
 
-        assert_eq!(group["files"][0]["shared_seconds"], 80.0);
+        assert_eq!(group["files"][0]["matched_seconds"], 80.0);
 
-        // 1 Mbps at 30fps.
+        // 1 Mbps at 30fps. The frame rate is the one figure carried raw only --
+        // its formatted twin lives on the console line and nowhere else.
         assert_eq!(group["files"][0]["codec"], "h264");
-        assert_eq!(group["files"][0]["framerate"], "30fps");
+        assert!(group["files"][0]["framerate"].is_null(), "framerate should be raw-only");
         assert_eq!(group["files"][0]["framerate_fps"], 30.0);
         assert_eq!(group["files"][0]["bitrate_bps"], 1_048_576);
         assert_eq!(group["files"][0]["quality_bits_per_frame"], 34_952);
@@ -1613,11 +1703,13 @@ shared_to_seconds";
         assert_eq!(file["quality"], "-");
         assert_eq!(file["bitrate_bps"], 1_048_576, "the bitrate is still perfectly knowable");
 
-        // The CSV says the same thing with empty fields rather than nulls: a
-        // dash in the formatted column, nothing at all in the raw one.
+        // The CSV says the same thing with empty fields rather than nulls. The
+        // frame rate is a single empty cell because it is carried raw only --
+        // quality below it still shows the pair, a dash in the formatted column
+        // and nothing at all in the raw one.
         let csv = fs::read_to_string(&csv_path).unwrap();
         assert!(
-            csv.contains(";1920;1080;-;;h264;7.5MB;7864320;1.0Mbps;1048576;-;;"),
+            csv.contains(";1920;1080;;h264;7.5MB;7864320;1.0Mbps;1048576;-;;"),
             "{}",
             csv
         );

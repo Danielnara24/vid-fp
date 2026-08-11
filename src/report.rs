@@ -336,8 +336,19 @@ mod tests {
     use std::path::PathBuf;
 
     const HEADER: &str = "group;action;full_path;length;length_seconds;resolution;width;height;\
-framerate;framerate_fps;codec;size;size_bytes;bitrate;bitrate_bps;quality;quality_bits_per_frame;\
-shared_with;shared_seconds;shared_from;shared_to;shared_from_seconds;shared_to_seconds";
+framerate_fps;codec;size;size_bytes;bitrate;bitrate_bps;quality;quality_bits_per_frame;\
+matched_with;samples;matched_seconds;matched_from;matched_to;matched_from_seconds;\
+matched_to_seconds";
+
+    /// The layout shipped before the link columns went directional: a
+    /// `framerate` column that no longer exists, and `shared_*` where the
+    /// current build writes `matched_*`. Nothing this module reads moved, so a
+    /// report written by such a build still replays -- which is the promise
+    /// `column()` makes and the reason the layout was free to change.
+    const LEGACY_HEADER: &str = "group;action;full_path;length;length_seconds;resolution;width;\
+height;framerate;framerate_fps;codec;size;size_bytes;bitrate;bitrate_bps;quality;\
+quality_bits_per_frame;shared_with;shared_seconds;shared_from;shared_to;shared_from_seconds;\
+shared_to_seconds";
 
     /// A CSV row in the real column layout, with only the three fields this
     /// module reads filled in.
@@ -347,7 +358,12 @@ shared_with;shared_seconds;shared_from;shared_to;shared_from_seconds;shared_to_s
     /// `column()` gives the parser, and these tests should not be the one place
     /// that quietly stops exercising it.
     fn row(path: &str, size: u64, action: &str) -> String {
-        let columns: Vec<&str> = HEADER.split(';').collect();
+        row_in(HEADER, path, size, action)
+    }
+
+    /// The same, against whichever layout the caller is exercising.
+    fn row_in(header: &str, path: &str, size: u64, action: &str) -> String {
+        let columns: Vec<&str> = header.split(';').collect();
         let mut fields = vec![String::new(); columns.len()];
         let mut set = |name: &str, value: String| {
             fields[columns.iter().position(|c| *c == name).unwrap()] = value;
@@ -390,6 +406,33 @@ shared_with;shared_seconds;shared_from;shared_to;shared_from_seconds;shared_to_s
         let report = read(&path, &stats).unwrap();
 
         assert_eq!(report.rows, 3);
+        assert_eq!(report.marked.len(), 1);
+        assert_eq!(report.marked[0].path, "/b.mkv");
+        assert_eq!(report.marked[0].size, 20);
+        assert_eq!(stats.report_unusable.count(), 0);
+    }
+
+    #[test]
+    fn test_a_report_from_a_build_with_the_old_link_columns_still_replays() {
+        // The link columns were renamed (`shared_*` -> `matched_*`) and the
+        // formatted `framerate` column dropped when the report went
+        // directional. Neither is anything this module reads, and columns are
+        // located by name, so a report an older build wrote is still a valid
+        // instruction to delete something -- which is the whole reason the
+        // layout could be changed at all.
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "{}\n{}\n{}\n",
+            LEGACY_HEADER,
+            row_in(LEGACY_HEADER, "/a.mkv", 10, "KEEP"),
+            row_in(LEGACY_HEADER, "/b.mkv", 20, "DELETE"),
+        );
+        let path = write_report(&dir, &body);
+
+        let stats = RunStats::default();
+        let report = read(&path, &stats).unwrap();
+
+        assert_eq!(report.rows, 2);
         assert_eq!(report.marked.len(), 1);
         assert_eq!(report.marked[0].path, "/b.mkv");
         assert_eq!(report.marked[0].size, 20);

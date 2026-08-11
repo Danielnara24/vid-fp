@@ -413,12 +413,34 @@ everything it touches into a single group. Raise
 `--match-percent` or `--min-duration` if incidental links are pulling unrelated
 files together.
 
-**The "shared" column is footage, not frames.** It is the most a file shares
-with any group member it was directly compared against, in seconds of runtime —
-so a two-minute clip inside a twenty-two minute episode reads as two minutes
-from both ends, and a pair linked only by a common title card reads as the
-second or two that card lasts. Read it against the file's own length: that ratio
-is what separates a re-encode from a shared intro.
+**The "matched" column is footage, not frames.** It is how much of *this file's
+own runtime* was found in the group member it matched most closely, in seconds —
+so a pair linked only by a common title card reads as the second or two that
+card lasts. Read it against the file's own length: that ratio is what separates
+a re-encode from a shared intro.
+
+Every figure on a row describes that row's file, including this one. On a
+genuine match that costs nothing, because both ends agree anyway: a two-minute
+clip inside a twenty-two minute episode is 100% of the clip and 9% of the
+episode, and 100% × 2min and 9% × 22min are both two minutes, so both rows read
+two minutes. Where the two rows *disagree*, they are supposed to — it means one
+file was found almost entirely inside the other while the other was barely
+covered back, and that asymmetry is a fact about the pair worth seeing. It is
+most often a sampling artifact: see the `samples` column below.
+
+Note this is not the figure `--min-duration` gates on. That one reconciles the
+two ends to a single conservative number for the pair, because a gate has to
+decide something about the pair; a row has to describe one file. On the honest
+matches they are the same number.
+
+**The `samples` column is how many frame hashes the file's fingerprint holds**,
+after featureless frames (black, fades, title cards) have been dropped. It is
+what makes the rest of the row interpretable. A file with very few samples has
+each one standing for a long stretch of runtime, so its matched footage comes
+out coarse; at the limit, **a file with one sample has that sample standing for
+its entire runtime, so any match at all covers 100% of it** and no
+`--match-percent` can gate it. If a row reports far more matched footage than
+the file on the other end of the same pair, check this column first.
 
 It reports the *best* link rather than the worst because a file only needs one
 solid match to be a duplicate. In a group fused together by an incidental link —
@@ -437,9 +459,10 @@ about that strongest link:
 
 | Column | Meaning |
 | --- | --- |
-| `shared_with` | The group member the `shared_seconds` figure on this row describes |
-| `shared_from`, `shared_to` | Where that footage sits **in this file's own runtime** |
-| `shared_from_seconds`, `shared_to_seconds` | The same two as raw seconds |
+| `matched_with` | The group member the `matched_seconds` figure on this row describes |
+| `samples` | How many frame hashes this file's fingerprint holds |
+| `matched_from`, `matched_to` | Where that footage sits **in this file's own runtime** |
+| `matched_from_seconds`, `matched_to_seconds` | The same two as raw seconds |
 
 The timestamps are per file, not per pair, and that is the point: a two-minute
 clip cut from the middle of an episode reads `00:00:00`–`00:02:01` on its own row
@@ -450,22 +473,30 @@ you.
 Read the range as an **envelope, not a continuous stretch**: it runs from the
 start of the first matching moment to the end of the last, and matches in
 between can be scattered. Two episodes sharing an opening and a closing theme
-have an envelope covering the whole hour and a `shared_seconds` of about
+have an envelope covering the whole hour and a `matched_seconds` of about
 thirty. When the two figures agree, the match is one continuous run; when the
-envelope is much the wider, it isn't.
+envelope is much the wider, either the match is scattered through it or the file
+is too coarsely sampled to tell — `samples` is what separates those two.
+`matched_seconds` never exceeds its own envelope.
 
 **Every column runs in the same order in both formats**, in three blocks: what
 the row *is* (`group`, `action`, `full_path`), what the file *is* (`length`
 through `quality_bits_per_frame`), and what it was measured *against*
-(`shared_with` through `shared_to_seconds`). `action` sits second because
+(`matched_with` through `matched_to_seconds`). `action` sits second because
 `--from-report` exists to have it edited, and an action column you have to
 scroll sideways to find is one that gets edited on the wrong row.
+
+`samples` is the exception to that grouping: it describes the file rather than
+the link, but it sits inside the last block, immediately before the figure it
+qualifies.
 
 Anything shown formatted is immediately followed by the raw number it was
 formatted from — `length`/`length_seconds`, `resolution`/`width`/`height`,
 `size`/`size_bytes`, and so on — because a spreadsheet cannot sort `1.0MB`
 against `900.0KB`, nor `1920x1080` against `640x480`. Sort and filter on the raw
-column; read the other one.
+column; read the other one. The frame rate is the one exception: the reports
+carry only `framerate_fps`, and the formatted `23.98fps` form appears on the
+console line alone.
 
 Column positions are not stable across versions, and nothing needs them to be:
 `--from-report` finds columns by name, so a report from an older build still
@@ -473,7 +504,7 @@ replays, and so does one a spreadsheet handed back reordered.
 
 The JSON additionally gives every file a `matches` array — one entry per group
 member it was directly compared against, strongest first, each with its own
-`shared_seconds` and range. The top-level fields describe entry `[0]`. That is
+`matched_seconds` and range. The top-level fields describe entry `[0]`. That is
 where a group of three or more stops needing a caveat: the whole set of
 measurements is there, pair by pair.
 

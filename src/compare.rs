@@ -230,8 +230,10 @@ impl Span {
 /// artefact: a two-minute clip cut from a twenty-two minute episode covers
 /// ~100% of the clip and ~9% of the episode. Both numbers are correct, they
 /// describe completely different situations, and no single figure expresses
-/// either. They are kept apart here and reconciled only at the point of
-/// reporting -- see `shared_seconds`.
+/// either. They are kept apart here and stay apart through the report, which
+/// states each one against its own file's runtime -- see `matched_seconds`.
+/// Only `--min-duration` reconciles them, and it does so for itself -- see
+/// `overlap_seconds`.
 ///
 /// The spans are directional for the same reason and are never reconciled at
 /// all: "where the shared footage sits" has two different right answers.
@@ -318,14 +320,59 @@ impl MatchIndex {
         self.links.get(&(subject, other))?.span
     }
 
-    /// Seconds of content two files have in common -- the figure every report
-    /// prints, and the one `--min-duration` gates on.
+    /// Seconds of `subject`'s OWN runtime that `other` was found to contain --
+    /// the figure the report prints on `subject`'s row.
+    ///
+    /// Directional, and deliberately so. Every other figure on a report row
+    /// describes the row's own file, including the envelope from `span`, and a
+    /// symmetric figure sitting among them cannot be read: on the low-coverage
+    /// side of a lopsided pair it contradicts the envelope printed beside it,
+    /// with nothing in the row to say that one of the numbers changed subject.
+    /// The report used to print `overlap_seconds` here and a file whose matched
+    /// footage envelope ran 0.00-8.84 reported 1.88 seconds of it.
+    ///
+    /// Taken over `duration` rather than `total_ms`, which matters on the files
+    /// where those two clocks differ. `sample_times` only ever extends the
+    /// runtime -- `total_ms` is `max(duration * 1000, last_sample + gap)` -- so
+    /// `total_ms >= duration * 1000` always, and taking the coverage over the
+    /// smaller of the two keeps this figure under BOTH of the things a reader
+    /// puts it next to: the file's own `length` column, which is `duration`,
+    /// and the envelope from `span`, which is stated on the `total_ms` clock.
+    /// Over `total_ms` it would be the exact matched milliseconds back, but a
+    /// fully covered file whose samples outran its container runtime would then
+    /// report more matched footage than the length printed beside it.
+    ///
+    /// This does NOT make the pair figure redundant in general -- it is what
+    /// `--min-duration` gates on, and `overlap_seconds` still owns it -- but on
+    /// an honest match the two agree: the clip's `100% x 2min` and the host's
+    /// `9% x 22min` are both two minutes, so each row prints two minutes and
+    /// the symmetry the pair figure was reaching for survives. Where they
+    /// disagree the pair is lopsided, and that is worth seeing rather than
+    /// flattening to a minimum.
+    ///
+    /// `None` when the pair was never compared, which is not the same as
+    /// compared and sharing nothing.
+    pub fn matched_seconds(&self, subject: usize, other: usize, fps: &[VideoFingerprint])
+        -> Option<f64>
+    {
+        let coverage = self.coverage(subject, other)?;
+        Some(coverage as f64 * fps[subject].duration)
+    }
+
+    /// Seconds of content two files have in common, reconciled to one figure --
+    /// what `--min-duration` gates on.
     ///
     /// The arithmetic and the reasoning behind it live in `overlap_seconds`,
     /// which the gate calls directly because it runs before any `MatchIndex`
     /// exists. This is that function reached by index: it looks the pair's two
     /// directional coverages up and hands them over. `None` when the pair was
     /// never compared, which is not the same as compared and sharing nothing.
+    ///
+    /// Test-only since the report went directional -- see `matched_seconds`.
+    /// The gate itself never had a `MatchIndex` to reach it through, so nothing
+    /// in the run path lost a caller; what these tests keep pinned is that the
+    /// gate's definition still reconciles the way it always did.
+    #[cfg(test)]
     pub fn shared_seconds(&self, a: usize, b: usize, fps: &[VideoFingerprint]) -> Option<f64> {
         let cov_a = self.coverage(a, b)?;
         let cov_b = self.coverage(b, a)?;
@@ -345,10 +392,15 @@ impl MatchIndex {
     /// That is why a chained group -- A-B and B-C measured, A-C never -- gives A
     /// one link rather than two.
     ///
-    /// Ordered by shared duration descending, ties broken on path, so the
+    /// Ordered by matched duration descending, ties broken on path, so the
     /// report is reproducible run to run: the strongest link is `first()`, which
     /// is what the single-figure columns show, and the whole list is what the
     /// JSON carries so a three-file group can be read pair by pair.
+    ///
+    /// "Strongest" is measured in `subject`'s own footage, which is the only
+    /// reading that makes the ordering agree with the row it sorts: the link
+    /// printed is the one accounting for the most of THIS file, so a file
+    /// reporting most of its runtime is a copy of something here.
     pub fn links_of(&self, subject: usize, fps: &[VideoFingerprint]) -> Vec<GroupLink> {
         let Some(others) = self.neighbours.get(&subject) else {
             return Vec::new();
@@ -359,15 +411,15 @@ impl MatchIndex {
             .filter_map(|&other| {
                 Some(GroupLink {
                     other,
-                    shared_seconds: self.shared_seconds(subject, other, fps)?,
+                    matched_seconds: self.matched_seconds(subject, other, fps)?,
                     span: self.span(subject, other),
                 })
             })
             .collect();
 
         links.sort_by(|x, y| {
-            y.shared_seconds
-                .partial_cmp(&x.shared_seconds)
+            y.matched_seconds
+                .partial_cmp(&x.matched_seconds)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| fps[x.other].path.cmp(&fps[y.other].path))
         });
@@ -408,29 +460,31 @@ impl MatchIndex {
     }
 }
 
-/// Seconds of footage one measured pair has in common.
+/// Seconds of footage one measured pair has in common, as a single figure.
 ///
 /// Each side estimates it as its own coverage times its own runtime, and for
 /// genuinely shared footage the two agree, because the shared segment has one
 /// real duration no matter which file you measure it in: a clip's `100% x 2min`
 /// and its host's `9% x 22min` are both two minutes.
 ///
-/// That agreement is the whole point. Coverage is asymmetric, and its asymmetry
-/// is what makes a report confusing; duration is symmetric and reads the same
-/// from either end. Where the two estimates disagree -- different keyframe
-/// densities, tolerance landing differently on each side -- the LOWER is taken,
-/// the conservative reading for a tool that deletes things.
+/// Where the two estimates disagree -- different keyframe densities, tolerance
+/// landing differently on each side -- the LOWER is taken, the conservative
+/// reading for a tool that deletes things.
 ///
 /// A file whose runtime the container never reported contributes no estimate.
 /// If neither file has a known runtime the answer is `None`: the overlap is
 /// unknown, which is not the same as zero.
 ///
-/// A free function rather than a method because `--min-duration` gates on this
-/// figure in `find_all_matches`, long before a `MatchIndex` exists, and the
-/// report prints it afterwards. Those two used to compute it separately and
-/// disagreed: the gate took the HIGHER of the two estimates while the report
-/// took the lower, so `--min-duration 5` admitted -- and marked DELETE -- pairs
-/// whose own reported overlap read 2.9s. One definition, one answer.
+/// **`--min-duration` is the only caller.** The report deliberately does not use
+/// this: reconciling to one number is right for a gate, which has to decide
+/// something about the pair, and wrong for a row, which has to describe one
+/// file -- see `MatchIndex::matched_seconds`. The two are not in danger of
+/// drifting the way the gate and the report once did (the gate took the HIGHER
+/// estimate while the report took the lower, so `--min-duration 5` admitted --
+/// and marked DELETE -- pairs whose own reported overlap read 2.9s), because
+/// they no longer answer the same question: this one is the pair's floor and
+/// the row's is that row's own footage, and the row's is never the smaller of
+/// the two.
 fn overlap_seconds(cov_a: f32, duration_a: f64, cov_b: f32, duration_b: f64) -> Option<f64> {
     let mut estimate: Option<f64> = None;
     for (coverage, runtime) in [(cov_a, duration_a), (cov_b, duration_b)] {
@@ -444,14 +498,21 @@ fn overlap_seconds(cov_a: f32, duration_a: f64, cov_b: f32, duration_b: f64) -> 
 }
 
 /// One file's measured relationship with one other member of its group.
+///
+/// Every field is stated from the SUBJECT's end. That uniformity is the point:
+/// these become one report row, and a row whose figures answer for two
+/// different files cannot be read.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GroupLink {
     /// Index into the fingerprint list of the file on the other end.
     pub other: usize,
-    /// Seconds of footage the two have in common -- symmetric, so this reads
-    /// the same from either end of the pair.
-    pub shared_seconds: f64,
+    /// Seconds of the SUBJECT's own runtime that `other` was found to contain.
+    /// Directional -- see `MatchIndex::matched_seconds`. On an honest match it
+    /// reads the same from both ends anyway; where it does not, the pair is
+    /// lopsided and the two rows are supposed to say so.
+    pub matched_seconds: f64,
     /// Where that footage sits in the SUBJECT's runtime, not the other file's.
+    /// Always an envelope of `matched_seconds`, never narrower than it.
     pub span: Option<Span>,
 }
 
@@ -1196,10 +1257,10 @@ mod tests {
         ]);
         let group = [0, 1, 2];
 
-        assert_near(idx.best_link_in_group(0, &group, &fps).map(|l| l.shared_seconds), 600.0);
-        assert_near(idx.best_link_in_group(1, &group, &fps).map(|l| l.shared_seconds), 600.0);
+        assert_near(idx.best_link_in_group(0, &group, &fps).map(|l| l.matched_seconds), 600.0);
+        assert_near(idx.best_link_in_group(1, &group, &fps).map(|l| l.matched_seconds), 600.0);
         // 2 has nothing better than its three seconds, and still reports them.
-        assert_near(idx.best_link_in_group(2, &group, &fps).map(|l| l.shared_seconds), 3.0);
+        assert_near(idx.best_link_in_group(2, &group, &fps).map(|l| l.matched_seconds), 3.0);
     }
 
     #[test]
@@ -1220,9 +1281,9 @@ mod tests {
         ]);
         let group = [0, 1, 2];
 
-        assert_near(idx.best_link_in_group(0, &group, &fps).map(|l| l.shared_seconds), 600.0);
-        assert_near(idx.best_link_in_group(1, &group, &fps).map(|l| l.shared_seconds), 600.0);
-        assert_near(idx.best_link_in_group(2, &group, &fps).map(|l| l.shared_seconds), 300.0);
+        assert_near(idx.best_link_in_group(0, &group, &fps).map(|l| l.matched_seconds), 600.0);
+        assert_near(idx.best_link_in_group(1, &group, &fps).map(|l| l.matched_seconds), 600.0);
+        assert_near(idx.best_link_in_group(2, &group, &fps).map(|l| l.matched_seconds), 300.0);
     }
 
     #[test]
@@ -1231,7 +1292,7 @@ mod tests {
         let fps = vec![mock_fp_lasting(600.0), mock_fp_lasting(600.0)];
         let idx = MatchIndex::new(vec![]);
 
-        assert_eq!(idx.best_link_in_group(0, &[0, 1], &fps).map(|l| l.shared_seconds), None);
+        assert_eq!(idx.best_link_in_group(0, &[0, 1], &fps).map(|l| l.matched_seconds), None);
     }
 
     #[test]
@@ -1319,9 +1380,9 @@ mod tests {
 
         assert_eq!(links.len(), 2);
         assert_eq!(links[0].other, 1);
-        assert_near(Some(links[0].shared_seconds), 600.0);
+        assert_near(Some(links[0].matched_seconds), 600.0);
         assert_eq!(links[1].other, 2);
-        assert_near(Some(links[1].shared_seconds), 6.0);
+        assert_near(Some(links[1].matched_seconds), 6.0);
     }
 
     #[test]
