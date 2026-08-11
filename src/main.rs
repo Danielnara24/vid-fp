@@ -270,7 +270,8 @@ struct Args {
     /// Maximum Hamming distance between two frame hashes, out of 64 bits.
     /// Higher = looser matching, lower = stricter matching. Default is 4.
     /// Two unrelated frames sit about 32 bits apart, so the useful range is
-    /// roughly 2 (only near-identical frames) to 14 (visibly the same shot).
+    /// roughly 2 (only near-identical frames) to 12 (visibly the same shot);
+    /// past that unrelated footage starts linking whole groups together.
     /// A hash is 64 bits, so no two can be further apart than that and values
     /// above 64 are rejected before the scan starts.
     #[arg(short = 'd', long = "hamming-distance", default_value_t = 4)]

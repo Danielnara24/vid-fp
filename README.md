@@ -317,7 +317,7 @@ frames may be) and `-p` (how much of a video must match). They trade off against
 each other, so change one at a time.
 
 `-d` counts differing bits of a 64-bit frame hash. Two unrelated frames sit
-about 32 bits apart, so the whole useful range is roughly 2 to 14: below that
+about 32 bits apart, so the whole useful range is roughly 2 to 12: below that
 only a bit-identical re-encode matches, above it unrelated footage starts to.
 
 **Only even values of `-d` do anything.** Every hash has exactly 32 of its 64
@@ -348,16 +348,6 @@ Dark scenes, fades, and letterboxed content look alike to any perceptual hash,
 and a loose `-d` conflates them. (Frames with no structure at all are dropped
 outright rather than hashed, so black frames and plain title cards can't link
 anything on their own.)
-
-The index that proposes candidate pairs widens automatically with `-d`: `-d 0`–`3`
-probes one index bin per frame per block, and `-d 4` and above probes 17. It is
-exhaustive up to `-d 7`; past that it may fail to *propose* a pair whose frames
-are all near the far edge of the tolerance. Once a pair is proposed it is always
-compared exactly, and genuine duplicates share many frames, so what gets dropped
-is uniformly marginal: measured on a 727-file library at `-d 14`, every pair the
-index missed shared under half of the shorter file's runtime and the median
-shared 11%, against a median of 63% for the pairs it found. Nothing that matched
-at a stricter `-d` is ever lost — the monotonicity above holds at every rung.
 
 `--min-duration` is an absolute floor, in seconds, on how much footage two files
 must share. It's the tool to reach for when `-p` alone can't express what you

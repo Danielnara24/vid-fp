@@ -19,47 +19,22 @@ const BLOCKS: usize = 4;
 const BLOCK_BITS: usize = HASH_BITS as usize / BLOCKS;
 const BINS: usize = 1 << BLOCK_BITS;
 
-/// Ceiling on how far the probe will widen, whatever `--hamming-distance` says.
+/// What one bin probe costs, in units of "one hash comparison".
 ///
-/// The number of keys probed per block is the number of 16-bit patterns with at
-/// most `radius` bits set: 1, 17, 137, 697. Radius 1 is exhaustive up to a
-/// tolerance of 7 and a very good filter above it; radius 2 costs 8x more
-/// lookups on every hash in the library to chase pairs that share exactly one
-/// marginal frame and nothing else.
+/// A probe loads two offsets, binary-searches past the videos already handled
+/// and builds a slice before it looks at a single hash; a comparison is an XOR,
+/// a popcount and a branch. Four is the ratio the measurements in
+/// `index_is_cheaper` imply, and nothing is sensitive to it being exactly right:
+/// the two routes it chooses between sit within a factor of two of each other on
+/// either side of the crossover.
+const PROBE_COST: usize = 4;
+
+/// What handing one pair to phase 2 costs before it compares anything: two
+/// `vec![false; _]` allocations and the loop setup, in the same units.
 ///
-/// The default tolerance of 4 sits inside that exhaustive range, so the cap
-/// costs a default run nothing; it starts binding at `-d 8`, which the accuracy
-/// ladder and any deliberately loose scan reach. It is safe there because phase
-/// 1 only has to *propose* a pair: two encodes of the same footage agree closely
-/// on many frames, not one, and phase 2 then measures all of them exactly.
-///
-/// Above `-d 8` the cap does drop pairs, and it is worth being exact about
-/// which. Measured on the 727-file local corpus at `-p 10`, against the same
-/// scan with the cap raised until the answer stopped moving (radius 4, i.e.
-/// genuinely exhaustive), counting the files reported as duplicates:
-///
-/// ```text
-///     -d      10     12     14     16
-///     r=1    302    338    434    559
-///     r=4    307    351    517    691
-/// ```
-///
-/// What it drops is uniformly marginal. Of the 83 files radius 1 misses at
-/// `-d 14`, the median shares 10.9% of its own runtime with the file it matched
-/// and the strongest shares 47.4% -- NOT ONE is above half. The 434 it does find
-/// have a median of 63.1%, and 247 of them are above half. Nor does the cap ever
-/// lose a match the tool found at a stricter setting: holding `-p 20` and
-/// raising `-d` from 4 to 16, the reported file set only ever grows, and not one
-/// of the 184 files found at `-d 4` goes missing at any rung.
-///
-/// So this is a filter that removes frame-level coincidences and keeps
-/// substantial matches, which is what it was built to be. An earlier version of
-/// this comment claimed the wider probe "changed not a single group"; that is
-/// simply false above `-d 8` -- ten whole groups appear at `-d 14` that radius 1
-/// never proposes -- and the claim is replaced by the numbers above rather than
-/// re-measured, because what matters is the strength of what is dropped and not
-/// the count.
-const MAX_PROBE_RADIUS: u32 = 1;
+/// Only ever decisive for a library of many very short files, where there are
+/// too few hashes for the comparison itself to outweigh the bookkeeping.
+const PAIR_COST: usize = 8;
 
 /// The `k`th 16-bit block of a hash, most significant first.
 #[inline(always)]
@@ -75,9 +50,63 @@ fn block_of(hash: u64, k: usize) -> usize {
 /// across four blocks without leaving one of them untouched, so probing the
 /// exact bins alone finds every pair. The default tolerance of 4 is the first
 /// value that needs a neighbour lookup, which costs 17 bins per block instead
-/// of 1; the cap keeps it there however high `-d` goes.
+/// of 1.
+///
+/// Nothing caps this, so phase 1 proposes every pair within the tolerance at
+/// EVERY tolerance -- the pigeonhole guarantee above holds unconditionally. It
+/// used to be capped at radius 1, which made the index exhaustive only to `-d 7`
+/// and a filter above that, and what the filter dropped was substantial enough
+/// to matter: on the 727-file local corpus at `-p 10` it reported 434 files at
+/// `-d 14` against 517 exhaustive, and 559 against 691 at `-d 16`. The cap paid
+/// for itself in nothing but time, and `index_is_cheaper` buys that back at the
+/// loose end far more effectively than a cap did.
 fn probe_radius(max_hamming_dist: u32) -> u32 {
-    (max_hamming_dist / BLOCKS as u32).min(MAX_PROBE_RADIUS)
+    max_hamming_dist / BLOCKS as u32
+}
+
+/// Whether to propose candidates through the index or skip it and compare every
+/// pair of videos outright.
+///
+/// The two routes return the same pairs -- the index is exhaustive at every
+/// tolerance and phase 2 measures whatever it is handed -- so this is purely a
+/// question of which is faster, and the answer flips as `-d` rises. Per stored
+/// hash the index examines `BLOCKS * masks` bins holding `total_hashes / BINS`
+/// hashes apiece, where the direct route examines every other hash in the
+/// library. The mask count is what moves: 1, 17, 137, 697, 2517 keys per block
+/// for radius 0 through 4, so the index's side of this grows by roughly 5x per
+/// rung of `-d 4` while the direct side does not move at all.
+///
+/// Measured, compare stage only, warm cache, 8 threads -- the local 727-file
+/// corpus (9k hashes) and a 42-file library of full episodes (33k hashes):
+///
+/// ```text
+///     -d            8      12      16      20      24      32
+///     radius        2       3       4       5       6       8
+///     9k  index   11ms    33ms   106ms   303ms   681ms      --
+///     9k  direct  36ms    35ms    37ms    36ms    45ms      --
+///     33k index  316ms   675ms  1511ms  3375ms  6906ms 17932ms
+///     33k direct 379ms   394ms   416ms   405ms   497ms  1064ms
+/// ```
+///
+/// The direct route is flat because it compares everything whatever the
+/// tolerance says; the index is not, and by `-d 32` it spends eighteen seconds
+/// proposing the same pairs the direct route proposes in one. That is the whole
+/// reason this function exists: an uncapped radius is exhaustive but degenerates
+/// at the loose end, where the probe set has grown wide enough to touch most of
+/// the library and the index has stopped being an index.
+///
+/// The estimate picks the faster route everywhere except the two near-ties at
+/// radius 3, where it keeps the index for the 33k library that would have run
+/// 1.7x quicker directly, and drops it for the 9k one that was already 1.06x
+/// ahead. Being within a factor of two at the crossover is all the accuracy this
+/// needs: what it exists to avoid is the order of magnitude at the right-hand
+/// end of the table, not a coin-flip in the middle.
+fn index_is_cheaper(masks: usize, videos: usize, total_hashes: usize) -> bool {
+    let bin_len = total_hashes / BINS;
+    let index = total_hashes * BLOCKS * masks * (PROBE_COST + bin_len);
+    let direct = total_hashes * total_hashes / 2 + videos * videos / 2 * PAIR_COST;
+
+    index <= direct
 }
 
 /// Every bit pattern to XOR a block key with, i.e. every 16-bit value with at
@@ -434,12 +463,15 @@ pub struct GroupLink {
 /// comparison, and nothing else.
 ///
 /// The probe radius is derived from the tolerance rather than fixed (see
-/// `probe_radius`), which makes the index exhaustive for every `max_hamming_dist`
-/// up to `BLOCKS * MAX_PROBE_RADIUS + BLOCKS - 1` = 7: every pair within the
-/// tolerance is proposed. Above that the radius stops widening and an individual
-/// frame pair can be missed, but real duplicates share hundreds of frames, so
-/// missing *every* one of them is vanishingly unlikely -- and phase 2 then
-/// recovers the frames the probe skipped for any pair that was proposed at all.
+/// `probe_radius`), and nothing bounds it, so this is exhaustive at every
+/// `max_hamming_dist`: any pair within the tolerance is proposed. What phase 2
+/// adds is not recall of missed pairs but the measurement itself -- the index
+/// says which videos could overlap and never how much, which is why it carries
+/// no per-frame detail.
+///
+/// `masks` is passed in rather than derived here because its length is also what
+/// decides whether this function is worth calling at all -- see
+/// `index_is_cheaper`.
 ///
 /// The blocks are indexed ONE AT A TIME, and each index is dropped before the
 /// next is built. Four live indices is four entries per stored hash; one is one.
@@ -448,15 +480,14 @@ pub struct GroupLink {
 /// are orders of magnitude scarcer than the hashes they were found from.
 fn candidate_pairs(
     fingerprints: &[VideoFingerprint],
+    masks: &[u16],
     max_hamming_dist: u32,
 ) -> Vec<(usize, usize)> {
     let n = fingerprints.len();
-    let radius = probe_radius(max_hamming_dist);
-    let masks = probe_masks(radius);
 
     log::debug!(
         "Probing each block at radius {} ({} key(s) per block) for -d {}.",
-        radius,
+        probe_radius(max_hamming_dist),
         masks.len(),
         max_hamming_dist
     );
@@ -619,50 +650,83 @@ pub fn find_all_matches(
     min_match_percent: f32,
     min_duration: f64,
 ) -> Vec<Match> {
-    let candidates = candidate_pairs(fingerprints, max_hamming_dist);
+    let n = fingerprints.len();
+    let total_hashes: usize = fingerprints.iter().map(|fp| fp.valid_hashes.len()).sum();
+    let masks = probe_masks(probe_radius(max_hamming_dist));
+
+    // The two arms differ only in where the pairs come from, and they agree on
+    // every pair: the index is exhaustive, and the direct route is what
+    // "exhaustive" means. Measuring one pair is the same work either way, so it
+    // lives in `measure_pair` and neither arm can drift from the other.
+    let pairs: Vec<(usize, usize)> = if index_is_cheaper(masks.len(), n, total_hashes) {
+        let candidates = candidate_pairs(fingerprints, &masks, max_hamming_dist);
+        info!("Index scan produced {} candidate pair(s); verifying...", candidates.len());
+        candidates
+    } else {
+        // Deliberately not materialised: at the tolerances that get here the
+        // pair list is the whole triangle, which is quadratic in the library
+        // size and would be the largest allocation in the program by far. The
+        // parallel range below yields it instead, and the inner range is
+        // parallel too because the outer one is lopsided -- video 0 pairs with
+        // everything and the last video with nothing.
+        info!("Tolerance is too loose for the index; comparing all pairs directly...");
+
+        return (0..n)
+            .into_par_iter()
+            .flat_map(|v_a| ((v_a + 1)..n).into_par_iter().map(move |v_b| (v_a, v_b)))
+            .filter_map(|pair| {
+                measure_pair(fingerprints, pair, max_hamming_dist, min_match_percent, min_duration)
+            })
+            .collect();
+    };
+
     if shutdown_requested() {
         return Vec::new();
     }
-    info!("Index scan produced {} candidate pair(s); verifying...", candidates.len());
 
-    candidates
+    pairs
         .into_par_iter()
-        .filter_map(|(v_a, v_b)| {
-            if shutdown_requested() {
-                return None;
-            }
-            let fp_a = &fingerprints[v_a];
-            let fp_b = &fingerprints[v_b];
-
-            let (pct_a, pct_b, span_a, span_b) = match_overlap(fp_a, fp_b, max_hamming_dist);
-
-            if pct_a.max(pct_b) < min_match_percent {
-                return None;
-            }
-
-            if min_duration > 0.0 {
-                // Measured exactly the way the report measures it -- see
-                // `overlap_seconds`, which both sides now share. A pair whose
-                // overlap cannot be measured at all (neither file reported a
-                // runtime) cannot clear a floor stated in seconds, so `None`
-                // fails the gate rather than passing it.
-                let cleared = overlap_seconds(pct_a, fp_a.duration, pct_b, fp_b.duration)
-                    .is_some_and(|secs| secs >= min_duration);
-                if !cleared {
-                    return None;
-                }
-            }
-
-            Some(Match {
-                a: v_a,
-                b: v_b,
-                coverage_a: pct_a,
-                coverage_b: pct_b,
-                span_a,
-                span_b,
-            })
+        .filter_map(|pair| {
+            measure_pair(fingerprints, pair, max_hamming_dist, min_match_percent, min_duration)
         })
         .collect()
+}
+
+/// Phase 2 for one pair: measure it exactly, then apply both gates. `None` when
+/// the pair fails either of them, or when the run is shutting down.
+fn measure_pair(
+    fingerprints: &[VideoFingerprint],
+    (v_a, v_b): (usize, usize),
+    max_hamming_dist: u32,
+    min_match_percent: f32,
+    min_duration: f64,
+) -> Option<Match> {
+    if shutdown_requested() {
+        return None;
+    }
+    let fp_a = &fingerprints[v_a];
+    let fp_b = &fingerprints[v_b];
+
+    let (pct_a, pct_b, span_a, span_b) = match_overlap(fp_a, fp_b, max_hamming_dist);
+
+    if pct_a.max(pct_b) < min_match_percent {
+        return None;
+    }
+
+    if min_duration > 0.0 {
+        // Measured exactly the way the report measures it -- see
+        // `overlap_seconds`, which both sides now share. A pair whose overlap
+        // cannot be measured at all (neither file reported a runtime) cannot
+        // clear a floor stated in seconds, so `None` fails the gate rather than
+        // passing it.
+        let cleared = overlap_seconds(pct_a, fp_a.duration, pct_b, fp_b.duration)
+            .is_some_and(|secs| secs >= min_duration);
+        if !cleared {
+            return None;
+        }
+    }
+
+    Some(Match { a: v_a, b: v_b, coverage_a: pct_a, coverage_b: pct_b, span_a, span_b })
 }
 
 #[cfg(test)]
@@ -751,6 +815,14 @@ mod tests {
         assert_eq!(block_of(h, 3), 0xCDEF);
     }
 
+    /// The pairs phase 1 proposes on its own, with no gate and no phase 2. Tests
+    /// about the index have to ask it directly: `find_all_matches` is free to
+    /// skip it entirely (see `index_is_cheaper`), and on fingerprints this small
+    /// it always does.
+    fn proposed(fps: &[VideoFingerprint], max_hamming_dist: u32) -> Vec<(usize, usize)> {
+        candidate_pairs(fps, &probe_masks(probe_radius(max_hamming_dist)), max_hamming_dist)
+    }
+
     #[test]
     fn test_probe_radius_is_derived_from_the_tolerance() {
         // The pigeonhole rule: three differing bits cannot cover four blocks, so
@@ -759,21 +831,42 @@ mod tests {
         assert_eq!(probe_radius(3), 0, "a tight tolerance probes exact bins only");
         assert_eq!(probe_radius(4), 1);
         assert_eq!(probe_radius(7), 1);
-        // Past 7 the rule would ask for radius 2, and the cap declines: the
-        // index becomes a filter rather than an enumerator, which is what phase
-        // 2 exists to make safe.
-        assert_eq!(probe_radius(8), MAX_PROBE_RADIUS);
-        assert_eq!(probe_radius(64), MAX_PROBE_RADIUS, "and it stops widening at the cap");
+        // And it keeps widening, with nothing to stop it. A radius that lagged
+        // the tolerance would make the index a filter rather than an enumerator.
+        assert_eq!(probe_radius(8), 2);
+        assert_eq!(probe_radius(63), 15);
+        assert_eq!(probe_radius(HASH_BITS), BLOCK_BITS as u32, "the widest -d probes every bin");
     }
 
     #[test]
     fn test_probe_masks_are_exactly_the_patterns_within_the_radius() {
         // 1, 17, 137: sum of C(16, i) up to the radius. These are the multiplier
-        // on every single bin lookup in the scan, which is why the cap exists.
+        // on every single bin lookup in the scan, and the reason a loose enough
+        // tolerance is better served by comparing every pair outright.
         assert_eq!(probe_masks(0), vec![0u16]);
         assert_eq!(probe_masks(1).len(), 17);
         assert_eq!(probe_masks(2).len(), 137);
         assert!(probe_masks(2).iter().all(|m| m.count_ones() <= 2));
+        assert_eq!(probe_masks(BLOCK_BITS as u32).len(), BINS, "radius 16 is every bin");
+    }
+
+    #[test]
+    fn test_the_index_is_abandoned_once_the_probe_outgrows_the_library() {
+        // A library the size of the local corpus: 727 videos, 9k hashes. The
+        // index earns its keep at the tolerances anyone should be using and
+        // stops earning it at the loose end, where the probe set has grown wide
+        // enough to touch most of the library.
+        let (videos, hashes) = (727, 8966);
+        let pays = |d: u32| index_is_cheaper(probe_masks(probe_radius(d)).len(), videos, hashes);
+
+        assert!(pays(4), "the default tolerance must never pay for the whole triangle");
+        assert!(pays(8));
+        assert!(!pays(16), "radius 4 is 2517 keys a block; the direct route is measured faster");
+        assert!(!pays(32));
+
+        // And an empty library keeps the index rather than walking a triangle of
+        // pairs that cannot match: there are no hashes to compare.
+        assert!(index_is_cheaper(probe_masks(probe_radius(64)).len(), videos, 0));
     }
 
     #[test]
@@ -820,10 +913,9 @@ mod tests {
             mock_fp_with_hashes(vec![hash], 1),
         ];
 
-        let matches = find_all_matches(&fps, 0, 1.0, 0.0);
-
         // Each unordered pair exactly once, always with the lower index first.
-        assert_eq!(pairs(&matches), vec![(0, 1), (0, 2), (1, 2)]);
+        assert_eq!(proposed(&fps, 0), vec![(0, 1), (0, 2), (1, 2)]);
+        assert_eq!(pairs(&find_all_matches(&fps, 0, 1.0, 0.0)), vec![(0, 1), (0, 2), (1, 2)]);
     }
 
     #[test]
@@ -838,7 +930,7 @@ mod tests {
 
         let fps = vec![mock_fp_with_hashes(vec![a], 1), mock_fp_with_hashes(vec![b], 1)];
 
-        assert_eq!(pairs(&find_all_matches(&fps, 3, 1.0, 0.0)), vec![(0, 1)]);
+        assert_eq!(proposed(&fps, 3), vec![(0, 1)]);
     }
 
     #[test]
@@ -853,40 +945,92 @@ mod tests {
 
         let fps = vec![mock_fp_with_hashes(vec![a], 1), mock_fp_with_hashes(vec![b], 1)];
 
-        assert_eq!(pairs(&find_all_matches(&fps, 4, 1.0, 0.0)), vec![(0, 1)]);
+        assert_eq!(proposed(&fps, 4), vec![(0, 1)]);
         assert!(
-            find_all_matches(&fps, 3, 1.0, 0.0).is_empty(),
+            proposed(&fps, 3).is_empty(),
             "and four bits apart is genuinely outside a three-bit tolerance"
         );
     }
 
     #[test]
-    fn test_two_phase_recovers_frames_the_index_cannot_propose() {
-        // Only reachable above the radius cap, which is the entire remaining
-        // gap in the index. Frame 2 differs by 3 bits in EVERY block (total 12)
-        // and the radius is capped at 1, so no probe can see it. Frame 1 is
-        // identical, so the PAIR still becomes a candidate -- and phase 2's
-        // brute force then counts frame 2 as well.
-        let shared = 0x0000_0000_0000_0000u64;
-        let unprobeable_a = 0xFFFF_FFFF_FFFF_FFFFu64;
-        let unprobeable_b = unprobeable_a ^ 0x0007_0007_0007_0007;
+    fn test_the_index_proposes_a_pair_no_single_block_agrees_on() {
+        // Three differing bits in EVERY block, total 12. Nothing here is within
+        // radius 1 of anything, and under the old cap this pair was unreachable
+        // for the index -- it was proposed only because the two files also
+        // shared an identical frame, and phase 2 then recovered the rest.
+        //
+        // With the radius derived from the tolerance, floor(12 / 4) = 3 reaches
+        // it directly: no shared frame, no rescue, still proposed.
+        let a = 0xFFFF_FFFF_FFFF_FFFFu64;
+        let b = a ^ 0x0007_0007_0007_0007;
+        assert_eq!((a ^ b).count_ones(), 12);
+        assert_eq!(probe_radius(12), 3);
 
-        assert_eq!((unprobeable_a ^ unprobeable_b).count_ones(), 12);
-        assert!(probe_radius(12) < 3, "no block is within reach of the probe");
+        let fps = vec![mock_fp_with_hashes(vec![a], 1), mock_fp_with_hashes(vec![b], 1)];
+
+        assert_eq!(proposed(&fps, 12), vec![(0, 1)]);
+        assert!(
+            proposed(&fps, 11).is_empty(),
+            "twelve bits apart is outside an eleven-bit tolerance, and radius 2 cannot see it"
+        );
+    }
+
+    #[test]
+    fn test_phase_two_counts_frames_the_index_only_had_to_propose() {
+        // The index answers "could these two overlap"; it never answers "by how
+        // much", and the count of hashes it happened to hit is not that figure.
+        // Here the pair is proposed off the frame the two share, and only phase
+        // 2's exhaustive comparison sees that the OTHER frame matches too.
+        //
+        // Demanding 100% overlap: reachable only if both frames are counted, so
+        // index-only accounting would have scored this pair at 50% and dropped
+        // it.
+        let shared = 0x0000_0000_0000_0000u64;
+        let far_a = 0xFFFF_FFFF_FFFF_FFFFu64;
+        let far_b = far_a ^ 0x0007_0007_0007_0007;
 
         let fps = vec![
-            mock_fp_with_hashes(vec![shared, unprobeable_a], 2),
-            mock_fp_with_hashes(vec![shared, unprobeable_b], 2),
+            mock_fp_with_hashes(vec![shared, far_a], 2),
+            mock_fp_with_hashes(vec![shared, far_b], 2),
         ];
 
-        // Demanding 100% overlap: only reachable if BOTH frames are counted.
-        // Index-only accounting would have scored this pair at 50%.
-        let matches = find_all_matches(&fps, 12, 1.0, 0.0);
-        assert_eq!(
-            pairs(&matches),
-            vec![(0, 1)],
-            "phase 2 must recover the frame the probe could not reach"
-        );
+        assert_eq!(pairs(&find_all_matches(&fps, 12, 1.0, 0.0)), vec![(0, 1)]);
+    }
+
+    #[test]
+    fn test_both_routes_propose_the_same_pairs_at_every_tolerance() {
+        // The exhaustiveness claim, stated as a property rather than as an
+        // argument: whatever the index proposes has to be exactly what comparing
+        // every pair of videos finds, at every rung of `-d`. This is what lets
+        // `find_all_matches` choose between the two on cost alone.
+        //
+        // Hashes chosen to sit at awkward distances -- one block, several
+        // blocks, one bit in each -- so the pigeonhole rule is actually loaded.
+        let fps: Vec<VideoFingerprint> = [
+            0x0000_0000_0000_0000u64,
+            0x0000_0000_0000_00FFu64,
+            0x0001_0001_0001_0001u64,
+            0x0007_0007_0007_0007u64,
+            0x00FF_0000_0000_0000u64,
+            0xFFFF_FFFF_FFFF_FFFFu64,
+        ]
+        .iter()
+        .map(|&h| mock_fp_with_hashes(vec![h], 1))
+        .collect();
+
+        for d in 0..=HASH_BITS {
+            let mut direct: Vec<(usize, usize)> = Vec::new();
+            for a in 0..fps.len() {
+                for b in (a + 1)..fps.len() {
+                    let (h_a, h_b) = (fps[a].valid_hashes[0], fps[b].valid_hashes[0]);
+                    if (h_a ^ h_b).count_ones() <= d {
+                        direct.push((a, b));
+                    }
+                }
+            }
+
+            assert_eq!(proposed(&fps, d), direct, "the index missed a pair at -d {}", d);
+        }
     }
 
     #[test]
