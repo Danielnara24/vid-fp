@@ -290,7 +290,7 @@ and the byte total before anything happens.
 | `--follow-symlinks` | Descend into symlinked folders | off |
 | `-e`, `--exclude <FOLDER>` | Exclude a folder; repeat for several | — |
 | `-x`, `--extensions <EXT>` | Video extensions to include, comma-separated or repeated | `mp4,mkv,avi,mov,flv,webm` |
-| `-d`, `--hamming-distance <N>` | Frame-match tolerance, in bits out of 64; higher = less strict matching. Raise to increase duplicates found (but can increase false positives). See [Tuning](#tuning) | `4` |
+| `-d`, `--hamming-distance <N>` | Frame-match tolerance, in bits out of 64; higher = less strict matching. Raise to increase duplicates found (but can increase false positives). Values above `64` are refused. See [Tuning](#tuning) | `4` |
 | `-p`, `--match-percent <F>` | Min % of overlap to count as a duplicate, from `0` to `100`; Lower = Includes shorter matches (but can increase false positives). Values outside the range are refused | `20.0` |
 | `--min-duration <SECS>` | Min shared clip length in seconds for a match. Videos shorter than this are skipped entirely. `0` = off; negative values are refused | `0.0` |
 | `-k`, `--priority <P>` | Criteria for KEEPING files: `length`, `resolution`, `quality`, or `size`. The chosen one is compared first; the rest follow in the default order. See [Codecs and quality](#codecs-and-quality) | `length` |
@@ -353,8 +353,11 @@ The index that proposes candidate pairs widens automatically with `-d`: `-d 0`�
 probes one index bin per frame per block, and `-d 4` and above probes 17. It is
 exhaustive up to `-d 7`; past that it may fail to *propose* a pair whose frames
 are all near the far edge of the tolerance. Once a pair is proposed it is always
-compared exactly, and genuine duplicates share many frames, so a miss is very
-unlikely.
+compared exactly, and genuine duplicates share many frames, so what gets dropped
+is uniformly marginal: measured on a 727-file library at `-d 14`, every pair the
+index missed shared under half of the shorter file's runtime and the median
+shared 11%, against a median of 63% for the pairs it found. Nothing that matched
+at a stricter `-d` is ever lost — the monotonicity above holds at every rung.
 
 `--min-duration` is an absolute floor, in seconds, on how much footage two files
 must share. It's the tool to reach for when `-p` alone can't express what you

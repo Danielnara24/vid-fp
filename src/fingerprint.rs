@@ -185,7 +185,20 @@ fn sample_times(times: &[Option<u32>], duration_sec: f64) -> (Vec<u32>, u32) {
 
     let last = times.iter().copied().max().unwrap_or(0);
     if total_ms <= last {
-        let average_gap = last / n.max(1) as u32;
+        // `n` samples spanning 0..last have `n - 1` gaps between them, not `n`.
+        // Dividing by `n` understates the spacing by a factor of (n-1)/n -- 17%
+        // at six samples -- and the figure is used to give the LAST sample a
+        // span, so the tail of such a video was consistently credited with less
+        // footage than it stands for.
+        //
+        // Reached more often than the doc comment above suggests: not only by a
+        // container that reported no runtime, but by any file whose last sample
+        // lands past the runtime it did report. An MP4 that opens on a negative
+        // dts is the common way in, since anchoring at the first keyframe shifts
+        // every sample later by that amount. Three of the 727 files in the local
+        // corpus arrive here with a perfectly good duration.
+        let gaps = (n as u32).saturating_sub(1).max(1);
+        let average_gap = last / gaps;
         total_ms = last.saturating_add(average_gap.max(1));
     }
 
@@ -1440,6 +1453,46 @@ mod tests {
             codec: "h264".to_string(),
             frame_rate,
         }
+    }
+
+    #[test]
+    fn test_the_last_sample_is_extended_by_a_real_average_gap() {
+        // Six samples a second apart, and a container that under-reports its
+        // runtime -- which is how this branch is actually reached: anchoring at
+        // the first keyframe shifts every sample later, so an MP4 opening on a
+        // negative dts can put the last one past the duration in the header.
+        //
+        // The spacing is 1000 ms and the last sample has to stand for about that
+        // much footage. Dividing the span by the sample COUNT rather than by the
+        // number of gaps between them gave 5000/6 = 833.
+        let times: Vec<Option<u32>> = (0..6).map(|i| Some(i * 1000)).collect();
+        let (out, total_ms) = sample_times(&times, 4.5);
+
+        assert_eq!(out.len(), 6);
+        assert_eq!(total_ms, 6000, "5000 + one 1000 ms gap, not 5000 + 833");
+    }
+
+    #[test]
+    fn test_a_single_sample_still_gets_a_span() {
+        // One sample has no gap to average, and a zero-length span would delete
+        // it from every coverage figure. The `.max(1)` is what keeps it.
+        let (_, total_ms) = sample_times(&[Some(0)], 0.0);
+        assert!(total_ms >= 1, "a lone sample must stand for something, got {}", total_ms);
+
+        // And nothing at all must not divide by zero.
+        let (out, total_ms) = sample_times(&[], 0.0);
+        assert!(out.is_empty());
+        assert!(total_ms >= 1);
+    }
+
+    #[test]
+    fn test_a_known_runtime_is_left_alone() {
+        // The branch above must not fire when the header's duration already
+        // covers the samples: that figure is the container's own and is better
+        // than anything derived from the spacing.
+        let times: Vec<Option<u32>> = (0..6).map(|i| Some(i * 1000)).collect();
+        let (_, total_ms) = sample_times(&times, 10.0);
+        assert_eq!(total_ms, 10_000);
     }
 
     #[test]

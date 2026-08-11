@@ -11,7 +11,7 @@ mod sources;
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
 use clap_complete::Shell;
-use compare::{find_all_matches, MatchIndex};
+use compare::{find_all_matches, MatchIndex, HASH_BITS};
 use export::Disposal;
 use fingerprint::{fingerprint_video, VideoFingerprint, MAX_DECODE_THREADS};
 use indicatif::{ProgressBar, ProgressState, ProgressStyle};
@@ -37,7 +37,8 @@ use utils::{shutdown_requested, Policy, Priority};
 /// scanned rather than by the number of times they have changed: a file that is
 /// re-encoded, re-muxed, or scanned with different sampling settings replaces
 /// its own entry instead of growing a second one beside it.
-const CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("fingerprints_dct_ct_ff8");
+const CACHE_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("fingerprints_dct_ct_ff8_tail");
 
 /// Tables earlier builds wrote, all dead. They are dropped whole on the first
 /// run of this one.
@@ -75,11 +76,19 @@ const CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("fingerpr
 ///   sampling knobs but deliberately not an FFmpeg version, so entries written
 ///   either side of the switch are indistinguishable to a lookup and would have
 ///   mixed silently, forever.
-const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 4] = [
+/// - `fingerprints_dct_ct_ff8` holds the right hashes against a `total_ms` that
+///   is a few tenths of a percent short. `sample_times` extends the last sample
+///   by one average gap when the samples outrun the runtime the container
+///   reported, and it divided the span by the number of SAMPLES rather than by
+///   the number of gaps between them. The field keeps its name and its units and
+///   only its value moves, which is precisely the case a layout check cannot
+///   catch -- and it moves for real files, three of the 727 in the local corpus.
+const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 5] = [
     TableDefinition::new("fingerprints"),
     TableDefinition::new("fingerprints_by_path"),
     TableDefinition::new("fingerprints_dct"),
     TableDefinition::new("fingerprints_dct_ct"),
+    TableDefinition::new("fingerprints_dct_ct_ff8"),
 ];
 
 /// Hard ceiling on the cache's page cache.
@@ -262,6 +271,8 @@ struct Args {
     /// Higher = looser matching, lower = stricter matching. Default is 4.
     /// Two unrelated frames sit about 32 bits apart, so the useful range is
     /// roughly 2 (only near-identical frames) to 14 (visibly the same shot).
+    /// A hash is 64 bits, so no two can be further apart than that and values
+    /// above 64 are rejected before the scan starts.
     #[arg(short = 'd', long = "hamming-distance", default_value_t = 4)]
     hamming_distance: u32,
 
@@ -1198,7 +1209,17 @@ Interrupted with Ctrl-C.
     // Only pruning can leave dead space behind at this point: it removes
     // entries the run will not refill, by design. A cleared cache was already
     // compacted while it was empty, and everything in the file now is live.
-    if !shutdown_requested() && args.prune_cache {
+    //
+    // Hence `!args.clear_cache`, which this condition used to be missing even
+    // though the sentence above already stated the rule. `--prune-cache` and
+    // `--clear-cache` together skip the prune itself (see `run`: after a clear
+    // there is nothing stale, because there is nothing at all), so the run
+    // removed no entries -- and then compacted anyway, copying every live page
+    // of a cache the scan had just rewritten from scratch to reclaim exactly
+    // nothing. That is the same waste compaction was moved out of the tail of
+    // the run to avoid; it is invisible on a small cache and is a full rewrite
+    // plus an fsync on a large one.
+    if !shutdown_requested() && args.prune_cache && !args.clear_cache {
         match db.compact() {
             Ok(true) => info!("Compacted the fingerprint cache."),
             Ok(false) => {}
@@ -1264,6 +1285,25 @@ fn run(
         anyhow::bail!(
             "--match-percent must be between 0 and 100 (coverage is capped at 100%, so a \
              higher floor could never be met)."
+        );
+    }
+    // The same reasoning as --match-percent, arriving from the other end. A frame
+    // hash is 64 bits, so 64 is the furthest apart two of them can possibly be:
+    // a tolerance above that is one no pair could ever exceed, and it accepts
+    // every pair the index proposes -- which with --delete armed can only ever
+    // ADD files to the DELETE set. Left unchecked, `-d 100` collapsed a 727-file
+    // library into one group with 322 files marked DELETE, and said nothing.
+    //
+    // 64 itself stays legal and means "match anything", the mirror of `-p 0`.
+    // Nothing here narrows the range to the one `--help` calls useful (2 to 14):
+    // a loose scan is a legitimate thing to ask for, and this is only refusing
+    // the arithmetic that cannot mean anything.
+    if max_hamming > HASH_BITS {
+        anyhow::bail!(
+            "--hamming-distance must be between 0 and {} (a frame hash is {} bits, so no two \
+             of them can be further apart than that).",
+            HASH_BITS,
+            HASH_BITS
         );
     }
 
