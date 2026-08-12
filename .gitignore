@@ -9,3 +9,6 @@
 
 # Ignore local accuracy test file
 /tests/local_accuracy_test.rs
+# Ground-truth corpus labeling: generated pools, contact sheets and the
+# review page. All reproducible from benchmark/gt.py against a local corpus.
+/benchmark
