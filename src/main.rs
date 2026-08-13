@@ -620,18 +620,20 @@ struct Job {
 /// holds still when the codec changes, which is the whole reason it reads more
 /// steadily than the megabytes a second it replaces.
 ///
-/// Every reading this returns is the same width, including the one before there
-/// is anything to report. The field is redrawn several times a second and the
-/// file name sits to the right of it, so a reading one character wider drags the
-/// name along with it -- which is most of what a flickering bar is made of. That
-/// is what the unit ladder is for: the number keeps three significant figures and
-/// the unit absorbs the magnitude, rather than the digits growing.
+/// The reading carries no padding: the bar rules its fields apart with a single
+/// space either side of a box-drawing bar, and a field that reserved room for its
+/// widest value read as a second, wider gap in front of the number. What keeps
+/// the field from swinging is the unit ladder rather than a column width -- the
+/// number keeps three significant figures and the unit absorbs the magnitude, so
+/// the whole range from a stalled thread to a workstation spans one character.
+/// The file name to the right does shift by that character, which is the price of
+/// the tighter spacing and the reason the digits are held to three.
 fn work_rate(per_sec: f64) -> String {
     // The dash is "no reading", and it is also where anything unusable lands:
     // the rate is a division by an elapsed time that starts at zero, so the
     // first tick of a run can hand this an absurdity, and a bar is the wrong
     // place to find out. Nothing real reaches the top of the ladder below.
-    let unmeasurable = || format!("{:>11}", "-");
+    let unmeasurable = || "-".to_string();
     if !per_sec.is_finite() || per_sec <= 0.0 {
         return unmeasurable();
     }
@@ -642,17 +644,18 @@ fn work_rate(per_sec: f64) -> String {
         _ => (per_sec / 1e6, "Mpx"),
     };
 
-    // Five columns of number whatever the magnitude, so 999 and 1.00 line up.
-    // Above a thousand the ladder has already changed unit, except at the top of
-    // it, where there is nothing bigger to change to.
+    // Three significant figures whatever the magnitude, which is three or four
+    // characters: 374, 56.2, 2.50. Above a thousand the ladder has already
+    // changed unit, except at the top of it, where there is nothing bigger to
+    // change to -- so a number that still needs five columns is out of range.
     let number = if scaled >= 100.0 {
-        format!("{:>5.0}", scaled)
+        format!("{:.0}", scaled)
     } else if scaled >= 10.0 {
-        format!("{:>5.1}", scaled)
+        format!("{:.1}", scaled)
     } else {
-        format!("{:>5.2}", scaled)
+        format!("{:.2}", scaled)
     };
-    if number.len() > 5 {
+    if number.len() > 4 {
         return unmeasurable();
     }
     format!("{} {}/s", number, unit)
@@ -1699,7 +1702,7 @@ fn run(
             let pb = ProgressBar::new(total_weight.min(u64::MAX as u128) as u64);
             pb.set_style(
                 ProgressStyle::with_template(
-                    "{elapsed_precise} \u{2502} [{bar:28.cyan/blue}] \u{2502} {percent:>3}% \u{2502} {work_rate} \u{2502} {prefix} \u{2502} {msg}",
+                    "{elapsed_precise} \u{2502} [{bar:28.cyan/blue}] \u{2502} {percent}% \u{2502} {work_rate} \u{2502} {prefix} \u{2502} {msg}",
                 )
                 .unwrap()
                 .with_key("work_rate", |state: &ProgressState, w: &mut dyn std::fmt::Write| {
@@ -2108,12 +2111,13 @@ mod tests {
         assert!(scan_encloses(Path::new("/home/you/Documents"), &scanned).is_none());
     }
 
-    /// The bar redraws this field several times a second, and everything to the
-    /// right of it moves if it changes width -- which is what a line that
-    /// flickers is made of. So the width is the property worth pinning, across
-    /// the whole range including the "nothing measured yet" reading.
+    /// The bar spaces its fields itself -- one space either side of each rule --
+    /// so a reading that carried its own padding would show up as a wider gap in
+    /// front of one number than in front of all the others. Nothing this returns
+    /// pads, including the "nothing measured yet" reading, and the unit ladder
+    /// holds the rest of the range inside a single character of width.
     #[test]
-    fn test_the_speedometer_keeps_one_width() {
+    fn test_the_speedometer_pads_nothing_and_stays_narrow() {
         let readings = [
             work_rate(0.0),
             work_rate(f64::NAN),
@@ -2125,8 +2129,16 @@ mod tests {
             work_rate(f64::MAX),
         ];
         for r in &readings {
-            assert_eq!(r.chars().count(), readings[0].chars().count(), "{:?}", readings);
+            assert_eq!(r.trim(), r, "{:?}", readings);
         }
+
+        // The dash is the one narrow reading, and it is only on screen before
+        // there is anything to measure. Every real one is 9 or 10 characters.
+        let measured: Vec<usize> =
+            readings.iter().filter(|r| r.as_str() != "-").map(|r| r.chars().count()).collect();
+        let lo = measured.iter().min().copied().unwrap();
+        let hi = measured.iter().max().copied().unwrap();
+        assert!(hi - lo <= 1, "{:?}", readings);
     }
 
     #[test]
