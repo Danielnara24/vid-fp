@@ -325,25 +325,34 @@ constant time offset, so their matches corroborate each other; two videos that
 merely look alike produce matches scattered across unrelated moments. `-d`
 therefore sets two thresholds rather than one:
 
-- a match with nothing behind it must be within `-d`, and never further than 8
-  bits however high you set the flag;
+- a match with nothing behind it must be within `-d`, exactly as before;
 - a match that another frame match agrees with — a different frame of each
-  video, landing at the same offset — may reach 12 bits, or `-d` itself once
-  that is higher.
+  video, landing within half a second of the same offset — may reach `-d + 6`.
 
 **Past 12 bits, one witness stops being enough.** Two unrelated frames land
 within 12 bits of each other about once in fifty million; within 20 bits, once
 in six thousand. A pair of coincidences that far out is not rare enough to mean
 anything, so the number of agreeing frame matches required grows with the
-distance: one out to 12 bits, two at 14, three at 16, four at 20. Nothing at or
-below `-d 12` is judged any differently for it.
+distance: one out to 12 bits, two at 14, three at 16, four at 20.
 
-The practical effect is that the tight end of the range is far more useful than
-it used to be and the loose end is far harder to fool. It also means `-d 8`,
-`-d 10` and `-d 12` are now the same scan: the strict side has stopped at 8 and
-the corroborated side has reached 12. Past `-d 12` you are asking for matches
-whose own distance proves nothing, and the report will be as good as the
-agreement behind them.
+Both thresholds move with every rung of `-d` and neither is clamped against a
+constant, so the flag stays a sensitivity control across its whole range.
+Measured against a hand-labeled pair set (see the accuracy notes), each rung
+beats what the same setting did when `-d` was a single flat threshold:
+
+| `-d` | matches on their own | with agreement | precision | recall |
+|---:|---|---|---:|---:|
+| 2 | ≤ 2 bits | ≤ 8 | 100.0% | 65.4% |
+| **4** (default) | ≤ 4 bits | ≤ 10 | 99.7% | 75.4% |
+| 6 | ≤ 6 bits | ≤ 12 | 99.2% | 83.9% |
+| 8 | ≤ 8 bits | ≤ 14 | 98.3% | 88.3% |
+| 10 | ≤ 10 bits | ≤ 16 | 96.0% | 91.9% |
+| 12 | ≤ 12 bits | ≤ 18 | 88.5% | 94.7% |
+
+Recall there is recall of what any tool found, so read it as a relative figure;
+precision is exact. The knee on that corpus sits around `-d 10`, and the
+default is deliberately well inside it — the default's job is to be safe on the
+corpus nobody measured.
 
 **Both knobs are monotone**, which is what makes tuning them predictable:
 

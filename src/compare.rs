@@ -36,43 +36,64 @@ const PROBE_COST: usize = 4;
 /// too few hashes for the comparison itself to outweigh the bookkeeping.
 const PAIR_COST: usize = 8;
 
-/// How far a frame match may reach with nothing but its own distance behind it.
+/// One standard deviation of the distance between two UNRELATED frame hashes.
 ///
-/// Above this a single close-looking frame is not evidence: the corpus is full
-/// of near-static shots, and two unrelated videos of the same white-background
-/// subject produce individual frames ten bits apart all the time. `-d` still
-/// caps this -- the strict tolerance is `min(-d, this)` -- so a tighter `-d`
-/// tightens it and a looser one does not loosen it.
-const UNCORROBORATED_BITS: u32 = 8;
+/// That distance is Binomial(`HASH_BITS`, 1/2): mean `HASH_BITS / 2`, standard
+/// deviation `sqrt(HASH_BITS) / 2` -- 32 +/- 4 bits for the 64-bit hash. Every
+/// constant below is expressed as a multiple of it rather than in bits, because
+/// a bit count is only meaningful against the width of the hash it came from:
+/// "6 bits" says nothing on its own, "1.5 sigma below chance" says the same
+/// thing about a 64-bit hash and a 256-bit one. Widen the hash and these
+/// rescale themselves; the tuning that would otherwise be silently wrong is the
+/// tuning that never has to be redone.
+fn sigma() -> f64 {
+    (HASH_BITS as f64).sqrt() / 2.0
+}
 
-/// How far a frame match may reach once another frame match corroborates it,
-/// and how much looser than `-d` that is allowed to be.
+/// How much looser than `-d` a corroborated frame match may be, in sigma.
 ///
-/// Two frame matches corroborate each other when they place the two videos at
-/// the same time offset. That is the measurement this whole rule rests on: over
-/// the hand-labeled pair set, sample pairs that coincide in time are within 4
-/// bits 64% of the time when the footage really is shared and 0.0% of the time
-/// when it is not, and within 12 bits 75% against 0.6%. Distance alone cannot
-/// separate those populations; distance plus agreement about *when* can.
+/// 1.5 sigma is 6 bits on a 64-bit hash. **This is added to `-d`, never capped
+/// against a constant**, which is the whole point: the flag has to stay a
+/// sensitivity control across its range. An earlier version clamped the
+/// corroborated side at 12 bits, and the effect was that `-d 4` through `-d 12`
+/// all produced within twenty pairs of each other on the local corpus -- five
+/// rungs of a knob doing nothing, with the flat range positioned by whichever
+/// corpus it was fitted to.
 ///
-/// The loose tolerance is `max(-d, min(-d + SLACK, CORROBORATED_BITS))`, so it
-/// never drops below what the user asked for and never runs away from it
-/// either: `-d 0` reaches 8, `-d 4` reaches 12, and from `-d 12` up the
-/// tolerance is simply `-d`.
-const CORROBORATED_BITS: u32 = 12;
-const CORROBORATION_SLACK: u32 = 8;
+/// Measured against the alternatives over the hand-labeled pairs, scoring the
+/// whole ladder rather than one setting. A gap of 6 beats the flat single
+/// threshold at every rung (F1 0.762 -> 0.859 at the default `-d 4`, 0.827 ->
+/// 0.909 at `-d 6`, 0.887 -> 0.931 at `-d 8`). Pulling the strict side down to
+/// `-d - 2` and narrowing the gap to 4 scores WORSE than a flat threshold below
+/// `-d 10` -- the lone matches it gives up cost more than the narrow
+/// corroborated window wins back. Widening to 8 buys recall at the default and
+/// gives it back from `-d 10` up, where the strict side is what starts letting
+/// false positives through.
+const CORROBORATION_SLACK_SIGMA: f64 = 1.5;
+
+/// The distance at which one witness is exactly enough, in sigma below chance.
+///
+/// 5 sigma is 12 bits on a 64-bit hash. It anchors the witness schedule below
+/// and **caps nothing**: a match further out than this is not refused, it is
+/// asked for more agreement.
+const EVIDENCE_ANCHOR_SIGMA: f64 = 5.0;
 
 /// How much evidence a corroborated cluster of frame matches has to carry,
-/// counted in multiples of what ONE match at `CORROBORATED_BITS` carries.
+/// counted in multiples of what ONE match at `EVIDENCE_ANCHOR_SIGMA` carries.
 ///
-/// Two is the value that leaves `CORROBORATED_BITS` needing exactly one witness
-/// -- i.e. the value that keeps every tolerance from `-d 0` to `-d 12`
-/// behaving exactly as it did when this was a flat "one witness will do".
-/// Everything it changes is above that, where a flat rule was far too generous:
-/// scored against the hand-labeled pairs, `-d 16` goes from 91.1% precision to
-/// 97.1% and `-d 20` from 72.8% to 91.0%, and F1 rises at both (0.922 -> 0.940,
-/// 0.835 -> 0.925).
+/// Two is the value that makes the anchor come out at exactly one witness, so
+/// this and `EVIDENCE_ANCHOR_SIGMA` are one calibration between them, not two.
+/// What they buy is the loose end: against a flat "one witness will do", `-d 10`
+/// goes from 88.1% precision to 93.2% and `-d 12` from 78.4% to 85.9%, F1 rising
+/// at both.
 const CORROBORATION_BUDGET: f64 = 2.0;
+
+/// A distance expressed as sigma below the mean of the unrelated-pair
+/// distribution, rounded to a whole number of bits.
+fn sigma_below_chance(sigmas: f64) -> u32 {
+    let mean = HASH_BITS as f64 / 2.0;
+    (mean - sigmas * sigma()).round().max(0.0) as u32
+}
 
 /// How improbable a frame match at `distance` is by chance, as a base-10
 /// order of magnitude.
@@ -112,11 +133,12 @@ fn chance_orders_of_magnitude(distance: u32) -> f64 {
 /// distance past ~30 bits: unrelated frames sit around 32 bits apart, so a match
 /// out there is not evidence of anything at any cluster size.
 fn witness_schedule() -> [u32; HASH_BITS as usize + 1] {
-    let budget = CORROBORATION_BUDGET * chance_orders_of_magnitude(CORROBORATED_BITS);
+    let anchor = sigma_below_chance(EVIDENCE_ANCHOR_SIGMA);
+    let budget = CORROBORATION_BUDGET * chance_orders_of_magnitude(anchor);
     let mut schedule = [u32::MAX; HASH_BITS as usize + 1];
     for (distance, needed) in schedule.iter_mut().enumerate() {
         let each = chance_orders_of_magnitude(distance as u32);
-        // Multiply rather than divide: at exactly `CORROBORATED_BITS` the two
+        // Multiply rather than divide: at exactly the anchor distance the two
         // sides are equal, and a division would land on 2.0000000001 as often
         // as on 2.0 and quietly demand a second witness there.
         *needed = (2..=HASH_BITS)
@@ -150,13 +172,18 @@ struct Tolerance {
 
 impl Tolerance {
     fn for_distance(max_hamming_dist: u32) -> Self {
+        // `-d` IS the strict tolerance -- a lone frame match within it counts,
+        // exactly as it did before corroboration existed -- and the corroborated
+        // side sits a fixed distance above it. Nothing clamps either against a
+        // constant, so every rung of the flag moves both, which is what keeps it
+        // a sensitivity control rather than a switch between two fitted regimes.
+        let slack = (CORROBORATION_SLACK_SIGMA * sigma()).round() as u32;
         Tolerance {
-            strict: max_hamming_dist.min(UNCORROBORATED_BITS),
-            // Saturating because nothing here should depend on `run` having
-            // already refused everything above `HASH_BITS`.
-            loose: max_hamming_dist.max(
-                max_hamming_dist.saturating_add(CORROBORATION_SLACK).min(CORROBORATED_BITS),
-            ),
+            strict: max_hamming_dist,
+            // Saturating, then clamped to the hash width: nothing here should
+            // depend on `run` having already refused everything above it, and a
+            // tolerance wider than the hash accepts every pair anyway.
+            loose: max_hamming_dist.saturating_add(slack).min(HASH_BITS),
         }
     }
 
@@ -1107,8 +1134,9 @@ mod tests {
 
     /// Both tolerances pinned to the same value, so a test can state which
     /// samples pair up without the corroboration rule having a say. `-d` never
-    /// produces one of these above `UNCORROBORATED_BITS`; it is the phase-2
-    /// behaviour these tests are about, not the mapping from the flag.
+    /// never produces one of these -- the two sides are always a fixed gap
+    /// apart; it is the phase-2 behaviour these tests are about, not the
+    /// mapping from the flag.
     fn exactly(bits: u32) -> Tolerance {
         Tolerance { strict: bits, loose: bits }
     }
@@ -1250,24 +1278,41 @@ mod tests {
             assert!(tol.strict >= previous.strict && tol.loose >= previous.loose);
             previous = tol;
         }
-        assert_eq!(Tolerance::for_distance(4), Tolerance { strict: 4, loose: 12 });
-        assert_eq!(Tolerance::for_distance(12), Tolerance { strict: 8, loose: 12 });
-        assert_eq!(Tolerance::for_distance(20), Tolerance { strict: 8, loose: 20 });
+        // Both sides move with every rung and neither ever saturates: the gap
+        // is constant, so `-d 12` is not `-d 4` with extra steps.
+        assert_eq!(Tolerance::for_distance(0), Tolerance { strict: 0, loose: 6 });
+        assert_eq!(Tolerance::for_distance(4), Tolerance { strict: 4, loose: 10 });
+        assert_eq!(Tolerance::for_distance(12), Tolerance { strict: 12, loose: 18 });
+        assert_eq!(Tolerance::for_distance(20), Tolerance { strict: 20, loose: 26 });
+        // ...except against the hash width, past which a tolerance means nothing.
+        assert_eq!(
+            Tolerance::for_distance(HASH_BITS),
+            Tolerance { strict: HASH_BITS, loose: HASH_BITS }
+        );
     }
 
     #[test]
-    fn test_one_witness_is_enough_out_to_the_corroborated_distance() {
-        // Everything `-d 12` and below reaches sits at one witness, which is what
-        // makes the schedule a change to the loose end alone: no setting in the
-        // documented range judges a frame match differently for having it.
+    fn test_the_thresholds_are_stated_in_sigma_so_they_track_the_hash_width() {
+        // The two constants are multiples of the unrelated-pair standard
+        // deviation, which is `sqrt(HASH_BITS) / 2` -- 4 bits for this hash. A
+        // wider hash rescales them instead of silently keeping a tuning that was
+        // only ever right for 64 bits.
+        assert!((sigma() - 4.0).abs() < 1e-9);
+        assert_eq!(sigma_below_chance(EVIDENCE_ANCHOR_SIGMA), 12);
+        assert_eq!((CORROBORATION_SLACK_SIGMA * sigma()).round() as u32, 6);
+    }
+
+    #[test]
+    fn test_one_witness_is_exactly_enough_at_the_anchor() {
+        // `CORROBORATION_BUDGET` is calibrated to put the anchor distance at one
+        // witness, so the two constants are a single calibration. If this fails,
+        // they have drifted apart and the schedule means something else.
         let schedule = witness_schedule();
-        for distance in 0..=CORROBORATED_BITS {
-            assert_eq!(
-                schedule[distance as usize], 1,
-                "a match at {distance} bits should still need exactly one witness"
-            );
+        let anchor = sigma_below_chance(EVIDENCE_ANCHOR_SIGMA) as usize;
+        for (distance, needed) in schedule.iter().enumerate().take(anchor + 1) {
+            assert_eq!(*needed, 1, "a match at {distance} bits should need exactly one witness");
         }
-        assert!(schedule[16] > 1, "16 bits is 175x more likely by chance than 12");
+        assert!(schedule[anchor + 4] > 1, "4 bits further out is 175x likelier by chance");
     }
 
     #[test]
@@ -1302,12 +1347,16 @@ mod tests {
             vec![mock_fp_sampled(a, 1000), mock_fp_sampled(b, 1000)]
         };
 
+        // `-d 10` puts 16 bits on the corroborated side (10 + 6), so the quota
+        // is what decides. Each sample has exactly (n - 1) witnesses.
         let needed = witness_schedule()[16];
-        assert!(find_all_matches(&pair_of(needed as u64), 16, 1.0, 0.0).is_empty(),
+        assert!(find_all_matches(&pair_of(needed as u64), 10, 1.0, 0.0).is_empty(),
                 "{needed} witnesses are required and only {} were available", needed - 1);
-        assert!(!find_all_matches(&pair_of(needed as u64 + 1), 16, 1.0, 0.0).is_empty());
-        // ...and none of it is reachable at all until `-d` opens the tolerance.
-        assert!(find_all_matches(&pair_of(needed as u64 + 1), 12, 1.0, 0.0).is_empty());
+        assert!(!find_all_matches(&pair_of(needed as u64 + 1), 10, 1.0, 0.0).is_empty());
+        // A tighter `-d` puts 16 bits out of reach entirely, however many agree.
+        assert!(find_all_matches(&pair_of(needed as u64 + 4), 8, 1.0, 0.0).is_empty());
+        // A looser one takes each match on its own distance, quota irrelevant.
+        assert!(!find_all_matches(&pair_of(2), 16, 1.0, 0.0).is_empty());
     }
 
     #[test]
