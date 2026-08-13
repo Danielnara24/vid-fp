@@ -272,6 +272,12 @@ struct Args {
     /// Two unrelated frames sit about 32 bits apart, so the useful range is
     /// roughly 2 (only near-identical frames) to 12 (visibly the same shot);
     /// past that unrelated footage starts linking whole groups together.
+    /// A frame match standing on its own must be within this and never further
+    /// than 8 bits; one that another frame match agrees with about the time
+    /// offset between the two videos may reach 12, or this value once it is
+    /// higher. That is why -d 8, -d 10 and -d 12 produce the same scan. Past
+    /// 12 bits one agreeing match stops being enough, and the number required
+    /// grows with the distance: two at 14, three at 16, four at 20.
     /// A hash is 64 bits, so no two can be further apart than that and values
     /// above 64 are rejected before the scan starts.
     #[arg(short = 'd', long = "hamming-distance", default_value_t = 4)]

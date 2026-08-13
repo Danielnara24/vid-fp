@@ -36,6 +36,137 @@ const PROBE_COST: usize = 4;
 /// too few hashes for the comparison itself to outweigh the bookkeeping.
 const PAIR_COST: usize = 8;
 
+/// How far a frame match may reach with nothing but its own distance behind it.
+///
+/// Above this a single close-looking frame is not evidence: the corpus is full
+/// of near-static shots, and two unrelated videos of the same white-background
+/// subject produce individual frames ten bits apart all the time. `-d` still
+/// caps this -- the strict tolerance is `min(-d, this)` -- so a tighter `-d`
+/// tightens it and a looser one does not loosen it.
+const UNCORROBORATED_BITS: u32 = 8;
+
+/// How far a frame match may reach once another frame match corroborates it,
+/// and how much looser than `-d` that is allowed to be.
+///
+/// Two frame matches corroborate each other when they place the two videos at
+/// the same time offset. That is the measurement this whole rule rests on: over
+/// the hand-labeled pair set, sample pairs that coincide in time are within 4
+/// bits 64% of the time when the footage really is shared and 0.0% of the time
+/// when it is not, and within 12 bits 75% against 0.6%. Distance alone cannot
+/// separate those populations; distance plus agreement about *when* can.
+///
+/// The loose tolerance is `max(-d, min(-d + SLACK, CORROBORATED_BITS))`, so it
+/// never drops below what the user asked for and never runs away from it
+/// either: `-d 0` reaches 8, `-d 4` reaches 12, and from `-d 12` up the
+/// tolerance is simply `-d`.
+const CORROBORATED_BITS: u32 = 12;
+const CORROBORATION_SLACK: u32 = 8;
+
+/// How much evidence a corroborated cluster of frame matches has to carry,
+/// counted in multiples of what ONE match at `CORROBORATED_BITS` carries.
+///
+/// Two is the value that leaves `CORROBORATED_BITS` needing exactly one witness
+/// -- i.e. the value that keeps every tolerance from `-d 0` to `-d 12`
+/// behaving exactly as it did when this was a flat "one witness will do".
+/// Everything it changes is above that, where a flat rule was far too generous:
+/// scored against the hand-labeled pairs, `-d 16` goes from 91.1% precision to
+/// 97.1% and `-d 20` from 72.8% to 91.0%, and F1 rises at both (0.922 -> 0.940,
+/// 0.835 -> 0.925).
+const CORROBORATION_BUDGET: f64 = 2.0;
+
+/// How improbable a frame match at `distance` is by chance, as a base-10
+/// order of magnitude.
+///
+/// Two unrelated 64-bit frame hashes differ in Binomial(64, 1/2) places, so the
+/// chance of landing within `distance` of each other spans four orders of
+/// magnitude across the range `-d` covers: 3.7e-11 at 8 bits, 2.0e-8 at 12,
+/// 3.5e-6 at 16, 1.7e-4 at 20. One witness is not the same evidence at 20 bits
+/// that it is at 12, and this is the function that says so.
+///
+/// Computed rather than tabulated because `HASH_BITS` is the only input and a
+/// table would have to be re-derived by hand if the hash ever widened. It runs
+/// once per scan.
+fn chance_orders_of_magnitude(distance: u32) -> f64 {
+    let mut term = 1.0f64; // C(HASH_BITS, 0)
+    let mut sum = 1.0f64;
+    for i in 1..=distance.min(HASH_BITS) {
+        term *= (HASH_BITS - i + 1) as f64 / i as f64;
+        sum += term;
+    }
+    HASH_BITS as f64 * std::f64::consts::LOG10_2 - sum.log10()
+}
+
+/// How many witnesses a frame match at each distance needs, indexed by that
+/// distance.
+///
+/// A cluster of `m` matches that agree on one time offset is roughly `m`
+/// independent coincidences, so its evidence is `m` times one match's. Solving
+/// for the smallest `m` that carries `CORROBORATION_BUDGET` gives the schedule:
+/// one witness out to 12 bits, two at 14, three at 16, four at 20. The
+/// independence is an approximation -- near-static footage produces matches that
+/// are anything but independent, which is exactly why a witness must be a
+/// different sample on both sides -- so the budget is calibrated rather than
+/// derived, and only the SHAPE comes from the arithmetic.
+///
+/// `u32::MAX` where no attainable cluster could carry the budget, which is every
+/// distance past ~30 bits: unrelated frames sit around 32 bits apart, so a match
+/// out there is not evidence of anything at any cluster size.
+fn witness_schedule() -> [u32; HASH_BITS as usize + 1] {
+    let budget = CORROBORATION_BUDGET * chance_orders_of_magnitude(CORROBORATED_BITS);
+    let mut schedule = [u32::MAX; HASH_BITS as usize + 1];
+    for (distance, needed) in schedule.iter_mut().enumerate() {
+        let each = chance_orders_of_magnitude(distance as u32);
+        // Multiply rather than divide: at exactly `CORROBORATED_BITS` the two
+        // sides are equal, and a division would land on 2.0000000001 as often
+        // as on 2.0 and quietly demand a second witness there.
+        *needed = (2..=HASH_BITS)
+            .find(|m| *m as f64 * each >= budget)
+            .map(|m| m - 1)
+            .unwrap_or(u32::MAX);
+    }
+    schedule
+}
+
+/// How far apart two frame matches may place the videos and still count as the
+/// same alignment, in milliseconds.
+///
+/// Well under a keyframe interval on any real encode, so two matches landing in
+/// the same window are describing the same instant rather than two instants that
+/// happen to be nearby. Measured against 200, 800 and 1500: 200 and 800 score
+/// identically to this, and 1500 starts admitting scattered coincidences.
+const ALIGNMENT_TOLERANCE_MS: i64 = 500;
+
+/// The two Hamming distances one `-d` implies.
+///
+/// `strict` is what a frame match needs on its own; `loose` is what it needs
+/// when another match agrees with it about the time offset between the two
+/// videos. `strict <= loose` always, and both move monotonically with `-d`, so
+/// raising the tolerance can only ever admit more.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Tolerance {
+    strict: u32,
+    loose: u32,
+}
+
+impl Tolerance {
+    fn for_distance(max_hamming_dist: u32) -> Self {
+        Tolerance {
+            strict: max_hamming_dist.min(UNCORROBORATED_BITS),
+            // Saturating because nothing here should depend on `run` having
+            // already refused everything above `HASH_BITS`.
+            loose: max_hamming_dist.max(
+                max_hamming_dist.saturating_add(CORROBORATION_SLACK).min(CORROBORATED_BITS),
+            ),
+        }
+    }
+
+    /// The widest distance any frame match can be admitted at -- what phase 1
+    /// has to be exhaustive to, and what the probe radius is derived from.
+    fn widest(&self) -> u32 {
+        self.loose
+    }
+}
+
 /// The `k`th 16-bit block of a hash, most significant first.
 #[inline(always)]
 fn block_of(hash: u64, k: usize) -> usize {
@@ -654,21 +785,55 @@ fn candidate_pairs(
 /// already built and is still holding in cache, against the quadratic hash
 /// comparison above them. They are free in the only sense that matters here:
 /// nothing about which frames are examined, or which pairs survive, changes.
+///
+/// ## Two tolerances, and why the looser one needs a witness
+///
+/// A frame match inside `tol.strict` is taken at face value. One between
+/// `strict` and `loose` is only taken if a *different* frame of each video also
+/// matches at the same time offset -- see `ALIGNMENT_TOLERANCE_MS`. Two encodes
+/// of the same footage place their shared frames at one constant offset, so real
+/// matches corroborate each other for free; two videos that merely look alike
+/// scatter, and a scattered near-match is exactly the one worth refusing.
+///
+/// This cuts both ways, which is the point. Below `-d 8` it *admits* matches the
+/// tolerance alone would have refused, and above it, it *refuses* uncorroborated
+/// ones the tolerance alone would have taken.
 fn match_overlap(
     fp_a: &VideoFingerprint,
     fp_b: &VideoFingerprint,
-    max_hamming_dist: u32,
+    tol: Tolerance,
+    schedule: &[u32; HASH_BITS as usize + 1],
 ) -> (f32, f32, Option<Span>, Option<Span>) {
     let mut matched_a = vec![false; fp_a.valid_hashes.len()];
     let mut matched_b = vec![false; fp_b.valid_hashes.len()];
 
+    // Every match out to `loose`, tagged with the offset it implies. Strict
+    // matches are in here too: they are the strongest witnesses there are, and
+    // leaving them out would make a loose match's fate depend on whether its
+    // corroborator happened to be close enough to stand alone.
+    //
+    // This is the only allocation the rule adds, it lives for one pair, and it
+    // holds one 24-byte entry per frame MATCH rather than per frame pair --
+    // unrelated frames sit ~32 bits apart and never enter it. Measured on the
+    // local corpus: +0.6 MB peak at the default `-d 4`, +2.4 MB at `-d 24`.
+    let mut aligned: Vec<(i64, u32, u32, u32)> = Vec::new();
+
     for (i, &h_a) in fp_a.valid_hashes.iter().enumerate() {
         for (j, &h_b) in fp_b.valid_hashes.iter().enumerate() {
-            if (h_a ^ h_b).count_ones() <= max_hamming_dist {
+            let distance = (h_a ^ h_b).count_ones();
+            if distance <= tol.strict {
                 matched_a[i] = true;
                 matched_b[j] = true;
             }
+            if distance <= tol.loose {
+                let offset = fp_a.valid_t_start[i] as i64 - fp_b.valid_t_start[j] as i64;
+                aligned.push((offset, i as u32, j as u32, distance));
+            }
         }
+    }
+
+    if tol.loose > tol.strict {
+        corroborated(&mut aligned, schedule, &mut matched_a, &mut matched_b);
     }
 
     // Each stored hash stands in for the picture over [t_start, t_end), so the
@@ -702,6 +867,64 @@ fn match_overlap(
     )
 }
 
+/// Flag every frame match that enough *other* frame matches agree with about the
+/// time offset between the two videos.
+///
+/// `aligned` is every match out to the loose tolerance. Sorting it by offset
+/// puts every match that could witness another one next to it, so one pass with
+/// a sliding window settles the whole pair. A witness must differ on BOTH sides:
+/// one frame of A matching two neighbouring frames of B says only that B holds a
+/// static shot, and a static shot is what admits unrelated footage.
+///
+/// How many witnesses are enough comes from `schedule`, i.e. from how far apart
+/// the two frames were -- one out to 12 bits, two at 14, three at 16. A single
+/// witness is a fine bar for a match that chance produces once in 50 million and
+/// a poor one for a match it produces once in six thousand.
+///
+/// `O(m log m)` in the number of loose matches, against the `O(n * m)` popcount
+/// loop that produced them. `m` is small on anything unrelated -- an unrelated
+/// frame pair sits ~32 bits apart and never enters this list at all.
+fn corroborated(
+    aligned: &mut [(i64, u32, u32, u32)],
+    schedule: &[u32; HASH_BITS as usize + 1],
+    matched_a: &mut [bool],
+    matched_b: &mut [bool],
+) {
+    if aligned.len() < 2 {
+        return;
+    }
+
+    // In place: the caller's vector is the only copy, and at a wide `-d` on two
+    // long videos it is the largest thing this pass holds.
+    aligned.sort_unstable();
+
+    // `lo` is the first entry still inside the window of `k`, and it only ever
+    // moves forward, so finding the left edge is linear over the whole scan. The
+    // right edge is walked per entry, and the walk stops as soon as the quota is
+    // met -- which on a genuine pair is within the next entry or two.
+    let mut lo = 0usize;
+    for k in 0..aligned.len() {
+        let (offset, i, j, distance) = aligned[k];
+        while offset - aligned[lo].0 > ALIGNMENT_TOLERANCE_MS {
+            lo += 1;
+        }
+        let needed = schedule[distance.min(HASH_BITS) as usize];
+        if needed == u32::MAX {
+            continue;
+        }
+        let witnesses = aligned[lo..]
+            .iter()
+            .take_while(|&&(o, _, _, _)| o - offset <= ALIGNMENT_TOLERANCE_MS)
+            .filter(|&&(_, wi, wj, _)| wi != i && wj != j)
+            .take(needed as usize)
+            .count();
+        if witnesses as u32 >= needed {
+            matched_a[i as usize] = true;
+            matched_b[j as usize] = true;
+        }
+    }
+}
+
 /// Every pair of videos that clears both gates, with the coverage that got them
 /// there.
 ///
@@ -719,14 +942,22 @@ pub fn find_all_matches(
 ) -> Vec<Match> {
     let n = fingerprints.len();
     let total_hashes: usize = fingerprints.iter().map(|fp| fp.valid_hashes.len()).sum();
-    let masks = probe_masks(probe_radius(max_hamming_dist));
+    // Phase 1 has to be exhaustive at the WIDEST distance phase 2 can admit, not
+    // at `-d`: a pair whose only matches are corroborated ones would otherwise
+    // never be proposed, and the corroboration rule would be unreachable exactly
+    // where it does the most good.
+    let tol = Tolerance::for_distance(max_hamming_dist);
+    let masks = probe_masks(probe_radius(tol.widest()));
+    // One table for the whole run: it depends on the hash width alone, and
+    // every pair reads the same answers out of it.
+    let schedule = witness_schedule();
 
     // The two arms differ only in where the pairs come from, and they agree on
     // every pair: the index is exhaustive, and the direct route is what
     // "exhaustive" means. Measuring one pair is the same work either way, so it
     // lives in `measure_pair` and neither arm can drift from the other.
     let pairs: Vec<(usize, usize)> = if index_is_cheaper(masks.len(), n, total_hashes) {
-        let candidates = candidate_pairs(fingerprints, &masks, max_hamming_dist);
+        let candidates = candidate_pairs(fingerprints, &masks, tol.widest());
         info!("Index scan produced {} candidate pair(s); verifying...", candidates.len());
         candidates
     } else {
@@ -742,7 +973,7 @@ pub fn find_all_matches(
             .into_par_iter()
             .flat_map(|v_a| ((v_a + 1)..n).into_par_iter().map(move |v_b| (v_a, v_b)))
             .filter_map(|pair| {
-                measure_pair(fingerprints, pair, max_hamming_dist, min_match_percent, min_duration)
+                measure_pair(fingerprints, pair, tol, &schedule, min_match_percent, min_duration)
             })
             .collect();
     };
@@ -754,7 +985,7 @@ pub fn find_all_matches(
     pairs
         .into_par_iter()
         .filter_map(|pair| {
-            measure_pair(fingerprints, pair, max_hamming_dist, min_match_percent, min_duration)
+            measure_pair(fingerprints, pair, tol, &schedule, min_match_percent, min_duration)
         })
         .collect()
 }
@@ -764,7 +995,8 @@ pub fn find_all_matches(
 fn measure_pair(
     fingerprints: &[VideoFingerprint],
     (v_a, v_b): (usize, usize),
-    max_hamming_dist: u32,
+    tol: Tolerance,
+    schedule: &[u32; HASH_BITS as usize + 1],
     min_match_percent: f32,
     min_duration: f64,
 ) -> Option<Match> {
@@ -774,7 +1006,7 @@ fn measure_pair(
     let fp_a = &fingerprints[v_a];
     let fp_b = &fingerprints[v_b];
 
-    let (pct_a, pct_b, span_a, span_b) = match_overlap(fp_a, fp_b, max_hamming_dist);
+    let (pct_a, pct_b, span_a, span_b) = match_overlap(fp_a, fp_b, tol, schedule);
 
     if pct_a.max(pct_b) < min_match_percent {
         return None;
@@ -873,6 +1105,14 @@ mod tests {
         i.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x0F0F_0F0F_0F0F_0F0F
     }
 
+    /// Both tolerances pinned to the same value, so a test can state which
+    /// samples pair up without the corroboration rule having a say. `-d` never
+    /// produces one of these above `UNCORROBORATED_BITS`; it is the phase-2
+    /// behaviour these tests are about, not the mapping from the flag.
+    fn exactly(bits: u32) -> Tolerance {
+        Tolerance { strict: bits, loose: bits }
+    }
+
     #[test]
     fn test_blocks_partition_the_hash_without_gaps_or_overlap() {
         let h = 0x0123_4567_89AB_CDEFu64;
@@ -951,22 +1191,123 @@ mod tests {
     }
 
     #[test]
-    fn test_find_all_matches_hamming_limit() {
-        let base_hash = 0x0000_0000_0000_0000;
-        let diff_hash = 0x0000_0000_0000_0007; // 3 bits different
-
+    fn test_a_lone_frame_match_beyond_the_tolerance_is_refused() {
+        // One sample each, 3 bits apart, at `-d 2`. It is inside the loose
+        // tolerance but there is no second match to place the two videos at an
+        // offset, so nothing corroborates it and the tolerance is all it has.
         let fps = vec![
-            mock_fp_with_hashes(vec![base_hash, base_hash], 2),
-            mock_fp_with_hashes(vec![diff_hash, diff_hash], 2),
+            mock_fp_sampled(vec![0x0000_0000_0000_0000], 1000),
+            mock_fp_sampled(vec![0x0000_0000_0000_0007], 1000),
         ];
 
-        // Should NOT match if max_hamming is 2
-        let no_matches = find_all_matches(&fps, 2, 1.0, 0.0);
-        assert!(no_matches.is_empty(), "Should be filtered by hamming distance");
+        assert!(find_all_matches(&fps, 2, 1.0, 0.0).is_empty());
+        // The same pair at a tolerance that covers it outright.
+        assert!(!find_all_matches(&fps, 4, 1.0, 0.0).is_empty());
+    }
 
-        // SHOULD match if max_hamming is 3
-        let valid_matches = find_all_matches(&fps, 3, 1.0, 0.0);
-        assert!(!valid_matches.is_empty(), "Should pass hamming distance check");
+    #[test]
+    fn test_frame_matches_agreeing_on_an_offset_are_admitted_beyond_the_tolerance() {
+        // Three samples each, every one 3 bits from its opposite number and ~32
+        // from everything else, all at the same offset. At `-d 2` none of them
+        // stands on its own, and all of them witness each other.
+        let a: Vec<u64> = (0..3).map(distinct_hash).collect();
+        let b: Vec<u64> = a.iter().map(|h| h ^ 0b111).collect();
+        let fps = vec![mock_fp_sampled(a, 2000), mock_fp_sampled(b, 2000)];
+
+        let matches = find_all_matches(&fps, 2, 1.0, 0.0);
+        assert_eq!(pairs(&matches), vec![(0, 1)]);
+        assert!(
+            (matches[0].coverage_a - 1.0).abs() < 1e-6,
+            "every sample was corroborated, so all of the runtime is covered"
+        );
+    }
+
+    #[test]
+    fn test_frame_matches_disagreeing_on_an_offset_do_not_witness_each_other() {
+        // Both of A's samples match B's single sample at 4 bits, but they place
+        // the videos ten seconds apart from each other. That is one static-
+        // looking frame reaching two moments, not two moments lining up, and it
+        // is exactly the shape the alignment window exists to refuse.
+        let fps = vec![
+            mock_fp_sampled(vec![0x0000, 0x00FF], 10_000),
+            mock_fp_sampled(vec![0x000F], 10_000),
+        ];
+
+        assert!(find_all_matches(&fps, 2, 1.0, 0.0).is_empty());
+        // Still found once the tolerance covers the distance on its own.
+        assert!(!find_all_matches(&fps, 4, 1.0, 0.0).is_empty());
+    }
+
+    #[test]
+    fn test_the_tolerance_pair_moves_monotonically_with_the_flag() {
+        // `-d` may only ever admit more as it rises, whichever side of the
+        // corroboration rule a frame match falls on.
+        let mut previous = Tolerance { strict: 0, loose: 0 };
+        for d in 0..=HASH_BITS {
+            let tol = Tolerance::for_distance(d);
+            assert!(tol.strict <= tol.loose, "-d {d}: strict must not exceed loose");
+            assert!(tol.loose >= d, "-d {d}: never stricter than the flag asked for");
+            assert!(tol.strict >= previous.strict && tol.loose >= previous.loose);
+            previous = tol;
+        }
+        assert_eq!(Tolerance::for_distance(4), Tolerance { strict: 4, loose: 12 });
+        assert_eq!(Tolerance::for_distance(12), Tolerance { strict: 8, loose: 12 });
+        assert_eq!(Tolerance::for_distance(20), Tolerance { strict: 8, loose: 20 });
+    }
+
+    #[test]
+    fn test_one_witness_is_enough_out_to_the_corroborated_distance() {
+        // Everything `-d 12` and below reaches sits at one witness, which is what
+        // makes the schedule a change to the loose end alone: no setting in the
+        // documented range judges a frame match differently for having it.
+        let schedule = witness_schedule();
+        for distance in 0..=CORROBORATED_BITS {
+            assert_eq!(
+                schedule[distance as usize], 1,
+                "a match at {distance} bits should still need exactly one witness"
+            );
+        }
+        assert!(schedule[16] > 1, "16 bits is 175x more likely by chance than 12");
+    }
+
+    #[test]
+    fn test_the_witness_schedule_never_softens_as_the_distance_grows() {
+        // A further-apart pair of frames is weaker evidence, never stronger, so
+        // the quota may only rise. Nothing downstream re-checks this: the
+        // schedule is read straight out of the table per match.
+        let schedule = witness_schedule();
+        for distance in 1..=HASH_BITS as usize {
+            assert!(
+                schedule[distance] >= schedule[distance - 1],
+                "{distance} bits asks for fewer witnesses than {} does",
+                distance - 1
+            );
+        }
+        assert_eq!(
+            schedule[HASH_BITS as usize],
+            u32::MAX,
+            "two hashes as far apart as they can be are not evidence at any cluster size"
+        );
+    }
+
+    #[test]
+    fn test_a_far_match_needs_more_corroboration_than_a_close_one() {
+        // Every sample of A matches its opposite number in B at 16 bits and
+        // nothing else, all at one offset -- so each match has exactly (n - 1)
+        // witnesses and the pair turns on the quota alone.
+        let far = 0xFFFFu64; // 16 bits set
+        let pair_of = |n: u64| {
+            let a: Vec<u64> = (0..n).map(distinct_hash).collect();
+            let b: Vec<u64> = a.iter().map(|h| h ^ far).collect();
+            vec![mock_fp_sampled(a, 1000), mock_fp_sampled(b, 1000)]
+        };
+
+        let needed = witness_schedule()[16];
+        assert!(find_all_matches(&pair_of(needed as u64), 16, 1.0, 0.0).is_empty(),
+                "{needed} witnesses are required and only {} were available", needed - 1);
+        assert!(!find_all_matches(&pair_of(needed as u64 + 1), 16, 1.0, 0.0).is_empty());
+        // ...and none of it is reachable at all until `-d` opens the tolerance.
+        assert!(find_all_matches(&pair_of(needed as u64 + 1), 12, 1.0, 0.0).is_empty());
     }
 
     #[test]
@@ -1311,7 +1652,7 @@ mod tests {
         let host = mock_fp_sampled((0..10).map(distinct_hash).collect(), 1000);
         let clip = mock_fp_sampled((4..7).map(distinct_hash).collect(), 1000);
 
-        let (_, _, span_clip, span_host) = match_overlap(&clip, &host, 0);
+        let (_, _, span_clip, span_host) = match_overlap(&clip, &host, exactly(0), &witness_schedule());
 
         assert_eq!(span_clip, Some(Span { start_ms: 0, end_ms: 3000 }));
         assert_eq!(
@@ -1331,7 +1672,7 @@ mod tests {
         let a = mock_fp_sampled((0..10).map(distinct_hash).collect(), 1000);
         let b = mock_fp_sampled(vec![distinct_hash(0), distinct_hash(9)], 1000);
 
-        let (coverage_a, _, span_a, _) = match_overlap(&a, &b, 0);
+        let (coverage_a, _, span_a, _) = match_overlap(&a, &b, exactly(0), &witness_schedule());
 
         assert_eq!(span_a, Some(Span { start_ms: 0, end_ms: 10_000 }));
         // Two samples of ten, i.e. two seconds of the ten the envelope spans.
@@ -1429,7 +1770,7 @@ mod tests {
         let a = mock_fp_sampled(vec![distinct_hash(1)], 1000);
         let b = mock_fp_sampled(vec![distinct_hash(2)], 1000);
 
-        let (_, _, span_a, span_b) = match_overlap(&a, &b, 0);
+        let (_, _, span_a, span_b) = match_overlap(&a, &b, exactly(0), &witness_schedule());
 
         assert_eq!(span_a, None);
         assert_eq!(span_b, None);

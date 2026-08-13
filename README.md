@@ -286,7 +286,7 @@ and the byte total before anything happens.
 | `--follow-symlinks` | Descend into symlinked folders | off |
 | `-e`, `--exclude <FOLDER>` | Exclude a folder; repeat for several | — |
 | `-x`, `--extensions <EXT>` | Video extensions to include, comma-separated or repeated | `mp4,mkv,avi,mov,flv,webm` |
-| `-d`, `--hamming-distance <N>` | Frame-match tolerance, in bits out of 64; higher = less strict matching. Raise to increase duplicates found (but can increase false positives). Values above `64` are refused. See [Tuning](#tuning) | `4` |
+| `-d`, `--hamming-distance <N>` | Frame-match tolerance, in bits out of 64; higher = less strict matching. Raise to increase duplicates found (but can increase false positives). A match backed by another at the same time offset is allowed further; see [Tuning](#tuning). Values above `64` are refused | `4` |
 | `-p`, `--match-percent <F>` | Min % of overlap to count as a duplicate, from `0` to `100`; Lower = Includes shorter matches (but can increase false positives). Values outside the range are refused | `20.0` |
 | `--min-duration <SECS>` | Min shared clip length in seconds for a match. Videos shorter than this are skipped entirely. `0` = off; negative values are refused | `0.0` |
 | `-k`, `--priority <P>` | Criteria for KEEPING files: `length`, `resolution`, `quality`, or `size`. The chosen one is compared first; the rest follow in the default order. See [Codecs and quality](#codecs-and-quality) | `length` |
@@ -319,6 +319,32 @@ only a bit-identical re-encode matches, above it unrelated footage starts to.
 bits set, so any two of them differ in an even number of places — `-d 5` accepts
 exactly what `-d 4` accepts, `-d 7` exactly what `-d 6` does. Step in twos.
 
+**A frame match is judged on its distance *and* on whether anything backs it
+up.** Two encodes of the same footage place every frame they share at one
+constant time offset, so their matches corroborate each other; two videos that
+merely look alike produce matches scattered across unrelated moments. `-d`
+therefore sets two thresholds rather than one:
+
+- a match with nothing behind it must be within `-d`, and never further than 8
+  bits however high you set the flag;
+- a match that another frame match agrees with — a different frame of each
+  video, landing at the same offset — may reach 12 bits, or `-d` itself once
+  that is higher.
+
+**Past 12 bits, one witness stops being enough.** Two unrelated frames land
+within 12 bits of each other about once in fifty million; within 20 bits, once
+in six thousand. A pair of coincidences that far out is not rare enough to mean
+anything, so the number of agreeing frame matches required grows with the
+distance: one out to 12 bits, two at 14, three at 16, four at 20. Nothing at or
+below `-d 12` is judged any differently for it.
+
+The practical effect is that the tight end of the range is far more useful than
+it used to be and the loose end is far harder to fool. It also means `-d 8`,
+`-d 10` and `-d 12` are now the same scan: the strict side has stopped at 8 and
+the corroborated side has reached 12. Past `-d 12` you are asking for matches
+whose own distance proves nothing, and the report will be as good as the
+agreement behind them.
+
 **Both knobs are monotone**, which is what makes tuning them predictable:
 
 - Raising `-d` (or lowering `-p`) only ever *adds* files to the report. Nothing
@@ -334,9 +360,9 @@ you see something you don't recognise.
 match is a short clip inside a long video. Two encodes of the same footage only
 line up frame-for-frame when their keyframes do; when they don't — one encoder
 cutting on scene changes, another on a fixed interval — each file samples
-moments the other never looked at, and a looser `-d` is what bridges the gap.
-Expect a group like that to report roughly half the runtime as shared even
-though the files are identical end to end.
+moments the other never looked at, and no tolerance can bridge a frame that was
+never sampled. Expect a group like that to report well under its full runtime as
+shared even though the files are identical end to end.
 
 **Getting false positives?** Lower `-d` first — it's the blunter of the two.
 Dark scenes, fades, and letterboxed content look alike to any perceptual hash,
