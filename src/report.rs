@@ -4,9 +4,9 @@
 //! This one does not decide anything: it reads a CSV report an earlier run
 //! wrote, takes the rows whose `action` column says DELETE, and disposes of
 //! exactly those. The point is the rows the earlier run *could not* decide --
-//! a codec standoff, a file that reached its group through a chain -- which are
-//! flagged REVIEW precisely because a human has to choose, and which until now
-//! had nowhere to record that choice but `rm`.
+//! a codec standoff, a copy that leads on one metric while another leads on a
+//! different one -- which are flagged REVIEW precisely because a human has to
+//! choose, and which until now had nowhere to record that choice but `rm`.
 //!
 //! So the report is expected to have been edited, and the edits are the input.
 //! A REVIEW turned into a DELETE is acted on; a DELETE turned into a KEEP is

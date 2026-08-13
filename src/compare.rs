@@ -285,10 +285,10 @@ pub struct Link {
 ///
 /// `neighbours` is the same information as an adjacency list, and it exists
 /// because the report asks a question the pair map answers badly: "everything
-/// this file matched". Answering that by probing the map for every other member
-/// of the group is quadratic in the group size, and a loose scan can produce one
-/// component with hundreds of members -- while the number of edges inside it
-/// stays proportional to the pairs actually measured, which is far smaller.
+/// this file matched". Answering that by probing the map for every other file in
+/// the library is quadratic, and a loose scan can leave one file with hundreds
+/// of neighbours -- while the number of edges stays proportional to the pairs
+/// actually measured, which is far smaller.
 pub struct MatchIndex {
     links: HashMap<(usize, usize), Link>,
     neighbours: HashMap<usize, Vec<usize>>,
@@ -379,18 +379,18 @@ impl MatchIndex {
         overlap_seconds(cov_a, fps[a].duration, cov_b, fps[b].duration)
     }
 
-    /// Every measured link `subject` has, strongest first.
+    /// Every measured link `subject` has *within `group`*, strongest first.
     ///
-    /// No group has to be supplied, because every file `subject` matched is in
-    /// `subject`'s group by construction: clustering unions each matched pair,
-    /// so a neighbour and its subject always land in the same component. The
-    /// group is the transitive closure of this list, never smaller than it.
+    /// The group has to be supplied because groups overlap: a file that is a
+    /// duplicate in two cliques matched files in both, and a row reported under
+    /// one of them must not name a file the reader cannot see beside it. So the
+    /// neighbour list is filtered to the group being printed.
     ///
-    /// Pairs that were never measured are absent rather than present with a
-    /// zero, because "never compared" and "compared and shares nothing" are
-    /// different statements and only the second one is evidence about the files.
-    /// That is why a chained group -- A-B and B-C measured, A-C never -- gives A
-    /// one link rather than two.
+    /// Inside a clique that filter is the only thing doing any work -- every
+    /// other member is a neighbour by construction, so the result always has
+    /// `group.len() - 1` entries. It is written as a lookup rather than assumed,
+    /// because the assumption is exactly what a change to the clustering rule
+    /// would break silently.
     ///
     /// Ordered by matched duration descending, ties broken on path, so the
     /// report is reproducible run to run: the strongest link is `first()`, which
@@ -401,13 +401,19 @@ impl MatchIndex {
     /// reading that makes the ordering agree with the row it sorts: the link
     /// printed is the one accounting for the most of THIS file, so a file
     /// reporting most of its runtime is a copy of something here.
-    pub fn links_of(&self, subject: usize, fps: &[VideoFingerprint]) -> Vec<GroupLink> {
+    pub fn links_of(
+        &self,
+        subject: usize,
+        group: &[usize],
+        fps: &[VideoFingerprint],
+    ) -> Vec<GroupLink> {
         let Some(others) = self.neighbours.get(&subject) else {
             return Vec::new();
         };
 
         let mut links: Vec<GroupLink> = others
             .iter()
+            .filter(|&&other| group.contains(&other))
             .filter_map(|&other| {
                 Some(GroupLink {
                     other,
@@ -453,10 +459,10 @@ impl MatchIndex {
     pub fn best_link_in_group(
         &self,
         subject: usize,
-        _group: &[usize],
+        group: &[usize],
         fps: &[VideoFingerprint],
     ) -> Option<GroupLink> {
-        self.links_of(subject, fps).into_iter().next()
+        self.links_of(subject, group, fps).into_iter().next()
     }
 }
 
@@ -1265,11 +1271,12 @@ mod tests {
 
     #[test]
     fn test_a_pair_that_was_never_compared_is_skipped_rather_than_erasing_the_figure() {
-        // A chain: 0-1 and 1-2 matched, 0 and 2 never did. They share a group
-        // because groups are connected components, so 0's row must report what
-        // it shares with 1 -- the link that put it there. Treating the absent
-        // 0-2 pair as unknown would blank the column for most of a chained
-        // group, and treating it as zero would claim a comparison nobody made.
+        // A chain: 0-1 and 1-2 matched, 0 and 2 never did. Clustering does not
+        // hand this module a group like that -- every real group is a clique --
+        // but the lookup must not depend on that, so it is asked directly: 0's
+        // row reports what it shares with 1, the link that exists. Treating the
+        // absent 0-2 pair as unknown would blank the column, and treating it as
+        // zero would claim a comparison nobody made.
         let fps = vec![
             mock_fp_lasting(600.0),
             mock_fp_lasting(600.0),
@@ -1376,7 +1383,7 @@ mod tests {
             Match::new(0, 1, 1.0, 1.0),   // 600s
             Match::new(0, 2, 0.01, 0.01), // 6s
         ]);
-        let links = idx.links_of(0, &fps);
+        let links = idx.links_of(0, &[0, 1, 2], &fps);
 
         assert_eq!(links.len(), 2);
         assert_eq!(links[0].other, 1);
@@ -1406,7 +1413,7 @@ mod tests {
             vec![Match::new(0, 1, 1.0, 1.0), Match::new(0, 2, 1.0, 1.0)],
             vec![Match::new(0, 2, 1.0, 1.0), Match::new(0, 1, 1.0, 1.0)],
         ] {
-            let links = MatchIndex::new(matches).links_of(0, &fps);
+            let links = MatchIndex::new(matches).links_of(0, &[0, 1, 2], &fps);
             assert_eq!(
                 fps[links[0].other].path, "/aardvark.mp4",
                 "an exact tie should fall to the alphabetically first path"

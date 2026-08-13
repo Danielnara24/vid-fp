@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
-use utils::{shutdown_requested, Policy, Priority};
+use utils::{shutdown_requested, Priority};
 
 /// The one table in the cache: absolute file path -> bincode'd `CacheEntry`.
 ///
@@ -308,13 +308,6 @@ struct Args {
     #[arg(short = 'k', long = "priority", default_value = "length")]
     priority: Priority,
 
-    /// Mark a file DELETE even when it never matched the copy being kept,
-    /// reaching its group only through a chain of matches. Such files are
-    /// flagged REVIEW by default. This changes labels only -- deleting still
-    /// requires --delete or --move-to.
-    #[arg(long = "trust-chains")]
-    trust_chains: bool,
-
     /// Output file for the results (supports .txt, .csv, .json)
     #[arg(short = 'o', long = "output", value_hint = clap::ValueHint::FilePath)]
     output: Option<String>,
@@ -356,7 +349,7 @@ struct Args {
         conflicts_with_all = [
             "include", "exclude", "from_file", "null", "recursive", "follow_symlinks",
             "extensions", "hamming_distance", "match_percent", "min_duration",
-            "kf_interval", "min_kf_samples", "priority", "trust_chains", "output",
+            "kf_interval", "min_kf_samples", "priority", "output",
             "prune_cache", "threads",
         ]
     )]
@@ -1998,10 +1991,7 @@ fn run(
         &matches,
         args.output.as_ref(),
         start_time.elapsed().as_secs(),
-        Policy {
-            priority: args.priority,
-            trust_chains: args.trust_chains,
-        },
+        args.priority,
         disposal.as_ref(),
         args.yes,
         stats,

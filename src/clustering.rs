@@ -1,87 +1,97 @@
 //! Turning "these two videos match" edges into groups.
 //!
-//! A group is a *connected component*: files reachable from one another by
-//! following matches. Every file appears in exactly one group, and a group is a
-//! reporting unit -- "these are related, here they are side by side".
+//! A group is a *maximal clique*: every file in it matched every other file in
+//! it, and no file outside it matched all of them. That definition is the whole
+//! safety argument for what `export.rs` does next -- it keeps one file per group
+//! and marks the rest DELETE, which is only defensible if every DELETE target
+//! was independently confirmed against every other member, including the one
+//! being kept.
 //!
-//! That makes the partition the organising idea of the whole report. There is no
-//! such thing as a file whose fate depends on which group you read it in,
-//! because there is only one; `export.rs` therefore resolves KEEP, DELETE and
-//! REVIEW entirely inside a group and never has to reconcile a file's roles
-//! across several of them.
-//!
-//! What a component does NOT assert is that its members are pairwise
-//! duplicates. Matching is not transitive: three episodes sharing an opening
-//! sequence are linked without any two being copies of each other, and a clip
-//! cut from a long video links to its host without linking to the host's other
-//! clips. A single such edge fuses everything it touches into one component. So
-//! a component says "a chain of matches runs through all of these", which is a
-//! weaker claim than "these are all the same video".
-//!
-//! That is why membership and fate are decided separately. Grouping follows the
-//! chain, because the point of a group is to put related files in front of you
-//! together; deletion does not, because `export.rs` will only mark a file DELETE
-//! if it directly matched a copy that survives the group. A file that got here
-//! through some third file is reported alongside its group and flagged REVIEW.
-//! The coverage figures printed beside each row are what tell a re-encode from a
-//! shared title card.
+//! Anything looser breaks that argument, because matching here is not
+//! transitive. Three episodes sharing an opening sequence are pairwise linked
+//! without any two of them being duplicates; a clip cut from a long video links
+//! to the host without linking to the host's other clips. Merging on partial
+//! connectivity -- connected components, or "close enough" expansion rules --
+//! collapses exactly those cases into one group and then has to hold most of it
+//! back for review, because the ranking inside such a group compares files that
+//! were never measured against each other. Requiring a complete subgraph makes
+//! that impossible to express: inside a clique, the loser of a ranking has by
+//! construction been compared with the winner.
 //!
 //! Whether an edge exists at all is decided upstream by `--hamming-distance`,
 //! `--match-percent` and `--min-duration`. This module adds no thresholds of its
-//! own; it only follows the links the comparison stage found.
+//! own; it only refuses to invent links that the comparison stage did not find.
+//!
+//! The price of being strict is that groups overlap: a file belonging to two
+//! cliques is reported in both, so the report is a list of relationships rather
+//! than a partition of the library. That is expected -- `export.rs` resolves
+//! each file's fate ONCE, across every group it appears in, and prints the same
+//! verdict on each of its rows.
 
 use crate::fingerprint::VideoFingerprint;
-use std::collections::HashMap;
+use std::collections::HashSet;
 
-/// A disjoint-set forest over file indices.
+/// Bron-Kerbosch with Tomita pivoting.
 ///
-/// Components are built by merging as the edges stream past rather than by
-/// walking the graph afterwards, so nothing has to hold an adjacency list for
-/// the whole library -- two `usize` vectors is the entire cost, and a scan of a
-/// hundred thousand videos that matched nothing pays for two hundred thousand
-/// integers and no allocation per file.
-struct DisjointSet {
-    parent: Vec<usize>,
-    /// Number of members in the tree rooted here. Only meaningful for a root.
-    size: Vec<usize>,
-}
-
-impl DisjointSet {
-    fn new(n: usize) -> Self {
-        DisjointSet {
-            parent: (0..n).collect(),
-            size: vec![1; n],
+/// `r` is the clique built so far, `p` the candidates that could still extend
+/// it, and `x` the candidates already used as an extension somewhere higher in
+/// the tree. A clique is maximal exactly when nothing can extend it (`p` empty)
+/// and nothing was deliberately excluded from it (`x` empty). `x` is what stops
+/// the same clique being emitted once per ordering of its members.
+///
+/// The pivot is what keeps this tractable on dense neighbourhoods. Every
+/// maximal clique must contain the pivot or one of its non-neighbours, so
+/// branching on only the non-neighbours skips whole subtrees that could not
+/// produce anything new. Picking the pivot with the most neighbours still in
+/// `p` skips the most.
+fn bron_kerbosch(
+    r: HashSet<usize>,
+    mut p: HashSet<usize>,
+    mut x: HashSet<usize>,
+    adjacency: &[HashSet<usize>],
+    cliques: &mut Vec<HashSet<usize>>,
+) {
+    if p.is_empty() {
+        // Nothing left to add. If nothing was excluded either, `r` is maximal.
+        // A group of one is not a duplicate of anything, so it is dropped here
+        // rather than filtered out downstream.
+        if x.is_empty() && r.len() > 1 {
+            cliques.push(r);
         }
+        return;
     }
 
-    /// The representative of `v`'s component, flattening the path on the way.
-    ///
-    /// Path halving rather than full compression: it points every second node
-    /// straight at its grandparent, which gives the same near-constant
-    /// amortized cost as the textbook two-pass version in a single loop and
-    /// without recursion -- and a component here can span a whole series, so a
-    /// recursive `find` is a stack depth chosen by the user's library.
-    fn find(&mut self, mut v: usize) -> usize {
-        while self.parent[v] != v {
-            self.parent[v] = self.parent[self.parent[v]];
-            v = self.parent[v];
-        }
-        v
-    }
+    // `p` is non-empty, so the union is too and this always yields a pivot; the
+    // fallback below is only there to keep the function total.
+    let pivot = p
+        .union(&x)
+        .max_by_key(|&&v| adjacency[v].intersection(&p).count())
+        .copied();
 
-    /// Merge the components holding `a` and `b`. Hanging the smaller tree off
-    /// the larger is what keeps the trees shallow enough for `find` to stay
-    /// cheap regardless of the order the edges arrive in.
-    fn union(&mut self, a: usize, b: usize) {
-        let (mut ra, mut rb) = (self.find(a), self.find(b));
-        if ra == rb {
-            return;
-        }
-        if self.size[ra] < self.size[rb] {
-            std::mem::swap(&mut ra, &mut rb);
-        }
-        self.parent[rb] = ra;
-        self.size[ra] += self.size[rb];
+    let branches: Vec<usize> = match pivot {
+        Some(u) => p.difference(&adjacency[u]).copied().collect(),
+        None => p.iter().copied().collect(),
+    };
+
+    for v in branches {
+        let neighbors = &adjacency[v];
+
+        let mut next_r = r.clone();
+        next_r.insert(v);
+
+        bron_kerbosch(
+            next_r,
+            neighbors.intersection(&p).copied().collect(),
+            neighbors.intersection(&x).copied().collect(),
+            adjacency,
+            cliques,
+        );
+
+        // `v` has now appeared in every clique it can belong to at this level.
+        // Moving it into `x` stops the branches to its right rediscovering
+        // those same cliques with `v` appended.
+        p.remove(&v);
+        x.insert(v);
     }
 }
 
@@ -89,44 +99,55 @@ impl DisjointSet {
 ///
 /// Indices refer to positions in `fingerprints`. Within a group they are
 /// ordered by path; the groups themselves are ordered largest first. A file that
-/// matched nothing is in no group at all -- a component of one is not a
-/// duplicate set, and dropping it here is what keeps the report to the files
-/// that are actually implicated in something.
+/// matched nothing is in no group at all -- a group of one is not a duplicate
+/// set, and dropping it here is what keeps the report to the files that are
+/// actually implicated in something.
 pub fn find_duplicate_groups(
     n: usize,
     edges: Vec<(usize, usize)>,
     fingerprints: &[VideoFingerprint],
 ) -> Vec<Vec<usize>> {
-    let mut sets = DisjointSet::new(n);
+    let mut adjacency = vec![HashSet::new(); n];
     for (i, j) in edges {
-        sets.union(i, j);
+        adjacency[i].insert(j);
+        adjacency[j].insert(i);
     }
 
-    // Bucketing by root is what turns the forest back into groups. The size
-    // check keeps unmatched files out of the map entirely, which on a real
-    // library is the overwhelming majority of it.
-    let mut components: HashMap<usize, Vec<usize>> = HashMap::new();
-    for v in 0..n {
-        let root = sets.find(v);
-        if sets.size[root] > 1 {
-            components.entry(root).or_default().push(v);
-        }
-    }
+    // Only a linked file can be in a group of two or more, and a file with no
+    // edges cannot extend anyone else's clique either -- so leaving it out of
+    // `p` changes no result. On a real library the overwhelming majority of
+    // videos match nothing at all, and seeding them would spend one recursion,
+    // plus a clone of an n-sized set, per file to rediscover that.
+    let candidates: HashSet<usize> = (0..n).filter(|&v| !adjacency[v].is_empty()).collect();
 
-    let mut groups: Vec<Vec<usize>> = components
-        .into_values()
-        .map(|mut indices| {
+    let mut cliques = Vec::new();
+    bron_kerbosch(
+        HashSet::new(),
+        candidates,
+        HashSet::new(),
+        &adjacency,
+        &mut cliques,
+    );
+
+    // Note there is no subset-elimination pass here. Every clique above is
+    // maximal by construction, and a maximal clique cannot be contained in
+    // another one: the members making up the difference would have extended it.
+
+    let mut groups: Vec<Vec<usize>> = cliques
+        .into_iter()
+        .map(|clique| {
+            let mut indices: Vec<usize> = clique.into_iter().collect();
             indices.sort_by(|&a, &b| fingerprints[a].path.cmp(&fingerprints[b].path));
             indices
         })
         .collect();
 
-    // Discovery order follows HashMap iteration, which is not stable across
+    // Discovery order follows HashSet iteration, which is not stable across
     // runs, so the output is sorted into a total order instead: largest groups
     // first, ties broken by comparing member paths in order. Paths are unique
-    // (files are deduplicated by inode before they reach this point) and every
-    // file belongs to exactly one group, so no two distinct groups can compare
-    // equal and the result is fully reproducible.
+    // (files are deduplicated by inode before they reach this point) and no two
+    // maximal cliques hold the same members, so no two distinct groups can
+    // compare equal and the result is fully reproducible.
     groups.sort_by(|a, b| {
         b.len().cmp(&a.len()).then_with(|| {
             a.iter()
@@ -141,7 +162,6 @@ pub fn find_duplicate_groups(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
 
     // Helper function to create dummy fingerprints for testing. Clustering only
     // ever looks at paths, so the codec and frame rate are just plausible
@@ -170,8 +190,17 @@ mod tests {
             .collect()
     }
 
+    fn adjacency_of(n: usize, edges: &[(usize, usize)]) -> Vec<HashSet<usize>> {
+        let mut adjacency: Vec<HashSet<usize>> = vec![HashSet::new(); n];
+        for &(i, j) in edges {
+            adjacency[i].insert(j);
+            adjacency[j].insert(i);
+        }
+        adjacency
+    }
+
     #[test]
-    fn test_find_duplicate_groups_fully_connected_trio() {
+    fn test_find_duplicate_groups_simple_clique() {
         let fps = vec![
             mock_fingerprint("a.mp4"),
             mock_fingerprint("b.mp4"),
@@ -211,50 +240,59 @@ mod tests {
     }
 
     #[test]
-    fn test_a_chain_collapses_into_one_group() {
-        // 0-1 and 1-2 with no 0-2 edge. 0 and 2 were never compared with each
-        // other, but they are reachable through 1, so they are related and
-        // belong in the same reporting unit.
-        let fps = mock_library(3);
-        let groups = find_duplicate_groups(3, vec![(0, 1), (1, 2)], &fps);
-
-        assert_eq!(groups, vec![vec![0, 1, 2]]);
-    }
-
-    #[test]
-    fn test_a_partially_linked_file_joins_the_group_it_is_linked_to() {
-        // 0-1-2 is a triangle; 3 is linked to 0 and 1 but not to 2. One group of
-        // four: having a match inside the component is the whole membership
-        // test, and being unmatched against one member does not exclude a file.
+    fn test_a_partially_linked_file_is_never_absorbed_into_a_group() {
+        // The regression this file exists to prevent. 0-1-2 is a triangle; 3 is
+        // linked to 0 and 1 but NOT to 2. An expansion rule that admits any node
+        // with two edges into a group folds 3 into {0,1,2}, where the ranking can
+        // then mark it DELETE on the strength of a comparison against 2 that
+        // never happened. With --delete --permanent, unrecoverably.
         let fps = mock_library(4);
         let edges = vec![(0, 1), (0, 2), (1, 2), (0, 3), (1, 3)];
 
         let groups = find_duplicate_groups(4, edges, &fps);
 
-        assert_eq!(groups, vec![vec![0, 1, 2, 3]]);
+        assert_eq!(
+            groups,
+            vec![vec![0, 1, 2], vec![0, 1, 3]],
+            "the two maximal cliques must be reported separately"
+        );
+        for group in &groups {
+            assert!(
+                !(group.contains(&2) && group.contains(&3)),
+                "files that never matched must never share a group"
+            );
+        }
     }
 
     #[test]
-    fn test_groups_sharing_a_file_become_one_group() {
-        // Two triangles joined at node 2, which is a duplicate within each of
-        // two otherwise unrelated sets. One shared file is enough to make all
-        // five one group, and so one decision rather than a file whose fate has
-        // to be reconciled across the groups reporting it.
+    fn test_a_chain_does_not_collapse_into_one_group() {
+        // 0-1 and 1-2 with no 0-2 edge. Treating the match relation as
+        // transitive would produce a single group of three; it is not
+        // transitive, so this is two overlapping pairs.
+        let fps = mock_library(3);
+        let groups = find_duplicate_groups(3, vec![(0, 1), (1, 2)], &fps);
+
+        assert_eq!(groups, vec![vec![0, 1], vec![1, 2]]);
+    }
+
+    #[test]
+    fn test_overlapping_cliques_are_both_reported() {
+        // Two triangles sharing node 2 -- e.g. one video that is genuinely a
+        // duplicate within two otherwise unrelated sets. Both groups stand, and
+        // export.rs resolves node 2's fate across them.
         let fps = mock_library(5);
         let edges = vec![(0, 1), (0, 2), (1, 2), (2, 3), (2, 4), (3, 4)];
 
         let groups = find_duplicate_groups(5, edges, &fps);
 
-        assert_eq!(groups, vec![vec![0, 1, 2, 3, 4]]);
+        assert_eq!(groups, vec![vec![0, 1, 2], vec![2, 3, 4]]);
     }
 
     #[test]
-    fn test_every_file_appears_in_exactly_one_group() {
+    fn test_every_group_is_a_complete_subgraph() {
         // The invariant export.rs depends on, checked over a graph messy enough
-        // to have several dense neighbourhoods, a bridge between them, and a
-        // dangling pair. Everything with an edge is grouped, exactly once;
-        // everything without one is absent.
-        let fps = mock_library(9);
+        // to have several overlapping cliques and a stray cross-link.
+        let fps = mock_library(7);
         let edges = vec![
             (0, 1),
             (0, 2),
@@ -262,57 +300,69 @@ mod tests {
             (2, 3),
             (2, 4),
             (3, 4), // triangle sharing node 2
-            (4, 5), // dangling pair off the second triangle
+            (4, 5), // dangling pair
             (0, 3), // a stray link between the two triangles
-            (6, 7), // an unrelated pair
         ];
 
-        let groups = find_duplicate_groups(9, edges.clone(), &fps);
+        let groups = find_duplicate_groups(7, edges.clone(), &fps);
+        let adjacency = adjacency_of(7, &edges);
 
-        let mut seen: HashSet<usize> = HashSet::new();
+        assert!(!groups.is_empty(), "this graph clearly has duplicates");
+
         for group in &groups {
             assert!(group.len() > 1, "a group of one is not a duplicate set");
-            for &idx in group {
-                assert!(seen.insert(idx), "{} was reported in two groups", idx);
+            assert!(!group.contains(&6), "an unmatched file must not be grouped");
+
+            for (pos, &a) in group.iter().enumerate() {
+                for &b in &group[pos + 1..] {
+                    assert!(
+                        adjacency[a].contains(&b),
+                        "{:?} contains the unmatched pair ({}, {})",
+                        group,
+                        a,
+                        b
+                    );
+                }
             }
         }
 
-        assert_eq!(groups, vec![vec![0, 1, 2, 3, 4, 5], vec![6, 7]]);
-        assert!(!seen.contains(&8), "an unmatched file must not be grouped");
-
-        // And every edge is answered for: both ends of each match landed in the
-        // same group, which is what makes the partition a report of the graph
-        // rather than a summary of it.
+        // And every edge is answered for: both ends of each match are reported
+        // side by side somewhere, which is what makes the output a report of the
+        // graph rather than a summary of it.
         for (a, b) in edges {
-            let group = groups.iter().find(|g| g.contains(&a)).unwrap();
-            assert!(group.contains(&b), "({}, {}) matched but were split", a, b);
+            assert!(
+                groups.iter().any(|g| g.contains(&a) && g.contains(&b)),
+                "({}, {}) matched but appear in no group together",
+                a,
+                b
+            );
         }
     }
 
     #[test]
     fn test_unmatched_files_cost_nothing() {
-        // A thousand videos, two matches. Isolated files never reach the output
-        // side at all: they are their own root, of size one, and skipped.
+        // A thousand videos, two matches. Isolated files are kept out of the
+        // search entirely, so this is instant rather than a thousand recursions
+        // each cloning a thousand-element set.
         let fps = mock_library(1000);
         let groups = find_duplicate_groups(1000, vec![(10, 20), (20, 30)], &fps);
 
-        assert_eq!(groups, vec![vec![10, 20, 30]]);
+        assert_eq!(groups, vec![vec![10, 20], vec![20, 30]]);
     }
 
     #[test]
     fn test_a_repeated_edge_does_not_duplicate_a_member() {
         // The comparison stage can propose a pair from several blocks of the
-        // index. A second union of an already-merged pair is a no-op, and the
-        // member list is built from the files rather than from the edges, so
-        // neither can put a file in a group twice.
+        // index. The adjacency is a set of sets, so a second insertion of an
+        // already-known edge changes nothing.
         let fps = mock_library(3);
         let groups = find_duplicate_groups(3, vec![(0, 1), (1, 0), (0, 1), (1, 2)], &fps);
 
-        assert_eq!(groups, vec![vec![0, 1, 2]]);
+        assert_eq!(groups, vec![vec![0, 1], vec![1, 2]]);
     }
 
     #[test]
-    fn test_output_is_reproducible_despite_hashmap_iteration_order() {
+    fn test_output_is_reproducible_despite_hashset_iteration_order() {
         let fps = mock_library(8);
         let edges = vec![(0, 1), (0, 2), (1, 2), (3, 4), (5, 6)];
 

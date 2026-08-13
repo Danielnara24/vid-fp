@@ -4,11 +4,7 @@ Fast video **duplicate and clip finder** for Linux. It fingerprints videos from 
 keyframes and groups together files that have the same content, even when they differ
 in resolution, file size, or container, and even when one video is only a **trimmed
 clip embedded inside another**.
-
-Unlike tools that hash whole files or match on exact frames, `vid-fp` is built to catch
-the hard cases: a 2-minute clip cut out of a full episode, the same movie at two
-resolutions, or a video that was re-encoded. It reports duplicate groups and can
-optionally move the redundant copies to the trash.
+It reports duplicate groups and can optionally move the redundant copies to the trash.
 
 > **Note:** `vid-fp` can delete files. By default it does nothing destructive —
 > it only reports. Deletion happens *only* when you pass `--delete`, it asks you
@@ -18,7 +14,7 @@ optionally move the redundant copies to the trash.
 ## Requirements
 
 Linux, x86_64, **glibc 2.35 or newer** (Ubuntu 22.04+, Debian 12+, Fedora 36+,
-current Arch and Mint). Nothing else — the release binary bundles its own FFmpeg,
+current Arch and Mint). Nothing else, the release binary bundles its own FFmpeg,
 so you do **not** need FFmpeg installed.
 
 ## Installation
@@ -207,9 +203,9 @@ vid-fp ~/Videos -r --delete --permanent
 Once the scan is done and the groups are resolved, an armed run stops and asks
 before it touches anything.
 
-Return accepts. Answering `n` doesn't abort the run — it just demotes it to a
+Return accepts. Answering `n` doesn't abort the run, it demotes it to a
 report-only one, so you still get the full table and the reclaimable figure
-without re-scanning. Pass `-y`/`--yes` to skip the question.
+without re-scanning. Pass `-y`/`--yes` to skip the prompt.
 
 The prompt only appears when there's a terminal on both stdin and stderr, so it
 can never block a script, a cron job, or `fd … | vid-fp - --delete`; those runs
@@ -294,7 +290,6 @@ and the byte total before anything happens.
 | `-p`, `--match-percent <F>` | Min % of overlap to count as a duplicate, from `0` to `100`; Lower = Includes shorter matches (but can increase false positives). Values outside the range are refused | `20.0` |
 | `--min-duration <SECS>` | Min shared clip length in seconds for a match. Videos shorter than this are skipped entirely. `0` = off; negative values are refused | `0.0` |
 | `-k`, `--priority <P>` | Criteria for KEEPING files: `length`, `resolution`, `quality`, or `size`. The chosen one is compared first; the rest follow in the default order. See [Codecs and quality](#codecs-and-quality) | `length` |
-| `--trust-chains` | Mark a file DELETE even when it never matched the copy being kept, reaching its group only through a chain of matches; such files are flagged REVIEW by default. Changes labels only, deleting still needs `--delete` or `--move-to` | off |
 | `--keyframe-interval <F>` | Seconds between sampled keyframes (`0` = every keyframe); Higher = Faster processing (Increasing this can hinder the capability of finding short matches between videos) | `0.0` |
 | `--min-keyframes <F>` | Min keyframes kept for short videos (only relevant when keyframe-interval > 0) | `4.0` |
 | `-o`, `--output <FILE>` | Optional path to save the report — `.txt`, `.csv`, or `.json` | — |
@@ -335,7 +330,7 @@ a file that shows up when you loosen the knobs was always a weaker match than
 the ones already there. Start at the defaults and walk one knob outward until
 you see something you don't recognise.
 
-**Not finding duplicates you expect?** Raise `-d` to 10–12, or lower `-p` if the
+**Not finding duplicates you expect?** Raise `-d`, or lower `-p` if the
 match is a short clip inside a long video. Two encodes of the same footage only
 line up frame-for-frame when their keyframes do; when they don't — one encoder
 cutting on scene changes, another on a fixed interval — each file samples
@@ -400,24 +395,24 @@ file.
 
 ## How it reads the results
 
-**A group is everything related to everything else in it.** Files are grouped by
-following matches: if A matches B and B matches C, all three land in one group,
-whether or not A and C were ever directly compared with each other. This way
-every file appears in exactly one group, so a group is a self-contained unit 
-and each file gets one action decided inside it.
+**Every file in a group matched every other file in it.** A group is
+the tool's evidence for deleting something, so it never asserts a comparison it
+did not make.
 
-That means a group is not a promise that all its members are copies of each
-other. Matching isn't transitive: three episodes sharing an opening sequence are
-linked without any two being duplicates, and one such link is enough to fuse
-everything it touches into a single group. Raise
-`--match-percent` or `--min-duration` if incidental links are pulling unrelated
-files together.
+**A file can appear in more than one group.** Its action is still decided once, for
+the file, not once per group. A file marked DELETE in one group reads DELETE
+in every group it appears in, and a file held for REVIEW anywhere is held
+everywhere.
+
+If B is redundant against A and C is redundant against B, both B and C go in a single
+pass and A is what's left. It is what stops you having to re-run until a chain has collapsed one hop
+at a time, and it is a reason to read a dry run's report before passing `--delete`.
 
 **The "matched" column is footage, not frames.** It is how much of *this file's
 own runtime* was found in the group member it matched most closely, in seconds —
 so a pair linked only by a common title card reads as the second or two that
 card lasts. Read it against the file's own length: that ratio is what separates
-a re-encode from a shared intro.
+a re-encode from a shared clip.
 
 Every figure on a row describes that row's file, including this one. On a
 genuine match that costs nothing, because both ends agree anyway: a two-minute
@@ -454,8 +449,7 @@ more, check the pair you care about rather than assuming one number covers all
 of them.
 
 **The CSV and JSON say which file, and where.** The console and `.txt` report
-have one line per file, but the machine-readable formats carry three more things
-about that strongest link:
+have one line per file, but the machine-readable formats carry more data:
 
 | Column | Meaning |
 | --- | --- |
@@ -464,7 +458,7 @@ about that strongest link:
 | `matched_from`, `matched_to` | Where that footage sits **in this file's own runtime** |
 | `matched_from_seconds`, `matched_to_seconds` | The same two as raw seconds |
 
-The timestamps are per file, not per pair, and that is the point: a two-minute
+The timestamps are per file, not per pair: a two-minute
 clip cut from the middle of an episode reads `00:00:00`–`00:02:01` on its own row
 and `00:19:59`–`00:22:40` on the episode's. The second one is the answer to
 "where in this episode is that clip", which nothing else in the report can tell
@@ -508,25 +502,22 @@ member it was directly compared against, strongest first, each with its own
 where a group of three or more stops needing a caveat: the whole set of
 measurements is there, pair by pair.
 
-Every file in a duplicate group is labeled with an action:
+Every file in a duplicate group is labeled with an action. The label is the
+file's, not the group's: a file appearing in several groups shows the same one
+in all of them, resolved as REVIEW > DELETE > KEEP.
 
 - **KEEP** — the best copy in the group, chosen by your `--priority`. There is
   one per group, except in a codec standoff (below), where each codec's best is
-  held for REVIEW instead.
-- **DELETE** — a redundant copy. Nothing happens to it without `--delete`; the
-  summary totals these into the reclaimable figure so you can see the cost of
-  the run before committing to it.
+  held for REVIEW instead — and except where that best copy is itself redundant
+  against something in another group, in which case it reads DELETE here too.
+- **DELETE** — a redundant copy, in at least one of the groups it appears in.
+  Nothing happens to it without `--delete`; the summary totals these into the
+  reclaimable figure so you can see the cost of the run before committing to it.
 - **REVIEW** — a copy worth a manual look before deleting; for example, the KEEP
   pick is the longest video but a *different* file has higher resolution, or the
   group holds the best copy of each of several codecs and nothing comparable can
-  choose between them. REVIEW files are never deleted automatically.
-
-  The third reason is the chain: **a file is only marked DELETE if it actually
-  matched a copy that's being kept.** A group is built by following matches, so
-  a member can lose the ranking without ever having been compared against the
-  survivor — it got there through some third file. Deleting on that basis
-  removes something nothing ever measured against the file replacing it, so it's
-  flagged REVIEW instead. Pass `--trust-chains` to mark those DELETE too.
+  choose between them. REVIEW files are never deleted, in any
+  group.
 
 Once armed, DELETE rows report what actually happened: **DELETED** (trashed or
 removed), **MOVED** (relocated by `--move-to`), **FAILED**, or **CHANGED** — the
@@ -572,10 +563,10 @@ a different tolerance is instant.
   wins over `--delete`/`--permanent` whenever it's passed.
 - **Do a dry run first.** Look at the output (or a saved `--output` report) before
   running with `--delete`.
-- **DELETE always rests on a measurement, not on an inference.** A file is only
-  marked DELETE if it directly matched a copy that survives its group; one that
-  reached the group through a chain is flagged REVIEW. `--trust-chains` opts out
-  of this.
+- **DELETE always rests on a measurement, not on an inference.** Every member of
+  a group was directly compared with every other, so a file marked DELETE lost
+  the ranking to a copy it was actually measured against — never to one it
+  merely shares a group with.
   - **No double-counting.** Hard links and symlinks to the same file collapse into
   a single entry, so the reported space freed reflects bytes actually reclaimed.
   - **Tab-complete your `-e` paths.** An exclude folder that can't be resolved
