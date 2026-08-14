@@ -15,6 +15,13 @@
 //! fingerprint failure instead of a silent skip, which is the correct trade for
 //! a tool whose worst failure mode is quietly doing less than it was asked.
 //!
+//! `-x '*'` is the escape hatch for when the guess cannot be made at all: a
+//! folder of extensionless files (a `Camera Uploads` dump, a DVD rip, anything
+//! named by a hash) is unreachable from a folder walk otherwise, because
+//! `Path::extension` has nothing to offer and no list of suffixes can name the
+//! absence of one. It means "hand every regular file to the decoder and let the
+//! decoder say", which is the same contract a named path already gets.
+//!
 //! `--exclude` is the opposite: it applies to everything, including a path named
 //! explicitly. It is the one flag whose entire purpose is "do not touch this",
 //! and `find ... | vid-fp - -e ~/keep --delete` has to mean what it obviously
@@ -108,10 +115,17 @@ pub fn collect(sources: &Sources, stats: &RunStats) -> Result<Scan> {
         info!("Excluding folders: {:?}", sources.exclude);
     }
 
-    // HashSet iteration order is unspecified; sort for a stable, readable log.
-    let mut ext_display: Vec<&str> = extensions.iter().map(|s| s.as_str()).collect();
-    ext_display.sort_unstable();
-    info!("Searching extensions: {:?}", ext_display);
+    match &extensions {
+        // Worth saying out loud: it is the one setting under which a folder of
+        // text files becomes a folder of failed fingerprints.
+        Wanted::Anything => info!("Searching every file, whatever its extension (-x '*')."),
+        Wanted::OneOf(set) => {
+            // HashSet iteration order is unspecified; sort for a stable log.
+            let mut ext_display: Vec<&str> = set.iter().map(|s| s.as_str()).collect();
+            ext_display.sort_unstable();
+            info!("Searching extensions: {:?}", ext_display);
+        }
+    }
 
     let excludes = resolve_excludes(sources.exclude, stats);
     let requested = requested_paths(sources, stats)?;
@@ -200,7 +214,7 @@ pub fn collect(sources: &Sources, stats: &RunStats) -> Result<Scan> {
 fn walk_folder(
     base: &Path,
     sources: &Sources,
-    extensions: &HashSet<String>,
+    extensions: &Wanted,
     excludes: &[PathBuf],
     seen_inodes: &mut HashSet<(u64, u64)>,
     found: &mut Vec<ScannedFile>,
@@ -241,11 +255,19 @@ fn walk_folder(
             }
         };
 
+        // A directory is never a file to fingerprint, and WalkDir already knows
+        // which entries are directories -- so asking it here costs nothing and
+        // saves a stat() per folder under `-x '*'`, where the extension filter
+        // no longer turns them away.
+        if entry.file_type().is_dir() {
+            continue;
+        }
+
         let path = entry.path();
 
-        // Extension first: it is free, and it keeps us from stat()ing every
+        // Extension next: it is free, and it keeps us from stat()ing every
         // non-video file in the tree.
-        if !has_wanted_extension(path, extensions) {
+        if !extensions.accepts(path) {
             continue;
         }
 
@@ -383,28 +405,66 @@ fn split_path_list(raw: &[u8], null_separated: bool) -> Vec<&[u8]> {
         .collect()
 }
 
-fn normalize_extensions(requested: &[String]) -> Result<HashSet<String>> {
+/// The guess a folder walk makes about which of its files are videos.
+///
+/// Two shapes rather than one set, because "every file" is not expressible as a
+/// list of suffixes: a file with no extension at all has nothing for
+/// `Path::extension` to return, so no entry could ever name it. That is not a
+/// corner case -- it is a whole camera dump, a DVD rip, or anything named by a
+/// content hash -- and before `-x '*'` those folders were unreachable from a
+/// walk, with the only workaround being to pipe the paths in from another tool.
+enum Wanted {
+    /// `-x '*'`. Every regular file the walk finds, extension or not.
+    Anything,
+    /// Files whose extension is in this set, lowercased and dot-free.
+    OneOf(HashSet<String>),
+}
+
+impl Wanted {
+    fn accepts(&self, path: &Path) -> bool {
+        match self {
+            Wanted::Anything => true,
+            Wanted::OneOf(extensions) => path
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|ext| extensions.contains(ext.to_lowercase().as_str())),
+        }
+    }
+}
+
+/// The wildcard, spelled the way a shell user expects. Quoting is on them --
+/// unquoted it is a glob, and one that expands to the directory's contents.
+const WILDCARD: &str = "*";
+
+fn normalize_extensions(requested: &[String]) -> Result<Wanted> {
     // Strip an optional leading dot and lowercase, so `-x .MP4`, `-x MP4`, and
     // `-x mp4` all behave identically. A HashSet gives O(1) lookups during the
     // walk and dedups automatically.
+    // `-x '*.mkv'` is how a shell user spells the same thing, and the entry it
+    // produces would otherwise be a suffix no file on earth has -- matching
+    // nothing, silently, which is the failure this flag is being widened to fix.
     let extensions: HashSet<String> = requested
         .iter()
-        .map(|e| e.trim().trim_start_matches('.').to_lowercase())
+        .map(|e| {
+            let e = e.trim();
+            let e = e.strip_prefix("*.").unwrap_or(e);
+            e.trim_start_matches('.').to_lowercase()
+        })
         .filter(|e| !e.is_empty())
         .collect();
+
+    // The wildcard wins over anything beside it. `-x '*',mkv` is not a
+    // contradiction to refuse -- it is a wider request with a narrower one
+    // still written down, and the wider one is what was asked for.
+    if extensions.contains(WILDCARD) {
+        return Ok(Wanted::Anything);
+    }
 
     if extensions.is_empty() {
         anyhow::bail!("No valid video extensions to search for (--extensions was empty).");
     }
 
-    Ok(extensions)
-}
-
-fn has_wanted_extension(path: &Path, extensions: &HashSet<String>) -> bool {
-    path.extension()
-        .and_then(|s| s.to_str())
-        .map(|ext| extensions.contains(ext.to_lowercase().as_str()))
-        .unwrap_or(false)
+    Ok(Wanted::OneOf(extensions))
 }
 
 /// Canonicalize the exclude list so prefix matching is safe and reliable.
@@ -559,6 +619,103 @@ mod tests {
             collected(&sources(&include, &[], &extensions_of(&["mkv"])), &stats),
             vec![video]
         );
+    }
+
+    #[test]
+    fn test_the_wildcard_reaches_a_file_with_no_extension_at_all() {
+        // The case no extension list can express, and the reason `*` exists: a
+        // camera dump or a DVD rip whose files are named by a hash was
+        // unreachable from a folder walk entirely.
+        let dir = tempfile::tempdir().unwrap();
+        let bare = touch(dir.path(), "VTS_01_1");
+        let video = touch(dir.path(), "episode.mkv");
+
+        let include = vec![dir.path().to_string_lossy().to_string()];
+        let stats = RunStats::default();
+
+        let mut expected = vec![bare, video];
+        expected.sort();
+        assert_eq!(
+            collected(&sources(&include, &[], &extensions_of(&["*"])), &stats),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_the_wildcard_widens_whatever_it_is_written_beside() {
+        // `-x '*',mkv` is not a contradiction to refuse: it is a wider request
+        // with a narrower one still written down.
+        let dir = tempfile::tempdir().unwrap();
+        let subtitle = touch(dir.path(), "episode.srt");
+        let video = touch(dir.path(), "episode.mkv");
+
+        let include = vec![dir.path().to_string_lossy().to_string()];
+        let stats = RunStats::default();
+
+        let mut expected = vec![subtitle, video];
+        expected.sort();
+        assert_eq!(
+            collected(&sources(&include, &[], &extensions_of(&["mkv", "*"])), &stats),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_a_directory_named_like_a_video_is_not_a_video() {
+        // Under `-x '*'` the extension filter no longer turns directories away,
+        // so the walk has to. A folder called `season1.mkv` is a real thing --
+        // an extracted Blu-ray structure is one -- and handing it to the decoder
+        // would report a problem against something that is not a file.
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("season1.mkv")).unwrap();
+        let video = touch(dir.path(), "episode.mkv");
+
+        let include = vec![dir.path().to_string_lossy().to_string()];
+        let stats = RunStats::default();
+
+        assert_eq!(
+            collected(&sources(&include, &[], &extensions_of(&["*"])), &stats),
+            vec![video]
+        );
+        assert!(!stats.had_problems());
+    }
+
+    #[test]
+    fn test_an_extension_may_be_written_the_way_a_shell_glob_is() {
+        // `-x '*.mkv'` would otherwise be a suffix no file has, matching nothing
+        // at all -- silently, which is the failure this flag was widened to fix.
+        let dir = tempfile::tempdir().unwrap();
+        let video = touch(dir.path(), "episode.mkv");
+        touch(dir.path(), "episode.srt");
+
+        let include = vec![dir.path().to_string_lossy().to_string()];
+        let stats = RunStats::default();
+
+        assert_eq!(
+            collected(&sources(&include, &[], &extensions_of(&["*.MKV"])), &stats),
+            vec![video]
+        );
+    }
+
+    #[test]
+    fn test_the_default_list_covers_the_containers_a_camera_or_a_capture_writes() {
+        // Named individually rather than as a count, because the failure this
+        // guards is one extension quietly going missing: a folder of .mts files
+        // that reports "No videos found" reads as a broken tool, not as a
+        // narrow default.
+        let dir = tempfile::tempdir().unwrap();
+        let mut expected: Vec<String> = ["clip.mts", "capture.ts", "rip.vob", "itunes.m4v"]
+            .iter()
+            .map(|n| touch(dir.path(), n))
+            .collect();
+        expected.sort();
+        touch(dir.path(), "episode.srt");
+
+        let include = vec![dir.path().to_string_lossy().to_string()];
+        let defaults = extensions_of(&crate::DEFAULT_EXTENSIONS);
+        let stats = RunStats::default();
+
+        assert_eq!(collected(&sources(&include, &[], &defaults), &stats), expected);
     }
 
     #[test]

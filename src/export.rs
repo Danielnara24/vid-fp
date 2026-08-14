@@ -2233,6 +2233,46 @@ matched_from_seconds;matched_to_seconds";
     }
 
     #[test]
+    fn test_every_report_format_that_records_a_size_can_be_handed_straight_back() {
+        // The writer and the readers, tied together. `report.rs` locates three
+        // fields in each format and this is what proves it is locating the ones
+        // THIS module wrote -- in the same shape, with the same spelling of
+        // DELETE, and with a size the staleness check will agree with. A report
+        // this tool wrote and cannot replay is the failure worth a test of its
+        // own, because everything else about it looks right.
+        for extension in ["csv", "json"] {
+            let dir = tempfile::tempdir().unwrap();
+            let keep = at(&dir, "long.mkv");
+            let doomed = at(&dir, "short.mkv");
+
+            let fps = vec![mock_fp_at(&keep, 60.0), mock_fp_at(&doomed, 10.0)];
+            materialize_all(&fps);
+
+            let groups = vec![vec![0, 1]];
+            let path_str = report_to(extension);
+
+            // Report-only: nothing is touched, and the report is the whole
+            // output -- which is the run --from-report exists to follow.
+            output_results(
+                &groups, &fps, &all_compared(fps.len()), Some(&path_str), 0, Priority::Length,
+                None, true, &RunStats::default(),
+            ).unwrap();
+
+            assert!(Path::new(&doomed).exists(), "{}: nothing is removed yet", extension);
+
+            let stats = RunStats::default();
+            let gone = crate::report::apply(&path_str, &Disposal::Permanent, true, &stats).unwrap();
+
+            assert_eq!(gone, vec![doomed.clone()], "{}", extension);
+            assert!(!Path::new(&doomed).exists(), "{}: the DELETE row was acted on", extension);
+            assert!(Path::new(&keep).exists(), "{}: and nothing else was", extension);
+            assert!(!stats.had_problems(), "{}: every row was understood", extension);
+
+            let _ = fs::remove_file(path_str);
+        }
+    }
+
+    #[test]
     fn test_quality_settles_groups_that_tie_on_length_and_resolution() {
         // Same length, same resolution, same codec: under the default order the
         // decision reaches quality, and the denser copy is kept. Nothing is

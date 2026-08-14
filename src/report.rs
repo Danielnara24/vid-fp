@@ -22,9 +22,18 @@
 //! that has been replaced since -- the one guarantee that gets *more* valuable
 //! the longer a report sits before it is acted on.
 //!
-//! Only the CSV is read. The JSON carries the same `action` field, but nobody
-//! adjudicates a REVIEW by hand-editing a JSON tree, and a second parser would
-//! be a second place for this to be wrong.
+//! Both formats `-o` can write a decision into are read: the CSV, and the JSON
+//! that is the richer of the two. What is deliberately NOT duplicated is the
+//! judgement. A format reader here does one thing -- pull three cells out of one
+//! row and say where that row was -- and every question about what those cells
+//! MEAN (is this a word we wrote? is that a byte count? has this path already
+//! been claimed?) is answered once, in `Rows::consider`, for rows of every
+//! format. A second parser is only a second place to be wrong if it is allowed
+//! to decide anything, and this one is not.
+//!
+//! `.txt` remains unreadable, and that is a property of the format rather than
+//! an omission: it is a rendering for a human, with no size beside each path to
+//! check the file against before removing it.
 
 use anyhow::{anyhow, Context, Result};
 use log::info;
@@ -72,6 +81,140 @@ struct Report {
     rows: usize,
 }
 
+/// One row of a report, in whatever format it arrived in.
+///
+/// Three fields, because three is everything the destructive step needs: which
+/// file, how big it was when the decision was taken, and what the decision was.
+/// `at` is only ever quoted back to the user, and each format spells it the way
+/// that format is navigated -- a line number for the CSV, a path through the
+/// tree for the JSON -- because a complaint about a row you cannot find is a
+/// complaint you cannot act on.
+struct Row<'a> {
+    at: String,
+    action: &'a str,
+    /// Deliberately untrimmed. See `Rows::consider`.
+    file: &'a str,
+    size: &'a str,
+}
+
+/// The rows of one report, and the single place that decides what any of them
+/// mean.
+///
+/// Every format reader feeds this. That is the whole arrangement: the readers
+/// know how to find three cells, and nothing else, so adding a format cannot
+/// add a way for DELETE to be interpreted.
+#[derive(Default)]
+struct Rows {
+    marked: Vec<Marked>,
+    rows: usize,
+    /// One file can only be disposed of once. A report vid-fp wrote never
+    /// repeats a path within its own decisions, but one assembled by hand or
+    /// concatenated from several runs can, and the second attempt would be a
+    /// spurious FAILED against a file the first one correctly removed.
+    seen: HashSet<String>,
+}
+
+impl Rows {
+    /// Take one row, and keep it if it asks for its file to be disposed of.
+    ///
+    /// Nothing here aborts. A report is a list of independent decisions, and one
+    /// mangled row is no reason to refuse to act on the ninety-nine good ones --
+    /// it is counted as a problem (exit 2) and named, which is the treatment
+    /// every "we did less than we were asked" case in this tool gets.
+    fn consider(&mut self, row: Row, report: &str, stats: &RunStats) {
+        self.rows += 1;
+
+        let action = row.action.trim();
+
+        // An emptied cell is unambiguous in effect -- nothing happens to that
+        // file -- so it is not worth complaining about. A report that arrives
+        // with EVERY action blank is caught by the count `apply` prints.
+        if action.is_empty() {
+            return;
+        }
+
+        let lower = action.to_ascii_lowercase();
+        if !KNOWN_ACTIONS.contains(&lower.as_str()) {
+            log::error!(
+                "{}: {} has an action of \"{}\", which is not one of {}. \
+                 The file it names was left alone.",
+                report,
+                row.at,
+                action,
+                KNOWN_ACTIONS.join("/").to_uppercase()
+            );
+            stats
+                .report_unusable
+                .record(format!("{} {}: action \"{}\"", report, row.at, action));
+            return;
+        }
+
+        if lower != ACT_ON {
+            return;
+        }
+
+        // The path is deliberately NOT trimmed, unlike every other cell read
+        // here. Leading and trailing spaces are legal in a Linux filename, and
+        // both writers emit one verbatim -- a trailing space does not make a CSV
+        // field need quoting, and JSON says exactly what it is given -- so
+        // trimming means the tool cannot even replay its own report. What it
+        // does instead is look up a DIFFERENT path: `dupe.mkv ` becomes
+        // `dupe.mkv`, and if that neighbour happens to be the size the row
+        // recorded, the staleness check passes and the wrong file is deleted.
+        // The check cannot catch it, because it is taken against whatever path
+        // survived the trim.
+        //
+        // Whitespace is still not a file name, so a cell holding only spaces is
+        // treated as the empty one it plainly is.
+        if row.file.trim().is_empty() {
+            log::error!("{}: {} is marked DELETE but names no file.", report, row.at);
+            stats
+                .report_unusable
+                .record(format!("{} {}: no full_path", report, row.at));
+            return;
+        }
+
+        // No fallback if this will not parse. The recorded size is the entire
+        // basis of the check that runs before the file is touched, and a
+        // deletion carried out without it is a deletion with nothing behind it
+        // -- so a row that lost its size is a row this mode declines to act on.
+        // (A report round-tripped through a spreadsheet that rewrote the column
+        // as 1.23E+09 lands here, which is why the value is quoted back.)
+        let size = match row.size.trim().parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => {
+                log::error!(
+                    "{}: {} is marked DELETE but its size_bytes is \"{}\", which is not a \
+                     byte count. {} was left alone: without the size it was measured at there is \
+                     nothing to check it against before removing it.",
+                    report,
+                    row.at,
+                    row.size.trim(),
+                    row.file
+                );
+                stats
+                    .report_unusable
+                    .record(format!("{} {}: unusable size_bytes", report, row.at));
+                return;
+            }
+        };
+
+        if self.seen.insert(row.file.to_string()) {
+            self.marked.push(Marked {
+                path: row.file.to_string(),
+                size,
+            });
+        }
+    }
+
+    fn finish(self) -> Report {
+        Report {
+            marked: self.marked,
+            rows: self.rows,
+        }
+    }
+}
+
 /// The index of the column called `name`.
 ///
 /// By name rather than by position on purpose, and it is what lets the column
@@ -87,7 +230,9 @@ fn column(headers: &csv::StringRecord, name: &str) -> Result<usize> {
         .ok_or_else(|| {
             anyhow!(
                 "The report has no '{}' column. --from-report reads the CSV that -o <file>.csv \
-                 writes; a .txt or .json report cannot be replayed.",
+                 writes, or the JSON that -o <file>.json writes; a .txt report cannot be \
+                 replayed, because it records no size to check each file against before \
+                 removing it.",
                 name
             )
         })
@@ -95,13 +240,32 @@ fn column(headers: &csv::StringRecord, name: &str) -> Result<usize> {
 
 /// Parse the report, keeping the rows marked DELETE.
 ///
-/// Rows that cannot be understood are counted as problems and skipped rather
-/// than aborting the read: a report is a list of independent decisions, and one
-/// mangled line is no reason to refuse to act on the ninety-nine good ones. A
-/// missing *column*, by contrast, means this is not a vid-fp CSV at all, and
-/// that does abort -- proceeding would mean acting on nothing and saying so as
-/// though the file had simply been empty.
+/// Which reader runs is decided by the extension, exactly as `--output` decides
+/// which writer runs, so a file this tool wrote is read back by the reader that
+/// matches the writer that produced it. Anything that is not `.json` is offered
+/// to the CSV reader rather than refused on sight: the CSV is what a report gets
+/// renamed to (`dupes.txt`, `dupes.bak`, no extension at all after a download),
+/// and it can say for itself whether it is one -- its header either has the
+/// three columns or it does not.
 fn read(path: &str, stats: &RunStats) -> Result<Report> {
+    let is_json = std::path::Path::new(path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("json"));
+
+    if is_json {
+        read_json(path, stats)
+    } else {
+        read_csv(path, stats)
+    }
+}
+
+/// The CSV report, located by column name.
+///
+/// A missing *column* means this is not a vid-fp CSV at all, and that does abort
+/// -- proceeding would mean acting on nothing and saying so as though the file
+/// had simply been empty.
+fn read_csv(path: &str, stats: &RunStats) -> Result<Report> {
     let mut rdr = csv::ReaderBuilder::new()
         .delimiter(b';')
         // A hand-edited file can easily carry a row with a field too few or too
@@ -120,13 +284,7 @@ fn read(path: &str, stats: &RunStats) -> Result<Report> {
     let size_col = column(&headers, "size_bytes")?;
     let action_col = column(&headers, "action")?;
 
-    let mut marked: Vec<Marked> = Vec::new();
-    let mut rows = 0usize;
-    // One file can only be disposed of once. A report vid-fp wrote never repeats
-    // a path -- groups partition the files -- but one assembled by hand or
-    // concatenated from several runs can, and the second attempt would be a
-    // spurious FAILED against a file the first one correctly removed.
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut rows = Rows::default();
 
     for (i, record) in rdr.records().enumerate() {
         // Line number as the user's editor counts them: the header is line 1.
@@ -147,92 +305,116 @@ fn read(path: &str, stats: &RunStats) -> Result<Report> {
         if record.iter().all(|f| f.trim().is_empty()) {
             continue;
         }
-        rows += 1;
 
-        let action = record.get(action_col).unwrap_or("").trim();
+        rows.consider(
+            Row {
+                at: format!("line {}", line),
+                action: record.get(action_col).unwrap_or(""),
+                file: record.get(path_col).unwrap_or(""),
+                size: record.get(size_col).unwrap_or(""),
+            },
+            path,
+            stats,
+        );
+    }
 
-        // An emptied cell is unambiguous in effect -- nothing happens to that
-        // file -- so it is not worth complaining about. A report that arrives
-        // with EVERY action blank is caught by the count `apply` prints.
-        if action.is_empty() {
-            continue;
-        }
+    Ok(rows.finish())
+}
 
-        let lower = action.to_ascii_lowercase();
-        if !KNOWN_ACTIONS.contains(&lower.as_str()) {
-            log::error!(
-                "{}: line {} has an action of \"{}\", which is not one of {}. \
-                 The file it names was left alone.",
-                path,
-                line,
-                action,
-                KNOWN_ACTIONS.join("/").to_uppercase()
-            );
+/// The JSON report.
+///
+/// Same three fields, found by key instead of by column, at
+/// `results[].files[]` -- which is where the writer puts one object per file
+/// with its own `action` beside its own `full_path` and `size_bytes`. The
+/// per-link `matches` array nested under each of those carries a `full_path`
+/// too and is deliberately never looked at: it names the file this row matched,
+/// not the file this row decides.
+///
+/// The shape is checked before the rows are, for the same reason the CSV checks
+/// for its columns: a JSON file with no `results` array is not a report, and
+/// walking it would find nothing to do and report that as a clean run over an
+/// empty list.
+fn read_json(path: &str, stats: &RunStats) -> Result<Report> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to open the report {}", path))?;
+
+    // The whole tree at once. A report is written in one `fs::write` and read
+    // back the same way; streaming it would buy nothing but a second shape to
+    // get wrong.
+    let root: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("{} is not valid JSON", path))?;
+
+    let groups = root.get("results").and_then(|r| r.as_array()).ok_or_else(|| {
+        anyhow!(
+            "The report {} has no 'results' array. --from-report reads the .csv or .json that \
+             -o writes; a .txt report cannot be replayed, because it records no size to check \
+             each file against before removing it.",
+            path
+        )
+    })?;
+
+    let mut rows = Rows::default();
+
+    for (g, group) in groups.iter().enumerate() {
+        // A group is located by its own `group` key when it has one, because
+        // that is the name the report prints and the user reads. Falling back to
+        // the index keeps a hand-assembled tree navigable.
+        let group_name = group
+            .get("group")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("results[{}]", g));
+
+        let Some(files) = group.get("files").and_then(|f| f.as_array()) else {
+            log::error!("{}: {} has no 'files' array; nothing in it was acted on.", path, group_name);
             stats
                 .report_unusable
-                .record(format!("{} line {}: action \"{}\"", path, line, action));
+                .record(format!("{} {}: no files array", path, group_name));
             continue;
-        }
-
-        if lower != ACT_ON {
-            continue;
-        }
-
-        // Deliberately NOT trimmed, unlike every other cell this function reads.
-        // Leading and trailing spaces are legal in a Linux filename, and the
-        // report writes one out verbatim -- a trailing space does not make a
-        // CSV field need quoting -- so trimming here means the tool cannot even
-        // replay its own report. What it does instead is look up a DIFFERENT
-        // path: `dupe.mkv ` becomes `dupe.mkv`, and if that neighbour happens to
-        // be the size the row recorded, the staleness check passes and the wrong
-        // file is deleted. The check cannot catch it, because it is taken against
-        // whatever path survived the trim.
-        //
-        // Whitespace is still not a file name, so a cell holding only spaces is
-        // treated as the empty one it plainly is.
-        let file = record.get(path_col).unwrap_or("");
-        if file.trim().is_empty() {
-            log::error!("{}: line {} is marked DELETE but names no file.", path, line);
-            stats
-                .report_unusable
-                .record(format!("{} line {}: no full_path", path, line));
-            continue;
-        }
-
-        // No fallback if this will not parse. The recorded size is the entire
-        // basis of the check that runs before the file is touched, and a
-        // deletion carried out without it is a deletion with nothing behind it
-        // -- so a row that lost its size is a row this mode declines to act on.
-        // (A report round-tripped through a spreadsheet that rewrote the column
-        // as 1.23E+09 lands here, which is why the value is quoted back.)
-        let size = match record.get(size_col).unwrap_or("").trim().parse::<u64>() {
-            Ok(n) => n,
-            Err(_) => {
-                log::error!(
-                    "{}: line {} is marked DELETE but its size_bytes is \"{}\", which is not a \
-                     byte count. {} was left alone: without the size it was measured at there is \
-                     nothing to check it against before removing it.",
-                    path,
-                    line,
-                    record.get(size_col).unwrap_or("").trim(),
-                    file
-                );
-                stats
-                    .report_unusable
-                    .record(format!("{} line {}: unusable size_bytes", path, line));
-                continue;
-            }
         };
 
-        if seen.insert(file.to_string()) {
-            marked.push(Marked {
-                path: file.to_string(),
-                size,
-            });
+        for (f, file) in files.iter().enumerate() {
+            let at = format!("{} file {}", group_name, f + 1);
+
+            // Every cell is read as the text it would have been in the CSV, so
+            // the shared rules apply unchanged: a number becomes its own
+            // digits, a string is taken as written, and anything absent is the
+            // empty cell it amounts to. `size_bytes` written as 4096.0 or as
+            // null therefore lands in the same "that is not a byte count"
+            // refusal a spreadsheet's 1.23E+09 does.
+            let action = cell(file.get("action"));
+            let filename = cell(file.get("full_path"));
+            let size = cell(file.get("size_bytes"));
+
+            rows.consider(
+                Row {
+                    at,
+                    action: &action,
+                    file: &filename,
+                    size: &size,
+                },
+                path,
+                stats,
+            );
         }
     }
 
-    Ok(Report { marked, rows })
+    Ok(rows.finish())
+}
+
+/// One JSON value as the cell it stands for.
+///
+/// A string keeps every byte of itself -- a path's leading space is part of its
+/// name and `Rows::consider` is relying on still having it. Anything else is
+/// rendered the way JSON writes it, which is what makes a number usable as a
+/// size and makes a nonsense value (an array, `true`) show up as the nonsense it
+/// is in the message that reports it, rather than as a blank.
+fn cell(value: Option<&serde_json::Value>) -> String {
+    match value {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Null) | None => String::new(),
+        Some(other) => other.to_string(),
+    }
 }
 
 /// Read `report_path` and dispose of everything it marks DELETE, returning the
@@ -259,9 +441,12 @@ pub fn apply(
     if report.marked.is_empty() {
         // Said out loud because the alternative is a run that prints a summary
         // full of zeroes and exits clean, which reads exactly like success.
+        // Named as "the action" rather than "the action column", because the
+        // JSON has no columns and a message that describes a file the user is
+        // not looking at is a message that reads as being about something else.
         info!(
-            "\nNothing in {} is marked DELETE, so no files were touched. Edit the action column \
-             to DELETE on the rows you want acted on.",
+            "\nNothing in {} is marked DELETE, so no files were touched. Set the action to \
+             DELETE on the rows you want acted on.",
             report_path
         );
         return Ok(Vec::new());
@@ -378,6 +563,39 @@ shared_to_seconds";
 
     fn write_report(dir: &tempfile::TempDir, body: &str) -> String {
         let path = dir.path().join("report.csv");
+        std::fs::write(&path, body).unwrap();
+        path.to_string_lossy().to_string()
+    }
+
+    /// One file object shaped exactly like the one `export.rs` writes: the
+    /// row's own fields, then the per-link list nested underneath it. The
+    /// nested entries carry a `full_path` of their own and no action, and this
+    /// module must never mistake one for a decision.
+    fn json_file(path: &str, size: serde_json::Value, action: &str) -> serde_json::Value {
+        serde_json::json!({
+            "action": action,
+            "full_path": path,
+            "length": "00:01:00",
+            "size_bytes": size,
+            "matched_with": "/somewhere/else.mkv",
+            "matches": [
+                { "full_path": "/somewhere/else.mkv", "matched_seconds": 60.0 }
+            ],
+        })
+    }
+
+    /// A whole JSON report, in the writer's own shape: a summary, then groups,
+    /// each with its files.
+    fn json_report(dir: &tempfile::TempDir, files: Vec<serde_json::Value>) -> String {
+        let tree = serde_json::json!({
+            "summary": { "total_groups": 1, "total_files_matched": files.len() },
+            "results": [ { "group": "group_1", "files": files } ],
+        });
+        write_json(dir, "report.json", &tree.to_string())
+    }
+
+    fn write_json(dir: &tempfile::TempDir, name: &str, body: &str) -> String {
+        let path = dir.path().join(name);
         std::fs::write(&path, body).unwrap();
         path.to_string_lossy().to_string()
     }
@@ -662,6 +880,244 @@ shared_to_seconds";
 
         assert_eq!(report.rows, 1);
         assert_eq!(stats.report_unusable.count(), 0);
+    }
+
+    // --- the JSON report ------------------------------------------------------
+    //
+    // The rules being exercised are the CSV's rules; what these tests are really
+    // asking is whether a second format reader can reach them without bringing
+    // opinions of its own.
+
+    #[test]
+    fn test_a_json_report_is_read_by_the_same_rules_as_the_csv() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = json_report(
+            &dir,
+            vec![
+                json_file("/a.mkv", serde_json::json!(10), "KEEP"),
+                json_file("/b.mkv", serde_json::json!(20), "DELETE"),
+                json_file("/c.mkv", serde_json::json!(30), "REVIEW"),
+            ],
+        );
+
+        let stats = RunStats::default();
+        let report = read(&path, &stats).unwrap();
+
+        assert_eq!(report.rows, 3);
+        assert_eq!(report.marked.len(), 1);
+        assert_eq!(report.marked[0].path, "/b.mkv");
+        assert_eq!(report.marked[0].size, 20);
+        assert_eq!(stats.report_unusable.count(), 0);
+    }
+
+    #[test]
+    fn test_the_nested_match_list_is_not_a_row() {
+        // Every file object carries a `matches` array whose entries have a
+        // `full_path` of their own. Those name the file this row was measured
+        // against -- reading one as a decision would delete a file nobody
+        // marked, and the file it named is the one that WON.
+        let dir = tempfile::tempdir().unwrap();
+        let path = json_report(&dir, vec![json_file("/b.mkv", serde_json::json!(20), "DELETE")]);
+
+        let stats = RunStats::default();
+        let report = read(&path, &stats).unwrap();
+
+        assert_eq!(report.rows, 1, "one file object is one row");
+        assert_eq!(report.marked.len(), 1);
+        assert_eq!(report.marked[0].path, "/b.mkv");
+    }
+
+    #[test]
+    fn test_a_json_size_is_taken_from_a_number_or_from_a_string() {
+        // The writer emits a bare number. An editor, a jq pipeline, or anything
+        // that round-tripped the file through a spreadsheet may hand back the
+        // same figure quoted, and that is the same figure.
+        let dir = tempfile::tempdir().unwrap();
+        let path = json_report(
+            &dir,
+            vec![
+                json_file("/a.mkv", serde_json::json!(4096), "DELETE"),
+                json_file("/b.mkv", serde_json::json!("8192"), "DELETE"),
+            ],
+        );
+
+        let stats = RunStats::default();
+        let report = read(&path, &stats).unwrap();
+
+        assert_eq!(report.marked.len(), 2);
+        assert_eq!(report.marked[0].size, 4096);
+        assert_eq!(report.marked[1].size, 8192);
+        assert_eq!(stats.report_unusable.count(), 0);
+    }
+
+    #[test]
+    fn test_a_json_delete_row_without_a_usable_size_is_refused() {
+        // Same rule as the CSV's, and for the same reason: the size is the only
+        // thing the file is checked against before it is removed. A fractional
+        // byte count is not one, and neither is a missing key.
+        let dir = tempfile::tempdir().unwrap();
+        let path = json_report(
+            &dir,
+            vec![
+                json_file("/a.mkv", serde_json::json!(1.23e9), "DELETE"),
+                json_file("/b.mkv", serde_json::Value::Null, "DELETE"),
+                json_file("/c.mkv", serde_json::json!(20), "DELETE"),
+            ],
+        );
+
+        let stats = RunStats::default();
+        let report = read(&path, &stats).unwrap();
+
+        assert_eq!(report.marked.len(), 1, "the good row still goes through");
+        assert_eq!(report.marked[0].path, "/c.mkv");
+        assert_eq!(stats.report_unusable.count(), 2);
+        assert!(stats.had_problems());
+    }
+
+    #[test]
+    fn test_a_json_path_keeps_the_whitespace_that_is_part_of_its_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = json_report(
+            &dir,
+            vec![json_file("/videos/dupe.mkv ", serde_json::json!(20), "DELETE")],
+        );
+
+        let stats = RunStats::default();
+        let report = read(&path, &stats).unwrap();
+
+        assert_eq!(report.marked[0].path, "/videos/dupe.mkv ", "the trailing space is the name");
+    }
+
+    #[test]
+    fn test_a_misspelt_action_in_json_is_reported_rather_than_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = json_report(&dir, vec![json_file("/a.mkv", serde_json::json!(10), "DELET")]);
+
+        let stats = RunStats::default();
+        let report = read(&path, &stats).unwrap();
+
+        assert!(report.marked.is_empty());
+        assert_eq!(stats.report_unusable.count(), 1);
+        assert!(stats.had_problems(), "a row nobody acted on must fail the run");
+    }
+
+    #[test]
+    fn test_a_json_row_is_located_by_the_group_name_the_report_prints() {
+        // What a complaint has to say to be actionable: not "row 14" of a tree
+        // nobody counts by row, but the group and position the file itself
+        // shows.
+        let dir = tempfile::tempdir().unwrap();
+        let path = json_report(
+            &dir,
+            vec![
+                json_file("/a.mkv", serde_json::json!(10), "KEEP"),
+                json_file("/b.mkv", serde_json::json!(20), "DELET"),
+            ],
+        );
+
+        let stats = RunStats::default();
+        read(&path, &stats).unwrap();
+
+        let complaints = stats.report_unusable.samples();
+        assert_eq!(complaints.len(), 1);
+        assert!(complaints[0].contains("group_1 file 2"), "{}", complaints[0]);
+    }
+
+    #[test]
+    fn test_a_json_file_that_is_not_a_report_is_refused_outright() {
+        // The counterpart of the CSV's missing-column abort. Walking it would
+        // find no rows and report a clean run over an empty list, which reads
+        // exactly like "nothing was marked".
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_json(&dir, "other.json", r#"{"videos": [{"action": "DELETE"}]}"#);
+
+        let stats = RunStats::default();
+        let err = read(&path, &stats).unwrap_err().to_string();
+
+        assert!(err.contains("results"), "{}", err);
+    }
+
+    #[test]
+    fn test_json_that_will_not_parse_is_refused_rather_than_half_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_json(&dir, "broken.json", r#"{"results": [ "#);
+
+        let stats = RunStats::default();
+        let err = format!("{:#}", read(&path, &stats).unwrap_err());
+
+        assert!(err.contains("not valid JSON"), "{}", err);
+    }
+
+    #[test]
+    fn test_the_format_is_chosen_by_extension_whatever_its_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = serde_json::json!({
+            "results": [ { "group": "group_1", "files": [
+                json_file("/b.mkv", serde_json::json!(20), "DELETE")
+            ] } ]
+        });
+        let path = write_json(&dir, "REPORT.JSON", &tree.to_string());
+
+        let stats = RunStats::default();
+        let report = read(&path, &stats).unwrap();
+
+        assert_eq!(report.marked.len(), 1, "a .JSON is still JSON");
+    }
+
+    #[test]
+    fn test_a_renamed_csv_is_still_read_as_one() {
+        // Anything that is not .json goes to the CSV reader, which can say for
+        // itself whether the file is a report. A report saved as dupes.txt by
+        // habit, or one a browser downloaded without its extension, still works.
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!("{}\n{}\n", HEADER, row("/b.mkv", 20, "DELETE"));
+        let path = write_json(&dir, "dupes.bak", &body);
+
+        let stats = RunStats::default();
+        let report = read(&path, &stats).unwrap();
+
+        assert_eq!(report.marked.len(), 1);
+    }
+
+    #[test]
+    fn test_apply_removes_exactly_the_marked_files_from_a_json_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let keep = make_file(&dir, "keep.mkv", 100);
+        let doomed = make_file(&dir, "doomed.mkv", 200);
+
+        let path = json_report(
+            &dir,
+            vec![
+                json_file(&keep, serde_json::json!(100), "KEEP"),
+                json_file(&doomed, serde_json::json!(200), "DELETE"),
+            ],
+        );
+
+        let stats = RunStats::default();
+        let gone = apply(&path, &Disposal::Permanent, true, &stats).unwrap();
+
+        assert_eq!(gone, vec![doomed.clone()]);
+        assert!(!PathBuf::from(&doomed).exists());
+        assert!(PathBuf::from(&keep).exists());
+        assert!(!stats.had_problems());
+    }
+
+    #[test]
+    fn test_a_json_file_that_changed_since_the_report_is_left_alone() {
+        // The staleness check is `dispose_one`'s, not the reader's, so this is
+        // really asking whether the JSON path reaches it with a real size.
+        let dir = tempfile::tempdir().unwrap();
+        let target = make_file(&dir, "target.mkv", 200);
+
+        let path = json_report(&dir, vec![json_file(&target, serde_json::json!(200), "DELETE")]);
+        std::fs::write(&target, vec![b'y'; 500]).unwrap();
+
+        let stats = RunStats::default();
+        let gone = apply(&path, &Disposal::Permanent, true, &stats).unwrap();
+
+        assert!(gone.is_empty());
+        assert!(PathBuf::from(&target).exists(), "it is not the file that was judged");
+        assert_eq!(stats.delete_stale.count(), 1);
     }
 
     #[test]

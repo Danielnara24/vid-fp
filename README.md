@@ -240,7 +240,7 @@ the count and the byte total first.
 Every file is re-checked against the size the report recorded immediately before
 it's touched, and left alone if it has changed, so a report can sit for a week
 before you get to it. Columns are found by name, so a reordered report still
-works. Only CSV reports are accepted; `.txt` and `.json` are refused.
+works. Only CSV and JSON reports are accepted; `.txt` reports refused.
 
 ## Options
 
@@ -252,7 +252,7 @@ works. Only CSV reports are accepted; `.txt` and `.json` are refused.
 | `-r`, `--recursive` | Include subfolders | off |
 | `--follow-symlinks` | Descend into symlinked folders | off |
 | `-e`, `--exclude <FOLDER>` | Exclude a folder; repeat for several | |
-| `-x`, `--extensions <EXT>` | Video extensions to include, comma-separated or repeated | `mp4,mkv,avi,mov,flv,webm` |
+| `-x`, `--extensions <EXT>` | Extensions a **folder walk** treats as videos, comma-separated or repeated. `-x '*'` (quoted) takes every file, including ones with no extension | `mp4,m4v,mkv,webm,avi,mov,flv,wmv,asf,mpg,mpeg,m2ts,mts,ts,vob,ogv,3gp,divx` |
 | `-d`, `--hamming-distance <N>` | Frame-match tolerance, in bits out of 64; higher = less strict matching. Raise to find more duplicates, at the cost of false positives. See [Tuning](#tuning). Values above `32` are refused | `4` |
 | `-p`, `--match-percent <F>` | Min % of overlap to count as a duplicate, from `0` to `100`. Lower includes shorter matches, at the cost of false positives | `20.0` |
 | `--min-duration <SECS>` | Min shared clip length in seconds for a match. Videos shorter than this are skipped entirely. `0` = off | `0.0` |
@@ -263,7 +263,7 @@ works. Only CSV reports are accepted; `.txt` and `.json` are refused.
 | `--delete` | Move files marked DELETE to the trash | off |
 | `--permanent` | With `--delete`, permanently remove instead | off |
 | `--move-to <DIR>` | Move the files marked DELETE under `DIR`, recreating their absolute paths inside it. Arms the run on its own and supersedes `--delete`/`--permanent` | |
-| `--from-report <FILE>` | Act on a CSV report from an earlier run instead of scanning. Requires `--delete` or `--move-to`. See [above](#acting-on-a-report-you-have-reviewed) | |
+| `--from-report <FILE>` | Act on a `.csv` or `.json` report from an earlier run instead of scanning. Requires `--delete` or `--move-to`. See [above](#acting-on-a-report-you-have-reviewed) | |
 | `-y`, `--yes` | Answer yes to the confirmation shown before any file is touched | off |
 | `-t`, `--threads <N>` | Worker threads (`0` = uses all cores) | `0` |
 | `-q`, `--quiet` | Only print errors | off |

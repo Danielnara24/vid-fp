@@ -200,6 +200,30 @@ fn sampling_is_on(kf_interval: f64) -> bool {
 /// a fingerprint never has to clone one.
 type CacheEntry = (Stamp, VideoFingerprint);
 
+/// What a folder walk assumes a video is called.
+///
+/// This list is a guess and the cost of it being wrong is asymmetric: an
+/// extension too many means one file the decoder rejects, named in the run's
+/// problem list; an extension too few means a folder that reports "No videos
+/// found" and a user who concludes the tool is broken. It was six entries long
+/// -- mp4, mkv, avi, mov, flv, webm -- and a camcorder's `.mts`, a TV capture's
+/// `.ts`, a DVD rip's `.vob` and an iTunes `.m4v` all fell straight through it.
+///
+/// So the rule for what belongs here is "a container FFmpeg can demux that
+/// something in the wild writes video into", not "a container this author
+/// uses". `.ts` is the one entry with a real cost -- a TypeScript source tree
+/// scanned recursively now hands every file to the decoder and gets a problem
+/// row per file -- and it stays, because it is also how every DVB capture and
+/// half the camcorders on earth name their footage, and the failure it causes is
+/// loud and localised while the failure it prevents is silent. `-x` narrows it
+/// for anyone that bites.
+///
+/// Not a substitute for `-x '*'`: no list can name a file that has no extension.
+const DEFAULT_EXTENSIONS: [&str; 18] = [
+    "mp4", "m4v", "mkv", "webm", "avi", "mov", "flv", "wmv", "asf", "mpg", "mpeg", "m2ts", "mts",
+    "ts", "vob", "ogv", "3gp", "divx",
+];
+
 #[derive(Parser, Debug)]
 #[command(
     author, version,
@@ -255,15 +279,20 @@ struct Args {
     #[arg(long = "follow-symlinks")]
     follow_symlinks: bool,
 
-    /// Video file extensions to search for (case-insensitive; a leading dot is
-    /// optional). Repeat the flag or comma-separate, e.g. `-x mp4,mkv` or
-    /// `-x mp4 -x mkv`. Defaults to the common video containers.
+    /// Video file extensions to search for in a FOLDER (case-insensitive; a
+    /// leading dot or `*.` is optional). Repeat the flag or comma-separate,
+    /// e.g. `-x mp4,mkv` or `-x mp4 -x mkv`. Defaults to the common video
+    /// containers. Use `-x '*'` — quoted — to fingerprint every file whatever
+    /// it is called, which is the only way to reach files with no extension at
+    /// all; expect failures for the non-videos it then hands to the decoder.
+    /// A file named on the command line is scanned whatever its extension, so
+    /// this never has to be widened just to reach one file.
     #[arg(
         short = 'x',
         long = "extensions",
         value_delimiter = ',',
         value_name = "EXT",
-        default_values_t = ["mp4", "mkv", "avi", "mov", "flv", "webm"].map(String::from)
+        default_values_t = DEFAULT_EXTENSIONS.map(String::from)
     )]
     extensions: Vec<String>,
 
@@ -341,14 +370,16 @@ struct Args {
           value_hint = clap::ValueHint::DirPath)]
     move_to: Option<String>,
 
-    /// Act on a CSV report from an earlier run instead of scanning anything.
-    /// Every row whose action column reads DELETE is disposed of, and nothing
-    /// else is touched — so editing that column is how you act on the rows the
-    /// tool would not decide for you (REVIEW), or spare one it would. Nothing
-    /// is re-fingerprinted and no groups are recomputed: the report is the
-    /// decision. Each file is still re-checked against the size the report
-    /// recorded and left alone if it changed since. Requires --delete or
-    /// --move-to, and cannot be combined with scanning or matching options.
+    /// Act on a .csv or .json report from an earlier run instead of scanning
+    /// anything (the format is taken from the extension). Every row whose
+    /// action reads DELETE is disposed of, and nothing else is touched — so
+    /// editing that field is how you act on the rows the tool would not decide
+    /// for you (REVIEW), or spare one it would. Nothing is re-fingerprinted and
+    /// no groups are recomputed: the report is the decision. Each file is still
+    /// re-checked against the size the report recorded and left alone if it
+    /// changed since. A .txt report cannot be replayed: it records no size to
+    /// check against. Requires --delete or --move-to, and cannot be combined
+    /// with scanning or matching options.
     #[arg(
         long = "from-report",
         value_name = "FILE",
@@ -509,7 +540,7 @@ fn announce(disposal: Option<&Disposal>) {
     }
 }
 
-/// `--from-report`: dispose of what a previous run's CSV marks DELETE, and
+/// `--from-report`: dispose of what a previous run's report marks DELETE, and
 /// nothing else.
 ///
 /// A separate entry point rather than a branch threaded through `run`, because
