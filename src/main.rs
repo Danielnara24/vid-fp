@@ -11,7 +11,7 @@ mod sources;
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
 use clap_complete::Shell;
-use compare::{find_all_matches, MatchIndex, HASH_BITS};
+use compare::{find_all_matches, max_hamming_distance, MatchIndex, HASH_BITS};
 use export::Disposal;
 use fingerprint::{fingerprint_video, VideoFingerprint, MAX_DECODE_THREADS};
 use indicatif::{ProgressBar, ProgressState, ProgressStyle};
@@ -278,8 +278,9 @@ struct Args {
     /// and the number required grows with the distance -- two at 14, three at
     /// 16, four at 20 -- so raising this trades precision for recall smoothly
     /// rather than falling off a cliff.
-    /// A hash is 64 bits, so no two can be further apart than that and values
-    /// above 64 are rejected before the scan starts.
+    /// Values above 32 are rejected before the scan starts: that is how far
+    /// apart two unrelated frames sit on average, so a higher tolerance matches
+    /// everything against everything and has nothing left to control.
     #[arg(short = 'd', long = "hamming-distance", default_value_t = 4)]
     hamming_distance: u32,
 
@@ -1290,23 +1291,37 @@ fn run(
              higher floor could never be met)."
         );
     }
-    // The same reasoning as --match-percent, arriving from the other end. A frame
-    // hash is 64 bits, so 64 is the furthest apart two of them can possibly be:
-    // a tolerance above that is one no pair could ever exceed, and it accepts
-    // every pair the index proposes -- which with --delete armed can only ever
-    // ADD files to the DELETE set. Left unchecked, `-d 100` collapsed a 727-file
-    // library into one group with 322 files marked DELETE, and said nothing.
+    // The same reasoning as --match-percent, arriving from the other end, and it
+    // stops at CHANCE rather than at the width of the hash. Two unrelated frames
+    // sit 32 bits apart on average, so a tolerance of 32 already accepts half of
+    // all unrelated frame pairs and one above it accepts most of them: the
+    // library stops being a library and becomes one enormous group, which with
+    // --delete armed can only ever ADD files to the DELETE set. Left unchecked,
+    // `-d 100` collapsed a 727-file library into one group with 322 files marked
+    // DELETE, and said nothing.
     //
-    // 64 itself stays legal and means "match anything", the mirror of `-p 0`.
-    // Nothing here narrows the range to the one `--help` calls useful (2 to 14):
-    // a loose scan is a legitimate thing to ask for, and this is only refusing
-    // the arithmetic that cannot mean anything.
-    if max_hamming > HASH_BITS {
+    // The ceiling used to be 64 -- the widest two hashes can possibly be apart --
+    // which refused only the arithmetic that could not mean anything and let
+    // through a whole range that could not mean anything either. Past chance the
+    // graph also stops being sparse enough to enumerate: `-d 36` on the local
+    // corpus is refused by the clustering ceiling in 9 seconds, but `-d 40` is a
+    // nearly COMPLETE graph, which has few enough groups to slip under that
+    // ceiling while costing minutes of quadratic pivot work to prove it. Chance
+    // is the honest edge of the range, and it is comfortably past the edge of the
+    // useful one (`--help` says 2 to 14).
+    //
+    // MAX_HAMMING_DISTANCE itself stays legal, the mirror of `-p 0`: it is a
+    // sensitivity control, and refusing its last rung would be arbitrary where
+    // refusing everything past chance is not.
+    let widest_useful = max_hamming_distance();
+    if max_hamming > widest_useful {
         anyhow::bail!(
-            "--hamming-distance must be between 0 and {} (a frame hash is {} bits, so no two \
-             of them can be further apart than that).",
+            "--hamming-distance must be between 0 and {} (a frame hash is {} bits, and two \
+             unrelated frames already differ in about {} of them -- a higher tolerance \
+             matches everything against everything).",
+            widest_useful,
             HASH_BITS,
-            HASH_BITS
+            widest_useful
         );
     }
 
@@ -1980,7 +1995,7 @@ fn run(
     // where they are the only thing that tells a genuine re-encode apart from a
     // clip that happened to clear --match-percent.
     let edges: Vec<(usize, usize)> = matches.iter().map(|m| (m.a, m.b)).collect();
-    let final_groups = clustering::find_duplicate_groups(n, edges, &fingerprints);
+    let final_groups = clustering::find_duplicate_groups(n, edges, &fingerprints, stats);
 
     // Consumes the Vec, so the pair list is not kept alive alongside the index.
     let matches = MatchIndex::new(matches);
@@ -2610,6 +2625,35 @@ mod tests {
         // The ends of the range are legal: 0 means "report every pair the index
         // proposes", which is a supported way to run this.
         for ok in ["--match-percent=0", "--match-percent=100"] {
+            let stats = RunStats::default();
+            assert!(
+                run(&args_over(&dir, &[ok]), &db, Instant::now(), 1, &stats).is_ok(),
+                "{} is inside the range and must be accepted",
+                ok
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_tolerance_past_chance_is_refused_before_any_work() {
+        // 32 is the mean distance between two unrelated frame hashes, so past it
+        // every file matches every other and the flag has nothing left to
+        // control. It used to be refused only above 64 -- the widest two hashes
+        // can be apart -- which let through a whole range where the answer was
+        // one group holding the library, and where the clustering ceilings stop
+        // helping: a NEARLY complete graph has few enough maximal cliques to slip
+        // under them while costing minutes to prove it.
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+
+        for bad in ["-d=33", "-d=40", "-d=64", "-d=100"] {
+            let err = run_error(&dir, &db, &[bad]);
+            assert!(err.contains("--hamming-distance"), "{}: {}", bad, err);
+        }
+
+        // Both ends stay legal: 0 is "only identical frames", and chance itself
+        // is the last rung of a sensitivity control rather than a special case.
+        for ok in ["-d=0", "-d=32"] {
             let stats = RunStats::default();
             assert!(
                 run(&args_over(&dir, &[ok]), &db, Instant::now(), 1, &stats).is_ok(),

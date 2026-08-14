@@ -58,7 +58,7 @@ impl Tally {
         self.count.load(Ordering::Relaxed)
     }
 
-    fn samples(&self) -> Vec<String> {
+    pub fn samples(&self) -> Vec<String> {
         self.samples
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -74,6 +74,7 @@ pub struct RunStats {
     pub unwalkable: Tally,
     pub unreadable: Tally,
     pub fingerprint_failed: Tally,
+    pub clustering_abandoned: Tally,
     pub cache_write_failed: Tally,
     pub cache_purge_failed: Tally,
     pub delete_stale: Tally,
@@ -88,7 +89,7 @@ pub struct RunStats {
 }
 
 impl RunStats {
-    fn problems(&self) -> [(&Tally, &'static str); 11] {
+    fn problems(&self) -> [(&Tally, &'static str); 12] {
         [
             // "path" rather than "folder": a scan target can now be a single
             // file, or a line piped in from another tool.
@@ -100,6 +101,22 @@ impl RunStats {
             (&self.unwalkable, "folder(s) could not be read while scanning"),
             (&self.unreadable, "file(s) could not be read"),
             (&self.fingerprint_failed, "video(s) could not be fingerprinted"),
+            // The files were fingerprinted and compared; what could not be done
+            // is enumerating every group they form, because a set of files that
+            // nearly all match each other has combinatorially many. Squarely a
+            // problem: those files are absent from the report entirely, and a
+            // tighter --hamming-distance is what resolves it.
+            //
+            // Counted in clusters rather than files -- one entry is one set of
+            // interlinked files, and the sample line beside it says how many
+            // files that was. Counting the files would put a five-figure number
+            // under a heading the user would then look for five figures of
+            // detail behind.
+            (
+                &self.clustering_abandoned,
+                "cluster(s) of files were too densely linked to group and are NOT in \
+                 the report (try a tighter --hamming-distance)",
+            ),
             (
                 &self.cache_write_failed,
                 "fingerprint(s) could not be cached (they will be redone next run)",
@@ -308,13 +325,14 @@ mod tests {
         s.unwalkable.record("/root/private");
         s.unreadable.record("/a.mp4");
         s.fingerprint_failed.record("/b.mkv");
+        s.clustering_abandoned.record("900 file(s) linked too densely to group");
         s.cache_write_failed.record("/c.mp4");
         s.cache_purge_failed.record("cache write failed");
         s.delete_stale.record("/d.mp4: 100 bytes when scanned, 200 bytes now");
         s.delete_failed.record("/e.mp4");
         s.report_unusable.record("report.csv line 4");
 
-        assert_eq!(s.problem_count(), 10);
+        assert_eq!(s.problem_count(), 11);
         assert!(s.had_problems());
     }
 }

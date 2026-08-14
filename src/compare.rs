@@ -1,13 +1,35 @@
 use crate::fingerprint::VideoFingerprint;
 use crate::utils::shutdown_requested;
+use indicatif::{ProgressBar, ProgressStyle};
 use log::info;
 use rayon::prelude::*;
 use std::collections::HashMap;
 
 /// Width of a frame hash, and therefore the largest Hamming distance any two of
-/// them can be apart. `run` refuses a `--hamming-distance` above this: a
-/// tolerance no pair could ever exceed accepts everything.
+/// them can be apart.
 pub const HASH_BITS: u32 = 64;
+
+/// The largest `--hamming-distance` `run` accepts: the mean distance between two
+/// UNRELATED frame hashes, i.e. chance itself.
+///
+/// Stated as zero sigma below chance rather than as `HASH_BITS / 2`, because
+/// that is what it means -- see `sigma()`. At this tolerance half of all
+/// unrelated frame pairs already match, so it is far past the useful range and
+/// exactly where "tolerant" turns into "indiscriminate". Above it there is
+/// nothing left to control: every file matches every other, the report is one
+/// group holding the library, and with `--delete` armed that is the whole
+/// library minus one file marked DELETE.
+///
+/// It is also where the clustering stage stops being able to answer at all. Just
+/// below chance the graph is dense but incomplete, which is combinatorial and
+/// gets refused in seconds by the ceilings in `clustering`; above it the graph
+/// is nearly COMPLETE, which has few enough maximal cliques to slip under those
+/// ceilings while taking minutes of quadratic pivot work to establish. Refusing
+/// the flag there is cheaper and clearer than teaching every later stage to cope
+/// with an input that cannot produce an answer worth having.
+pub fn max_hamming_distance() -> u32 {
+    sigma_below_chance(0.0)
+}
 
 /// The hash is split into this many equal blocks for indexing.
 ///
@@ -996,25 +1018,126 @@ pub fn find_all_matches(
         // everything and the last video with nothing.
         info!("Tolerance is too loose for the index; comparing all pairs directly...");
 
-        return (0..n)
+        // The count is the whole triangle even though the list of it is never
+        // built -- `n * (n - 1) / 2` is what the ranges below yield, and the bar
+        // needs a denominator rather than the pairs themselves. In u64 because
+        // this is the arm that runs on the libraries where it overflows a u32.
+        let total = n as u64 * n.saturating_sub(1) as u64 / 2;
+        let pb = verification_bar(total);
+
+        let matches = (0..n)
             .into_par_iter()
             .flat_map(|v_a| ((v_a + 1)..n).into_par_iter().map(move |v_b| (v_a, v_b)))
-            .filter_map(|pair| {
-                measure_pair(fingerprints, pair, tol, &schedule, min_match_percent, min_duration)
-            })
+            .map_init(
+                || Ticker::new(&pb),
+                |ticker, pair| {
+                    ticker.tick();
+                    measure_pair(fingerprints, pair, tol, &schedule, min_match_percent, min_duration)
+                },
+            )
+            .flatten()
             .collect();
+
+        pb.finish_and_clear();
+        return matches;
     };
 
     if shutdown_requested() {
         return Vec::new();
     }
 
-    pairs
+    let pb = verification_bar(pairs.len() as u64);
+
+    let matches = pairs
         .into_par_iter()
-        .filter_map(|pair| {
-            measure_pair(fingerprints, pair, tol, &schedule, min_match_percent, min_duration)
-        })
-        .collect()
+        .map_init(
+            || Ticker::new(&pb),
+            |ticker, pair| {
+                ticker.tick();
+                measure_pair(fingerprints, pair, tol, &schedule, min_match_percent, min_duration)
+            },
+        )
+        .flatten()
+        .collect();
+
+    pb.finish_and_clear();
+    matches
+}
+
+/// The bar phase 2 runs under.
+///
+/// Phase 1 announces how many pairs it proposed and then, until this existed,
+/// went silent for the whole of the verification. At the defaults that is a
+/// fifth of a second and nobody notices; at a loose `-d` over a large library it
+/// is minutes of a program that looks hung, immediately after a decode stage
+/// that reported itself continuously.
+///
+/// Shown at the same level as that stage's own log lines, so `--quiet` silences
+/// both -- and indicatif draws nothing when stderr is not a terminal, so a
+/// redirected run is unaffected either way. Unit tests install no logger at all,
+/// which leaves the max level at `Off` and the bar hidden; nothing here has to
+/// be told it is a test.
+///
+/// No ETA, for the same reason the decode bar has none: a pair costs the product
+/// of the two files' sample counts, which spans orders of magnitude across a
+/// mixed library, so a rate extrapolated from the pairs done so far predicts the
+/// remainder badly.
+fn verification_bar(pairs: u64) -> ProgressBar {
+    if pairs == 0 || !log::log_enabled!(log::Level::Info) {
+        return ProgressBar::hidden();
+    }
+
+    let pb = ProgressBar::new(pairs);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "{elapsed_precise} \u{2502} [{bar:28.cyan/blue}] \u{2502} {percent}% \u{2502} {human_pos}/{human_len} pairs",
+        )
+        .unwrap()
+        .progress_chars("=>-"),
+    );
+    pb
+}
+
+/// How many pairs one worker gets through before it touches the bar.
+///
+/// A pair is measured in microseconds and the bar redraws twenty times a second
+/// at most, so reporting each one is an atomic add on a line every thread is
+/// fighting over, bought entirely for pixels that are never drawn -- the same
+/// reasoning as `PROGRESS_STEP_BYTES` in the decode stage. At 512 a run of a
+/// million pairs still moves the bar two thousand times.
+const PAIRS_PER_REPORT: u64 = 512;
+
+/// A worker's unreported pair count, flushed to the bar in batches.
+///
+/// The flush on drop is what makes the batching invisible rather than merely
+/// coarse: rayon drops the per-worker state when that worker's slice is done, so
+/// the last partial batch is always accounted for and the bar lands on full
+/// however the pairs happened to be split.
+struct Ticker<'a> {
+    bar: &'a ProgressBar,
+    pending: u64,
+}
+
+impl<'a> Ticker<'a> {
+    fn new(bar: &'a ProgressBar) -> Self {
+        Ticker { bar, pending: 0 }
+    }
+
+    fn tick(&mut self) {
+        self.pending += 1;
+        if self.pending >= PAIRS_PER_REPORT {
+            self.bar.inc(self.pending);
+            self.pending = 0;
+        }
+    }
+}
+
+impl Drop for Ticker<'_> {
+    fn drop(&mut self) {
+        if self.pending > 0 {
+            self.bar.inc(self.pending);
+        }
+    }
 }
 
 /// Phase 2 for one pair: measure it exactly, then apply both gates. `None` when
@@ -1139,6 +1262,20 @@ mod tests {
     /// mapping from the flag.
     fn exactly(bits: u32) -> Tolerance {
         Tolerance { strict: bits, loose: bits }
+    }
+
+    #[test]
+    fn test_the_widest_tolerance_is_chance_itself() {
+        // Every threshold in this file is a multiple of sigma, and the ceiling
+        // on `-d` is the one at zero: the mean of the unrelated-pair
+        // distribution, 32 bits on a 64-bit hash.
+        assert_eq!(max_hamming_distance(), HASH_BITS / 2);
+
+        // Which is to say a match at the ceiling is no evidence at all -- about
+        // half of all unrelated frame pairs land within it, so it carries no
+        // orders of magnitude. Four bits tighter it is already carrying some.
+        assert!(chance_orders_of_magnitude(max_hamming_distance()) < 0.5);
+        assert!(chance_orders_of_magnitude(max_hamming_distance() - 4) > 0.5);
     }
 
     #[test]

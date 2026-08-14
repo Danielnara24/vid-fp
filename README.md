@@ -253,7 +253,7 @@ works. Only CSV reports are accepted; `.txt` and `.json` are refused.
 | `--follow-symlinks` | Descend into symlinked folders | off |
 | `-e`, `--exclude <FOLDER>` | Exclude a folder; repeat for several | |
 | `-x`, `--extensions <EXT>` | Video extensions to include, comma-separated or repeated | `mp4,mkv,avi,mov,flv,webm` |
-| `-d`, `--hamming-distance <N>` | Frame-match tolerance, in bits out of 64; higher = less strict matching. Raise to find more duplicates, at the cost of false positives. See [Tuning](#tuning). Values above `64` are refused | `4` |
+| `-d`, `--hamming-distance <N>` | Frame-match tolerance, in bits out of 64; higher = less strict matching. Raise to find more duplicates, at the cost of false positives. See [Tuning](#tuning). Values above `32` are refused | `4` |
 | `-p`, `--match-percent <F>` | Min % of overlap to count as a duplicate, from `0` to `100`. Lower includes shorter matches, at the cost of false positives | `20.0` |
 | `--min-duration <SECS>` | Min shared clip length in seconds for a match. Videos shorter than this are skipped entirely. `0` = off | `0.0` |
 | `-k`, `--priority <P>` | Criteria for KEEPING files: `length`, `resolution`, `quality`, or `size`. The chosen one is compared first, the rest follow in the default order. See [Codecs and quality](#codecs-and-quality) | `length` |
@@ -304,7 +304,9 @@ raising it finds more, and starts admitting false positives past about `-d 10`.
 files to the report; lowering `-d` or raising `-p` only ever *removes* them. The
 report at any setting is a subset of the report at every looser one, so start at
 the defaults and walk one knob outward until you see something you don't
-recognise.
+recognise. The one exception is a `-d` loose enough to link nearly everything,
+where a set of files can form too many overlapping groups to report and is left
+out of it entirely and listed under `Problems` instead.
 
 **Not finding duplicates you expect?** Raise `-d`, or lower `-p` if the match is
 a short clip inside a long video. Two encodes of the same footage only line up
