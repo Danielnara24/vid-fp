@@ -333,11 +333,17 @@ struct Args {
     #[arg(long = "keyframe-interval", default_value_t = 0.0)]
     kf_interval: f64,
 
-    /// Minimum keyframes to keep for short videos. They use a finer interval
-    /// automatically so subsampling never drops them below this count.
-    /// Default is 4.0.
-    /// This is only used when --keyframe-interval is > 0.0.
-    #[arg(long = "min-keyframes", default_value_t = 4.0)]
+    /// Minimum keyframes to keep for short videos. When duration divided by
+    /// this count is finer than --keyframe-interval, that finer spacing is used
+    /// instead, so every video keeps at least this many samples. The two rules
+    /// meet at a runtime of --keyframe-interval times this count: above it the
+    /// interval alone already yields enough samples and this never applies,
+    /// below it this takes over. Raising it is NOT monotonic, because a denser
+    /// sample makes each hash stand for a shorter span, so extra frames that
+    /// match nothing dilute a pair's coverage and can push it under
+    /// --match-percent. 4, 12, 20 and 28 all measure well; 8 and 16 lose pairs
+    /// that way. Only used when --keyframe-interval is > 0.0.
+    #[arg(long = "min-keyframes", default_value_t = 12.0)]
     min_kf_samples: f64,
 
     /// Priority for determining the best file to KEEP

@@ -258,7 +258,7 @@ works. Only CSV and JSON reports are accepted; `.txt` reports refused.
 | `--min-duration <SECS>` | Min shared clip length in seconds for a match. Videos shorter than this are skipped entirely. `0` = off | `0.0` |
 | `-k`, `--priority <P>` | Criteria for KEEPING files: `length`, `resolution`, `quality`, or `size`. The chosen one is compared first, the rest follow in the default order. See [Codecs and quality](#codecs-and-quality) | `length` |
 | `--keyframe-interval <F>` | Seconds between sampled keyframes (`0` = every keyframe). Higher is faster, but makes short matches harder to find | `0.0` |
-| `--min-keyframes <F>` | Min keyframes kept for short videos (only relevant when keyframe-interval > 0) | `4.0` |
+| `--min-keyframes <F>` | Min keyframes kept for short videos (only relevant when keyframe-interval > 0). Raising it is not monotonic — see [Tuning](#tuning) | `12.0` |
 | `-o`, `--output <FILE>` | Optional path to save the report: `.txt`, `.csv`, or `.json` | |
 | `--delete` | Move files marked DELETE to the trash | off |
 | `--permanent` | With `--delete`, permanently remove instead | off |
@@ -329,6 +329,23 @@ It also skips fingerprinting anything shorter than the floor, since such a file
 can't contain a long enough shared clip. Videos whose duration the container
 doesn't report are never skipped. Changing this flag doesn't invalidate the
 cache.
+
+### Sampling fewer frames
+
+`--keyframe-interval` is the speed knob. It sets a minimum gap, in seconds,
+between sampled keyframes and drops the rest before they reach the decoder. It
+costs recall, since a moment neither file sampled cannot match.
+
+`--min-keyframes` stops that from gutting short videos: when
+`duration / --min-keyframes` is finer than the interval, that finer spacing is
+used instead, so every video keeps at least that many samples. Moving `--min-keyframes`
+is nearly free on a library of long videos, and is most of the cost on a library of short clips.
+
+**Raising `--min-keyframes` is not monotone**, unlike `-d` and `-p`. Coverage is
+the span each hash stands for, so a denser sample makes every hash stand for
+less. Extra samples that match nothing dilute a pair's coverage and can push it
+under `-p`, taking the pair out of the report. If you change either flag, check 
+that the groups you expect are still there.
 
 ## Codecs and quality
 
