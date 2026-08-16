@@ -74,6 +74,23 @@ jobs:
           FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-static
         run: cargo build --release --locked --features static-ffmpeg
 
+      - name: Test
+        # The same feature flags as the Build above, which is what makes this
+        # safe to run here: `cargo test` builds the bin target too, so a bare
+        # `cargo test --release` would overwrite target/release/vid-fp with a
+        # DYNAMIC binary and every check below this point -- DT_NEEDED, AV1,
+        # the packaging -- would then be measuring the wrong file. Matching the
+        # flags means the tests run against the artifact that is about to ship
+        # rather than beside it.
+        #
+        # This is the only place the suite runs against the vendored FFmpeg 8.
+        # ci.yml tests the dynamic build against the runner's FFmpeg 6, which
+        # is a different decoder; CLAUDE.md's note that accuracy numbers only
+        # mean something from the static build applies to the unit tests too.
+        env:
+          FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-static
+        run: cargo test --release --locked --features static-ffmpeg
+
       - name: Verify the binary is actually self-contained
         # Each of these has been a real failure mode: linking the system FFmpeg
         # by accident, and configuring FFmpeg without dav1d so that every AV1

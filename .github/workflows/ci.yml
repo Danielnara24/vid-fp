@@ -1,0 +1,115 @@
+# .github/workflows/ci.yml
+#
+# Lint and unit tests on every push. This is a CLEAN-CHECKOUT gate, not a
+# correctness gate, and the difference matters:
+#
+#   * What it proves is that the 25 files actually committed build on their
+#     own, with a fresh registry and a cold target dir. A local `cargo test`
+#     cannot prove that -- it runs against a warm 25 GB target/ and a
+#     gitignored ./ffmpeg-static, so a source file that was never `git add`ed
+#     stays green forever on the machine that wrote it.
+#
+#   * What it does NOT prove is that vid-fp still groups videos correctly.
+#     tests/local_accuracy_test.rs and benchmark/ are gitignored and are not
+#     in the repo at all, so this workflow never even sees them -- it runs the
+#     in-bin unit tests and nothing else. Every threshold, the witness
+#     schedule and any CACHE_TABLE meaning change are invisible here. A green
+#     tick on a corroboration-rule commit means the code compiles, and that is
+#     all it means. Accuracy is still measured by hand against the local
+#     corpus, per CLAUDE.md.
+#
+# The binary that ships is tested separately, inside release.yml, because only
+# the static build against the vendored FFmpeg 8 is authoritative.
+#
+# No `cargo fmt --check` here on purpose: the tree is not rustfmt-clean, and a
+# formatting pass over 14k lines is a decision to take deliberately rather
+# than something to have forced on you by a red tick.
+
+name: ci
+
+on:
+  push:
+    # Tags are excluded: release.yml already covers those, and it builds and
+    # tests the static binary, which is the stricter of the two.
+    branches: ["**"]
+    paths-ignore: ["**.md", "LICENSE*"]
+  workflow_dispatch:
+
+# A push that supersedes another mid-run cancels it. At ~20-35 commits a week
+# this is most of the runner time this workflow would otherwise spend.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: clippy + tests
+    # Pinned, not ubuntu-latest. 24.04 carries FFmpeg 6.1 (libavcodec 60),
+    # which is what a `cargo install` user on a current distro links against.
+    # Do not drop to 22.04 to match release.yml: that image is FFmpeg 4.4 and
+    # ffmpeg-sys-next 8.1 does not build against it. release.yml gets away
+    # with 22.04 only because it vendors its own FFmpeg and deliberately has
+    # no libav*-dev installed.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        # The four libav* libraries and nothing else -- ffmpeg-next is pinned
+        # with default-features = false, so avdevice and avfilter are unused.
+        # The -dev packages pull in the matching runtime .so, which the
+        # fingerprint.rs tests need: they decode tests/fixtures/*.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+            clang pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Distinct from release.yml's "static" key. The two builds link
+          # different FFmpeg and share no artifacts worth trading.
+          key: ci
+
+      # --locked so a drifted Cargo.lock fails here rather than at release.
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Tests
+        run: cargo test --locked
+
+  msrv:
+    name: MSRV (rust-version in Cargo.toml)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+            clang pkg-config
+
+      - name: Install Rust
+        # Keep this in step with `rust-version` in Cargo.toml. That field is a
+        # promise to anyone running `cargo install vid-fp` on a distro
+        # toolchain, and until this job existed nothing checked it -- the
+        # development machine is several releases ahead of it.
+        uses: dtolnay/rust-toolchain@1.85
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+
+      # check, not build: this asks whether the crate still compiles on the
+      # oldest toolchain claimed, and the answer does not need a linked binary.
+      - name: Check
+        run: cargo check --all-targets --locked
