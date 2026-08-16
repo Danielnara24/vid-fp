@@ -133,6 +133,9 @@ vid-fp ~/Videos ~/Downloads -e ~/Downloads/keep -r
 
 # Write a report you can open later
 vid-fp ~/Videos -r -o results.csv
+
+# Pipe the report to another tool
+vid-fp ~/Videos -r -o - --format csv | grep DELETE
 ```
 
 By default the scan is **not** recursive. Add `-r` to descend into subfolders.
@@ -240,7 +243,9 @@ the count and the byte total first.
 Every file is re-checked against the size the report recorded immediately before
 it's touched, and left alone if it has changed, so a report can sit for a week
 before you get to it. Columns are found by name, so a reordered report still
-works. Only CSV and JSON reports are accepted; `.txt` reports refused.
+works, and the format is read from the file rather than its name, so a report
+kept as `dupes.bak` replays. Only CSV and JSON reports are accepted; `.txt`
+reports refused.
 
 ## Options
 
@@ -259,7 +264,8 @@ works. Only CSV and JSON reports are accepted; `.txt` reports refused.
 | `-k`, `--priority <P>` | Criteria for KEEPING files: `length`, `resolution`, `quality`, or `size`. The chosen one is compared first, the rest follow in the default order. See [Codecs and quality](#codecs-and-quality) | `length` |
 | `--keyframe-interval <F>` | Seconds between sampled keyframes (`0` = every keyframe). Higher is faster, but makes short matches harder to find | `0.0` |
 | `--min-keyframes <F>` | Min keyframes kept for short videos (only relevant when keyframe-interval > 0). Raising it is not monotonic — see [Tuning](#tuning) | `12.0` |
-| `-o`, `--output <FILE>` | Optional path to save the report: `.txt`, `.csv`, or `.json` | |
+| `-o`, `--output <FILE>` | Optional path to save the report: `.txt`, `.csv`, or `.json`. `-` writes it to stdout | |
+| `--format <FORMAT>` | Write the report as `txt`, `csv`, or `json`, whatever `--output` is called | from the extension |
 | `--delete` | Move files marked DELETE to the trash | off |
 | `--permanent` | With `--delete`, permanently remove instead | off |
 | `--move-to <DIR>` | Move the files marked DELETE under `DIR`, recreating their absolute paths inside it. Arms the run on its own and supersedes `--delete`/`--permanent` | |

@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
 use clap_complete::Shell;
 use compare::{find_all_matches, max_hamming_distance, MatchIndex, HASH_BITS};
-use export::Disposal;
+use export::{Disposal, Format, ReportTarget, Sink};
 use fingerprint::{fingerprint_video, VideoFingerprint, MAX_DECODE_THREADS};
 use indicatif::{ProgressBar, ProgressState, ProgressStyle};
 use log::info;
@@ -350,9 +350,21 @@ struct Args {
     #[arg(short = 'k', long = "priority", default_value = "length")]
     priority: Priority,
 
-    /// Output file for the results (supports .txt, .csv, .json)
+    /// Output file for the results. The format follows the extension (.txt,
+    /// .csv, .json; anything else is written as text) unless --format overrides
+    /// it. Use - to write the report to stdout, where it replaces the terminal
+    /// listing rather than repeating it; progress, warnings and prompts stay on
+    /// stderr, so `vid-fp DIR -o - --format csv | grep DELETE` pipes the report
+    /// alone. A file actually named - is reachable as ./-
     #[arg(short = 'o', long = "output", value_hint = clap::ValueHint::FilePath)]
     output: Option<String>,
+
+    /// Write the report in this format regardless of what --output is called.
+    /// Needed for stdout, which has no extension to read, and for a report kept
+    /// under a name that carries no format (dupes.bak). Without it the
+    /// extension decides.
+    #[arg(long = "format", value_enum, value_name = "FORMAT")]
+    format: Option<Format>,
 
     /// Delete the files marked DELETE. By default they are moved to the system
     /// trash (recoverable); add --permanent to remove them for good. Files
@@ -376,8 +388,9 @@ struct Args {
           value_hint = clap::ValueHint::DirPath)]
     move_to: Option<String>,
 
-    /// Act on a .csv or .json report from an earlier run instead of scanning
-    /// anything (the format is taken from the extension). Every row whose
+    /// Act on a CSV or JSON report from an earlier run instead of scanning
+    /// anything (the format is read from the file itself, so its name does not
+    /// matter). Every row whose
     /// action reads DELETE is disposed of, and nothing else is touched — so
     /// editing that field is how you act on the rows the tool would not decide
     /// for you (REVIEW), or spare one it would. Nothing is re-fingerprinted and
@@ -393,7 +406,7 @@ struct Args {
         conflicts_with_all = [
             "include", "exclude", "from_file", "null", "recursive", "follow_symlinks",
             "extensions", "hamming_distance", "match_percent", "min_duration",
-            "kf_interval", "min_kf_samples", "priority", "output",
+            "kf_interval", "min_kf_samples", "priority", "output", "format",
             "prune_cache", "threads",
         ]
     )]
@@ -492,10 +505,35 @@ fn resolve_move_to(dir: Option<&String>) -> Result<Option<PathBuf>> {
     Ok(Some(resolved))
 }
 
-/// Refuse a `--output` path that plainly cannot be written, before any work
-/// starts.
+/// The format an `--output` path implies when `--format` is silent.
 ///
-/// The same reasoning `resolve_move_to` is built on, applied to the other
+/// Anything unrecognised is text, which is what the writer's fallthrough arm
+/// did before this was written down: `-o report.xml` gets the console listing,
+/// not a refusal, because the extension is a hint about a file the user names
+/// and not a declaration this tool gets to reject.
+fn format_from_extension(path: &Path) -> Format {
+    match path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase()
+        .as_str()
+    {
+        "csv" => Format::Csv,
+        "json" => Format::Json,
+        _ => Format::Txt,
+    }
+}
+
+/// Turn `--output` and `--format` into the single value the writer reads, and
+/// refuse a destination that plainly cannot be written before any work starts.
+///
+/// The one place either flag is interpreted. `--format` alone is refused rather
+/// than assumed to mean stdout: with no `-o` a run writes no report at all, and
+/// quietly turning it into one that does would be deciding on the user's behalf
+/// where the fix is to name the destination.
+///
+/// The path check is the same reasoning `resolve_move_to` is built on, applied to the other
 /// argument naming a path: a destination that cannot exist is a typo, and
 /// finding a typo out after fingerprinting a library is finding it out several
 /// hours too late. The report used to be the one path checked only at the point
@@ -511,9 +549,28 @@ fn resolve_move_to(dir: Option<&String>) -> Result<Option<PathBuf>> {
 ///
 /// What it cannot see is permissions, which still surface at the end. That is
 /// now the only late failure, and it is the rare one: a mistyped path is a
-/// typo, an unwritable directory you own is a decision.
-fn check_output_path(output: Option<&String>) -> Result<()> {
-    let Some(out) = output else { return Ok(()) };
+/// typo, an unwritable directory you own is a decision. None of it applies to
+/// stdout, which is already open.
+fn report_target_for(output: Option<&str>, format: Option<Format>) -> Result<Option<ReportTarget>> {
+    let Some(out) = output else {
+        if format.is_some() {
+            anyhow::bail!(
+                "--format says how to write the report, not where to put it. Add --output <FILE>, \
+                 or -o - to write it to stdout."
+            );
+        }
+        return Ok(None);
+    };
+
+    if out == "-" {
+        return Ok(Some(ReportTarget {
+            sink: Sink::Stdout,
+            // Text is what the console prints, so a bare `-o -` is the listing
+            // the user is already reading, on a stream they can pipe.
+            format: format.unwrap_or(Format::Txt),
+        }));
+    }
+
     let path = Path::new(out);
 
     if path.is_dir() {
@@ -536,7 +593,10 @@ fn check_output_path(output: Option<&String>) -> Result<()> {
         );
     }
 
-    Ok(())
+    Ok(Some(ReportTarget {
+        sink: Sink::File(path.to_path_buf()),
+        format: format.unwrap_or_else(|| format_from_extension(path)),
+    }))
 }
 
 /// Say up front what is going to happen to the files marked DELETE, so it is
@@ -1538,7 +1598,7 @@ fn run(
     }
 
     let move_to = resolve_move_to(args.move_to.as_ref())?;
-    check_output_path(args.output.as_ref())?;
+    let report_target = report_target_for(args.output.as_deref(), args.format)?;
 
     // Say out loud which flags are not doing anything. A user who passed
     // --permanent and watched a report scroll by has to be told the files were
@@ -2225,7 +2285,7 @@ fn run(
         &final_groups,
         &fingerprints,
         &matches,
-        args.output.as_ref(),
+        report_target.as_ref(),
         start_time.elapsed().as_secs(),
         args.priority,
         disposal.as_ref(),
@@ -2946,12 +3006,83 @@ mod tests {
         // Including the bare relative name, whose parent is the empty string
         // rather than a directory -- the one shape this check could plausibly
         // get wrong in the direction that refuses a perfectly good run.
-        assert!(check_output_path(None).is_ok());
-        assert!(check_output_path(Some(&"report.csv".to_string())).is_ok());
+        assert!(report_target_for(None, None).unwrap().is_none());
+        assert!(report_target_for(Some("report.csv"), None).unwrap().is_some());
 
         let dir = tempfile::tempdir().unwrap();
         let inside = dir.path().join("report.csv").to_string_lossy().to_string();
-        assert!(check_output_path(Some(&inside)).is_ok());
+        assert!(report_target_for(Some(&inside), None).unwrap().is_some());
+    }
+
+    /// What a resolved target came out as, in the two words the test cares
+    /// about.
+    fn resolved(output: &str, format: Option<Format>) -> (String, Format) {
+        let target = report_target_for(Some(output), format).unwrap().unwrap();
+        let where_to = match &target.sink {
+            Sink::Stdout => "-".to_string(),
+            Sink::File(p) => p.to_string_lossy().to_string(),
+        };
+        (where_to, target.format)
+    }
+
+    #[test]
+    fn test_the_extension_still_decides_the_format_when_nothing_overrides_it() {
+        // The behaviour --format was added beside, not instead of: every -o
+        // that worked before it existed resolves the way it always did, and an
+        // extension nobody recognises is still text rather than a refusal.
+        assert_eq!(resolved("report.csv", None).1, Format::Csv);
+        assert_eq!(resolved("report.JSON", None).1, Format::Json);
+        assert_eq!(resolved("report.txt", None).1, Format::Txt);
+        assert_eq!(resolved("report.xml", None).1, Format::Txt);
+        assert_eq!(resolved("report", None).1, Format::Txt);
+    }
+
+    #[test]
+    fn test_format_overrides_whatever_the_file_is_called() {
+        // The point of the flag: the name and the layout are separate
+        // decisions, so a report can be kept under any name and still be
+        // written -- and read back -- as itself.
+        assert_eq!(resolved("dupes.bak", Some(Format::Csv)).1, Format::Csv);
+        assert_eq!(resolved("dupes.bak", Some(Format::Json)).1, Format::Json);
+
+        // Including when the extension says something else outright. An
+        // explicit flag is not a hint to be weighed against a filename.
+        assert_eq!(resolved("dupes.json", Some(Format::Csv)).1, Format::Csv);
+    }
+
+    #[test]
+    fn test_a_lone_dash_is_stdout_rather_than_a_file_of_that_name() {
+        // It used to be a path like any other: the parent of "-" is the working
+        // directory, so the check passed and the run wrote a file literally
+        // called - into the cwd.
+        assert!(matches!(
+            report_target_for(Some("-"), None).unwrap().unwrap().sink,
+            Sink::Stdout
+        ));
+
+        // Text by default, because that is what the console prints and a bare
+        // `-o -` is that listing on a stream you can pipe.
+        assert_eq!(resolved("-", None).1, Format::Txt);
+        assert_eq!(resolved("-", Some(Format::Json)).1, Format::Json);
+
+        // And the file of that name is still reachable, just not by accident.
+        assert!(matches!(
+            report_target_for(Some("./-"), None).unwrap().unwrap().sink,
+            Sink::File(_)
+        ));
+    }
+
+    #[test]
+    fn test_a_format_with_nowhere_to_go_is_refused() {
+        // --format alone could have been read as "and put it on stdout", which
+        // would turn a run that writes no report into one that does. It says
+        // how, not where.
+        let err = format!(
+            "{:#}",
+            report_target_for(None, Some(Format::Json)).unwrap_err()
+        );
+        assert!(err.contains("--output"), "{}", err);
+        assert!(err.contains("-o -"), "{}", err);
     }
 
     #[test]

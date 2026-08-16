@@ -10,7 +10,107 @@ use crate::utils::{
 };
 use std::collections::{HashMap, HashSet};
 use std::fs::{FileTimes, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+
+/// Which of the three layouts a report is written in.
+///
+/// The extension used to be the only way to say this, which made two things
+/// unsayable: a report under a name that carries no format (`dupes.bak`, and
+/// whatever a browser calls a download), and any format at all on stdout, which
+/// has no name to read. `--format` is that decision on its own, and the
+/// extension stays the default when it isn't given.
+///
+/// `Txt` is also what an unrecognised extension resolves to. That was a
+/// fallthrough arm in the writer before; it is a stated default now, decided in
+/// one place (`main::report_target_for`) rather than at the point of writing.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Format {
+    Txt,
+    Csv,
+    Json,
+}
+
+/// Where a report goes.
+///
+/// `Stdout` is `-o -`. It works because nothing else in a scan writes there:
+/// every result line, the progress bars and the confirmation prompt are all on
+/// stderr, so the report is the only thing on stdout and `vid-fp DIR -o -
+/// --format csv | grep DELETE` reads exactly the report. A file genuinely named
+/// `-` is still reachable as `./-`.
+#[derive(Clone, Debug)]
+pub enum Sink {
+    Stdout,
+    File(PathBuf),
+}
+
+/// A resolved `--output`/`--format` pair: where the report goes and how it is
+/// written.
+///
+/// One value rather than two arguments because they are one decision -- with
+/// the extension no longer answering for both, splitting them would have let a
+/// destination reach the writer without a format and have it guess again.
+#[derive(Clone, Debug)]
+pub struct ReportTarget {
+    pub sink: Sink,
+    pub format: Format,
+}
+
+/// Hand the finished report to its destination.
+///
+/// The one thing here that is not `fs::write` is what happens when the reader
+/// of a pipe goes away first: `vid-fp DIR -o - | head` closes stdout under us,
+/// and that is a normal end to a pipeline rather than a run that did less than
+/// it was asked. Every other write failure is still a problem the caller
+/// records. (Rust ignores SIGPIPE, so this arrives as an ordinary error rather
+/// than killing the process.)
+fn write_report(target: &ReportTarget, bytes: &[u8]) -> Result<()> {
+    match &target.sink {
+        Sink::File(path) => std::fs::write(path, bytes)
+            .with_context(|| format!("Failed to write the report to {}", path.display())),
+        Sink::Stdout => {
+            let mut out = std::io::stdout().lock();
+            match out.write_all(bytes).and_then(|()| out.flush()) {
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                other => other.context("Failed to write the report to stdout"),
+            }
+        }
+    }
+}
+
+/// Which parts of the run stderr still says out loud once the report has a
+/// destination.
+struct Console {
+    /// The per-group table of files.
+    listing: bool,
+    /// The counts, the reclaimable total and what the disposal actually did.
+    summary: bool,
+}
+
+/// A report on stdout REPLACES the console listing rather than joining it.
+///
+/// The two are the same run said twice: `-o -` printed the whole listing on
+/// stderr and the whole report on stdout, so a terminal showed everything twice
+/// and `vid-fp DIR -o - | grep DELETE` still scrolled the entire listing past
+/// the user on the way to the one line they asked for. A report written to a
+/// FILE is a different case and keeps both: the terminal is then the only place
+/// the run is visible while it happens.
+///
+/// The summary is the one part that does not simply follow the listing, because
+/// two of the three formats already end with it -- a `.txt` report is exactly
+/// this listing plus that summary, and the JSON carries the same figures under
+/// `summary`. The CSV carries neither, so there stderr keeps the receipt: what
+/// was reclaimable, what was removed, what went wrong. That is the part of a
+/// destructive run nobody should have to read out of a pipe.
+fn console_for(target: Option<&ReportTarget>) -> Console {
+    match target {
+        Some(ReportTarget { sink: Sink::Stdout, format }) => Console {
+            listing: false,
+            summary: *format == Format::Csv,
+        },
+        _ => Console { listing: true, summary: true },
+    }
+}
 
 /// What `--delete` does with a file marked DELETE.
 ///
@@ -289,7 +389,7 @@ pub fn output_results(
     final_groups: &[Vec<usize>],
     fingerprints: &[VideoFingerprint],
     matches: &MatchIndex,
-    output_file: Option<&String>,
+    report_target: Option<&ReportTarget>,
     total_elapsed_secs: u64,
     priority: Priority,
     disposal: Option<&Disposal>,
@@ -529,9 +629,13 @@ pub fn output_results(
     }
 
     // --- Reporting -----------------------------------------------------------
-    info!("\n========================================");
-    info!("             RESULTS");
-    info!("========================================\n");
+    let Console { listing: show_listing, summary: show_summary } = console_for(report_target);
+
+    if show_listing {
+        info!("\n========================================");
+        info!("             RESULTS");
+        info!("========================================\n");
+    }
 
     // Groups overlap, so summing their sizes counts a shared file once per
     // group it appears in -- a figure that can exceed the number of videos
@@ -554,14 +658,7 @@ pub fn output_results(
     // pair, so a group of `g` members contributes `g * (g - 1)` of them, and on
     // a library with one big group that is the largest allocation in the report.
     // Nobody should pay it to write a .txt.
-    let wants_json = output_file
-        .map(|p| {
-            Path::new(p)
-                .extension()
-                .and_then(|s| s.to_str())
-                .is_some_and(|s| s.eq_ignore_ascii_case("json"))
-        })
-        .unwrap_or(false);
+    let wants_json = report_target.is_some_and(|t| t.format == Format::Json);
 
     let mut json_out_groups = Vec::new();
 
@@ -645,7 +742,9 @@ pub fn output_results(
     for (i, group) in final_groups.iter().enumerate() {
         let group_name = format!("group_{}", i + 1);
 
-        info!("{}:", group_name);
+        if show_listing {
+            info!("{}:", group_name);
+        }
         txt_out.push_str(&format!("{}:\n", group_name));
 
         let mut json_files = Vec::new();
@@ -798,7 +897,9 @@ pub fn output_results(
                 matched_str,
                 fp.path
             );
-            info!("{}", line);
+            if show_listing {
+                info!("{}", line);
+            }
             txt_out.push_str(&line);
             txt_out.push('\n');
 
@@ -890,7 +991,9 @@ pub fn output_results(
             }));
         }
 
-        info!(""); // Empty line for spacing
+        if show_listing {
+            info!(""); // Empty line for spacing
+        }
         txt_out.push('\n');
 
         if wants_json {
@@ -940,15 +1043,8 @@ pub fn output_results(
         summary.push_str(&trouble_lines(failed_count, changed_count));
     }
 
-    info!("{}", summary);
-
-    // Helpful nudge when there's something to clean up but nothing was touched.
-    // Not for someone who declined: they typed the flag, saw the question, and
-    // said no. Telling them to type it again would be answering back.
-    if !acting && !declined && delete_candidate_count > 0 {
-        info!(
-            "\nRun with --delete to move the file(s) marked DELETE to the trash or with --move-to <DIR> to relocate them instead."
-        );
+    if show_summary {
+        info!("{}", summary);
     }
 
     // --- Writing the report ---------------------------------------------------
@@ -961,24 +1057,15 @@ pub fn output_results(
     // (exit 2, and a line in the Problems summary) -- it is not a reason to
     // forget what the run did to the filesystem.
     //
-    // `check_output_path` has already rejected the mistyped paths before any
+    // `report_target_for` has already rejected the mistyped paths before any
     // work started, so what reaches here is a permission or a full disk.
-    if let Some(out_path) = output_file {
+    if let Some(target) = report_target {
         let written = (move || -> Result<()> {
-            let path = Path::new(&out_path);
-            let ext = path
-                .extension()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_lowercase();
-
-            match ext.as_str() {
-                "csv" => {
-                    let csv_bytes = csv_wtr.into_inner().context("Failed to finalize CSV buffer")?;
-                    std::fs::write(path, csv_bytes)
-                        .context(format!("Failed to write CSV to {}", out_path))?;
+            let bytes = match target.format {
+                Format::Csv => {
+                    csv_wtr.into_inner().context("Failed to finalize CSV buffer")?
                 }
-                "json" => {
+                Format::Json => {
                     // Summary first, then the groups. It is the part a human opens
                     // the file to read, and burying it under an array with a row per
                     // duplicate makes it something you have to go looking for.
@@ -1011,30 +1098,51 @@ pub fn output_results(
                         },
                         "results": json_out_groups
                     });
-                    std::fs::write(path, serde_json::to_string_pretty(&json_final).unwrap())
-                        .context(format!("Failed to write JSON to {}", out_path))?;
+                    serde_json::to_string_pretty(&json_final).unwrap().into_bytes()
                 }
-                _ => {
+                Format::Txt => {
                     let mut full_txt = String::new();
                     full_txt.push_str(&txt_out);
                     full_txt.push_str(&summary);
                     full_txt.push('\n');
 
-                    std::fs::write(path, full_txt)
-                        .context(format!("Failed to write Text to {}", out_path))?;
+                    full_txt.into_bytes()
                 }
-            }
+            };
 
-            Ok(())
+            write_report(target, &bytes)
         })();
 
         match written {
-            Ok(()) => info!("\nResults saved to {}", out_path),
+            // Nothing to announce for stdout: the report is already there, and
+            // saying so on stderr would be describing the pipe to whoever is
+            // reading the other end of it.
+            Ok(()) => {
+                if let Sink::File(path) = &target.sink {
+                    info!("\nResults saved to {}", path.display());
+                }
+            }
             Err(e) => {
                 log::error!("{:#}", e);
                 stats.report_write_failed.record(format!("{:#}", e));
             }
         }
+    }
+
+    // Helpful nudge when there's something to clean up but nothing was touched.
+    // Not for someone who declined: they typed the flag, saw the question, and
+    // said no. Telling them to type it again would be answering back.
+    //
+    // Printed whatever the report does, because no format carries it: it is
+    // advice about the next command to run, not a figure this one measured.
+    // Last, therefore, and after the report has been written rather than before
+    // -- on `-o -` it was landing on stderr while the report it refers to was
+    // still being built, so the terminal read "run with --delete" and only then
+    // showed the run it was talking about.
+    if !acting && !declined && delete_candidate_count > 0 {
+        info!(
+            "\nRun with --delete to move the file(s) marked DELETE to the trash or with --move-to <DIR> to relocate them instead."
+        );
     }
 
     Ok(deleted_paths)
@@ -1223,8 +1331,43 @@ matched_from_seconds;matched_to_seconds";
             .to_string()
     }
 
+    /// The target a path implies on its own, which is what these tests were
+    /// written against and what a run with no `--format` still resolves to.
+    fn to_file(path: &str) -> ReportTarget {
+        ReportTarget {
+            sink: Sink::File(PathBuf::from(path)),
+            format: crate::format_from_extension(Path::new(path)),
+        }
+    }
+
     fn read_json(path: &str) -> serde_json::Value {
         serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn test_a_report_on_stdout_replaces_the_console_listing_instead_of_joining_it() {
+        let stdout = |format| ReportTarget { sink: Sink::Stdout, format };
+
+        // Both halves of a .txt report are on stdout, so stderr says neither.
+        // This is the case that printed the whole run twice.
+        assert!(!console_for(Some(&stdout(Format::Txt))).listing);
+        assert!(!console_for(Some(&stdout(Format::Txt))).summary);
+
+        // The JSON carries the same figures under its own `summary` key.
+        assert!(!console_for(Some(&stdout(Format::Json))).summary);
+
+        // The CSV carries no summary at all, so stderr keeps the receipt --
+        // what was reclaimable, what was removed, what went wrong.
+        assert!(!console_for(Some(&stdout(Format::Csv))).listing);
+        assert!(console_for(Some(&stdout(Format::Csv))).summary);
+
+        // A report going to a file changes nothing: the terminal is still the
+        // only place the run is visible while it happens.
+        let file = to_file("report.csv");
+        assert!(console_for(Some(&file)).listing);
+        assert!(console_for(Some(&file)).summary);
+        assert!(console_for(None).listing);
+        assert!(console_for(None).summary);
     }
 
     #[test]
@@ -1236,7 +1379,7 @@ matched_from_seconds;matched_to_seconds";
 
         // Report-only run: single item defaults to KEEP.
         let deleted = output_results(
-            &groups, &fps, &all_compared(fps.len()), Some(&path_str), 120, Priority::Length, None,
+            &groups, &fps, &all_compared(fps.len()), Some(&to_file(&path_str)), 120, Priority::Length, None,
             true, &RunStats::default(),
         ).unwrap();
 
@@ -1273,7 +1416,7 @@ matched_from_seconds;matched_to_seconds";
         let path_str = report_to("json");
 
         output_results(
-            &groups, &fps, &all_compared(fps.len()), Some(&path_str), 0, Priority::Length, None,
+            &groups, &fps, &all_compared(fps.len()), Some(&to_file(&path_str)), 0, Priority::Length, None,
             true, &RunStats::default(),
         ).unwrap();
 
@@ -1306,7 +1449,7 @@ matched_from_seconds;matched_to_seconds";
         let path_str = report_to("json");
 
         output_results(
-            &groups, &fps, &all_compared(fps.len()), Some(&path_str), 0, Priority::Length, None,
+            &groups, &fps, &all_compared(fps.len()), Some(&to_file(&path_str)), 0, Priority::Length, None,
             true, &RunStats::default(),
         ).unwrap();
 
@@ -1333,11 +1476,11 @@ matched_from_seconds;matched_to_seconds";
         let json_path = report_to("json");
 
         output_results(
-            &groups, &fps, &matches, Some(&csv_path), 0, Priority::Length, None,
+            &groups, &fps, &matches, Some(&to_file(&csv_path)), 0, Priority::Length, None,
             true, &RunStats::default(),
         ).unwrap();
         output_results(
-            &groups, &fps, &matches, Some(&json_path), 0, Priority::Length, None,
+            &groups, &fps, &matches, Some(&to_file(&json_path)), 0, Priority::Length, None,
             true, &RunStats::default(),
         ).unwrap();
 
@@ -1394,7 +1537,7 @@ matched_from_seconds;matched_to_seconds";
 
         let path_str = report_to("csv");
         output_results(
-            &groups, &fps, &matches, Some(&path_str), 0, Priority::Length, None,
+            &groups, &fps, &matches, Some(&to_file(&path_str)), 0, Priority::Length, None,
             true, &RunStats::default(),
         ).unwrap();
 
@@ -1441,7 +1584,7 @@ matched_from_seconds;matched_to_seconds";
         let path_str = report_to("csv");
 
         output_results(
-            &groups, &fps, &matches, Some(&path_str), 0, Priority::Length, None,
+            &groups, &fps, &matches, Some(&to_file(&path_str)), 0, Priority::Length, None,
             true, &RunStats::default(),
         ).unwrap();
 
@@ -1472,7 +1615,7 @@ matched_from_seconds;matched_to_seconds";
 
         let path_str = report_to("csv");
         output_results(
-            &groups, &fps, &matches, Some(&path_str), 0, Priority::Length, None,
+            &groups, &fps, &matches, Some(&to_file(&path_str)), 0, Priority::Length, None,
             true, &RunStats::default(),
         ).unwrap();
 
@@ -1515,7 +1658,7 @@ matched_from_seconds;matched_to_seconds";
 
         let path_str = report_to("json");
         output_results(
-            &groups, &fps, &matches, Some(&path_str), 0, Priority::Length, None,
+            &groups, &fps, &matches, Some(&to_file(&path_str)), 0, Priority::Length, None,
             true, &RunStats::default(),
         ).unwrap();
 
@@ -1565,7 +1708,7 @@ matched_from_seconds;matched_to_seconds";
 
         let path_str = report_to("json");
         output_results(
-            &groups, &fps, &matches, Some(&path_str), 0, Priority::Length, None,
+            &groups, &fps, &matches, Some(&to_file(&path_str)), 0, Priority::Length, None,
             true, &RunStats::default(),
         ).unwrap();
 
@@ -1599,7 +1742,7 @@ matched_from_seconds;matched_to_seconds";
         let path_str = report_to("csv");
 
         output_results(
-            &groups, &fps, &matches, Some(&path_str), 0, Priority::Length, None,
+            &groups, &fps, &matches, Some(&to_file(&path_str)), 0, Priority::Length, None,
             true, &RunStats::default(),
         ).unwrap();
 
@@ -1630,7 +1773,7 @@ matched_from_seconds;matched_to_seconds";
         let path_str = report_to("json");
 
         output_results(
-            &groups, &fps, &all_compared(fps.len()), Some(&path_str), 0, Priority::Length, None,
+            &groups, &fps, &all_compared(fps.len()), Some(&to_file(&path_str)), 0, Priority::Length, None,
             true, &RunStats::default(),
         ).unwrap();
 
@@ -1654,7 +1797,7 @@ matched_from_seconds;matched_to_seconds";
         let path_str = report_to("json");
 
         output_results(
-            &groups, &fps, &matches, Some(&path_str), 0, Priority::Length, None,
+            &groups, &fps, &matches, Some(&to_file(&path_str)), 0, Priority::Length, None,
             true, &RunStats::default(),
         ).unwrap();
 
@@ -1685,11 +1828,11 @@ matched_from_seconds;matched_to_seconds";
         let csv_path = report_to("csv");
 
         output_results(
-            &groups, &fps, &all_compared(fps.len()), Some(&json_path), 0, Priority::Length, None,
+            &groups, &fps, &all_compared(fps.len()), Some(&to_file(&json_path)), 0, Priority::Length, None,
             true, &RunStats::default(),
         ).unwrap();
         output_results(
-            &groups, &fps, &all_compared(fps.len()), Some(&csv_path), 0, Priority::Length, None,
+            &groups, &fps, &all_compared(fps.len()), Some(&to_file(&csv_path)), 0, Priority::Length, None,
             true, &RunStats::default(),
         ).unwrap();
 
@@ -1771,7 +1914,7 @@ matched_from_seconds;matched_to_seconds";
         let path_str = report_to("json");
 
         let moved = output_results(
-            &groups, &fps, &all_compared(fps.len()), Some(&path_str), 0, Priority::Length,
+            &groups, &fps, &all_compared(fps.len()), Some(&to_file(&path_str)), 0, Priority::Length,
             Some(&Disposal::MoveTo(dest.path().to_path_buf())), true, &stats,
         ).unwrap();
 
@@ -1945,7 +2088,7 @@ matched_from_seconds;matched_to_seconds";
         let path_str = report_to("json");
 
         let deleted = output_results(
-            &groups, &fps, &all_compared(fps.len()), Some(&path_str), 0, Priority::Length,
+            &groups, &fps, &all_compared(fps.len()), Some(&to_file(&path_str)), 0, Priority::Length,
             Some(&Disposal::Permanent), true, &stats,
         ).unwrap();
 
@@ -2076,7 +2219,7 @@ matched_from_seconds;matched_to_seconds";
         let path_str = report_to("json");
 
         let deleted = output_results(
-            &groups, &fps, &chain_of_three(), Some(&path_str), 0,
+            &groups, &fps, &chain_of_three(), Some(&to_file(&path_str)), 0,
             Priority::Length, None, true, &RunStats::default(),
         ).unwrap();
 
@@ -2123,7 +2266,7 @@ matched_from_seconds;matched_to_seconds";
         let path_str = report_to("json");
 
         let deleted = output_results(
-            &groups, &fps, &chain_of_three(), Some(&path_str), 0,
+            &groups, &fps, &chain_of_three(), Some(&to_file(&path_str)), 0,
             Priority::Length, Some(&Disposal::Permanent), true, &RunStats::default(),
         ).unwrap();
 
@@ -2202,7 +2345,7 @@ matched_from_seconds;matched_to_seconds";
         let path_str = report_to("json");
 
         let mut deleted = output_results(
-            &groups, &fps, &all_compared(fps.len()), Some(&path_str), 0, Priority::Length,
+            &groups, &fps, &all_compared(fps.len()), Some(&to_file(&path_str)), 0, Priority::Length,
             Some(&Disposal::Permanent), true, &stats,
         ).unwrap();
         deleted.sort();
@@ -2240,7 +2383,21 @@ matched_from_seconds;matched_to_seconds";
         // DELETE, and with a size the staleness check will agree with. A report
         // this tool wrote and cannot replay is the failure worth a test of its
         // own, because everything else about it looks right.
-        for extension in ["csv", "json"] {
+        // Each format under the extension that implies it, and then under one
+        // that implies nothing. The second pair is what `--format` made
+        // writable, and it is the round trip that broke when only the writer
+        // was decoupled: a JSON report called .bak went to the CSV reader and
+        // was refused for want of columns it was never going to have.
+        let cases: [(&str, Option<Format>); 4] = [
+            ("csv", None),
+            ("json", None),
+            ("bak", Some(Format::Csv)),
+            ("bak", Some(Format::Json)),
+        ];
+
+        for (extension, format) in cases {
+            let case = format!(".{} as {:?}", extension, format);
+
             let dir = tempfile::tempdir().unwrap();
             let keep = at(&dir, "long.mkv");
             let doomed = at(&dir, "short.mkv");
@@ -2250,23 +2407,27 @@ matched_from_seconds;matched_to_seconds";
 
             let groups = vec![vec![0, 1]];
             let path_str = report_to(extension);
+            let target = match format {
+                Some(f) => ReportTarget { sink: Sink::File(PathBuf::from(&path_str)), format: f },
+                None => to_file(&path_str),
+            };
 
             // Report-only: nothing is touched, and the report is the whole
             // output -- which is the run --from-report exists to follow.
             output_results(
-                &groups, &fps, &all_compared(fps.len()), Some(&path_str), 0, Priority::Length,
+                &groups, &fps, &all_compared(fps.len()), Some(&target), 0, Priority::Length,
                 None, true, &RunStats::default(),
             ).unwrap();
 
-            assert!(Path::new(&doomed).exists(), "{}: nothing is removed yet", extension);
+            assert!(Path::new(&doomed).exists(), "{}: nothing is removed yet", case);
 
             let stats = RunStats::default();
             let gone = crate::report::apply(&path_str, &Disposal::Permanent, true, &stats).unwrap();
 
-            assert_eq!(gone, vec![doomed.clone()], "{}", extension);
-            assert!(!Path::new(&doomed).exists(), "{}: the DELETE row was acted on", extension);
-            assert!(Path::new(&keep).exists(), "{}: and nothing else was", extension);
-            assert!(!stats.had_problems(), "{}: every row was understood", extension);
+            assert_eq!(gone, vec![doomed.clone()], "{}", case);
+            assert!(!Path::new(&doomed).exists(), "{}: the DELETE row was acted on", case);
+            assert!(Path::new(&keep).exists(), "{}: and nothing else was", case);
+            assert!(!stats.had_problems(), "{}: every row was understood", case);
 
             let _ = fs::remove_file(path_str);
         }
@@ -2322,7 +2483,7 @@ matched_from_seconds;matched_to_seconds";
         let path_str = report_to("json");
 
         let deleted = output_results(
-            &groups, &fps, &all_compared(fps.len()), Some(&path_str), 0, Priority::Length,
+            &groups, &fps, &all_compared(fps.len()), Some(&to_file(&path_str)), 0, Priority::Length,
             Some(&Disposal::Permanent), true, &RunStats::default(),
         ).unwrap();
 

@@ -240,24 +240,52 @@ fn column(headers: &csv::StringRecord, name: &str) -> Result<usize> {
 
 /// Parse the report, keeping the rows marked DELETE.
 ///
-/// Which reader runs is decided by the extension, exactly as `--output` decides
-/// which writer runs, so a file this tool wrote is read back by the reader that
-/// matches the writer that produced it. Anything that is not `.json` is offered
-/// to the CSV reader rather than refused on sight: the CSV is what a report gets
-/// renamed to (`dupes.txt`, `dupes.bak`, no extension at all after a download),
-/// and it can say for itself whether it is one -- its header either has the
-/// three columns or it does not.
+/// Which reader runs is decided by the file's first character, not by its name.
+/// The extension used to decide, which worked only for as long as `--output`
+/// decided by the extension too; `--format` broke the symmetry, and a report
+/// written as `-o dupes.bak --format json` would have been handed to the CSV
+/// reader and refused for want of columns it was never going to have. A report
+/// gets renamed (`dupes.txt`, `dupes.bak`, no extension at all after a
+/// download), so the file has to answer for itself -- which each format already
+/// does further in, the JSON by needing a `results` array and the CSV by needing
+/// its three columns. This just asks the same question one character earlier, so
+/// that a wrong guess produces the complaint that fits the file.
 fn read(path: &str, stats: &RunStats) -> Result<Report> {
-    let is_json = std::path::Path::new(path)
-        .extension()
-        .and_then(|s| s.to_str())
-        .is_some_and(|s| s.eq_ignore_ascii_case("json"));
-
-    if is_json {
+    if looks_like_json(path) {
         read_json(path, stats)
     } else {
         read_csv(path, stats)
     }
+}
+
+/// Whether the first thing in the file is the start of a JSON value.
+///
+/// `[` counts as well as `{`, though a report is always an object: an array
+/// gets JSON's complaint about a missing `results` key rather than the CSV's
+/// about a missing column, and that is the one a user can act on.
+///
+/// A file that cannot be opened or read is left to the reader it falls through
+/// to, which reports the failure with the path in it. There is nothing to be
+/// gained by saying it twice, in two different sentences, on the way past.
+fn looks_like_json(path: &str) -> bool {
+    use std::io::Read;
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+
+    // Enough for any run of leading whitespace a formatter or an editor would
+    // leave; a file that is all whitespace this far in is not a report of
+    // either kind.
+    let mut head = [0u8; 64];
+    let Ok(n) = file.read(&mut head) else {
+        return false;
+    };
+
+    head[..n]
+        .iter()
+        .find(|b| !b.is_ascii_whitespace())
+        .is_some_and(|b| *b == b'{' || *b == b'[')
 }
 
 /// The CSV report, located by column name.
@@ -1049,34 +1077,50 @@ shared_to_seconds";
     }
 
     #[test]
-    fn test_the_format_is_chosen_by_extension_whatever_its_case() {
+    fn test_the_format_is_read_out_of_the_file_not_off_its_name() {
+        // Both directions of the same rule, and the JSON half is the one
+        // --format made reachable: `-o dupes.bak --format json` writes a report
+        // no extension describes, and the run that replays it has only the
+        // bytes to go on. Leading whitespace is skipped, because a file that
+        // went through a formatter or an editor is still the report it was.
         let dir = tempfile::tempdir().unwrap();
         let tree = serde_json::json!({
             "results": [ { "group": "group_1", "files": [
                 json_file("/b.mkv", serde_json::json!(20), "DELETE")
             ] } ]
         });
-        let path = write_json(&dir, "REPORT.JSON", &tree.to_string());
 
         let stats = RunStats::default();
-        let report = read(&path, &stats).unwrap();
 
-        assert_eq!(report.marked.len(), 1, "a .JSON is still JSON");
+        for name in ["REPORT.JSON", "dupes.bak", "dupes.txt", "dupes"] {
+            let path = write_json(&dir, name, &format!("\n  {}", tree));
+            let report = read(&path, &stats).unwrap();
+            assert_eq!(report.marked.len(), 1, "{} is JSON whatever it is called", name);
+        }
+
+        // A report saved as dupes.txt by habit, or one a browser downloaded
+        // without its extension, reads as the CSV it is for the same reason.
+        let body = format!("{}\n{}\n", HEADER, row("/b.mkv", 20, "DELETE"));
+        for name in ["dupes.bak", "dupes.txt", "dupes", "REPORT.CSV"] {
+            let path = write_json(&dir, name, &body);
+            let report = read(&path, &stats).unwrap();
+            assert_eq!(report.marked.len(), 1, "{} is a CSV whatever it is called", name);
+        }
     }
 
     #[test]
-    fn test_a_renamed_csv_is_still_read_as_one() {
-        // Anything that is not .json goes to the CSV reader, which can say for
-        // itself whether the file is a report. A report saved as dupes.txt by
-        // habit, or one a browser downloaded without its extension, still works.
+    fn test_json_that_is_not_a_report_complains_as_json() {
+        // What the sniff buys beyond reading the right file: a JSON array named
+        // .csv used to be refused for want of a column it could never have had.
+        // The complaint a user can act on is the one about the shape of the
+        // file they actually wrote.
         let dir = tempfile::tempdir().unwrap();
-        let body = format!("{}\n{}\n", HEADER, row("/b.mkv", 20, "DELETE"));
-        let path = write_json(&dir, "dupes.bak", &body);
+        let path = write_json(&dir, "wrong.csv", r#"[{"full_path": "/b.mkv"}]"#);
 
         let stats = RunStats::default();
-        let report = read(&path, &stats).unwrap();
+        let err = format!("{:#}", read(&path, &stats).unwrap_err());
 
-        assert_eq!(report.marked.len(), 1);
+        assert!(err.contains("results"), "{}", err);
     }
 
     #[test]
