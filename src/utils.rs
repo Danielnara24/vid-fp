@@ -239,7 +239,6 @@ pub struct GroupMaxima {
     duration: f64,
     resolution: u64,
     per_codec: HashMap<String, CodecMaxima>,
-    mixed_codecs: bool,
 }
 
 impl GroupMaxima {
@@ -258,18 +257,25 @@ impl GroupMaxima {
             entry.file_size = entry.file_size.max(fp.file_size);
         }
 
-        let mixed_codecs = per_codec.len() > 1;
-
         GroupMaxima {
             duration,
             resolution: resolution_max,
             per_codec,
-            mixed_codecs,
         }
     }
 
     fn codec_maxima(&self, fp: &VideoFingerprint) -> CodecMaxima {
         self.per_codec.get(&fp.codec).copied().unwrap_or_default()
+    }
+
+    /// The best `metric` reached among the group's files sharing `fp`'s codec,
+    /// which is 0 for the metrics that are not measured per codec.
+    fn codec_max(&self, fp: &VideoFingerprint, metric: Priority) -> u64 {
+        match metric {
+            Priority::Quality => self.codec_maxima(fp).quality,
+            Priority::Size => self.codec_maxima(fp).file_size,
+            _ => 0,
+        }
     }
 
     /// 1 when `fp` is within tolerance of the best value `metric` can be
@@ -293,25 +299,50 @@ impl GroupMaxima {
         }
     }
 
-    /// Raw comparable value for a metric, or 0 where the metric cannot legally
-    /// separate this group's members.
-    ///
-    /// Duration is milliseconds so everything is an integer and comparison is
-    /// total (floats are not Ord). Bit-based metrics collapse to 0 for every
-    /// file the moment the group spans codecs: tiers have already ranked each
-    /// file against its own kind, and going on to compare the raw numbers would
-    /// be doing across codecs precisely what the tiers were built to prevent.
+    /// Raw value for a metric. Duration is milliseconds so everything is an
+    /// integer and comparison is total (floats are not Ord).
     fn value(&self, fp: &VideoFingerprint, metric: Priority) -> u64 {
-        if self.mixed_codecs && is_codec_relative(metric) {
-            return 0;
-        }
-
         match metric {
             Priority::Length => (fp.duration * 1000.0) as u64,
             Priority::Resolution => resolution(fp),
             Priority::Quality => fp.quality(),
             Priority::Size => fp.file_size,
         }
+    }
+
+    /// Order two of the group's files on one metric, greater meaning better.
+    ///
+    /// Codec-independent metrics compare their raw values. Codec-relative ones
+    /// compare each file's value as a FRACTION of the best its own codec
+    /// managed -- the same frame of reference `tier` uses, so this pass refines
+    /// the tiers instead of contradicting them, and a bit count is never held
+    /// against a bit count some other codec produced. Two files that are each
+    /// the best of their own kind tie here exactly as they tie on tiers, and
+    /// the decision falls through to path order for `export.rs` to flag.
+    ///
+    /// The fractions are cross-multiplied rather than divided, so the ordering
+    /// is exact and nothing new ties through rounding. Two files sharing a
+    /// codec share a denominator, which reduces their comparison to their raw
+    /// values: that is what stops a third file of some foreign codec blinding
+    /// them to each other. Zeroing the metric outright (what this replaced) hid
+    /// that case, because tiers cannot separate two copies inside the same 5%
+    /// band and the raw pass was the only thing left that could -- so the group
+    /// silently fell through to alphabetical order, and `export.rs` saw no
+    /// standoff to flag because the foreign file was not a contender.
+    fn compare(&self, a: &VideoFingerprint, b: &VideoFingerprint, metric: Priority) -> Ordering {
+        let (val_a, val_b) = (self.value(a, metric), self.value(b, metric));
+
+        if !is_codec_relative(metric) {
+            return val_a.cmp(&val_b);
+        }
+
+        // A codec whose maximum is 0 could not measure the metric at all (no
+        // frame rate, say), and then every one of its files is 0 too, so both
+        // products collapse to 0 and it ties rather than losing -- exactly how
+        // `within` treats the same case one pass earlier. u128 because the
+        // product of two u64 metrics does not fit in one.
+        let (max_a, max_b) = (self.codec_max(a, metric), self.codec_max(b, metric));
+        (val_a as u128 * max_b as u128).cmp(&(val_b as u128 * max_a as u128))
     }
 }
 
@@ -342,8 +373,10 @@ fn ordered_metrics(priority: Priority) -> [Priority; 4] {
 ///
 /// Two passes over the same metric order. The first compares tolerance tiers,
 /// so anything inside a band is a draw and defers to the next metric. The
-/// second compares raw values, separating files that tied on every band. Path
-/// order settles the rest, so the result never depends on input ordering.
+/// second compares values (see `GroupMaxima::compare`, which keeps the
+/// codec-relative ones codec-relative), separating files that tied on every
+/// band. Path order settles the rest, so the result never depends on input
+/// ordering.
 ///
 /// In a mixed-codec group both passes can legitimately run out of ways to
 /// separate two files, and the answer will then be the alphabetically first
@@ -370,7 +403,7 @@ pub fn find_best(
                 ord = ord.then(maxima.tier(fp_a, m).cmp(&maxima.tier(fp_b, m)));
             }
             for m in order {
-                ord = ord.then(maxima.value(fp_a, m).cmp(&maxima.value(fp_b, m)));
+                ord = ord.then(maxima.compare(fp_a, fp_b, m));
             }
 
             // Reversed so the alphabetically FIRST path wins, since max_by
@@ -626,10 +659,50 @@ mod tests {
         let group: Vec<usize> = (0..3).collect();
         let maxima = GroupMaxima::of(&group, &fps);
 
-        assert!(maxima.mixed_codecs, "the group spans two codecs");
+        assert_eq!(maxima.per_codec.len(), 2, "the group spans two codecs");
         assert_eq!(maxima.tier(&fps[0], Priority::Quality), 0, "thin h264 loses to fat h264");
         assert_eq!(maxima.tier(&fps[1], Priority::Quality), 1);
         assert_eq!(maxima.tier(&fps[2], Priority::Quality), 1, "best of its own kind");
+    }
+
+    #[test]
+    fn test_a_foreign_codec_bystander_does_not_blind_the_raw_value_tiebreak() {
+        // The tier pass cannot separate two h264 copies 4% apart -- that is
+        // inside the 5% band -- so the raw-value pass is the only thing left
+        // that can, and it must still run for files that share a codec even
+        // when some third file in the group does not.
+        let fps = vec![
+            fp_full("a_worse.mp4", 60.0, 1920, 1080, 8_640_000, "h264", 30.0),
+            fp_full("b_better.mp4", 60.0, 1920, 1080, 9_000_000, "h264", 30.0),
+            fp_full("c_av1.mp4", 60.0, 1280, 720, 3_000_000, "av1", 30.0),
+        ];
+
+        assert_eq!(
+            best(&fps, Priority::Quality),
+            1,
+            "the better h264 copy must win whether or not an av1 file is watching"
+        );
+    }
+
+    #[test]
+    fn test_the_best_of_each_codec_still_ties_when_one_codec_has_several() {
+        // The other half of the same rule. Restoring the tiebreak must not
+        // restore it ACROSS codecs: each file is measured as a fraction of the
+        // best its own codec managed, so both leaders read as their codec's
+        // best and tie, however many bits apart they are. The av1 file sorts
+        // first, so it can only win by that tie -- if the h264 leader's three
+        // times the bits counted, it would win outright and this would fail.
+        let fps = vec![
+            fp_full("a_av1.mp4", 60.0, 1920, 1080, 3_000_000, "av1", 30.0),
+            fp_full("b_h264_best.mp4", 60.0, 1920, 1080, 9_000_000, "h264", 30.0),
+            fp_full("c_h264_worse.mp4", 60.0, 1920, 1080, 8_600_000, "h264", 30.0),
+        ];
+
+        assert_eq!(
+            best(&fps, Priority::Quality),
+            0,
+            "a leader of one codec must not be outranked by a leader of another"
+        );
     }
 
     #[test]

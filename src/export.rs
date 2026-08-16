@@ -467,10 +467,10 @@ pub fn output_results(
         // encodes of one episode does not need five of them held for review.
         //
         // The election runs against maxima built from the codec's own
-        // contenders, not the group's. That is what re-enables the raw-value
-        // tiebreak: within one codec `mixed_codecs` is false, so two files
-        // sitting inside the same tolerance band are separated by their actual
-        // quality instead of falling through to alphabetical order.
+        // contenders, not the group's, so a file that already lost a
+        // codec-blind metric cannot set the bar its codec's contenders are
+        // tiered against -- its quality or size is no longer the standard any
+        // of them has to reach.
         let contenders: Vec<usize> = group
             .iter()
             .copied()
@@ -2571,11 +2571,11 @@ matched_from_seconds;matched_to_seconds";
     #[test]
     fn test_a_champion_is_elected_on_quality_not_on_filename() {
         // Two h264 encodes four percent apart: inside both tolerance bands, so
-        // every tier ties and the raw quality figure is the only thing left.
-        // Group-wide that figure is suppressed (the group spans codecs), which
-        // would hand the election to alphabetical order and elect the WORSE
-        // file -- the champion is therefore elected against its own codec's
-        // maxima, where the comparison is legitimate.
+        // every tier ties and the quality figure is the only thing left. The
+        // election runs against the codec's own contenders, so the av1 file
+        // neither sets the bar the two h264 copies are tiered against nor gets
+        // to be separated from them on bits -- and the WORSE h264 copy does not
+        // win the codec by sorting first.
         let dir = tempfile::tempdir().unwrap();
         let a_worse = at(&dir, "a_worse.mkv");
         let z_best = at(&dir, "z_best.mkv");
@@ -2601,6 +2601,45 @@ matched_from_seconds;matched_to_seconds";
             "sorting first is not a reason to survive a codec you lost"
         );
         assert!(Path::new(&other_codec).exists(), "the av1 copy stands on its own");
+    }
+
+    #[test]
+    fn test_a_foreign_codec_that_is_not_even_a_contender_decides_nothing() {
+        // The same two h264 encodes, but the av1 file is 720p and so loses the
+        // group on resolution before bits are ever consulted. That makes it a
+        // bystander rather than a contender, no standoff fires, and the whole
+        // decision rests on the group-wide ranking -- which used to suppress
+        // quality and size for every file the moment ANY foreign codec was
+        // present, hand the group to alphabetical order, and delete the better
+        // copy with nothing flagged for review.
+        let dir = tempfile::tempdir().unwrap();
+        let a_worse = at(&dir, "a_worse.mkv");
+        let z_best = at(&dir, "z_best.mkv");
+        let bystander = at(&dir, "m_av1_720p.mkv");
+
+        let mut small = mock_fp_sized(&bystander, 60.0, "av1", 4_000_000);
+        small.width = 1280;
+        small.height = 720;
+
+        let fps = vec![
+            mock_fp_sized(&a_worse, 60.0, "h264", 9_600_000),
+            mock_fp_sized(&z_best, 60.0, "h264", 10_000_000),
+            small,
+        ];
+        materialize_all(&fps);
+
+        let groups = vec![vec![0, 1, 2]];
+
+        output_results(
+            &groups, &fps, &all_compared(fps.len()), None, 0, Priority::Length,
+            Some(&Disposal::Permanent), true, &RunStats::default(),
+        ).unwrap();
+
+        assert!(Path::new(&z_best).exists(), "the denser h264 copy is the one to keep");
+        assert!(
+            !Path::new(&a_worse).exists(),
+            "sorting first is not a reason to survive a copy that beat you on bits"
+        );
     }
 
     #[test]
