@@ -267,6 +267,7 @@ works. Only CSV and JSON reports are accepted; `.txt` reports refused.
 | `-y`, `--yes` | Answer yes to the confirmation shown before any file is touched | off |
 | `-t`, `--threads <N>` | Worker threads (`0` = uses all cores) | `0` |
 | `-q`, `--quiet` | Only print errors | off |
+| `--cache <PATH>` | Use this cache file instead of the default one. Needed to run multiple scans at once, since a run locks its cache for the whole scan | `$XDG_CACHE_HOME/vid-fp/fingerprints.redb` |
 | `--clear-cache` | Wipe ALL vid-fp cache before running | off |
 | `--prune-cache` | Drop cached entries only for files not in this scan | off |
 | `--completions <SHELL>` | Print a completion script for `bash`, `zsh`, `fish`, `elvish`, or `powershell` and exit | |
@@ -483,6 +484,18 @@ meaning the file changed on disk after it was scanned and was left alone.
 Fingerprints are cached (under `$XDG_CACHE_HOME/vid-fp`, falling back to
 `~/.cache/vid-fp`), so re-scanning the same library is near-instant. Use
 `--clear-cache` or `--prune-cache` to manage it.
+
+A run takes an exclusive lock on its cache and holds it for the whole scan, not
+just while it reads it, so **two runs cannot share one cache**. To scan two
+libraries at the same time, give each run its own:
+
+```bash
+vid-fp -r ~/Videos/film &
+vid-fp -r ~/Videos/tv --cache ~/.cache/vid-fp/tv.redb
+```
+
+`--from-report` is the exception: it doesn't read the cache, so it runs anyway
+and only reports the entries it couldn't drop.
 
 An entry is invalidated by the file changing (size or modification time) and by
 the two flags that decide which frames get sampled, `--keyframe-interval` and,

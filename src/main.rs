@@ -17,7 +17,7 @@ use fingerprint::{fingerprint_video, VideoFingerprint, MAX_DECODE_THREADS};
 use indicatif::{ProgressBar, ProgressState, ProgressStyle};
 use log::info;
 use rayon::prelude::*;
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, DatabaseError, ReadableTable, StorageError, TableDefinition};
 use serde::{Deserialize, Serialize};
 use sources::ScannedFile;
 use stats::RunStats;
@@ -407,6 +407,17 @@ struct Args {
     #[arg(short = 'y', long = "yes")]
     yes: bool,
 
+    /// Use this cache file instead of the default one under
+    /// $XDG_CACHE_HOME/vid-fp (or ~/.cache/vid-fp). A run locks its cache for
+    /// the whole scan, so two runs at once need two caches — this is what
+    /// makes scanning separate libraries in parallel possible. A path that is
+    /// an existing directory, or is written with a trailing slash, gets the
+    /// default filename inside it; missing parent directories are created.
+    /// --clear-cache and --prune-cache act on whichever cache this names.
+    #[arg(long = "cache", value_name = "PATH",
+          value_hint = clap::ValueHint::FilePath)]
+    cache: Option<String>,
+
     /// Delete ALL cache before running
     #[arg(long = "clear-cache")]
     clear_cache: bool,
@@ -557,13 +568,19 @@ fn announce(disposal: Option<&Disposal>) {
 /// same per-file staleness check, the same disposal code, and the same cache
 /// bookkeeping afterwards.
 ///
+/// That bookkeeping is the only thing in this mode that touches the cache at
+/// all, which is why `db` is optional: another run holding the cache is not a
+/// reason to refuse a deletion this user has already reviewed. `main` makes
+/// that call and explains it; this end of it records the entries it could not
+/// drop and carries on.
+///
 /// Refusing to run without an arming flag is the one piece of validation clap
 /// cannot express. It is not merely useless without one -- a report-only
 /// `--from-report` would read a file, decide nothing, and print nothing that
 /// the report does not already say.
 fn run_from_report(
     args: &Args,
-    db: &Database,
+    db: Option<&Database>,
     report_path: &str,
     stats: &RunStats,
 ) -> Result<Outcome> {
@@ -585,14 +602,26 @@ fn run_from_report(
     let deleted_paths = report::apply(report_path, &disposal, args.yes, stats)?;
 
     if !deleted_paths.is_empty() {
-        match cache_forget(db, &deleted_paths) {
-            Ok(forgotten) => {
-                log::debug!("Dropped {} cache entry(ies) for removed file(s).", forgotten)
-            }
-            Err(e) => {
-                log::error!("Failed to drop cache entries for removed files: {:#}", e);
-                stats.cache_purge_failed.record(format!("{:#}", e));
-            }
+        match db {
+            Some(db) => match cache_forget(db, &deleted_paths) {
+                Ok(forgotten) => {
+                    log::debug!("Dropped {} cache entry(ies) for removed file(s).", forgotten)
+                }
+                Err(e) => {
+                    log::error!("Failed to drop cache entries for removed files: {:#}", e);
+                    stats.cache_purge_failed.record(format!("{:#}", e));
+                }
+            },
+            // The cache was busy when this run started, and `main` chose the
+            // deletions over the bookkeeping -- the reasoning is there. One
+            // record for the whole batch, exactly as the failure arm above
+            // does, because `cache_forget` is one transaction either way, and
+            // because a count with a single sample would render as "... and N
+            // more (see the errors above)" pointing at errors nothing printed.
+            None => stats.cache_purge_failed.record(format!(
+                "{} entry(ies) left behind: the cache was in use by another vid-fp run",
+                deleted_paths.len()
+            )),
         }
     }
 
@@ -1090,6 +1119,132 @@ fn retire_legacy_cache(cache_dir: &Path) {
     }
 }
 
+/// Where the cache lives when `--cache` is not given.
+///
+/// Only the default location gets the legacy sweep and the XDG lookup; a cache
+/// the user named is theirs, and this build has never written anything else
+/// beside it.
+const CACHE_FILE_NAME: &str = "fingerprints.redb";
+
+/// Decide which file this run's fingerprints are cached in.
+///
+/// A cache holds an exclusive lock for the whole run -- not just the cache pass
+/// -- so two concurrent scans cannot share one, and `--cache` is the only way
+/// to run them at all. See `open_cache`.
+///
+/// `--cache` names the database FILE, because that is what it is and because a
+/// user pointing at a scratch disk wants to know exactly what appears there.
+/// A path that is already a directory, or that is written with a trailing
+/// slash, is treated as one instead and gets the default filename inside it:
+/// `--cache /mnt/scratch` obviously means "a cache in here", and the
+/// alternative is a redb file named `scratch`.
+fn resolve_cache_path(explicit: Option<&str>) -> Result<PathBuf> {
+    let Some(raw) = explicit else {
+        // Follow XDG Base Directory Specification for caching
+        let cache_dir = std::env::var("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                if let Ok(home) = std::env::var("HOME") {
+                    PathBuf::from(home).join(".cache")
+                } else {
+                    PathBuf::from("/tmp")
+                }
+            })
+            .join("vid-fp");
+
+        std::fs::create_dir_all(&cache_dir).context("Failed to create cache directory")?;
+        retire_legacy_cache(&cache_dir);
+
+        return Ok(cache_dir.join(CACHE_FILE_NAME));
+    };
+
+    let given = Path::new(raw);
+    let path = if raw.ends_with('/') || given.is_dir() {
+        given.join(CACHE_FILE_NAME)
+    } else {
+        given.to_path_buf()
+    };
+
+    // The default location is created for the user, so a named one is too --
+    // otherwise `--cache /mnt/scratch/vid-fp/cache.redb` fails on a directory
+    // the user would have created without thinking about it.
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!("Failed to create the cache directory {}", parent.display())
+        })?;
+    }
+
+    Ok(path)
+}
+
+/// Why the cache could not be opened, and whether the run has to stop for it.
+///
+/// `locked` is the one failure a mode can survive: it says another run holds
+/// the file, not that anything is wrong with the file. Everything else -- an
+/// unreadable format, no permission, a full disk -- is a reason to stop, since
+/// nothing about it improves by carrying on. Only `--from-report` uses the
+/// distinction; see `main`.
+struct CacheUnavailable {
+    locked: bool,
+    reason: anyhow::Error,
+}
+
+/// Open the fingerprint cache, and say something useful when that fails.
+///
+/// A single file, an explicitly bounded page cache, and no background threads:
+/// every write is durable when its transaction commits, so there is no buffered
+/// work to lose and nothing that has to be told to stop.
+///
+/// Opening takes an exclusive `flock` on the file, which is what keeps two
+/// concurrent runs from fighting over the same cache -- and is also the most
+/// likely way this call fails, because scanning two libraries at once is a
+/// perfectly ordinary thing to do. redb reports that case as its own error
+/// variant, so every branch here can name both the file and what to do about
+/// it; a single `.context()` over the lot used to print one sentence with no
+/// path and no cause for four unrelated failures. The lock is released by the
+/// kernel when a process ends, however it ends, so there is no such thing as a
+/// stale one to advise clearing.
+fn open_cache(db_path: &Path) -> std::result::Result<Database, CacheUnavailable> {
+    let fatal = |reason| CacheUnavailable { locked: false, reason };
+
+    match Database::builder().set_cache_size(CACHE_SIZE_BYTES).create(db_path) {
+        Ok(db) => Ok(db),
+        Err(DatabaseError::DatabaseAlreadyOpen) => Err(CacheUnavailable {
+            locked: true,
+            reason: anyhow::anyhow!(
+                "Another vid-fp run is using the fingerprint cache at {}.\n\
+                 A run holds that cache for its whole scan, not just while it reads it, \
+                 so only one at a time can have it.\n\
+                 Wait for the other run to finish, or give this one a cache of its own:\n    \
+                 vid-fp --cache /path/to/other-cache.redb ...",
+                db_path.display()
+            ),
+        }),
+        Err(DatabaseError::UpgradeRequired(version)) => Err(fatal(anyhow::anyhow!(
+            "The fingerprint cache at {} is in an older on-disk format (version {}) \
+             that this build cannot open.\n\
+             Delete the file and it will be rebuilt on the next scan.",
+            db_path.display(),
+            version
+        ))),
+        Err(DatabaseError::Storage(StorageError::Io(e)))
+            if e.kind() == std::io::ErrorKind::PermissionDenied =>
+        {
+            Err(fatal(anyhow::anyhow!(
+                "No permission to open the fingerprint cache at {}: {}.\n\
+                 Fix the permissions, or point this run somewhere writable with \
+                 --cache /path/to/cache.redb.",
+                db_path.display(),
+                e
+            )))
+        }
+        Err(e) => Err(fatal(anyhow::Error::new(e).context(format!(
+            "Failed to open the fingerprint cache at {}",
+            db_path.display()
+        )))),
+    }
+}
+
 fn main() -> Result<()> {
     let start_time = Instant::now();
     let args = Args::parse();
@@ -1178,60 +1333,69 @@ Interrupted with Ctrl-C.
     ffmpeg_next::init().context("Failed to initialize FFmpeg bindings.")?;
     ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Quiet);
 
-    // Follow XDG Base Directory Specification for caching
-    let cache_dir = std::env::var("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            if let Ok(home) = std::env::var("HOME") {
-                PathBuf::from(home).join(".cache")
-            } else {
-                PathBuf::from("/tmp")
-            }
-        })
-        .join("vid-fp");
+    let db_path = resolve_cache_path(args.cache.as_deref())?;
 
-    std::fs::create_dir_all(&cache_dir).context("Failed to create cache directory")?;
-    retire_legacy_cache(&cache_dir);
-
-    let db_path = cache_dir.join("fingerprints.redb");
-
-    // A single file, an explicitly bounded page cache, and no background
-    // threads: every write is durable when its transaction commits, so there is
-    // no buffered work to lose and nothing that has to be told to stop. Opening
-    // takes an exclusive lock on the file, which is what keeps two concurrent
-    // runs from fighting over the same cache.
-    let mut db = Database::builder()
-        .set_cache_size(CACHE_SIZE_BYTES)
-        .create(&db_path)
-        .context("Failed to open or lock cache database")?;
-
-    ensure_cache_table(&db).context("Failed to initialize the fingerprint cache")?;
-
-    // Once, on the first run of this build. Nothing will ever look in those
-    // tables again, so every byte of them is dead. Compacting right afterwards
-    // is the only thing that returns those pages to the filesystem.
-    match retire_superseded_tables(&db) {
-        Ok(true) => {
-            info!("Removed the superseded fingerprint cache; fingerprints will be rebuilt once.");
-            if let Err(e) = db.compact() {
-                log::error!("Could not compact the fingerprint cache: {}", e);
-            }
+    // `--from-report` is the one mode that can run without a cache, and a busy
+    // cache is the one failure it can survive. That mode reads nothing out of
+    // the cache: it only drops the entries of the files it removes, afterwards.
+    // Refusing to replay a report the user has already reviewed -- for a piece
+    // of bookkeeping -- would block a deletion for as long as some unrelated
+    // scan takes, and the advice the locked message gives would be actively
+    // wrong here, since a cache handed over with `--cache` is not the one
+    // holding those entries: the run would delete the files and purge nothing.
+    // So the purge is given up instead, and loudly: a warning before the
+    // confirmation prompt, `cache_purge_failed` in the problem summary, exit 2,
+    // and `--prune-cache` collects the entries whenever it next runs.
+    //
+    // `--clear-cache` is exempt. Emptying a cache is not bookkeeping -- it is
+    // the thing that was asked for, and it cannot be given up quietly.
+    let mut db = match open_cache(&db_path) {
+        Ok(db) => Some(db),
+        Err(e) if e.locked && args.from_report.is_some() && !args.clear_cache => {
+            log::warn!(
+                "The fingerprint cache at {} is in use by another vid-fp run.\n\
+                 Continuing without it, since a report replay does not read it -- but the \
+                 files this run removes will keep their cached fingerprints until a later \
+                 run with --prune-cache.",
+                db_path.display()
+            );
+            None
         }
-        Ok(false) => {}
-        Err(e) => log::error!("{:#}", e),
-    }
+        Err(e) => return Err(e.reason),
+    };
 
-    // Handled here rather than inside `run` because compaction needs an
-    // exclusive handle on the database, and because this is the only point in
-    // the run where compacting is free. See `clear_cache`.
-    if args.clear_cache {
-        info!("Clearing all cache...");
-        clear_cache(&mut db)?;
+    if let Some(db) = db.as_mut() {
+        ensure_cache_table(db).context("Failed to initialize the fingerprint cache")?;
+
+        // Once, on the first run of this build. Nothing will ever look in those
+        // tables again, so every byte of them is dead. Compacting right
+        // afterwards is the only thing that returns those pages to the
+        // filesystem.
+        match retire_superseded_tables(db) {
+            Ok(true) => {
+                info!(
+                    "Removed the superseded fingerprint cache; fingerprints will be rebuilt once."
+                );
+                if let Err(e) = db.compact() {
+                    log::error!("Could not compact the fingerprint cache: {}", e);
+                }
+            }
+            Ok(false) => {}
+            Err(e) => log::error!("{:#}", e),
+        }
+
+        // Handled here rather than inside `run` because compaction needs an
+        // exclusive handle on the database, and because this is the only point
+        // in the run where compacting is free. See `clear_cache`.
+        if args.clear_cache {
+            info!("Clearing all cache...");
+            clear_cache(db)?;
+        }
     }
 
     let stats = RunStats::default();
 
-    let outcome = run(&args, &db, start_time, active_threads, &stats);
+    let outcome = run(&args, db.as_ref(), start_time, active_threads, &stats);
 
     // --- The only exit path ---------------------------------------------------
     // Every route out of `run` lands here -- success, failure, or interrupt.
@@ -1260,11 +1424,17 @@ Interrupted with Ctrl-C.
     // nothing. That is the same waste compaction was moved out of the tail of
     // the run to avoid; it is invisible on a small cache and is a full rewrite
     // plus an fsync on a large one.
+    //
+    // `db` is None only under `--from-report`, which cannot be given
+    // `--prune-cache` at all, so this never silently skips a compaction the
+    // user asked for.
     if !shutdown_requested() && args.prune_cache && !args.clear_cache {
-        match db.compact() {
-            Ok(true) => info!("Compacted the fingerprint cache."),
-            Ok(false) => {}
-            Err(e) => log::error!("Could not compact the fingerprint cache: {}", e),
+        if let Some(db) = db.as_mut() {
+            match db.compact() {
+                Ok(true) => info!("Compacted the fingerprint cache."),
+                Ok(false) => {}
+                Err(e) => log::error!("Could not compact the fingerprint cache: {}", e),
+            }
         }
     }
     drop(db);
@@ -1291,7 +1461,7 @@ Interrupted with Ctrl-C.
 
 fn run(
     args: &Args,
-    db: &Database,
+    db: Option<&Database>,
     start_time: Instant,
     active_threads: usize,
     stats: &RunStats,
@@ -1301,6 +1471,11 @@ fn run(
     if let Some(report_path) = &args.from_report {
         return run_from_report(args, db, report_path, stats);
     }
+
+    // `main` only ever hands over a `None` for `--from-report`, which has
+    // already returned by here. A scan reads the cache before every decode and
+    // writes it after, so there is nothing for it to degrade to.
+    let db = db.context("A scan cannot run without a fingerprint cache")?;
 
     let max_hamming = args.hamming_distance;
     let min_match_pct = args.match_percent / 100.0;
@@ -2595,7 +2770,7 @@ mod tests {
         let stats = RunStats::default();
 
         assert!(matches!(
-            run(&args, &db, Instant::now(), 1, &stats),
+            run(&args, Some(&db), Instant::now(), 1, &stats),
             Ok(Outcome::Completed)
         ));
         assert!(!Path::new(&doomed).exists(), "the file the report named is gone");
@@ -2604,6 +2779,39 @@ mod tests {
             "and so is the fingerprint filed under its path"
         );
         assert!(!stats.had_problems());
+    }
+
+    #[test]
+    fn test_a_report_run_without_a_cache_still_deletes_and_reports_the_lost_purge() {
+        // The deletions were reviewed by a human before this mode was ever
+        // invoked, so a cache some unrelated scan happens to be holding must
+        // not block them -- see `main`, which is where that is decided. What it
+        // costs is the purge, and the cost has to be audible: the entries stay
+        // until --prune-cache collects them, and a run that skipped them
+        // silently would exit 0 with nothing said.
+        let dir = tempfile::tempdir().unwrap();
+        let (doomed, report) = armed_report(&dir);
+
+        let args = Args::parse_from([
+            "vid-fp",
+            "--from-report",
+            &report,
+            "--delete",
+            "--permanent",
+            "--yes",
+        ]);
+        let stats = RunStats::default();
+
+        assert!(matches!(
+            run(&args, None, Instant::now(), 1, &stats),
+            Ok(Outcome::Completed)
+        ));
+        assert!(!Path::new(&doomed).exists(), "the deletion happens either way");
+
+        assert_eq!(stats.cache_purge_failed.count(), 1, "one record for the batch");
+        assert!(stats.had_problems(), "so the run exits 2 rather than reading as a clean one");
+        let sample = &stats.cache_purge_failed.samples()[0];
+        assert!(sample.contains("1 entry"), "and says how much was left behind: {sample}");
     }
 
     #[test]
@@ -2618,7 +2826,7 @@ mod tests {
         let args = Args::parse_from(["vid-fp", "--from-report", &report]);
         let stats = RunStats::default();
 
-        let err = run(&args, &db, Instant::now(), 1, &stats)
+        let err = run(&args, Some(&db), Instant::now(), 1, &stats)
             .expect_err("no disposal was ever constructed")
             .to_string();
 
@@ -2638,7 +2846,7 @@ mod tests {
 
     fn run_error(dir: &tempfile::TempDir, db: &Database, extra: &[&str]) -> String {
         let stats = RunStats::default();
-        run(&args_over(dir, extra), db, Instant::now(), 1, &stats)
+        run(&args_over(dir, extra), Some(db), Instant::now(), 1, &stats)
             .expect_err("this run should have been refused")
             .to_string()
     }
@@ -2664,7 +2872,7 @@ mod tests {
         for ok in ["--match-percent=0", "--match-percent=100"] {
             let stats = RunStats::default();
             assert!(
-                run(&args_over(&dir, &[ok]), &db, Instant::now(), 1, &stats).is_ok(),
+                run(&args_over(&dir, &[ok]), Some(&db), Instant::now(), 1, &stats).is_ok(),
                 "{} is inside the range and must be accepted",
                 ok
             );
@@ -2693,7 +2901,7 @@ mod tests {
         for ok in ["-d=0", "-d=32"] {
             let stats = RunStats::default();
             assert!(
-                run(&args_over(&dir, &[ok]), &db, Instant::now(), 1, &stats).is_ok(),
+                run(&args_over(&dir, &[ok]), Some(&db), Instant::now(), 1, &stats).is_ok(),
                 "{} is inside the range and must be accepted",
                 ok
             );
@@ -2777,5 +2985,66 @@ mod tests {
             cache_lookup(&db, path, &s).is_some(),
             "and the table is ready for the scan that follows"
         );
+    }
+
+    #[test]
+    fn test_a_locked_cache_names_the_file_and_the_way_out() {
+        // Scanning two libraries at once is ordinary, and this is what the
+        // second run hits. flock conflicts between two open file descriptions
+        // whether or not they belong to the same process, so holding `_first`
+        // here reproduces the concurrent run exactly.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fingerprints.redb");
+        let _first = Database::create(&path).unwrap();
+
+        let err = open_cache(&path).expect_err("the lock is held");
+        let message = format!("{:#}", err.reason);
+
+        assert!(
+            err.locked,
+            "the one failure --from-report is allowed to carry on through has to be \
+             distinguishable from the ones it is not"
+        );
+
+        assert!(
+            message.contains(&path.display().to_string()),
+            "the message has to say WHICH cache: {message}"
+        );
+        assert!(
+            message.contains("--cache"),
+            "and how to get a run of your own going: {message}"
+        );
+    }
+
+    #[test]
+    fn test_the_named_cache_path_is_used_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let wanted = dir.path().join("libraries").join("anime.redb");
+
+        let resolved = resolve_cache_path(Some(wanted.to_str().unwrap())).unwrap();
+
+        assert_eq!(resolved, wanted, "a named file is the cache, whatever it is called");
+        assert!(
+            wanted.parent().unwrap().is_dir(),
+            "and its directory is created, as the default location's is"
+        );
+    }
+
+    #[test]
+    fn test_a_directory_gets_the_default_filename_inside_it() {
+        // `--cache /mnt/scratch` means "a cache in here". Both the existing
+        // directory and the trailing slash say so; the second is the one a
+        // shell's tab completion writes for a directory that isn't there yet.
+        let dir = tempfile::tempdir().unwrap();
+
+        let existing = resolve_cache_path(Some(dir.path().to_str().unwrap())).unwrap();
+        assert_eq!(existing, dir.path().join(CACHE_FILE_NAME));
+
+        let not_yet = dir.path().join("scratch");
+        let trailing = format!("{}/", not_yet.display());
+        let resolved = resolve_cache_path(Some(&trailing)).unwrap();
+
+        assert_eq!(resolved, not_yet.join(CACHE_FILE_NAME));
+        assert!(not_yet.is_dir(), "the directory it named is created, not a file called `scratch`");
     }
 }
