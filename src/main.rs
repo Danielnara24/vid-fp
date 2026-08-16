@@ -124,6 +124,71 @@ const EXIT_WITH_PROBLEMS: i32 = 2;
 /// by definition, one that finishes before anybody looks at the bar.
 const PROGRESS_STEP_BYTES: u64 = 4 * 1024 * 1024;
 
+/// How far past the machine's core count `--threads` is allowed to reach.
+///
+/// **What actually bounds this flag is MEMORY, not CPU time**, and that is worth
+/// stating first because it is not what the flag looks like it controls. Peak RSS
+/// is close to linear in `--threads` while throughput is flat, measured here on
+/// two libraries with a fresh cache each run (so every file is decoded):
+///
+/// ```text
+///     -t     100 clips, 720p          16 clips, 1080p
+///      8     5.2-5.4 s   112 MB       5.3 s    422 MB
+///     16     5.2-5.5 s   205 MB       5.2 s    647 MB
+///     32     5.5-6.0 s   370 MB       5.3 s  1,137 MB
+///     64     5.4-6.4 s   620 MB       5.5 s  2,022 MB
+/// ```
+///
+/// Wall time does not improve once at any rung -- CPU utilisation is already
+/// 71-73% of eight cores at `-t 8` -- and the slope of the memory is a property
+/// of the LIBRARY rather than of the machine: ~9 MB per extra thread at 720p and
+/// ~28 MB at 1080p, so 4K footage would cost around four times the latter again.
+/// Note the 1080p column keeps climbing past 32 even though 16 files cap the
+/// worker count at 16: the budget is what widens, so each decode is handed more
+/// decoder threads and each of those holds its own full-resolution frame buffer
+/// (see `MAX_DECODE_THREADS`). Both mechanisms scale with this number. This is
+/// also the one figure the rest of the binary works hardest to keep flat -- the
+/// `mallopt` calls in `main` and the single contiguous frame buffer exist for it
+/// -- so an unbounded `-t` is the one input that can undo all of it.
+///
+/// Thread creation is the far cruder limit and only bites much later. Timed on a
+/// warm two-file cache, so the pool is the entire cost: 0.02 s at 8 through 256,
+/// 0.10 s at 512, 0.58 s at 1,024, 2.0 s at 2,048, 5.3 s at 4,096, 14.0 s at
+/// 8,192, and at 16,384 it burns 63 s of wall and 459 s of user time before
+/// failing. That is the reported hang -- `-t 1000` spending 19.7 s on a two-file
+/// library, `-t 20000` failing inside rayon's `build_global` with EAGAIN against
+/// this machine's `RLIMIT_NPROC` of 22,609 and then surviving a first SIGTERM.
+///
+/// So the useful floor and the harmful ceiling are far apart, and 4 sits between
+/// them with room on both sides rather than being tuned to either. It is
+/// generous against the measured throughput, which says one worker per core is
+/// already enough on local storage; it is restrained against the measured memory,
+/// since 4x on this machine is 32 workers and about 3.5 GB on a 4K library. The
+/// gap is left deliberately wide because the case that justifies ANY
+/// oversubscription is the one that cannot be measured from here: decoding off a
+/// network mount or a spinning disk, where workers block on I/O and cores sit
+/// idle. That case is real, it is not reproducible on this machine, and a ceiling
+/// tuned to local decode would refuse it.
+///
+/// Stated per core rather than as a flat number so it travels: a flat 32 would be
+/// a hard cap on a 128-core machine and 16x oversubscription on a dual-core one.
+/// Per-core also tracks the memory, since the machines with many cores are the
+/// ones with the RAM to spend on many frame buffers.
+const MAX_THREAD_OVERSUBSCRIPTION: usize = 4;
+
+/// The smallest ceiling `active_thread_count` will impose, whatever the core
+/// count.
+///
+/// Purely a portability floor, and it does nothing on any machine with 4 cores or
+/// more. The per-core rule above is about cores a decode can keep BUSY, but the
+/// one case that justifies oversubscription at all is workers blocked on I/O,
+/// where the useful number tracks the storage's latency and not the CPU at all --
+/// so on a one- or two-core VM with its videos on a network mount, 4x lands at 4
+/// or 8 and would be refusing a request that makes sense. 16 costs nothing here
+/// (8 cores put the ceiling at 32) and is still three orders of magnitude below
+/// where thread creation starts to hurt.
+const MIN_THREAD_CEILING: usize = 16;
+
 /// Everything other than the file's contents that decides whether a cached
 /// fingerprint is still the right answer for the file at a given path.
 ///
@@ -448,7 +513,15 @@ struct Args {
     #[arg(short = 'q', long = "quiet")]
     quiet: bool,
 
-    /// Maximum number of threads to use. 0 uses all available CPU cores (default).
+    /// Maximum number of threads to use. 0 uses all available CPU cores
+    /// (default), which is the fastest setting for videos on a local disk:
+    /// raising it further does not measurably speed a scan up, and every
+    /// concurrent decode holds a full-resolution frame buffer, so peak memory
+    /// grows roughly in step with this number. More workers than cores is still
+    /// worth trying when the videos are on a network mount or a slow disk,
+    /// where workers spend their time waiting on I/O rather than on the CPU.
+    /// Anything above four per core (or 16, whichever is larger) is capped at
+    /// that, with a note saying so.
     #[arg(short = 't', long = "threads", default_value_t = 0)]
     threads: usize,
 
@@ -791,6 +864,37 @@ fn work_rate(per_sec: f64) -> String {
         return unmeasurable();
     }
     format!("{} {}/s", number, unit)
+}
+
+/// How wide the run actually gets to be, given what `--threads` asked for and
+/// how many cores the machine has.
+///
+/// `0` means "one worker per core", which is what the flag has always
+/// documented. Everything else is taken at face value up to the ceiling
+/// `MAX_THREAD_OVERSUBSCRIPTION` and `MIN_THREAD_CEILING` set between them, and
+/// clamped above it. Both of those carry the measurements that chose them.
+///
+/// This is the only numeric flag that is CLAMPED rather than refused, and the
+/// difference is what a bad value can do. `-d`, `-p` and `--min-duration` change
+/// what the run REPORTS, so a value that cannot mean anything has to stop the
+/// run before it wastes an hour producing an answer nobody wants. A thread count
+/// changes only how fast the same answer arrives -- that is not a guess, it is
+/// why the count is deliberately kept out of the cache `Stamp`, and
+/// `test_threaded_decode_is_bit_identical` holds the claim up over the whole
+/// corpus. Aborting a scan over a performance knob would cost the user more than
+/// running at a sane width and saying so out loud.
+fn active_thread_count(requested: usize, cores: usize) -> usize {
+    // `available_parallelism` cannot return 0 and the fallback is 1, but this
+    // function is also the one place the invariant is cheap to state: a run with
+    // no workers decodes nothing and finishes instantly, reporting no groups.
+    let cores = cores.max(1);
+    if requested == 0 {
+        return cores;
+    }
+    let ceiling = cores
+        .saturating_mul(MAX_THREAD_OVERSUBSCRIPTION)
+        .max(MIN_THREAD_CEILING);
+    requested.min(ceiling)
 }
 
 /// How many of `free` threads a video of `weight` units of work should decode
@@ -1381,19 +1485,45 @@ Interrupted with Ctrl-C.
         libc::mallopt(libc::M_MMAP_THRESHOLD, 1024 * 1024); // 1 MiB
         libc::mallopt(libc::M_TRIM_THRESHOLD, 1024 * 1024);
     }
-    // Configure Rayon thread pool if a specific limit is requested
+    // --- How wide the run is --------------------------------------------------
+    // `-t` is the one numeric flag whose bound is enforced HERE rather than in
+    // `run`, and the reason is that it is spent before `run` is reached: rayon's
+    // `build_global` allocates every thread in the pool eagerly, so an absurd
+    // value has already cost its 19.7 seconds -- or wedged the process -- by the
+    // time any validation `run` could do would look at it.
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let active_threads = active_thread_count(args.threads, cores);
+    if args.threads > active_threads {
+        // Named in terms of memory rather than of cores, because that is what
+        // the ceiling is actually protecting: peak RSS is close to linear in
+        // this number and throughput is flat above one worker per core. A user
+        // who reads "more than this machine has cores" concludes the tool
+        // miscounted their cores; one who reads this can tell whether the
+        // setting was worth asking for.
+        log::warn!(
+            "--threads {} is above the ceiling of {} on this machine ({} cores); running \
+             with {}. Every concurrent decode holds a full-resolution frame buffer, so \
+             memory grows with this setting while throughput does not. Use 0 for one \
+             worker per core.",
+            args.threads,
+            active_threads,
+            cores,
+            active_threads
+        );
+    }
 
+    // Built from the clamped figure, never the requested one, so the rayon pool
+    // and the decoder thread budget can never disagree about how wide the run
+    // is. Left at rayon's own default when `-t` is absent, which is already one
+    // thread per core.
     if args.threads > 0 {
         rayon::ThreadPoolBuilder::new()
-            .num_threads(args.threads)
+            .num_threads(active_threads)
             .build_global()
             .context("Failed to configure global thread pool")?;
     }
-
-    let default_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    let active_threads = if args.threads > 0 { args.threads } else { default_threads };
 
     ffmpeg_next::init().context("Failed to initialize FFmpeg bindings.")?;
     ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Quiet);
@@ -2623,6 +2753,77 @@ mod tests {
         let grant = budget.claim(LOAD).unwrap();
         assert_eq!(grant.threads, 1);
         assert_eq!(budget.free(), 0);
+    }
+
+    #[test]
+    fn test_zero_threads_means_one_per_core() {
+        for cores in [1, 2, 8, 128] {
+            assert_eq!(active_thread_count(0, cores), cores);
+        }
+        // The `unwrap_or(1)` in `main` should be the only fallback, but a run
+        // with no workers at all decodes nothing and reports nothing, so the
+        // floor is stated here too.
+        assert_eq!(active_thread_count(0, 0), 1);
+    }
+
+    #[test]
+    fn test_a_reasonable_thread_request_is_taken_at_face_value() {
+        // Including the oversubscription a network mount or a slow disk makes
+        // worth asking for: more workers than cores is not a mistake, and up to
+        // the ceiling it is honoured exactly.
+        for requested in [1, 4, 8, 16, 32] {
+            assert_eq!(
+                active_thread_count(requested, 8),
+                requested,
+                "-t {} is inside 8 x {} and must be honoured",
+                requested,
+                MAX_THREAD_OVERSUBSCRIPTION
+            );
+        }
+    }
+
+    #[test]
+    fn test_an_absurd_thread_request_is_clamped_rather_than_obeyed() {
+        // The failure this exists for: rayon's `build_global` allocates the
+        // whole pool eagerly, so `-t 1000` on a two-file library used to spend
+        // 19.7 s building threads it would use two of, and `-t 20000` failed
+        // with EAGAIN and then hung. Neither number can reach the pool now.
+        assert_eq!(active_thread_count(1000, 8), 32);
+        assert_eq!(active_thread_count(20_000, 8), 32);
+        assert_eq!(active_thread_count(usize::MAX, 8), 32);
+    }
+
+    #[test]
+    fn test_the_ceiling_scales_with_the_machine_rather_than_being_a_flat_number() {
+        // A flat ceiling is wrong in both directions -- a hard cap on a large
+        // machine, and wild oversubscription on a small one -- and the memory
+        // this bounds is spent per worker, so it has to track the machine.
+        for cores in [1, 2, 4, 8, 16, 64, 128] {
+            let ceiling = active_thread_count(usize::MAX, cores);
+            assert!(
+                ceiling >= cores,
+                "{} cores must be reachable, not itself clamped",
+                cores
+            );
+            assert_eq!(
+                ceiling,
+                (cores * MAX_THREAD_OVERSUBSCRIPTION).max(MIN_THREAD_CEILING)
+            );
+        }
+
+        // The floor is a portability allowance, not a rung of the per-core rule:
+        // a one-core VM reading its videos off a network mount has a useful
+        // worker count set by the storage's latency, which has nothing to do
+        // with its cores. It must not bind on any ordinary machine.
+        assert_eq!(active_thread_count(usize::MAX, 1), MIN_THREAD_CEILING);
+        assert_eq!(active_thread_count(usize::MAX, 8), 32, "the floor is slack at 8 cores");
+    }
+
+    #[test]
+    fn test_the_ceiling_never_overflows_on_a_machine_it_cannot_imagine() {
+        // `cores * 4` is a multiplication on a number the OS supplies, so the
+        // saturating form is load-bearing rather than decorative.
+        assert!(active_thread_count(usize::MAX, usize::MAX) > 0);
     }
 
     fn stamp(mtime: i64, size: u64) -> Stamp {

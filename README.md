@@ -271,7 +271,7 @@ reports refused.
 | `--move-to <DIR>` | Move the files marked DELETE under `DIR`, recreating their absolute paths inside it. Arms the run on its own and supersedes `--delete`/`--permanent` | |
 | `--from-report <FILE>` | Act on a `.csv` or `.json` report from an earlier run instead of scanning. Requires `--delete` or `--move-to`. See [above](#acting-on-a-report-you-have-reviewed) | |
 | `-y`, `--yes` | Answer yes to the confirmation shown before any file is touched | off |
-| `-t`, `--threads <N>` | Worker threads (`0` = uses all cores) | `0` |
+| `-t`, `--threads <N>` | Worker threads (`0` = uses all cores). Raising it above that does not speed up a local scan and does raise peak memory, but can help when the videos are on a network mount or a slow disk. Capped at four per core, or 16, whichever is larger | `0` |
 | `-q`, `--quiet` | Only print errors | off |
 | `--cache <PATH>` | Use this cache file instead of the default one. Needed to run multiple scans at once, since a run locks its cache for the whole scan | `$XDG_CACHE_HOME/vid-fp/fingerprints.redb` |
 | `--clear-cache` | Wipe ALL vid-fp cache before running | off |
