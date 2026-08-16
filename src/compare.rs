@@ -1158,7 +1158,20 @@ fn measure_pair(
 
     let (pct_a, pct_b, span_a, span_b) = match_overlap(fp_a, fp_b, tol, schedule);
 
-    if pct_a.max(pct_b) < min_match_percent {
+    // A pair that shares NOTHING is not a match at any setting, and that has to
+    // be said separately from the gate: `-p 0` makes `< min_match_percent` false
+    // for every pair alive, including the ones whose overlap measured zero. That
+    // is not a hypothetical -- `index_is_cheaper` hands the direct route every
+    // pair in the library, so `-d 4 -p 0` over 110 unrelated files reported one
+    // group of 110 with `0.00` matched seconds on all 109 rows it condemned,
+    // while `-d 0 -p 0` over the same files reported none. The routes are
+    // supposed to agree on every pair (see `find_all_matches`); a performance
+    // heuristic was deciding a correctness question, and with `--delete` armed
+    // it decided it destructively.
+    //
+    // Written as a separate test rather than by turning the gate into `<=`,
+    // because `-p 100` must keep admitting a pair that is fully covered.
+    if pct_a.max(pct_b) <= 0.0 || pct_a.max(pct_b) < min_match_percent {
         return None;
     }
 
@@ -1684,6 +1697,55 @@ mod tests {
             find_all_matches(&fps, 0, 1.0, 30.0).is_empty(),
             "a full-coverage match must still fail a 30s floor"
         );
+    }
+
+    #[test]
+    fn test_the_gate_switched_off_still_refuses_a_pair_that_shares_nothing() {
+        // `-p 0` means "no floor", not "no measurement". Written as `<` alone
+        // the gate read `0.0 < 0.0`, which is false, so every pair phase 2 was
+        // handed became a Match -- and on the direct route phase 2 is handed the
+        // whole library. A scan of 110 unrelated files reported one group of
+        // 110, with 0.00 matched seconds on all 109 rows it marked DELETE.
+        let fps: Vec<VideoFingerprint> =
+            (0..4).map(|i| mock_fp_with_hashes(vec![distinct_hash(i)], 1)).collect();
+        let masks = probe_masks(probe_radius(Tolerance::for_distance(4).widest())).len();
+        assert!(
+            !index_is_cheaper(masks, fps.len(), fps.len()),
+            "this library has to take the direct route for the test to mean anything"
+        );
+
+        assert!(find_all_matches(&fps, 4, 0.0, 0.0).is_empty(), "unrelated files are not a group");
+
+        // And the flag keeps the meaning it is documented to have: with the
+        // floor off, any overlap at all is enough, however small.
+        let host = mock_fp_sampled((0..100).map(distinct_hash).collect(), 10);
+        let clip = mock_fp_sampled(vec![distinct_hash(7)], 10);
+        assert_eq!(
+            pairs(&find_all_matches(&[host, clip], 0, 0.0, 0.0)),
+            vec![(0, 1)],
+            "1% coverage must still clear a floor of 0"
+        );
+    }
+
+    #[test]
+    fn test_both_routes_agree_when_the_gate_is_switched_off() {
+        // The routes are chosen on cost alone, so anything they disagree about
+        // is decided by a performance heuristic -- and at `-p 0` they disagreed
+        // about the whole library. Big enough that `index_is_cheaper` says yes,
+        // which is the arm the small libraries above can never reach.
+        let mut fps: Vec<VideoFingerprint> =
+            (0..600).map(|i| mock_fp_with_hashes(vec![distinct_hash(i)], 1)).collect();
+        // One genuine pair, so the test cannot pass by finding nothing at all.
+        fps.push(mock_fp_with_hashes(vec![distinct_hash(3)], 1));
+
+        let tol = Tolerance::for_distance(4);
+        let hashes: usize = fps.iter().map(|fp| fp.valid_hashes.len()).sum();
+        assert!(
+            index_is_cheaper(probe_masks(probe_radius(tol.widest())).len(), fps.len(), hashes),
+            "this library has to take the index route for the test to mean anything"
+        );
+
+        assert_eq!(pairs(&find_all_matches(&fps, 4, 0.0, 0.0)), vec![(3, 600)]);
     }
 
     #[test]

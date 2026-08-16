@@ -319,7 +319,9 @@ struct Args {
     /// Minimum match percentage required to be considered a duplicate, from 0
     /// to 100. Default is 20.0 (20%). Values outside that range are rejected
     /// before the scan starts: coverage is capped at 100%, so a higher floor is
-    /// one no pair could ever clear.
+    /// one no pair could ever clear. 0 turns the gate off and reports every
+    /// pair that shares any footage at all; pairs sharing nothing are never
+    /// reported at any setting.
     #[arg(short = 'p', long = "match-percent", default_value_t = 20.0)]
     match_percent: f32,
 
@@ -1559,7 +1561,9 @@ fn run(
     // coverage figure to 1.0, so a floor above 100% is one no pair can ever
     // clear: the run would fingerprint the whole library and be structurally
     // incapable of reporting a single group. 0 stays legal and means "report
-    // every pair the index proposes".
+    // every pair with any measured overlap at all" -- it turns the gate off, it
+    // does not turn the measurement off, and `measure_pair` refuses a pair that
+    // shares nothing whatever this says.
     if !(0.0..=100.0).contains(&args.match_percent) {
         anyhow::bail!(
             "--match-percent must be between 0 and 100 (coverage is capped at 100%, so a \
