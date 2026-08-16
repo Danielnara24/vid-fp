@@ -256,7 +256,7 @@ reports refused.
 | `-0`, `--null` | Paths in the list are NUL-separated, for `find -print0` / `fd -0` | off |
 | `-r`, `--recursive` | Include subfolders | off |
 | `--follow-symlinks` | Descend into symlinked folders | off |
-| `-e`, `--exclude <FOLDER>` | Exclude a folder; repeat for several | |
+| `-e`, `--exclude <PATH>` | Exclude a folder or a single file; repeat for several. Matched by whole path components, so a file must be named exactly | |
 | `-x`, `--extensions <EXT>` | Extensions a **folder walk** treats as videos, comma-separated or repeated. `-x '*'` (quoted) takes every file, including ones with no extension | `mp4,m4v,mkv,webm,avi,mov,flv,wmv,asf,mpg,mpeg,m2ts,mts,ts,vob,ogv,3gp,divx` |
 | `-d`, `--hamming-distance <N>` | Frame-match tolerance, in bits out of 64; higher = less strict matching. Raise to find more duplicates, at the cost of false positives. See [Tuning](#tuning). Values above `32` are refused | `4` |
 | `-p`, `--match-percent <F>` | Min % of overlap to count as a duplicate, from `0` to `100`. Lower includes shorter matches, at the cost of false positives | `20.0` |
@@ -538,7 +538,7 @@ them, so re-running a scan at a different tolerance is instant.
   it was actually measured against.
 - **No double-counting.** Hard links and symlinks to the same file collapse into
   a single entry, so the reported space freed reflects bytes actually reclaimed.
-- **Tab-complete your `-e` paths.** An exclude folder that can't be resolved
+- **Tab-complete your `-e` paths.** An exclude path that can't be resolved
   excludes nothing.
 - **Nothing is acted on twice, or blind.** Every target is re-checked against
   its recorded size immediately before it's touched, and a file that changed

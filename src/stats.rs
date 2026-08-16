@@ -7,7 +7,7 @@
 //! non-zero when something went wrong, which is the only part a script sees.
 //!
 //! The split between "skipped" and "problems" is load-bearing: a skip is
-//! something the user asked for (`--min-duration`, an `--exclude` folder, a hard
+//! something the user asked for (`--min-duration`, an `--exclude` path, a hard
 //! link already queued), a problem is something the user asked for that did NOT
 //! happen. Only the latter touches the exit code.
 
@@ -181,7 +181,7 @@ impl RunStats {
             // matter, and the count is what keeps it from being silent.
             (
                 &self.skipped_excluded,
-                "named path(s) skipped because they sit under an --exclude folder",
+                "named path(s) skipped because --exclude covers them",
             ),
         ]
     }

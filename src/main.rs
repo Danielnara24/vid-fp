@@ -248,10 +248,13 @@ struct Args {
     )]
     include: Vec<String>,
 
-    /// Folder to exclude from the scan. Repeat the flag to exclude several
-    /// (e.g. -e ~/a -e ~/b). Applies to piped and explicitly named paths too.
-    #[arg(short = 'e', long = "exclude", value_name = "FOLDER",
-          value_hint = clap::ValueHint::DirPath)]
+    /// Path to exclude from the scan: a folder, or a single file. Repeat the
+    /// flag to exclude several (e.g. -e ~/a -e ~/b). Matched one whole path
+    /// component at a time, so -e ~/keep covers everything under it, while
+    /// -e ~/clips/take does NOT cover ~/clips/take.mkv -- a file has to be
+    /// named exactly. Applies to piped and explicitly named paths too.
+    #[arg(short = 'e', long = "exclude", value_name = "PATH",
+          value_hint = clap::ValueHint::AnyPath)]
     exclude: Vec<String>,
 
     /// Read the paths to scan from a file, one per line. `-` means stdin.

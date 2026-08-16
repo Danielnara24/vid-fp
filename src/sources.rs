@@ -25,7 +25,11 @@
 //! `--exclude` is the opposite: it applies to everything, including a path named
 //! explicitly. It is the one flag whose entire purpose is "do not touch this",
 //! and `find ... | vid-fp - -e ~/keep --delete` has to mean what it obviously
-//! means.
+//! means. It takes a folder or a single file, because `is_excluded` compares
+//! whole path components and neither `starts_with` nor `canonicalize` cares
+//! which it was given -- sparing one known original out of a folder being
+//! scanned needs no more than naming it. Component-wise is also what keeps
+//! `-e ~/clips/take` off `~/clips/take.mkv`.
 //!
 //! What comes back is not a list of paths but a list of files. Every entry has
 //! already been stat'ed here -- the walk needs (device, inode) to deduplicate
@@ -112,7 +116,7 @@ pub fn collect(sources: &Sources, stats: &RunStats) -> Result<Scan> {
         info!("Scanning: {:?}", named);
     }
     if !sources.exclude.is_empty() {
-        info!("Excluding folders: {:?}", sources.exclude);
+        info!("Excluding: {:?}", sources.exclude);
     }
 
     match &extensions {
@@ -159,7 +163,7 @@ pub fn collect(sources: &Sources, stats: &RunStats) -> Result<Scan> {
 
         if is_excluded(&resolved, &excludes) {
             stats.skipped_excluded.bump();
-            log::debug!("Skipping {}: under an excluded folder", resolved.display());
+            log::debug!("Skipping {}: named or under an --exclude path", resolved.display());
             continue;
         }
 
@@ -773,6 +777,49 @@ mod tests {
         );
         assert_eq!(stats.skipped_excluded.count(), 1);
         assert!(!stats.had_problems(), "an exclusion is a skip, not a failure");
+    }
+
+    #[test]
+    fn test_an_exclude_can_name_one_file_rather_than_a_folder() {
+        // The flag takes a path, and a file is one: sparing a known original
+        // out of a folder being scanned needs no more than naming it. Nothing
+        // here distinguishes the two -- which is exactly why the help used to
+        // say FOLDER and be wrong about it.
+        let dir = tempfile::tempdir().unwrap();
+        let spared = touch(dir.path(), "original.mkv");
+        let ordinary = touch(dir.path(), "copy.mkv");
+
+        let include = vec![dir.path().to_string_lossy().to_string()];
+        let exclude = vec![spared];
+        let stats = RunStats::default();
+
+        assert_eq!(
+            collected(&sources(&include, &exclude, &extensions_of(&["mkv"])), &stats),
+            vec![ordinary]
+        );
+        assert!(!stats.had_problems());
+    }
+
+    #[test]
+    fn test_an_exclude_matches_whole_components_rather_than_a_string_prefix() {
+        // `-e ~/clips/take` must not take `take.mkv` with it, and the only
+        // thing making that true is that `starts_with` here is the Path method
+        // rather than the str one. Both files are real, so the exclude
+        // resolves and the survivor proves the matching rule rather than a
+        // path that quietly excluded nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let stem = touch(dir.path(), "take");
+        let video = touch(dir.path(), "take.mkv");
+
+        let include = vec![dir.path().to_string_lossy().to_string()];
+        let exclude = vec![stem];
+        let stats = RunStats::default();
+
+        assert_eq!(
+            collected(&sources(&include, &exclude, &extensions_of(&["*"])), &stats),
+            vec![video]
+        );
+        assert!(!stats.had_problems(), "the excluded path resolved");
     }
 
     #[test]
