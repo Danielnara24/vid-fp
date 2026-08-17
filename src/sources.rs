@@ -87,14 +87,40 @@ pub struct ScannedFile {
 }
 
 impl ScannedFile {
-    fn of(path: &Path, meta: &std::fs::Metadata) -> Self {
-        ScannedFile {
-            path: path.to_string_lossy().to_string(),
+    /// The file, unless its name is not valid UTF-8.
+    ///
+    /// Every path downstream of this module is a `String` -- the cache key, the
+    /// report column, the deletion target -- so a name holding a byte that is
+    /// not valid UTF-8 cannot travel any further. It used to be forced through
+    /// `to_string_lossy`, which produced a path that DOES NOT EXIST: the file
+    /// was queued under a name with U+FFFD where the bad byte had been, and the
+    /// run reported "No such file or directory" against a file sitting right
+    /// there in the folder it had just walked. Never dangerous -- a lossy path
+    /// cannot be opened, so it cannot be fingerprinted and so cannot become a
+    /// DELETE candidate -- but it blamed the decoder for a name this tool had
+    /// mangled itself, and gave the user nothing to act on.
+    ///
+    /// Returning `None` puts the walk on the same footing as `read_path_list`,
+    /// which has always named and counted an undecodable line piped in from
+    /// another tool rather than mangling it into a path.
+    fn of(path: &Path, meta: &std::fs::Metadata) -> Option<Self> {
+        Some(ScannedFile {
+            path: path.to_str()?.to_string(),
             size: meta.len(),
             mtime: meta.mtime(),
             mtime_nsec: meta.mtime_nsec(),
-        }
+        })
     }
+}
+
+/// Say so, and count it. Both callers of `ScannedFile::of` word it the same
+/// way, because the file is equally unreachable however it was reached.
+fn record_undecodable(path: &Path, stats: &RunStats) {
+    let shown = path.to_string_lossy();
+    log::error!("Filename is not valid UTF-8 and was skipped: {}", shown);
+    stats
+        .unreadable
+        .record(format!("{}: filename is not valid UTF-8", shown));
 }
 
 /// What the scan found, and enough of how it was asked for to say what a
@@ -259,14 +285,24 @@ pub fn collect(sources: &Sources, stats: &RunStats) -> Result<Scan> {
             }
         } else if meta.is_file() {
             // No extension check: see the module docs. The user named this file.
-            if seen_inodes.insert((meta.dev(), meta.ino())) {
-                found.push(ScannedFile::of(&resolved, &meta));
-            } else {
-                stats.skipped_alias.bump();
-                log::debug!(
-                    "Skipping {}: same inode as a path already queued",
-                    resolved.display()
-                );
+            //
+            // Decodability is settled before the identity is claimed. A name
+            // this tool cannot carry may well be a hard link to one it can, and
+            // taking the inode for the unusable name would drop the usable one
+            // as an alias of a file that never made it into the list.
+            match ScannedFile::of(&resolved, &meta) {
+                None => record_undecodable(&resolved, stats),
+                Some(file) => {
+                    if seen_inodes.insert((meta.dev(), meta.ino())) {
+                        found.push(file);
+                    } else {
+                        stats.skipped_alias.bump();
+                        log::debug!(
+                            "Skipping {}: same inode as a path already queued",
+                            resolved.display()
+                        );
+                    }
+                }
             }
         } else {
             // A socket, fifo, or device node. Naming one is a mistake worth
@@ -365,6 +401,13 @@ fn walk_folder(
             continue;
         }
 
+        // Before the inode is claimed, for the reason `collect` gives: an
+        // unusable name must not stand in for a hard link that has a usable one.
+        let Some(file) = ScannedFile::of(path, &meta) else {
+            record_undecodable(path, stats);
+            continue;
+        };
+
         if !seen_inodes.insert((meta.dev(), meta.ino())) {
             stats.skipped_alias.bump();
             log::debug!(
@@ -374,7 +417,7 @@ fn walk_folder(
             continue;
         }
 
-        found.push(ScannedFile::of(path, &meta));
+        found.push(file);
     }
 
     true
@@ -580,6 +623,16 @@ mod tests {
         list.iter().map(|s| s.to_string()).collect()
     }
 
+    /// A real file whose name is not valid UTF-8, which is a perfectly ordinary
+    /// thing for a Linux filename to be: the kernel stores bytes, and only the
+    /// tools looking at them care whether they decode.
+    fn touch_raw(dir: &Path, name: &[u8]) -> PathBuf {
+        use std::os::unix::ffi::OsStrExt;
+        let path = dir.join(std::ffi::OsStr::from_bytes(name));
+        fs::write(&path, b"video").unwrap();
+        path
+    }
+
     /// A real file, returned by the canonical path collect() will produce.
     fn touch(dir: &Path, name: &str) -> String {
         let path = dir.join(name);
@@ -664,6 +717,78 @@ mod tests {
 
         assert_eq!(paths, vec!["/videos/good.mkv", "/videos/also_good.mkv"]);
         assert_eq!(stats.unreadable.count(), 1, "and the bad one is counted, not ignored");
+    }
+
+    /// The name is skipped HERE, where the problem is, rather than mangled into
+    /// a path that does not exist and handed to the decoder.
+    ///
+    /// What that used to look like: `to_string_lossy` put U+FFFD where the bad
+    /// byte was, the file was queued under that name, and the run ended with
+    /// "Failed to process .../bad<U+FFFD> name.mkv: No such file or directory"
+    /// -- a missing-file error against a file the walk had just listed, with
+    /// nothing to say the tool had renamed it on the way through.
+    #[test]
+    fn test_a_walked_name_that_is_not_utf8_is_skipped_rather_than_mangled() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = touch(dir.path(), "episode.mkv");
+        touch_raw(dir.path(), b"bad\xFF name.mkv");
+
+        let include = vec![dir.path().to_string_lossy().to_string()];
+        let stats = RunStats::default();
+
+        let found = collected(&sources(&include, &[], &extensions_of(&["mkv"])), &stats);
+        assert_eq!(found, vec![good], "and the rest of the folder still scans");
+        assert!(
+            found.iter().all(|p| Path::new(p).exists()),
+            "nothing may leave here under a name that is not on the disk"
+        );
+        assert_eq!(stats.unreadable.count(), 1, "counted, and named for what it is");
+        assert!(stats.unreadable.samples()[0].contains("not valid UTF-8"));
+    }
+
+    /// The other branch of `collect`. A path typed or piped in is a `String`
+    /// and so decodes by construction, but canonicalizing it does not have to:
+    /// a link with an ordinary name can resolve to one without.
+    #[test]
+    fn test_a_named_path_resolving_to_an_undecodable_name_is_skipped_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = touch_raw(dir.path(), b"bad\xFFname.mkv");
+        let link = dir.path().join("link.mkv");
+        std::os::unix::fs::symlink(&bad, &link).unwrap();
+
+        let include = vec![link.to_string_lossy().to_string()];
+        let stats = RunStats::default();
+
+        assert!(collected(&sources(&include, &[], &extensions_of(&["mkv"])), &stats).is_empty());
+        assert_eq!(stats.unreadable.count(), 1);
+        assert!(stats.had_problems(), "a file the user named and did not get");
+    }
+
+    /// Decodability is settled before the inode is claimed, so an unusable name
+    /// cannot stand in for a hard link that has a usable one -- which would
+    /// have skipped the readable path as an alias of a file that was never
+    /// queued, losing both.
+    #[test]
+    fn test_an_undecodable_name_does_not_claim_the_inode_of_a_readable_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = touch_raw(dir.path(), b"bad\xFFname.mkv");
+        let good = dir.path().join("episode.mkv");
+        fs::hard_link(&bad, &good).unwrap();
+        let via_bad = dir.path().join("link.mkv");
+        std::os::unix::fs::symlink(&bad, &via_bad).unwrap();
+
+        // The unusable one first: it is the order that used to lose the file.
+        let include = vec![
+            via_bad.to_string_lossy().to_string(),
+            good.to_string_lossy().to_string(),
+        ];
+        let stats = RunStats::default();
+
+        assert_eq!(
+            collected(&sources(&include, &[], &extensions_of(&["mkv"])), &stats),
+            vec![fs::canonicalize(&good).unwrap().to_string_lossy().to_string()]
+        );
+        assert_eq!(stats.skipped_alias.count(), 0, "nothing was queued for it to alias");
     }
 
     #[test]
