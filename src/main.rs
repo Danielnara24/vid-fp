@@ -19,7 +19,6 @@ use log::info;
 use rayon::prelude::*;
 use redb::{Database, DatabaseError, ReadableTable, StorageError, TableDefinition};
 use serde::{Deserialize, Serialize};
-use sources::ScannedFile;
 use stats::RunStats;
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashSet};
@@ -768,29 +767,6 @@ fn run_from_report(
     }
 
     Ok(Outcome::Completed)
-}
-
-/// The scanned folder that contains `dest`, if any.
-///
-/// The question is deliberately this way round. A landing path is `dest` plus
-/// the source's own absolute path, so `dest` being inside a scanned folder makes
-/// EVERY landing path inside it too -- that is the loop worth refusing. The
-/// reverse arrangement is not: `--move-to ~/Documents` while scanning
-/// `~/Documents/AN` sends `~/Documents/AN/ep.mkv` to
-/// `~/Documents/home/you/Documents/AN/ep.mkv`, which no scan of `~/Documents/AN`
-/// will ever reach. Testing containment the other way round -- "is a scanned
-/// file under dest" -- is what made every parent folder look like a loop.
-///
-/// Folders are approximated by the parents of the files that were found, which
-/// is what the scan actually reached: an exclude, a non-recursive walk, or an
-/// extension filter can all mean a named folder contributed nothing, and a
-/// folder nothing came out of is not one a moved file can be re-ingested from.
-fn scan_encloses(dest: &Path, scanned: &[ScannedFile]) -> Option<String> {
-    scanned.iter().find_map(|f| {
-        let parent = Path::new(&f.path).parent()?;
-        dest.starts_with(parent)
-            .then(|| parent.display().to_string())
-    })
 }
 
 /// One video that has to be decoded, and everything needed to decide how much
@@ -1775,7 +1751,7 @@ fn run(
     // the thread budget's weights and the prune all read from this list. On a
     // network mount that is the difference between three round trips per file
     // and one.
-    let mut video_files = match sources::collect(
+    let library = match sources::collect(
         &sources::Sources {
             include: &args.include,
             exclude: &args.exclude,
@@ -1787,11 +1763,11 @@ fn run(
         },
         stats,
     )? {
-        sources::Scan::Complete(files) => files,
+        sources::Scan::Complete(library) => library,
         sources::Scan::Interrupted => return Ok(Outcome::Interrupted),
     };
 
-// Moving a duplicate into a folder that is itself being scanned puts the
+    // Moving a duplicate into a folder that is itself being scanned puts the
     // file straight back into the next run's input, where it is still a
     // duplicate of the copy that was kept -- and the run after that would move
     // it again, one directory deeper each time. Nothing is lost, but the one
@@ -1799,13 +1775,13 @@ fn run(
     // quietly not happening, so it is worth stopping over rather than warning
     // about.
     if let Some(dest) = &move_to {
-        if let Some(scanned) = scan_encloses(dest, &video_files) {
+        if let Some(scanned) = library.walk_reaches(dest) {
             anyhow::bail!(
                 "The --move-to folder {} is inside {}, which this run scans, so the moved \
                  files would be picked up again next time. Exclude it with -e {}, or choose \
                  a destination outside the scanned folders.",
                 dest.display(),
-                scanned,
+                scanned.display(),
                 dest.display()
             );
         }
@@ -1815,7 +1791,7 @@ fn run(
         // path, so they sit in a sibling subtree the current scan never reaches
         // -- but a later recursive scan of the destination itself would find
         // both copies, so it is worth a word.
-        if video_files.iter().any(|f| Path::new(&f.path).starts_with(dest)) {
+        if library.files.iter().any(|f| Path::new(&f.path).starts_with(dest)) {
             info!(
                 "Note: {} is above the folder(s) being scanned. The moved files land in a \
                  separate subtree under it, so this run is unaffected -- but exclude it with \
@@ -1825,6 +1801,10 @@ fn run(
             );
         }
     }
+
+    // Every question about the REQUEST has been answered; from here on the run
+    // works from what it found.
+    let mut video_files = library.files;
 
     if args.prune_cache && !args.clear_cache {
         info!("Pruning cache for files not in the current scan...");
@@ -2503,36 +2483,6 @@ mod tests {
             disposal_for(None, false, true).is_none(),
             "--permanent alone must never act"
         );
-    }
-
-    fn scanned_at(path: &str) -> ScannedFile {
-        ScannedFile {
-            path: path.to_string(),
-            size: 12_345,
-            mtime: 1_700_000_000,
-            mtime_nsec: 0,
-        }
-    }
-
-    #[test]
-    fn test_a_destination_inside_the_scan_is_recognised() {
-        // Every landing path is dest + the source's absolute path, so a dest
-        // under a scanned folder puts all of them back in next run's input.
-        let scanned = vec![scanned_at("/mnt/media/show/ep01.mkv")];
-
-        assert_eq!(
-            scan_encloses(Path::new("/mnt/media/show/dupes"), &scanned).as_deref(),
-            Some("/mnt/media/show")
-        );
-    }
-
-    #[test]
-    fn test_a_destination_above_the_scan_is_not_a_loop() {
-        // The arrangement that used to trip the check: the moved file lands in
-        // a sibling subtree the scan never reaches.
-        let scanned = vec![scanned_at("/home/you/Documents/AN/ep01.mkv")];
-
-        assert!(scan_encloses(Path::new("/home/you/Documents"), &scanned).is_none());
     }
 
     /// The bar spaces its fields itself -- one space either side of each rule --

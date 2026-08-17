@@ -97,8 +97,69 @@ impl ScannedFile {
     }
 }
 
+/// What the scan found, and enough of how it was asked for to say what a
+/// FUTURE scan of the same request would find.
+///
+/// The second half exists for one caller: `--move-to` has to refuse a
+/// destination the next run would pick the moved files back out of, and that is
+/// a question about the request rather than about its answer. The files alone
+/// cannot settle it -- a folder that yielded nothing today (because the videos
+/// are all one level down, because everything in it was excluded, because it
+/// was empty) is still a folder a moved file would be found in tomorrow.
+pub struct Library {
+    pub files: Vec<ScannedFile>,
+    /// The folders that were walked, at the absolute paths the walk used. A
+    /// path the user named that turned out to be a file is not one of these:
+    /// naming a file scans that file, and nothing can ever be moved *into* it.
+    walked: Vec<PathBuf>,
+    /// The `--exclude` paths that resolved, which is what makes the advice in
+    /// the `--move-to` refusal true rather than merely plausible.
+    excluded: Vec<PathBuf>,
+}
+
+impl Library {
+    /// The scanned folder a file moved to `dest` would be found in again, if
+    /// any.
+    ///
+    /// The question is deliberately this way round. A landing path is `dest`
+    /// plus the source's own absolute path, so `dest` being inside a scanned
+    /// folder makes EVERY landing path inside it too -- that is the loop worth
+    /// refusing. The reverse arrangement is not: `--move-to ~/Documents` while
+    /// scanning `~/Documents/AN` sends `~/Documents/AN/ep.mkv` to
+    /// `~/Documents/home/you/Documents/AN/ep.mkv`, which no scan of
+    /// `~/Documents/AN` will ever reach. Testing containment the other way
+    /// round -- "is a scanned file under dest" -- is what made every parent
+    /// folder look like a loop.
+    ///
+    /// It is asked of the folders the run was POINTED AT, not of the parents of
+    /// the files that came out of them. Those two coincide only in a flat
+    /// library: `vid-fp lib -r --move-to lib/dupes` over a tree whose videos
+    /// all live in `lib/sub` has no found file whose parent encloses `lib/dupes`
+    /// at all, so the parent-based version sailed through and the run after it
+    /// re-ingested everything it had moved -- keeping the moved copy and moving
+    /// the original, one directory deeper each time.
+    ///
+    /// An `--exclude` covering `dest` is the one thing that makes it safe
+    /// again, and honouring it here is what makes the refusal's own advice
+    /// work: the excluded subtree is not walked, so the moved files are not
+    /// found. Nothing else in the request earns an exemption. A non-recursive
+    /// walk would not reach the landing paths today (they sit at least two
+    /// levels under `dest`), but the destination is still inside the library
+    /// this run was aimed at, and it becomes a loop the first time someone adds
+    /// `-r`.
+    pub fn walk_reaches(&self, dest: &Path) -> Option<&Path> {
+        if is_excluded(dest, &self.excluded) {
+            return None;
+        }
+        self.walked
+            .iter()
+            .find(|root| dest.starts_with(root))
+            .map(|root| root.as_path())
+    }
+}
+
 pub enum Scan {
-    Complete(Vec<ScannedFile>),
+    Complete(Library),
     /// Ctrl-C arrived mid-walk. The partial list is discarded rather than
     /// returned: a truncated library would silently change what counts as a
     /// duplicate, which is the last thing an interrupted run should do.
@@ -142,6 +203,7 @@ pub fn collect(sources: &Sources, stats: &RunStats) -> Result<Scan> {
     // figure never counts bytes that deleting a link would not return.
     let mut seen_inodes: HashSet<(u64, u64)> = HashSet::new();
     let mut found: Vec<ScannedFile> = Vec::new();
+    let mut walked: Vec<PathBuf> = Vec::new();
 
     for path in &requested {
         if shutdown_requested() {
@@ -179,6 +241,11 @@ pub fn collect(sources: &Sources, stats: &RunStats) -> Result<Scan> {
         };
 
         if meta.is_dir() {
+            // Recorded before the walk rather than after it: what makes this a
+            // scan root is having been pointed at, not having yielded
+            // anything. See `Library::walk_reaches`.
+            walked.push(resolved.clone());
+
             if !walk_folder(
                 &resolved,
                 sources,
@@ -211,7 +278,11 @@ pub fn collect(sources: &Sources, stats: &RunStats) -> Result<Scan> {
         }
     }
 
-    Ok(Scan::Complete(found))
+    Ok(Scan::Complete(Library {
+        files: found,
+        walked,
+        excluded: excludes,
+    }))
 }
 
 /// Walk one folder, appending every video in it. Returns false if interrupted.
@@ -535,11 +606,15 @@ mod tests {
         }
     }
 
-    fn scanned(sources: &Sources, stats: &RunStats) -> Vec<ScannedFile> {
+    fn library(sources: &Sources, stats: &RunStats) -> Library {
         match collect(sources, stats).unwrap() {
-            Scan::Complete(files) => files,
+            Scan::Complete(library) => library,
             Scan::Interrupted => panic!("nothing interrupted this scan"),
         }
+    }
+
+    fn scanned(sources: &Sources, stats: &RunStats) -> Vec<ScannedFile> {
+        library(sources, stats).files
     }
 
     /// Most tests here are about WHICH files were found, not what was learned
@@ -881,6 +956,104 @@ mod tests {
         let mut expected = vec![top, nested];
         expected.sort();
         assert_eq!(collected(&recursive, &stats), expected);
+    }
+
+    /// The layout the parent-of-a-found-file version of this check missed, and
+    /// the one a library is actually shaped like: nothing sits in the scan root
+    /// itself, so no found file's parent encloses the destination.
+    ///
+    /// The run that followed re-ingested what it had moved, kept THAT copy, and
+    /// moved the original in beside it -- an empty library and two files under
+    /// `dupes/` after two runs.
+    #[test]
+    fn test_a_destination_inside_the_scan_is_refused_even_with_no_video_beside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        touch(&root.join("sub"), "a.mkv");
+
+        let include = vec![root.to_string_lossy().to_string()];
+        let extensions = extensions_of(&["mkv"]);
+        let mut request = sources(&include, &[], &extensions);
+        request.recursive = true;
+        let stats = RunStats::default();
+
+        assert_eq!(
+            library(&request, &stats).walk_reaches(&root.join("dupes")),
+            Some(root.as_path())
+        );
+    }
+
+    /// A folder that yielded nothing this time is still a folder a moved file
+    /// would be found in next time, which is why the roots are recorded rather
+    /// than inferred from the files.
+    #[test]
+    fn test_a_scan_root_that_found_nothing_still_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+
+        let include = vec![root.to_string_lossy().to_string()];
+        let extensions = extensions_of(&["mkv"]);
+        let request = sources(&include, &[], &extensions);
+        let stats = RunStats::default();
+
+        let library = library(&request, &stats);
+        assert!(library.files.is_empty());
+        assert_eq!(library.walk_reaches(&root.join("dupes")), Some(root.as_path()));
+    }
+
+    #[test]
+    fn test_a_destination_above_the_scan_is_not_a_loop() {
+        // The arrangement that used to trip the check: the moved file lands in
+        // a sibling subtree the scan never reaches.
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let sub = root.join("season_1");
+        touch(&sub, "ep01.mkv");
+
+        let include = vec![sub.to_string_lossy().to_string()];
+        let extensions = extensions_of(&["mkv"]);
+        let request = sources(&include, &[], &extensions);
+        let stats = RunStats::default();
+
+        assert!(library(&request, &stats).walk_reaches(&root).is_none());
+    }
+
+    /// The refusal tells the user to exclude the destination, so excluding it
+    /// has to be an answer. It was not: with the videos directly in the scan
+    /// root, the parent-based check fired on the root whatever `-e` said, and
+    /// the advice led nowhere.
+    #[test]
+    fn test_excluding_the_destination_is_the_way_out_the_refusal_advertises() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        touch(&root, "a.mkv");
+        let dest = root.join("dupes");
+        fs::create_dir_all(&dest).unwrap();
+
+        let include = vec![root.to_string_lossy().to_string()];
+        let exclude = vec![dest.to_string_lossy().to_string()];
+        let extensions = extensions_of(&["mkv"]);
+        let mut request = sources(&include, &exclude, &extensions);
+        request.recursive = true;
+        let stats = RunStats::default();
+
+        assert!(library(&request, &stats).walk_reaches(&dest).is_none());
+    }
+
+    /// A named file is scanned, not walked, so nothing can be re-ingested from
+    /// beside it.
+    #[test]
+    fn test_a_named_file_is_not_a_folder_a_move_could_land_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let video = touch(&root, "a.mkv");
+
+        let include = vec![video];
+        let extensions = extensions_of(&["mkv"]);
+        let request = sources(&include, &[], &extensions);
+        let stats = RunStats::default();
+
+        assert!(library(&request, &stats).walk_reaches(&root.join("dupes")).is_none());
     }
 
     #[test]

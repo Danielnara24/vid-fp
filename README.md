@@ -220,7 +220,10 @@ problem instead. A destination on another filesystem is copied, flushed, and
 only then unlinked; if either step fails the original stays where it was.
 Timestamps and permissions are preserved.
 
-The destination must sit outside the scanned folders, or the run aborts.
+The destination must sit outside the scanned folders, or the run aborts:
+anything moved into a folder being scanned is found again by the next run, which
+keeps the moved copy and moves the original in beside it. To put the destination
+inside the library anyway, exclude it: `-r --move-to lib/dupes -e lib/dupes`.
 
 ### Acting on a report you have reviewed
 
