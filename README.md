@@ -280,7 +280,7 @@ reports refused.
 | `-q`, `--quiet` | Only print errors | off |
 | `--cache <PATH>` | Use this cache file instead of the default one. Needed to run multiple scans at once, since a run locks its cache for the whole scan | `$XDG_CACHE_HOME/vid-fp/fingerprints.redb` |
 | `--clear-cache` | Wipe ALL vid-fp cache before running | off |
-| `--prune-cache` | Drop cached entries only for files not in this scan | off |
+| `--prune-cache` | Drop cached entries only for files not in this scan. Skipped when the scan was incomplete | off |
 | `--completions <SHELL>` | Print a completion script for `bash`, `zsh`, `fish`, `elvish`, or `powershell` and exit | |
 | `--man` | Print the man page (roff) and exit | |
 

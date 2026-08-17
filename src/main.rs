@@ -510,7 +510,13 @@ struct Args {
     #[arg(long = "clear-cache")]
     clear_cache: bool,
 
-    /// Delete the cache of files not included in the current folder to scan
+    /// Drop the cached fingerprint of every file this scan did not find, so a
+    /// cache stops growing with libraries that have moved on. It is skipped,
+    /// loudly, when the scan was not complete enough to measure against: a scan
+    /// path that would not resolve, a folder that could not be read, or a scan
+    /// that found no videos at all. Pruning against a partial scan would throw
+    /// away fingerprints that are still good -- a mistyped folder empties the
+    /// cache -- so the run says so, keeps the entries, and exits 2.
     #[arg(long = "prune-cache")]
     prune_cache: bool,
 
@@ -1248,6 +1254,47 @@ fn cache_forget(db: &Database, paths: &[String]) -> Result<usize> {
     Ok(forgotten)
 }
 
+/// Why `--prune-cache` must not run this time, if it must not.
+///
+/// A prune keeps exactly the entries whose file is in front of the run and
+/// removes every other one, so it is only ever as correct as the scan is
+/// complete. A run that could not resolve a scan root, or could not read a
+/// folder underneath one, is looking at a subset of the library and reads
+/// everything it never reached as stale -- so a mistyped path with nothing
+/// behind it used to empty the whole cache, and the run KNEW the path had
+/// failed (it counts it, and exits 2) while pruning anyway. That is hours of
+/// decode discarded by one keystroke. This is the rule `resolve_excludes`
+/// already applies in the other direction: a path that will not resolve must
+/// not silently change what the run acts on.
+///
+/// An empty file list is refused for the same reason and needs no failure to
+/// get there, which is what makes it worth checking separately: a nested
+/// library scanned without `-r`, or one whose containers are not in
+/// `--extensions`, resolves cleanly, finds nothing, and would take the entire
+/// cache with it.
+///
+/// `unresolved_excludes` is deliberately not here. An `--exclude` that will not
+/// resolve excludes nothing, so the scan comes out WIDER than asked rather than
+/// narrower -- the prune then removes less than it should, which costs a
+/// re-decode of nothing.
+fn prune_obstacle(stats: &RunStats, found: usize) -> Option<String> {
+    let incomplete = [
+        (stats.unresolved_includes.count(), "scan path(s) could not be resolved"),
+        (stats.unwalkable.count(), "folder(s) could not be read"),
+        (stats.unreadable.count(), "file(s) could not be read"),
+    ];
+
+    if let Some((n, what)) = incomplete.into_iter().find(|(n, _)| *n > 0) {
+        return Some(format!("{} {}", n, what));
+    }
+
+    if found == 0 {
+        return Some("the scan found no videos".to_string());
+    }
+
+    None
+}
+
 /// Delete the cache this tool used to keep, if it is still lying around.
 ///
 /// sled stored a directory; redb stores a single file, so the two cannot even
@@ -1485,14 +1532,11 @@ Interrupted with Ctrl-C.
         // miscounted their cores; one who reads this can tell whether the
         // setting was worth asking for.
         log::warn!(
-            "--threads {} is above the ceiling of {} on this machine ({} cores); running \
-             with {}. Every concurrent decode holds a full-resolution frame buffer, so \
-             memory grows with this setting while throughput does not. Use 0 for one \
-             worker per core.",
+            "--threads {} capped at {} on this machine ({} cores); memory grows with this \
+             setting, throughput does not.",
             args.threads,
             active_threads,
-            cores,
-            active_threads
+            cores
         );
     }
 
@@ -1812,7 +1856,15 @@ fn run(
     // works from what it found.
     let mut video_files = library.files;
 
-    if args.prune_cache && !args.clear_cache {
+    // A prune is measured against what the scan FOUND, so it is only ever as
+    // correct as the scan was complete -- and a run that fell short knows it.
+    let pruning = args.prune_cache && !args.clear_cache;
+    let obstacle = if pruning { prune_obstacle(stats, video_files.len()) } else { None };
+
+    if let Some(reason) = obstacle {
+        log::warn!("Not pruning the cache: {}, so this run cannot tell what is stale.", reason);
+        stats.cache_prune_skipped.record(reason);
+    } else if pruning {
         info!("Pruning cache for files not in the current scan...");
         let valid_files: HashSet<&str> = video_files.iter().map(|f| f.path.as_str()).collect();
 
@@ -3057,6 +3109,118 @@ mod tests {
         assert!(err.contains("--delete"), "{}", err);
         assert!(err.contains("--move-to"), "{}", err);
         assert!(Path::new(&doomed).exists(), "and nothing was touched");
+    }
+
+    /// A cache holding one entry for a file that is not on disk anywhere, which
+    /// is exactly what `--prune-cache` exists to collect -- and exactly what a
+    /// prune measured against a scan that failed would collect by mistake.
+    const ORPHAN: &str = "/videos/long_gone.mkv";
+
+    fn cache_with_an_orphan(dir: &tempfile::TempDir) -> Database {
+        let db = temp_db(dir);
+        cache_store(&db, ORPHAN, stamp(1_700_000_000, 12_345), &mock_fp(ORPHAN)).unwrap();
+        db
+    }
+
+    fn cached_paths(db: &Database) -> Vec<String> {
+        let read = db.begin_read().unwrap();
+        let table = read.open_table(CACHE_TABLE).unwrap();
+        table
+            .iter()
+            .unwrap()
+            .map(|e| e.unwrap().0.value().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn test_a_scan_path_that_would_not_resolve_prunes_nothing() {
+        // The keystroke this guard is about: `vid-fp vidz --prune-cache` with
+        // `vids` meant. The scan resolves nothing, finds nothing, and every
+        // entry in the cache reads as stale -- so the run used to answer a
+        // typo by discarding hours of decode, having already recorded that the
+        // path failed and that it would be exiting 2 for it.
+        let dir = tempfile::tempdir().unwrap();
+        let db = cache_with_an_orphan(&dir);
+
+        let missing = dir.path().join("vidz").to_string_lossy().to_string();
+        let args = Args::parse_from(["vid-fp", &missing, "--prune-cache"]);
+        let stats = RunStats::default();
+
+        assert!(matches!(
+            run(&args, Some(&db), Instant::now(), 1, &stats),
+            Ok(Outcome::Completed)
+        ));
+
+        assert_eq!(cached_paths(&db), vec![ORPHAN.to_string()], "the cache is untouched");
+        assert_eq!(stats.cache_prune_skipped.count(), 1, "and the refusal is said out loud");
+        assert!(stats.had_problems(), "so the run exits 2 rather than reading as a clean one");
+    }
+
+    #[test]
+    fn test_a_scan_that_found_nothing_prunes_nothing() {
+        // The same damage with nothing whatever going wrong: an existing folder
+        // holding no videos this run can see -- a nested library scanned without
+        // -r, or one whose containers are outside --extensions. It resolves, it
+        // walks, it reports no problem, and pruning against it would still take
+        // the whole cache.
+        let dir = tempfile::tempdir().unwrap();
+        let db = cache_with_an_orphan(&dir);
+
+        let stats = RunStats::default();
+        assert!(matches!(
+            run(&args_over(&dir, &["--prune-cache"]), Some(&db), Instant::now(), 1, &stats),
+            Ok(Outcome::Completed)
+        ));
+
+        assert_eq!(cached_paths(&db), vec![ORPHAN.to_string()], "the cache is untouched");
+        assert_eq!(stats.cache_prune_skipped.count(), 1);
+    }
+
+    #[test]
+    fn test_a_scan_that_saw_the_whole_library_still_prunes() {
+        // The other half of the guard, and the reason it is written as a list of
+        // obstacles rather than "prune only when everything is perfect": a
+        // complete scan that finds files must still collect the entries those
+        // files do not account for, which is the whole point of the flag.
+        let dir = tempfile::tempdir().unwrap();
+        let db = cache_with_an_orphan(&dir);
+
+        let mut fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        fixture.push("tests/fixtures/test_video.mp4");
+        let scanned = dir.path().join("clip.mp4");
+        std::fs::copy(&fixture, &scanned).expect("the fixture video is part of the tree");
+
+        let stats = RunStats::default();
+        assert!(matches!(
+            run(&args_over(&dir, &["--prune-cache"]), Some(&db), Instant::now(), 1, &stats),
+            Ok(Outcome::Completed)
+        ));
+
+        let left = cached_paths(&db);
+        assert!(!left.iter().any(|p| p == ORPHAN), "the orphan is gone: {:?}", left);
+        assert_eq!(stats.cache_prune_skipped.count(), 0, "nothing stood in the way");
+    }
+
+    #[test]
+    fn test_only_the_failures_that_narrow_a_scan_stop_a_prune() {
+        // An --exclude that will not resolve excludes nothing, so the scan comes
+        // out WIDER than asked and the prune removes less than it could. That
+        // costs nothing and must not block the flag; every failure that hides
+        // files must.
+        let wider = RunStats::default();
+        wider.unresolved_excludes.record("/typo: No such file or directory");
+        assert_eq!(prune_obstacle(&wider, 3), None);
+
+        let narrower = RunStats::default();
+        narrower.unwalkable.record("/library/private: Permission denied");
+        assert!(prune_obstacle(&narrower, 3).is_some(), "a folder that could not be read");
+
+        let unreadable = RunStats::default();
+        unreadable.unreadable.record("/library/odd\u{fffd}name.mp4: filename is not valid UTF-8");
+        assert!(prune_obstacle(&unreadable, 3).is_some(), "a file that could not be read");
+
+        assert!(prune_obstacle(&RunStats::default(), 0).is_some(), "and an empty scan");
+        assert_eq!(prune_obstacle(&RunStats::default(), 1), None, "but a clean one prunes");
     }
 
     /// Everything the run needs to reach the argument checks: a real scan root

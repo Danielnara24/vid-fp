@@ -77,6 +77,7 @@ pub struct RunStats {
     pub clustering_abandoned: Tally,
     pub cache_write_failed: Tally,
     pub cache_purge_failed: Tally,
+    pub cache_prune_skipped: Tally,
     pub delete_stale: Tally,
     pub delete_failed: Tally,
     pub report_unusable: Tally,
@@ -89,7 +90,7 @@ pub struct RunStats {
 }
 
 impl RunStats {
-    fn problems(&self) -> [(&Tally, &'static str); 12] {
+    fn problems(&self) -> [(&Tally, &'static str); 13] {
         [
             // "path" rather than "folder": a scan target can now be a single
             // file, or a line piped in from another tool.
@@ -129,6 +130,15 @@ impl RunStats {
                 &self.cache_purge_failed,
                 "cached fingerprint(s) of deleted file(s) could not be dropped \
                  (use --prune-cache to clear them)",
+            ),
+            // The refusal IS the feature -- see `prune_obstacle` -- but the user
+            // asked for a prune and did not get one, and the next run will find
+            // the same entries still there. Counted for the same reason
+            // `clustering_abandoned` is: declining to answer is not the same as
+            // having answered, and the exit code is the only part a script sees.
+            (
+                &self.cache_prune_skipped,
+                "cache prune(s) skipped -- nothing was removed from the cache",
             ),
             // A problem rather than a skip, even though nothing went wrong and
             // the refusal is the point. The user asked for these files to be
@@ -328,11 +338,13 @@ mod tests {
         s.clustering_abandoned.record("900 file(s) linked too densely to group");
         s.cache_write_failed.record("/c.mp4");
         s.cache_purge_failed.record("cache write failed");
+        s.cache_prune_skipped.record("1 scan path(s) could not be resolved");
         s.delete_stale.record("/d.mp4: 100 bytes when scanned, 200 bytes now");
         s.delete_failed.record("/e.mp4");
         s.report_unusable.record("report.csv line 4");
+        s.report_write_failed.record("dupes.csv: permission denied");
 
-        assert_eq!(s.problem_count(), 11);
+        assert_eq!(s.problem_count(), 13);
         assert!(s.had_problems());
     }
 }
