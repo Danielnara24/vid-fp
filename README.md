@@ -222,8 +222,10 @@ Timestamps and permissions are preserved.
 
 The destination must sit outside the scanned folders, or the run aborts:
 anything moved into a folder being scanned is found again by the next run, which
-keeps the moved copy and moves the original in beside it. To put the destination
-inside the library anyway, exclude it: `-r --move-to lib/dupes -e lib/dupes`.
+keeps the moved copy and moves the original in beside it. A folder the scan only
+reaches through a symlink counts as scanned, and the refusal names the link. To
+put the destination inside the library anyway, exclude it:
+`-r --move-to lib/dupes -e lib/dupes`.
 
 ### Acting on a report you have reviewed
 
@@ -258,8 +260,8 @@ reports refused.
 | `--from-file <FILE>` | Read the paths to scan from a file, one per line (`-` = stdin) | |
 | `-0`, `--null` | Paths in the list are NUL-separated, for `find -print0` / `fd -0` | off |
 | `-r`, `--recursive` | Include subfolders | off |
-| `--follow-symlinks` | Descend into symlinked folders | off |
-| `-e`, `--exclude <PATH>` | Exclude a folder or a single file; repeat for several. Matched by whole path components, so a file must be named exactly | |
+| `--follow-symlinks` | Descend into symlinked folders. Deletions act on the file the link leads to | off |
+| `-e`, `--exclude <PATH>` | Exclude a folder or a single file; repeat for several. Matched by whole path components, so a file must be named exactly, and resolved through symlinks | |
 | `-x`, `--extensions <EXT>` | Extensions a **folder walk** treats as videos, comma-separated or repeated. `-x '*'` (quoted) takes every file, including ones with no extension | `mp4,m4v,mkv,webm,avi,mov,flv,wmv,asf,mpg,mpeg,m2ts,mts,ts,vob,ogv,3gp,divx` |
 | `-d`, `--hamming-distance <N>` | Frame-match tolerance, in bits out of 64; higher = less strict matching. Raise to find more duplicates, at the cost of false positives. See [Tuning](#tuning). Values above `32` are refused | `4` |
 | `-p`, `--match-percent <F>` | Min % of overlap to count as a duplicate, from `0` to `100`. Lower includes shorter matches, at the cost of false positives. `0` turns the gate off and reports every pair sharing any footage at all; a pair sharing none is never reported | `20.0` |
@@ -543,6 +545,8 @@ them, so re-running a scan at a different tolerance is instant.
   a single entry, so the reported space freed reflects bytes actually reclaimed.
 - **Tab-complete your `-e` paths.** An exclude path that can't be resolved
   excludes nothing.
+- **`-e` protects the file, not the spelling.** An excluded file stays excluded
+  when the scan reaches it by another route, such as a symlink.
 - **Nothing is acted on twice, or blind.** Every target is re-checked against
   its recorded size immediately before it's touched, and a file that changed
   since the scan is left alone and reported.

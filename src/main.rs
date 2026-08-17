@@ -316,7 +316,9 @@ struct Args {
     /// flag to exclude several (e.g. -e ~/a -e ~/b). Matched one whole path
     /// component at a time, so -e ~/keep covers everything under it, while
     /// -e ~/clips/take does NOT cover ~/clips/take.mkv -- a file has to be
-    /// named exactly. Applies to piped and explicitly named paths too.
+    /// named exactly. Applies to piped and explicitly named paths too, and
+    /// protects a file whichever route the scan reached it by, so excluding
+    /// either a symlink or what it points at covers both.
     #[arg(short = 'e', long = "exclude", value_name = "PATH",
           value_hint = clap::ValueHint::AnyPath)]
     exclude: Vec<String>,
@@ -340,9 +342,13 @@ struct Args {
     recursive: bool,
 
     /// Follow symbolic links while scanning. Off by default, which means a
-    /// symlinked directory is not descended into. Safe to enable: files are
-    /// deduplicated by (device, inode), so following a link never fingerprints
-    /// the same bytes twice.
+    /// symlinked directory is not descended into. The same bytes are never
+    /// fingerprinted twice however many links reach them, because files are
+    /// deduplicated by (device, inode). Worth knowing before arming a
+    /// destructive run: deleting or moving a file found through a link acts on
+    /// the file the link leads to, not on the link, so a folder you want left
+    /// alone is worth naming with --exclude (which follows links too, and
+    /// protects such a file whichever path the walk reached it by).
     #[arg(long = "follow-symlinks")]
     follow_symlinks: bool,
 
@@ -1777,11 +1783,11 @@ fn run(
     if let Some(dest) = &move_to {
         if let Some(scanned) = library.walk_reaches(dest) {
             anyhow::bail!(
-                "The --move-to folder {} is inside {}, which this run scans, so the moved \
-                 files would be picked up again next time. Exclude it with -e {}, or choose \
-                 a destination outside the scanned folders.",
+                "The --move-to folder {} would be scanned again by this run: it is {}, so the \
+                 moved files would be picked up next time. Exclude it with -e {}, or choose a \
+                 destination outside the scanned folders.",
                 dest.display(),
-                scanned.display(),
+                scanned,
                 dest.display()
             );
         }

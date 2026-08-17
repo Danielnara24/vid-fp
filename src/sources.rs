@@ -29,7 +29,9 @@
 //! whole path components and neither `starts_with` nor `canonicalize` cares
 //! which it was given -- sparing one known original out of a folder being
 //! scanned needs no more than naming it. Component-wise is also what keeps
-//! `-e ~/clips/take` off `~/clips/take.mkv`.
+//! `-e ~/clips/take` off `~/clips/take.mkv`. It protects the bytes rather than
+//! the spelling, so a file reached by another route -- a symlink, a second scan
+//! root -- is excluded just the same; see `is_excluded_target`.
 //!
 //! What comes back is not a list of paths but a list of files. Every entry has
 //! already been stat'ed here -- the walk needs (device, inode) to deduplicate
@@ -134,10 +136,18 @@ fn record_undecodable(path: &Path, stats: &RunStats) {
 /// was empty) is still a folder a moved file would be found in tomorrow.
 pub struct Library {
     pub files: Vec<ScannedFile>,
-    /// The folders that were walked, at the absolute paths the walk used. A
-    /// path the user named that turned out to be a file is not one of these:
+    /// The folders the walk reached, canonicalized. Two kinds of entry: a
+    /// folder the user pointed at, and -- under `--follow-symlinks` -- the
+    /// TARGET of every directory symlink the walk descended through. A path
+    /// the user named that turned out to be a file is not one of these:
     /// naming a file scans that file, and nothing can ever be moved *into* it.
-    walked: Vec<PathBuf>,
+    ///
+    /// The second kind is what keeps the question answerable at all once links
+    /// are being followed. A scan of `lib` whose only route to `store` is
+    /// `lib/link -> store` reaches every file in `store` while `store` sits
+    /// under no root the user typed, so `--move-to store` looked safe and the
+    /// next run found what the last one had moved.
+    walked: Vec<Reached>,
     /// The `--exclude` paths that resolved, which is what makes the advice in
     /// the `--move-to` refusal true rather than merely plausible.
     excluded: Vec<PathBuf>,
@@ -173,14 +183,44 @@ impl Library {
     /// levels under `dest`), but the destination is still inside the library
     /// this run was aimed at, and it becomes a loop the first time someone adds
     /// `-r`.
-    pub fn walk_reaches(&self, dest: &Path) -> Option<&Path> {
+    ///
+    /// Both sides of the comparison are canonical, which is the only reason a
+    /// symlink cannot walk around it: `dest` comes from `resolve_move_to`, and
+    /// a folder reached through a link contributes its target rather than the
+    /// path the walk spelled.
+    pub fn walk_reaches(&self, dest: &Path) -> Option<&Reached> {
         if is_excluded(dest, &self.excluded) {
             return None;
         }
-        self.walked
-            .iter()
-            .find(|root| dest.starts_with(root))
-            .map(|root| root.as_path())
+        self.walked.iter().find(|r| dest.starts_with(&r.root))
+    }
+}
+
+/// A folder this scan reaches, and how it got there.
+///
+/// The route matters only for what the `--move-to` refusal can say. A
+/// destination reached through a link is usually the link's target ITSELF, so a
+/// message built on the target alone came out as "X is inside X, which this run
+/// scans" -- true, unhelpful, and silent about the one path the user has to go
+/// and look at.
+pub struct Reached {
+    root: PathBuf,
+    /// The symlink the walk followed to get here, if it did not get here
+    /// directly.
+    via: Option<PathBuf>,
+}
+
+impl std::fmt::Display for Reached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.via {
+            None => write!(f, "inside {}, which this run scans", self.root.display()),
+            Some(link) => write!(
+                f,
+                "reached through the symlink {}, which this run follows into {}",
+                link.display(),
+                self.root.display()
+            ),
+        }
     }
 }
 
@@ -227,9 +267,11 @@ pub fn collect(sources: &Sources, stats: &RunStats) -> Result<Scan> {
     // identity means each set of bytes is fingerprinted exactly once, so the
     // report never lists a file as a duplicate of itself and the "space freed"
     // figure never counts bytes that deleting a link would not return.
-    let mut seen_inodes: HashSet<(u64, u64)> = HashSet::new();
-    let mut found: Vec<ScannedFile> = Vec::new();
-    let mut walked: Vec<PathBuf> = Vec::new();
+    let mut into = Collecting {
+        seen_inodes: HashSet::new(),
+        found: Vec::new(),
+        walked: Vec::new(),
+    };
 
     for path in &requested {
         if shutdown_requested() {
@@ -270,17 +312,12 @@ pub fn collect(sources: &Sources, stats: &RunStats) -> Result<Scan> {
             // Recorded before the walk rather than after it: what makes this a
             // scan root is having been pointed at, not having yielded
             // anything. See `Library::walk_reaches`.
-            walked.push(resolved.clone());
+            into.walked.push(Reached {
+                root: resolved.clone(),
+                via: None,
+            });
 
-            if !walk_folder(
-                &resolved,
-                sources,
-                &extensions,
-                &excludes,
-                &mut seen_inodes,
-                &mut found,
-                stats,
-            ) {
+            if !walk_folder(&resolved, sources, &extensions, &excludes, &mut into, stats) {
                 return Ok(Scan::Interrupted);
             }
         } else if meta.is_file() {
@@ -293,8 +330,8 @@ pub fn collect(sources: &Sources, stats: &RunStats) -> Result<Scan> {
             match ScannedFile::of(&resolved, &meta) {
                 None => record_undecodable(&resolved, stats),
                 Some(file) => {
-                    if seen_inodes.insert((meta.dev(), meta.ino())) {
-                        found.push(file);
+                    if into.seen_inodes.insert((meta.dev(), meta.ino())) {
+                        into.found.push(file);
                     } else {
                         stats.skipped_alias.bump();
                         log::debug!(
@@ -315,10 +352,22 @@ pub fn collect(sources: &Sources, stats: &RunStats) -> Result<Scan> {
     }
 
     Ok(Scan::Complete(Library {
-        files: found,
-        walked,
+        files: into.found,
+        walked: into.walked,
         excluded: excludes,
     }))
+}
+
+/// What a walk accumulates, carried from one scan root to the next.
+///
+/// One bag rather than three out-parameters because the three are one thing:
+/// the answer being built. The inode set in particular has to span roots -- two
+/// scan roots that overlap must collapse to one entry, not two -- so none of
+/// these can be per-folder.
+struct Collecting {
+    seen_inodes: HashSet<(u64, u64)>,
+    found: Vec<ScannedFile>,
+    walked: Vec<Reached>,
 }
 
 /// Walk one folder, appending every video in it. Returns false if interrupted.
@@ -327,8 +376,7 @@ fn walk_folder(
     sources: &Sources,
     extensions: &Wanted,
     excludes: &[PathBuf],
-    seen_inodes: &mut HashSet<(u64, u64)>,
-    found: &mut Vec<ScannedFile>,
+    into: &mut Collecting,
     stats: &RunStats,
 ) -> bool {
     let mut walker = WalkDir::new(base).follow_links(sources.follow_symlinks);
@@ -339,9 +387,16 @@ fn walk_folder(
         walker = walker.max_depth(1);
     }
 
-    let it = walker
-        .into_iter()
-        .filter_entry(|e| !is_excluded(e.path(), excludes));
+    let follow = sources.follow_symlinks;
+
+    // Directories are canonicalized here so an excluded subtree reached through
+    // a link is PRUNED rather than merely rejected file by file. Folders are
+    // few, so a realpath each is cheap; the files inside are checked further
+    // down, once the extension filter has thinned them out.
+    let it = walker.into_iter().filter_entry(|e| {
+        let through_links = e.file_type().is_dir() && (follow || e.path_is_symlink());
+        !is_excluded_target(e.path(), excludes, through_links)
+    });
 
     for entry in it {
         if shutdown_requested() {
@@ -371,6 +426,17 @@ fn walk_folder(
         // saves a stat() per folder under `-x '*'`, where the extension filter
         // no longer turns them away.
         if entry.file_type().is_dir() {
+            // One that was reached by following a link is a place this request
+            // scans without any root the user typed enclosing it, so the
+            // `--move-to` guard has to be told about it. See `Library::walked`.
+            if follow && entry.path_is_symlink() {
+                if let Ok(target) = std::fs::canonicalize(entry.path()) {
+                    into.walked.push(Reached {
+                        root: target,
+                        via: Some(entry.path().to_path_buf()),
+                    });
+                }
+            }
             continue;
         }
 
@@ -379,6 +445,22 @@ fn walk_folder(
         // Extension next: it is free, and it keeps us from stat()ing every
         // non-video file in the tree.
         if !extensions.accepts(path) {
+            continue;
+        }
+
+        // The exclusion test again, now through the link. `filter_entry` above
+        // compared the path the WALK used, which under --follow-symlinks goes
+        // through the link and so can never carry the canonical prefix an
+        // `--exclude` resolved to -- while every destructive step downstream
+        // (`remove_file`, `rename`) resolves the link and acts on the real
+        // file. Left as it was, `-e keep` did not protect `keep/precious.mp4`
+        // from a run that reached it as `scan/linkdir/precious.mp4`.
+        if is_excluded_target(path, excludes, follow || entry.path_is_symlink()) {
+            stats.skipped_excluded.bump();
+            log::debug!(
+                "Skipping {}: leads to a file under an --exclude path",
+                path.display()
+            );
             continue;
         }
 
@@ -408,7 +490,7 @@ fn walk_folder(
             continue;
         };
 
-        if !seen_inodes.insert((meta.dev(), meta.ino())) {
+        if !into.seen_inodes.insert((meta.dev(), meta.ino())) {
             stats.skipped_alias.bump();
             log::debug!(
                 "Skipping {}: same inode as a path already queued",
@@ -417,7 +499,7 @@ fn walk_folder(
             continue;
         }
 
-        found.push(file);
+        into.found.push(file);
     }
 
     true
@@ -614,6 +696,40 @@ fn is_excluded(path: &Path, excludes: &[PathBuf]) -> bool {
     excludes.iter().any(|ex| path.starts_with(ex))
 }
 
+/// Is this path, or the file it actually leads to, under an `--exclude`?
+///
+/// `--exclude` protects BYTES, and the only name every route to a set of bytes
+/// agrees on is the canonical one -- which is why `resolve_excludes`
+/// canonicalizes what the user typed. A walk path does not have to be
+/// canonical: with `--follow-symlinks` on, `scan/linkdir/precious.mp4` names
+/// the same file as `keep/precious.mp4` and shares not one component with it,
+/// so the prefix test could never fire. It failed in BOTH directions, which is
+/// what made it impossible to work around: excluding the real folder did not
+/// match the path the walk used, and excluding the link path the user could
+/// actually see in the report was canonicalized into the real folder and so did
+/// not match either. Everything downstream resolves the link -- `remove_file`
+/// on the walk path unlinks the real file -- so the exclusion has to as well.
+///
+/// The raw test comes first because it is free and answers almost every case:
+/// a walk with no symlink in it produces canonical paths already, `collect`
+/// having canonicalized the root. `through_links` is what the callers use to
+/// keep the realpath off the default path entirely -- it is asked only of an
+/// entry that IS a link, or of any entry at all when links are being followed.
+///
+/// A path that will not canonicalize is not excluded, and needs no protecting:
+/// it cannot be opened, so it cannot be fingerprinted, moved or deleted.
+fn is_excluded_target(path: &Path, excludes: &[PathBuf], through_links: bool) -> bool {
+    if is_excluded(path, excludes) {
+        return true;
+    }
+
+    if !through_links || excludes.is_empty() {
+        return false;
+    }
+
+    std::fs::canonicalize(path).is_ok_and(|real| is_excluded(&real, excludes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,6 +784,11 @@ mod tests {
 
     fn scanned(sources: &Sources, stats: &RunStats) -> Vec<ScannedFile> {
         library(sources, stats).files
+    }
+
+    /// The folder a file moved to `dest` would be found in again, if any.
+    fn reaches(library: &Library, dest: &Path) -> Option<PathBuf> {
+        library.walk_reaches(dest).map(|r| r.root.clone())
     }
 
     /// Most tests here are about WHICH files were found, not what was learned
@@ -1022,6 +1143,153 @@ mod tests {
         assert!(!stats.had_problems(), "the excluded path resolved");
     }
 
+    /// `--exclude` protects bytes, not spellings, and a link is another
+    /// spelling. Under `--follow-symlinks` the walk path goes THROUGH the link
+    /// and shares no component with the folder the exclude resolved to, so the
+    /// prefix test could never fire -- and `remove_file` on that walk path
+    /// unlinks the real file inside the protected folder. `-e keep` with
+    /// `--delete --permanent` destroyed exactly what it was written to save.
+    #[test]
+    fn test_an_exclude_protects_a_file_reached_through_a_symlinked_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let keep = root.join("keep");
+        touch(&keep, "precious.mkv");
+        touch(&keep.join("deep"), "also_precious.mkv");
+        let scan = root.join("scan");
+        let ordinary = touch(&scan, "copy.mkv");
+        std::os::unix::fs::symlink(&keep, scan.join("linkdir")).unwrap();
+
+        let include = vec![scan.to_string_lossy().to_string()];
+        let exclude = vec![keep.to_string_lossy().to_string()];
+        let extensions = extensions_of(&["mkv"]);
+        let mut request = sources(&include, &exclude, &extensions);
+        request.recursive = true;
+        request.follow_symlinks = true;
+        let stats = RunStats::default();
+
+        assert_eq!(collected(&request, &stats), vec![ordinary]);
+        assert!(!stats.had_problems(), "an exclusion is a skip, not a failure");
+        assert_eq!(
+            stats.skipped_excluded.count(),
+            0,
+            "the link itself is refused, so the subtree behind it is pruned \
+             rather than walked and rejected file by file"
+        );
+    }
+
+    /// The other direction, and the reason the first one could not simply be
+    /// worked around: the path the user sees in the report is the link path,
+    /// and `resolve_excludes` canonicalizes that into the real folder. Naming
+    /// either one has to work, and canonicalizing both sides is what makes both
+    /// the same question.
+    #[test]
+    fn test_excluding_the_link_path_works_as_well_as_excluding_the_real_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        touch(&root.join("keep"), "precious.mkv");
+        let scan = root.join("scan");
+        let ordinary = touch(&scan, "copy.mkv");
+        let link = scan.join("linkdir");
+        std::os::unix::fs::symlink(root.join("keep"), &link).unwrap();
+
+        let include = vec![scan.to_string_lossy().to_string()];
+        let exclude = vec![link.to_string_lossy().to_string()];
+        let extensions = extensions_of(&["mkv"]);
+        let mut request = sources(&include, &exclude, &extensions);
+        request.recursive = true;
+        request.follow_symlinks = true;
+        let stats = RunStats::default();
+
+        assert_eq!(collected(&request, &stats), vec![ordinary]);
+        assert!(!stats.had_problems());
+    }
+
+    /// The benign-looking half of the same bug, which is why the check is not
+    /// gated on `--follow-symlinks`: a symlinked FILE is walked by default (the
+    /// stat follows it), so it escaped `-e` too. Removing it only unlinked the
+    /// link, leaving the original intact -- but the run then reported the
+    /// original's bytes as freed, having freed none of them.
+    #[test]
+    fn test_an_exclude_protects_a_file_reached_through_a_symlink_to_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let protected = touch(&root.join("keep"), "precious.mkv");
+        let scan = root.join("scan");
+        let ordinary = touch(&scan, "copy.mkv");
+        std::os::unix::fs::symlink(&protected, scan.join("link.mkv")).unwrap();
+
+        let include = vec![scan.to_string_lossy().to_string()];
+        let exclude = vec![root.join("keep").to_string_lossy().to_string()];
+        let extensions = extensions_of(&["mkv"]);
+        let request = sources(&include, &exclude, &extensions);
+        let stats = RunStats::default();
+
+        assert_eq!(collected(&request, &stats), vec![ordinary]);
+        assert_eq!(stats.skipped_excluded.count(), 1);
+    }
+
+    /// The per-file half of the check, which the pruning above never reaches:
+    /// one file inside a folder that is otherwise fair game. `-e` takes a path
+    /// and a file is one, so sparing a single known original has to work
+    /// through a link as well.
+    #[test]
+    fn test_an_exclude_naming_one_file_reaches_it_through_a_link_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let elsewhere = root.join("elsewhere");
+        let protected = touch(&elsewhere, "precious.mkv");
+        let spare = touch(&elsewhere, "spare.mkv");
+        let scan = root.join("scan");
+        let ordinary = touch(&scan, "copy.mkv");
+        std::os::unix::fs::symlink(&elsewhere, scan.join("linkdir")).unwrap();
+
+        let include = vec![scan.to_string_lossy().to_string()];
+        let exclude = vec![protected];
+        let extensions = extensions_of(&["mkv"]);
+        let mut request = sources(&include, &exclude, &extensions);
+        request.recursive = true;
+        request.follow_symlinks = true;
+        let stats = RunStats::default();
+
+        let mut expected = vec![
+            ordinary,
+            scan.join("linkdir/spare.mkv").to_string_lossy().to_string(),
+        ];
+        expected.sort();
+        assert_eq!(collected(&request, &stats), expected, "{} was found", spare);
+        assert_eq!(stats.skipped_excluded.count(), 1);
+        assert!(!stats.had_problems());
+    }
+
+    /// A link that leads somewhere ordinary is still scanned. The exclusion
+    /// check resolves links; it does not turn them away.
+    #[test]
+    fn test_following_a_link_still_finds_the_videos_beyond_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let elsewhere = root.join("elsewhere");
+        touch(&elsewhere, "beyond.mkv");
+        let scan = root.join("scan");
+        let ordinary = touch(&scan, "copy.mkv");
+        std::os::unix::fs::symlink(&elsewhere, scan.join("linkdir")).unwrap();
+
+        let include = vec![scan.to_string_lossy().to_string()];
+        let exclude = vec![root.join("keep").to_string_lossy().to_string()];
+        let extensions = extensions_of(&["mkv"]);
+        let mut request = sources(&include, &exclude, &extensions);
+        request.recursive = true;
+        request.follow_symlinks = true;
+        let stats = RunStats::default();
+
+        // Walked as `scan/linkdir/beyond.mkv`: the path is the one the walk
+        // used, and only the exclusion test asks where it leads.
+        let mut expected = vec![ordinary, scan.join("linkdir/beyond.mkv").to_string_lossy().to_string()];
+        expected.sort();
+        assert_eq!(collected(&request, &stats), expected);
+        assert_eq!(stats.unresolved_excludes.count(), 1, "the -e path does not exist");
+    }
+
     #[test]
     fn test_the_same_bytes_named_twice_are_queued_once() {
         let dir = tempfile::tempdir().unwrap();
@@ -1103,8 +1371,8 @@ mod tests {
         let stats = RunStats::default();
 
         assert_eq!(
-            library(&request, &stats).walk_reaches(&root.join("dupes")),
-            Some(root.as_path())
+            reaches(&library(&request, &stats), &root.join("dupes")),
+            Some(root.clone())
         );
     }
 
@@ -1123,7 +1391,7 @@ mod tests {
 
         let library = library(&request, &stats);
         assert!(library.files.is_empty());
-        assert_eq!(library.walk_reaches(&root.join("dupes")), Some(root.as_path()));
+        assert_eq!(reaches(&library, &root.join("dupes")), Some(root.clone()));
     }
 
     #[test]
@@ -1140,7 +1408,7 @@ mod tests {
         let request = sources(&include, &[], &extensions);
         let stats = RunStats::default();
 
-        assert!(library(&request, &stats).walk_reaches(&root).is_none());
+        assert!(reaches(&library(&request, &stats), &root).is_none());
     }
 
     /// The refusal tells the user to exclude the destination, so excluding it
@@ -1162,7 +1430,119 @@ mod tests {
         request.recursive = true;
         let stats = RunStats::default();
 
-        assert!(library(&request, &stats).walk_reaches(&dest).is_none());
+        assert!(reaches(&library(&request, &stats), &dest).is_none());
+    }
+
+    /// The guard asks about the roots, and under `--follow-symlinks` the roots
+    /// are not the whole of what the walk reaches. `lib/link -> store` puts
+    /// every file in `store` inside the scan while `store` sits under no root
+    /// the user typed, so `dest.starts_with(root)` was false and the run moved
+    /// its duplicates straight back into its own input -- the next run found
+    /// them under `lib/link/...` and moved them one level deeper.
+    #[test]
+    fn test_a_destination_reachable_only_through_a_symlink_is_still_a_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let lib = root.join("lib");
+        touch(&lib, "a.mkv");
+        let store = root.join("store");
+        fs::create_dir_all(&store).unwrap();
+        std::os::unix::fs::symlink(&store, lib.join("link")).unwrap();
+
+        let include = vec![lib.to_string_lossy().to_string()];
+        let extensions = extensions_of(&["mkv"]);
+        let mut request = sources(&include, &[], &extensions);
+        request.recursive = true;
+        request.follow_symlinks = true;
+        let stats = RunStats::default();
+
+        assert_eq!(
+            reaches(&library(&request, &stats), &store),
+            Some(store.clone()),
+            "reached through the link, so a moved file comes back"
+        );
+
+        // And the refusal names the link, which is the only path the user can
+        // go and do anything about. Built on the target alone it read "store is
+        // inside store, which this run scans".
+        let library = library(&request, &stats);
+        let said = library.walk_reaches(&store).unwrap().to_string();
+        assert!(
+            said.contains(&lib.join("link").to_string_lossy().to_string()),
+            "{}",
+            said
+        );
+    }
+
+    /// The destination one level inside the link's target is the same loop:
+    /// the landing paths are under it either way.
+    #[test]
+    fn test_a_destination_under_a_symlinked_folder_is_a_loop_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let lib = root.join("lib");
+        touch(&lib, "a.mkv");
+        let store = root.join("store");
+        fs::create_dir_all(store.join("dupes")).unwrap();
+        std::os::unix::fs::symlink(&store, lib.join("link")).unwrap();
+
+        let include = vec![lib.to_string_lossy().to_string()];
+        let extensions = extensions_of(&["mkv"]);
+        let mut request = sources(&include, &[], &extensions);
+        request.recursive = true;
+        request.follow_symlinks = true;
+        let stats = RunStats::default();
+
+        assert_eq!(
+            reaches(&library(&request, &stats), &store.join("dupes")),
+            Some(store.clone())
+        );
+    }
+
+    /// Without the flag the walk does not go through the link, so the
+    /// destination really is outside the library and the move really does get
+    /// the file out of it. The guard must not refuse this.
+    #[test]
+    fn test_the_same_destination_is_fine_when_links_are_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let lib = root.join("lib");
+        touch(&lib, "a.mkv");
+        let store = root.join("store");
+        fs::create_dir_all(&store).unwrap();
+        std::os::unix::fs::symlink(&store, lib.join("link")).unwrap();
+
+        let include = vec![lib.to_string_lossy().to_string()];
+        let extensions = extensions_of(&["mkv"]);
+        let mut request = sources(&include, &[], &extensions);
+        request.recursive = true;
+        let stats = RunStats::default();
+
+        assert!(reaches(&library(&request, &stats), &store).is_none());
+    }
+
+    /// Excluding the destination is still the way out, and it has to keep
+    /// working when the route to it is a link: the excluded folder is pruned,
+    /// so it is not one of the places this walk reaches.
+    #[test]
+    fn test_excluding_a_symlinked_destination_is_still_the_way_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let lib = root.join("lib");
+        touch(&lib, "a.mkv");
+        let store = root.join("store");
+        fs::create_dir_all(&store).unwrap();
+        std::os::unix::fs::symlink(&store, lib.join("link")).unwrap();
+
+        let include = vec![lib.to_string_lossy().to_string()];
+        let exclude = vec![store.to_string_lossy().to_string()];
+        let extensions = extensions_of(&["mkv"]);
+        let mut request = sources(&include, &exclude, &extensions);
+        request.recursive = true;
+        request.follow_symlinks = true;
+        let stats = RunStats::default();
+
+        assert!(reaches(&library(&request, &stats), &store).is_none());
     }
 
     /// A named file is scanned, not walked, so nothing can be re-ingested from
@@ -1178,7 +1558,7 @@ mod tests {
         let request = sources(&include, &[], &extensions);
         let stats = RunStats::default();
 
-        assert!(library(&request, &stats).walk_reaches(&root.join("dupes")).is_none());
+        assert!(reaches(&library(&request, &stats), &root.join("dupes")).is_none());
     }
 
     #[test]
