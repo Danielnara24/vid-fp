@@ -649,17 +649,32 @@ pub fn output_results(
         .collect::<HashSet<usize>>()
         .len();
 
-    let mut txt_out = String::new();
-    // Whether the JSON tree is worth building at all.
+    // Which of the three report bodies this run is actually going to write.
     //
-    // It was always built and then thrown away on a run that asked for text or
-    // CSV, which was a small waste while every file contributed a fixed handful
-    // of fields. The per-link list below is not fixed -- it is one object per
-    // pair, so a group of `g` members contributes `g * (g - 1)` of them, and on
-    // a library with one big group that is the largest allocation in the report.
-    // Nobody should pay it to write a .txt.
-    let wants_json = report_target.is_some_and(|t| t.format == Format::Json);
+    // At most one of them is, and the other two used to be built in full and
+    // thrown away. The JSON tree was gated for exactly that reason and the
+    // other two were left ungated, which is the more expensive half: the text
+    // body is the whole listing accumulated in a `String` and the CSV is the
+    // whole listing again through a serializer, so a run writing JSON built
+    // both, and a run writing NO report at all still built both. Measured at
+    // `-d 18` on the local corpus (9,003 groups, a 31 MB CSV and a 17 MB txt),
+    // peak RSS: report-only 66 -> 18 MB, `-o x.csv` 67 -> 50 MB. Every format
+    // comes out byte-identical either way -- what is gone is the two copies of
+    // the report nobody asked for.
+    //
+    // The console listing is a separate question, answered by `console_for`: a
+    // run with no `--output` prints the listing to the terminal and builds no
+    // body at all, which is why the text line below is built when EITHER wants
+    // it and pushed only when the report does.
+    //
+    // The per-link JSON list is the one that scales worst -- one object per
+    // pair, so a group of `g` members contributes `g * (g - 1)` of them.
+    let format = report_target.map(|t| t.format);
+    let wants_txt = format == Some(Format::Txt);
+    let wants_csv = format == Some(Format::Csv);
+    let wants_json = format == Some(Format::Json);
 
+    let mut txt_out = String::new();
     let mut json_out_groups = Vec::new();
 
     // Use csv crate for robust and RFC-compliant CSV generation
@@ -711,33 +726,35 @@ pub fn output_results(
     // `framerate` is the one figure with no formatted twin, by request: the
     // formatted form is still on the console line, where a human reads it, and
     // the reports keep only `framerate_fps` to sort on.
-    csv_wtr
-        .write_record([
-            "group",
-            "action",
-            "full_path",
-            "length",
-            "length_seconds",
-            "resolution",
-            "width",
-            "height",
-            "framerate_fps",
-            "codec",
-            "size",
-            "size_bytes",
-            "bitrate",
-            "bitrate_bps",
-            "quality",
-            "quality_bits_per_frame",
-            "matched_with",
-            "samples",
-            "matched_seconds",
-            "matched_from",
-            "matched_to",
-            "matched_from_seconds",
-            "matched_to_seconds",
-        ])
-        .context("Failed to write CSV header")?;
+    if wants_csv {
+        csv_wtr
+            .write_record([
+                "group",
+                "action",
+                "full_path",
+                "length",
+                "length_seconds",
+                "resolution",
+                "width",
+                "height",
+                "framerate_fps",
+                "codec",
+                "size",
+                "size_bytes",
+                "bitrate",
+                "bitrate_bps",
+                "quality",
+                "quality_bits_per_frame",
+                "matched_with",
+                "samples",
+                "matched_seconds",
+                "matched_from",
+                "matched_to",
+                "matched_from_seconds",
+                "matched_to_seconds",
+            ])
+            .context("Failed to write CSV header")?;
+    }
 
     for (i, group) in final_groups.iter().enumerate() {
         let group_name = format!("group_{}", i + 1);
@@ -745,7 +762,9 @@ pub fn output_results(
         if show_listing {
             info!("{}:", group_name);
         }
-        txt_out.push_str(&format!("{}:\n", group_name));
+        if wants_txt {
+            txt_out.push_str(&format!("{}:\n", group_name));
+        }
 
         let mut json_files = Vec::new();
 
@@ -883,52 +902,62 @@ pub fn output_results(
             // reader having to know which end of the pair it was measured from.
             // The frame rate, the sample count and the bits-per-frame figure
             // carry their units for the same reason.
-            let line = format!(
-                "\t{:<8} {}, {}, {}, {}, {}, {}, {}, {} samples, {} matched, {}",
-                format!("{},", action_str),
-                duration_str,
-                res_str,
-                frame_rate_str,
-                codec_str,
-                size_str,
-                bitrate_str,
-                quality_str,
-                samples_raw,
-                matched_str,
-                fp.path
-            );
-            if show_listing {
-                info!("{}", line);
+            //
+            // Built when either the terminal or a .txt report is going to read
+            // it, and not otherwise: on a CSV or JSON run this line is the one
+            // piece of the text body that is neither shown nor saved.
+            if show_listing || wants_txt {
+                let line = format!(
+                    "\t{:<8} {}, {}, {}, {}, {}, {}, {}, {} samples, {} matched, {}",
+                    format!("{},", action_str),
+                    duration_str,
+                    res_str,
+                    frame_rate_str,
+                    codec_str,
+                    size_str,
+                    bitrate_str,
+                    quality_str,
+                    samples_raw,
+                    matched_str,
+                    fp.path
+                );
+                if show_listing {
+                    info!("{}", line);
+                }
+                if wants_txt {
+                    txt_out.push_str(&line);
+                    txt_out.push('\n');
+                }
             }
-            txt_out.push_str(&line);
-            txt_out.push('\n');
 
             // 2. CSV Output
-            csv_wtr.write_record([
-                &group_name,
-                action_str,
-                &fp.path,
-                &duration_str,
-                &length_seconds_raw,
-                &res_str,
-                &width_raw,
-                &height_raw,
-                &frame_rate_raw,
-                &codec_str,
-                &size_str,
-                &size_bytes_raw,
-                &bitrate_str,
-                &bitrate_bps_raw,
-                &quality_str,
-                &quality_raw,
-                &matched_with_raw,
-                &samples_raw,
-                &matched_seconds_raw,
-                &matched_from_str,
-                &matched_to_str,
-                &matched_from_raw,
-                &matched_to_raw,
-            ]).context("Failed to write CSV record")?;
+            if wants_csv {
+                csv_wtr.write_record([
+                    &group_name,
+                    action_str,
+                    &fp.path,
+                    &duration_str,
+                    &length_seconds_raw,
+                    &res_str,
+                    &width_raw,
+                    &height_raw,
+                    &frame_rate_raw,
+                    &codec_str,
+                    &size_str,
+                    &size_bytes_raw,
+                    &bitrate_str,
+                    &bitrate_bps_raw,
+                    &quality_str,
+                    &quality_raw,
+                    &matched_with_raw,
+                    &samples_raw,
+                    &matched_seconds_raw,
+                    &matched_from_str,
+                    &matched_to_str,
+                    &matched_from_raw,
+                    &matched_to_raw,
+                ]).context("Failed to write CSV record")?;
+            }
 
             // 3. JSON File Output
             //
@@ -994,7 +1023,9 @@ pub fn output_results(
         if show_listing {
             info!(""); // Empty line for spacing
         }
-        txt_out.push('\n');
+        if wants_txt {
+            txt_out.push('\n');
+        }
 
         if wants_json {
             json_out_groups.push(serde_json::json!({
@@ -2373,6 +2404,55 @@ matched_from_seconds;matched_to_seconds";
         );
 
         let _ = fs::remove_file(path_str);
+    }
+
+    /// Each report body is now built only when it is the one being written, and
+    /// this is what keeps that from quietly writing an empty file.
+    ///
+    /// The saving itself is not observable from out here -- a run writes the
+    /// same bytes either way, and what changed is the two bodies it no longer
+    /// builds on the way -- so what is testable is the half that could break:
+    /// every format still says everything it said. The text one had no test at
+    /// all before, which is exactly the body a gating mistake would empty.
+    #[test]
+    fn test_each_format_still_carries_its_whole_body_now_that_only_one_is_built() {
+        let fps = vec![mock_fp_at("/fake/keep.mkv", 60.0), mock_fp_at("/fake/dupe.mkv", 10.0)];
+        let groups = vec![vec![0, 1]];
+
+        let write = |extension: &str| {
+            let path_str = report_to(extension);
+            output_results(
+                &groups, &fps, &all_compared(fps.len()), Some(&to_file(&path_str)), 3661,
+                Priority::Length, None, true, &RunStats::default(),
+            ).unwrap();
+            let contents = fs::read_to_string(&path_str).unwrap();
+            let _ = fs::remove_file(&path_str);
+            contents
+        };
+
+        // The text body is the listing plus the summary, and both halves of it
+        // are accumulated inside the per-group loop the gate now sits in.
+        let txt = write("txt");
+        assert!(txt.contains("group_1:"), "{}", txt);
+        assert!(txt.contains("/fake/keep.mkv"), "{}", txt);
+        assert!(txt.contains("/fake/dupe.mkv"), "{}", txt);
+        assert!(txt.contains("KEEP"), "{}", txt);
+        assert!(txt.contains("DELETE"), "{}", txt);
+        assert!(txt.contains("Total groups found: 1"), "{}", txt);
+        assert!(txt.contains("Total time elapsed: 01:01:01"), "{}", txt);
+
+        // The CSV is the header and a row per file, both behind the same gate.
+        let csv = write("csv");
+        assert!(csv.contains(CSV_HEADER), "{}", csv);
+        assert_eq!(csv.lines().count(), 3, "header and one row per file: {}", csv);
+        assert!(csv.contains(";KEEP;/fake/keep.mkv;"), "{}", csv);
+        assert!(csv.contains(";DELETE;/fake/dupe.mkv;"), "{}", csv);
+
+        // And the JSON, whose gate is the one that was already here.
+        let json: serde_json::Value = serde_json::from_str(&write("json")).unwrap();
+        assert_eq!(json["summary"]["total_groups"], 1);
+        assert_eq!(json["results"][0]["files"].as_array().unwrap().len(), 2);
+        assert_eq!(json["results"][0]["files"][0]["full_path"], "/fake/keep.mkv");
     }
 
     #[test]
