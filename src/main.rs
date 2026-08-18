@@ -263,14 +263,14 @@ impl Stamp {
         self.mtime == other.mtime
             && self.mtime_nsec == other.mtime_nsec
             && self.size == other.size
-            && same_setting(self.kf_interval, other.kf_interval)
+            && same_sampling(self.kf_interval, other.kf_interval)
             // `--min-keyframes` is a FLOOR on the sampling interval, and with no
             // interval in force there is nothing for it to floor -- see
             // `effective_interval`, which requires a real interval before it
             // reads this at all. Comparing it regardless threw away a whole
             // library's fingerprints for a flag that provably changed not one
-            // frame. The two intervals are already known equal here, so testing
-            // either side's is the same test.
+            // frame. Either both intervals are known equal by here or both are
+            // off, so testing either side's flag is the same test.
             && (!sampling_is_on(other.kf_interval)
                 || same_setting(self.min_kf_samples, other.min_kf_samples))
     }
@@ -278,6 +278,27 @@ impl Stamp {
 
 fn same_setting(a: f64, b: f64) -> bool {
     a == b || (a.is_nan() && b.is_nan())
+}
+
+/// Whether two runs sample keyframes the same way.
+///
+/// The interval is not a number the decode reads, it is a number the decode
+/// asks a question of: `effective_interval` is `kf_interval > 0.0`, so EVERY
+/// value that fails that test -- 0.0, any negative, NaN -- decodes every
+/// keyframe and produces bit-identical fingerprints. Comparing the figures
+/// instead of the answers made `--keyframe-interval=-5` a different setting
+/// from the default, and the miss overwrites the entry it missed, so the next
+/// default run missed too: alternating the two re-decoded the whole library
+/// every time, twice over, for a flag that provably changed not one frame.
+/// Same class of bug as the one `--min-keyframes` used to cause below, and the
+/// same fix -- ask the predicate the decode asks.
+fn same_sampling(a: f64, b: f64) -> bool {
+    if !sampling_is_on(a) && !sampling_is_on(b) {
+        // Both mean "decode every keyframe". Nothing downstream can tell them
+        // apart, so neither may invalidate the other's entry.
+        return true;
+    }
+    same_setting(a, b)
 }
 
 /// Whether keyframe subsampling actually happens at this interval.
@@ -3318,6 +3339,43 @@ mod tests {
         };
 
         assert!(nonsense.matches(&nonsense), "an entry must be able to match itself");
+    }
+
+    #[test]
+    fn test_every_interval_that_samples_nothing_is_the_same_setting() {
+        // `effective_interval` is gated on `kf_interval > 0.0`, so 0.0, a
+        // negative and NaN all decode every keyframe and cannot be told apart
+        // from the fingerprint they produce. Comparing the figures made them
+        // three settings: `--keyframe-interval=-5` missed against a default
+        // entry, overwrote it, and the next default run missed in turn, so
+        // alternating them never hit the cache at all.
+        let base = stamp(1_700_000_000, 12_345); // kf_interval 0.0, the default
+        let negative = Stamp { kf_interval: -5.0, ..base };
+        let other_negative = Stamp { kf_interval: -0.5, ..base };
+        let nonsense = Stamp { kf_interval: f64::NAN, ..base };
+
+        for off in [negative, other_negative, nonsense] {
+            assert!(base.matches(&off), "sampling is off either way; the entry stands");
+            assert!(off.matches(&base), "and it stands in the other direction too");
+        }
+        assert!(negative.matches(&nonsense), "two ways of spelling the same non-setting");
+
+        // A real interval is still a real change, in both directions.
+        let sampled = Stamp { kf_interval: 5.0, ..base };
+        assert!(!negative.matches(&sampled));
+        assert!(!sampled.matches(&negative));
+        assert!(!nonsense.matches(&sampled), "NaN is off, 5.0 is not");
+        assert!(!sampled.matches(&nonsense));
+    }
+
+    #[test]
+    fn test_min_keyframes_still_decides_nothing_beside_an_interval_that_is_off() {
+        // The two guards have to agree about what "off" means, or the wrong
+        // one of them starts comparing a flag the decode never reads.
+        let negative = Stamp { kf_interval: -5.0, ..stamp(1_700_000_000, 12_345) };
+        let fewer = Stamp { min_kf_samples: 2.0, ..negative };
+
+        assert!(negative.matches(&fewer), "no interval to floor, so this floors nothing");
     }
 
     fn mock_fp(path: &str) -> VideoFingerprint {
