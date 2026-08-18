@@ -521,6 +521,18 @@ while an interval is in force, `--min-keyframes`. The comparison flags (`-d`,
 `-p`, `--min-duration`) are applied to cached fingerprints and never invalidate
 them, so re-running a scan at a different tolerance is instant.
 
+### Images and text files
+
+FFmpeg opens more than video, so under `-x '*'` images are fingerprinted as a
+one-frame video and `.txt` as an ANSI terminal rendering at 640x400. The
+resolution, fps and duration on those rows are FFmpeg's defaults for the
+format, not properties of the file.
+
+On images this is an ordinary perceptual image hash and works. On text it
+compares a picture of the text at 16x16, a layout signature rather than the
+words, so those groups are mostly noise. A one-frame file also reads as 0% or
+100% covered, so `-p` cannot gate it. `--min-duration 1` drops these matches.
+
 ## Exit codes
 
 | Code | Meaning |
