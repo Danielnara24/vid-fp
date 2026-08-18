@@ -225,6 +225,7 @@ pub fn dispose_one(
     // decision being acted on may be hours or days old.
     if let Some(detail) = changed_since(path, measured_size) {
         log::error!(
+            target: crate::stats::COUNTED,
             "Not removing {}: it changed on disk after it was scanned",
             path
         );
@@ -235,7 +236,7 @@ pub fn dispose_one(
     match dispose_of(path, disposal) {
         Ok(()) => Fate::Done,
         Err(e) => {
-            log::error!("{:#}", e);
+            log::error!(target: crate::stats::COUNTED, "{:#}", e);
             stats.delete_failed.record(path.to_string());
             Fate::Failed
         }
@@ -1154,7 +1155,7 @@ pub fn output_results(
                 }
             }
             Err(e) => {
-                log::error!("{:#}", e);
+                log::error!(target: crate::stats::COUNTED, "{:#}", e);
                 stats.report_write_failed.record(format!("{:#}", e));
             }
         }

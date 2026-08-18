@@ -119,7 +119,7 @@ impl ScannedFile {
 /// way, because the file is equally unreachable however it was reached.
 fn record_undecodable(path: &Path, stats: &RunStats) {
     let shown = path.to_string_lossy();
-    log::error!("Filename is not valid UTF-8 and was skipped: {}", shown);
+    log::error!(target: crate::stats::COUNTED, "Filename is not valid UTF-8 and was skipped: {}", shown);
     stats
         .unreadable
         .record(format!("{}: filename is not valid UTF-8", shown));
@@ -136,6 +136,18 @@ fn record_undecodable(path: &Path, stats: &RunStats) {
 /// was empty) is still a folder a moved file would be found in tomorrow.
 pub struct Library {
     pub files: Vec<ScannedFile>,
+    /// What the walk was willing to pick up, which is the only thing that makes
+    /// the count sayable. Every other setting of `--extensions` means a walk
+    /// turned away everything not named like a video, so what came back are
+    /// video files; under `-x '*'` there was no filter at all and they are
+    /// simply files. Saying "video files" there is how a scan of a home
+    /// directory announced "Found 229112 video files" and then spent the run
+    /// failing to decode 229 thousand of them.
+    ///
+    /// A named path is never filtered (see the module doc), so this describes
+    /// the walk and not every route in. That is the one it is asked about: a
+    /// user who typed a path knows what they typed.
+    pub any_extension: bool,
     /// The folders the walk reached, canonicalized. Two kinds of entry: a
     /// folder the user pointed at, and -- under `--follow-symlinks` -- the
     /// TARGET of every directory symlink the walk descended through. A path
@@ -285,7 +297,7 @@ pub fn collect(sources: &Sources, stats: &RunStats) -> Result<Scan> {
         let resolved = match std::fs::canonicalize(path) {
             Ok(p) => p,
             Err(e) => {
-                log::error!("Could not resolve '{}': {}", path, e);
+                log::error!(target: crate::stats::COUNTED, "Could not resolve '{}': {}", path, e);
                 stats.unresolved_includes.record(format!("{}: {}", path, e));
                 continue;
             }
@@ -300,7 +312,7 @@ pub fn collect(sources: &Sources, stats: &RunStats) -> Result<Scan> {
         let meta = match std::fs::metadata(&resolved) {
             Ok(m) => m,
             Err(e) => {
-                log::error!("Cannot stat {}: {}", resolved.display(), e);
+                log::error!(target: crate::stats::COUNTED, "Cannot stat {}: {}", resolved.display(), e);
                 stats
                     .unreadable
                     .record(format!("{}: {}", resolved.display(), e));
@@ -344,7 +356,7 @@ pub fn collect(sources: &Sources, stats: &RunStats) -> Result<Scan> {
         } else {
             // A socket, fifo, or device node. Naming one is a mistake worth
             // hearing about rather than a file worth trying to decode.
-            log::error!("Not a file or folder: {}", resolved.display());
+            log::error!(target: crate::stats::COUNTED, "Not a file or folder: {}", resolved.display());
             stats
                 .unresolved_includes
                 .record(format!("{}: not a file or folder", resolved.display()));
@@ -353,6 +365,7 @@ pub fn collect(sources: &Sources, stats: &RunStats) -> Result<Scan> {
 
     Ok(Scan::Complete(Library {
         files: into.found,
+        any_extension: matches!(extensions, Wanted::Anything),
         walked: into.walked,
         excluded: excludes,
     }))
@@ -415,7 +428,7 @@ fn walk_folder(
                     .path()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| base.display().to_string());
-                log::error!("Cannot scan {}: {}", at, e);
+                log::error!(target: crate::stats::COUNTED, "Cannot scan {}: {}", at, e);
                 stats.unwalkable.record(format!("{}: {}", at, e));
                 continue;
             }
@@ -471,7 +484,7 @@ fn walk_folder(
         let meta = match std::fs::metadata(path) {
             Ok(m) => m,
             Err(e) => {
-                log::error!("Cannot stat {}: {}", path.display(), e);
+                log::error!(target: crate::stats::COUNTED, "Cannot stat {}: {}", path.display(), e);
                 stats
                     .unreadable
                     .record(format!("{}: {}", path.display(), e));
@@ -575,7 +588,7 @@ fn read_path_list<R: Read>(
             Ok(path) => paths.push(path.to_string()),
             Err(e) => {
                 let shown = String::from_utf8_lossy(entry).into_owned();
-                log::error!("Path is not valid UTF-8 and was skipped: {}", shown);
+                log::error!(target: crate::stats::COUNTED, "Path is not valid UTF-8 and was skipped: {}", shown);
                 stats.unreadable.record(format!("{}: {}", shown, e));
             }
         }
@@ -680,6 +693,7 @@ fn resolve_excludes(requested: &[String], stats: &RunStats) -> Vec<PathBuf> {
             Ok(resolved) => excludes.push(resolved),
             Err(e) => {
                 log::error!(
+                    target: crate::stats::COUNTED,
                     "Could not resolve exclude path '{}': {} -- nothing was excluded for it",
                     p,
                     e
@@ -784,6 +798,25 @@ mod tests {
 
     fn scanned(sources: &Sources, stats: &RunStats) -> Vec<ScannedFile> {
         library(sources, stats).files
+    }
+
+    /// The walk's own answer to "are these video files, or just files", which is
+    /// the only thing that entitles the run to call them either.
+    #[test]
+    fn test_a_wildcard_walk_says_it_filtered_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "clip.mkv");
+        touch(dir.path(), "notes.txt");
+        let include = vec![dir.path().to_string_lossy().to_string()];
+        let stats = RunStats::default();
+
+        let wild = library(&sources(&include, &[], &["*".to_string()]), &stats);
+        assert!(wild.any_extension);
+        assert_eq!(wild.files.len(), 2, "the text file is a candidate under -x '*'");
+
+        let named = library(&sources(&include, &[], &["mkv".to_string()]), &stats);
+        assert!(!named.any_extension);
+        assert_eq!(named.files.len(), 1, "and is not one otherwise");
     }
 
     /// The folder a file moved to `dest` would be found in again, if any.

@@ -54,6 +54,18 @@ const KEEP: usize = 8;
 /// at risk of being dropped.
 const MIN_AC_ENERGY: f32 = 8.0;
 
+/// How many times in a row the demuxer may fail before the file is treated as
+/// finished.
+///
+/// The backstop for a demuxer that errors forever without ever reaching EOF --
+/// `input_is_spent` covers the far commoner case where it has, and mis-reports
+/// it. Generous on purpose: a real file that stumbles this many times CONSECUTIVELY,
+/// with not one packet in between, is damaged past the point where the tail of
+/// its keyframes would be worth having. Each iteration is one failed read, so
+/// even the full count costs milliseconds.
+const MAX_CONSECUTIVE_DEMUX_ERRORS: u32 = 1024;
+
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct VideoFingerprint {
     pub path: String,
@@ -439,6 +451,175 @@ fn frame_rate_of(stream: &ffmpeg_next::format::stream::Stream<'_>, duration_sec:
     frame_rate
 }
 
+
+/// The probe gate's verdict: nothing in this file looks like any format
+/// libavformat knows.
+///
+/// A type rather than a string because two callers need to RECOGNISE it, not
+/// just print it. `main` remembers this verdict in the cache and no other, since
+/// it is the only failure that is purely a function of bytes the run has already
+/// read -- a permission error or a vanished file is about the moment, not the
+/// file, and must be re-asked every run. Both fields are kept so the sentence
+/// can be regenerated from the cache instead of stored in it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct NotMedia {
+    /// How much of the file was read before giving up: `FIRST_PROBE_BYTES`, or
+    /// `SECOND_PROBE_BYTES` when the name earned a second look.
+    pub bytes: usize,
+    /// What the best guess scored. At most `NO_EVIDENCE`, or this would not exist.
+    pub score: i32,
+}
+
+impl std::fmt::Display for NotMedia {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no demuxer recognised the first {} bytes of this file (the best guess scored {} of \
+             {}, which libavformat treats as no evidence)",
+            self.bytes,
+            self.score,
+            ffmpeg_next::ffi::AVPROBE_SCORE_MAX
+        )
+    }
+}
+
+impl std::error::Error for NotMedia {}
+
+/// Errnos that describe the RUN rather than the file: the machine, the mount,
+/// the permissions, this process's file descriptors. Every one of them can be
+/// different next run with the bytes completely unchanged, which is exactly what
+/// makes a refusal built on one unsafe to remember.
+///
+/// A list rather than "anything with an errno", which is what this started as
+/// and which was wrong in a way only the corpus showed: `AVERROR(EINVAL)` is
+/// how libavformat reports plenty of ordinary content problems, and 746 files in
+/// a home directory fail that way. Treating them as environmental meant
+/// re-opening and re-decoding all 746 on every single run -- the exact cost the
+/// cache exists to remove. EINVAL is deliberately absent, and so is every other
+/// errno not written here: the default is that a failure is about the file.
+const ENVIRONMENTAL: &[i32] = &[
+    libc::EPERM,
+    libc::ENOENT,
+    libc::EINTR,
+    libc::EIO,
+    libc::ENXIO,
+    libc::EBADF,
+    libc::EAGAIN,
+    libc::ENOMEM,
+    libc::EACCES,
+    libc::EBUSY,
+    libc::ENODEV,
+    libc::ENFILE,
+    libc::EMFILE,
+    libc::ENOSPC,
+    libc::EROFS,
+    libc::ELOOP,
+    libc::ETIMEDOUT,
+    libc::ECONNREFUSED,
+    libc::EHOSTUNREACH,
+    libc::ENETUNREACH,
+    libc::ESTALE,
+];
+
+/// Whether a failure is about the MOMENT rather than about the file.
+///
+/// A permission that will be granted tomorrow, a file that vanished mid-scan, a
+/// network mount that dropped: asking again next run can legitimately give a
+/// different answer, so nothing about these may be remembered. Everything else
+/// here -- no demuxer recognised it, the streams would not parse, there is no
+/// video stream, no frame decoded, no decoder for this codec -- is a statement
+/// about bytes the `Stamp` already guards, and asking again costs the same work
+/// for the same answer.
+///
+/// The test is the error's TYPE and errno, never its text. `ffmpeg_next::Error`
+/// maps every AVERROR it knows to a named variant (`InvalidData`, `Eof`,
+/// `DecoderNotFound`, ...) and everything else -- the `AVERROR(errno)` family --
+/// to `Other`, so an OS error arriving through libavformat is as visible as one
+/// arriving through `std::io`. Only the errnos in `ENVIRONMENTAL` count.
+pub fn is_transient(error: &anyhow::Error) -> bool {
+    error.chain().any(|link| {
+        if let Some(ffmpeg_next::Error::Other { errno }) = link.downcast_ref::<ffmpeg_next::Error>()
+        {
+            return ENVIRONMENTAL.contains(errno);
+        }
+        // An io::Error with no errno behind it (an EOF, a timeout the runtime
+        // synthesised) is treated as environmental: unlike the FFmpeg side,
+        // nothing in this pipeline raises one to describe a file's contents.
+        if let Some(io) = link.downcast_ref::<std::io::Error>() {
+            return io.raw_os_error().is_none_or(|errno| ENVIRONMENTAL.contains(&errno));
+        }
+        false
+    })
+}
+
+/// The probe gate's verdict, if that is what this error is.
+///
+/// Walks the chain rather than testing the outermost error, because every route
+/// here wraps it in context first ("Failed to open video file: ...").
+pub fn not_media(error: &anyhow::Error) -> Option<NotMedia> {
+    error.chain().find_map(|link| link.downcast_ref::<NotMedia>().copied())
+}
+
+/// How much of a file libavformat is given to say what format it is, before this
+/// tool concludes there is nothing there.
+///
+/// `PROBE_BUF_MIN`: the size of the FIRST pass `av_probe_input_buffer2` runs, so
+/// asking at this size adds no question of our own. It reads the answer
+/// libavformat is about to compute anyway, and only decides whether to let it
+/// carry on computing.
+///
+/// What carrying on costs is the escalation: that function doubles its buffer --
+/// 2 KB, 4 KB, ... to 1 MB -- for as long as nothing has scored above
+/// `AVPROBE_SCORE_RETRY`, re-running all ~300 demuxer probes at every step. For
+/// a file that is not media that loop always runs to the end. Measured over the
+/// 248k files of a home directory: 0.5 ms for a 4 KB file, 24 ms at 64 KB,
+/// 130 ms at 512 KB, flat at ~140 ms above 1 MB. It was 2,042 s of the 2,099 s
+/// such a scan spent weighing -- 97% of the pass, spent proving a negative about
+/// object files.
+const FIRST_PROBE_BYTES: usize = 2048;
+
+/// How much is read before turning away a file that showed a whisper of a
+/// signal.
+///
+/// A score of exactly 1 is not a weak opinion, it is libavformat's way of
+/// spelling "no opinion": `av_probe_input_format3` floors the score of any
+/// demuxer whose extension list matches the NAME at 1 whatever the bytes said,
+/// and `mp3_probe` returns 1 for a single frame sync anywhere in the buffer.
+/// Both are usually noise -- 16,652 files in that home directory score exactly 1
+/// at 2 KB, nearly all of them `.o` files with one accidental sync, and a bigger
+/// buffer takes the score back to 0 (mp3 wants `max_frames >= buf_size/10000`,
+/// which one stray sync stops satisfying as the buffer grows). Escalating them
+/// to 1 MB costs 20 ms each to disprove a signal that was never there.
+///
+/// But it is not ALWAYS noise, and that is what this second size is for. A real
+/// 11.8 MB MP3 in the same corpus scores 1 at 2 KB, 25 at 4 KB and 51 from 8 KB
+/// on, because its first frames sit behind an ID3 tag; turning it away on the
+/// 2 KB reading alone was wrong, even though nothing downstream would have
+/// fingerprinted it. 16 KB is chosen with room to spare: across those 248k
+/// files, every file a full 1 MB probe ever identified with a real score is
+/// already identified by 16 KB except eight, and all eight are `.o` or
+/// `query-cache.bin` that a big buffer briefly reads as `mpegvideo` -- a score
+/// that oscillates 51, then 0, as the buffer grows again.
+const SECOND_PROBE_BYTES: usize = 16384;
+
+/// The score libavformat assigns when it has nothing: see `SECOND_PROBE_BYTES`.
+/// A file has to beat this, at one size or the other, to be worth opening.
+///
+/// The safety property that makes this hard to get wrong: a match on the file's
+/// EXTENSION alone scores 1, so any file named like media -- `.mp4`, `.mkv`,
+/// `.mp3`, anything at all that some demuxer claims -- is guaranteed to reach
+/// the second look rather than being turned away at 2 KB. Only a file whose name
+/// tells nothing AND whose first bytes match nothing is refused outright, which
+/// on that corpus is 205,014 of 229,144 files. Of the 3,404 that a full-budget
+/// probe went on to identify with a real score, 40 fall below this line: 39 are
+/// object files and build caches, and the fortieth is that MP3, which the second
+/// look recovers. Every one of the 735 real videos in the two test corpora
+/// scores 98 or 100 at 2 KB -- the margin is not a few points, it is the scale.
+const NO_EVIDENCE: i32 = 1;
+
+/// The zeroed tail every `read_probe` implementation is allowed to read into.
+const AVPROBE_PADDING_SIZE: usize = 32;
+
 /// Open the container WITHOUT probing it.
 ///
 /// `ffmpeg_next::format::input` is `avformat_open_input` followed by
@@ -452,7 +633,14 @@ fn frame_rate_of(stream: &ffmpeg_next::format::stream::Stream<'_>, duration_sec:
 /// audio decoder, and a re-read of the head of the file, per file, per run.
 fn open_input(filepath: &str) -> Result<ffmpeg_next::format::context::Input> {
     let path = std::ffi::CString::new(filepath)
-        .map_err(|_| anyhow!("Path contains an interior NUL byte: {}", filepath))?;
+        .map_err(|_| anyhow!("the path contains an interior NUL byte"))?;
+
+    // Ask libavformat's own first probe pass what this file looks like, and stop
+    // here if the answer is "nothing". See `first_probe_score` for why that is
+    // both safe and the single biggest cost in a `-x '*'` run.
+    if let Some((bytes, score)) = unrecognised(filepath) {
+        return Err(anyhow!(NotMedia { bytes, score }));
+    }
 
     unsafe {
         let mut ps: *mut ffmpeg_next::ffi::AVFormatContext = std::ptr::null_mut();
@@ -466,6 +654,133 @@ fn open_input(filepath: &str) -> Result<ffmpeg_next::format::context::Input> {
             e => Err(anyhow!(ffmpeg_next::Error::from(e))),
         }
     }
+}
+
+/// How much of a file was read before concluding it is not media, and what the
+/// best guess scored -- or `None` if it IS worth opening.
+///
+/// Two sizes rather than one, because the cheap answer is right about 90% of a
+/// home directory and wrong about a real MP3. See `FIRST_PROBE_BYTES` and
+/// `SECOND_PROBE_BYTES`.
+///
+/// A file that cannot be read here is never a verdict: it is handed to
+/// `avformat_open_input` anyway, so the user gets the real error ("No such file
+/// or directory", "Permission denied") rather than this function's opinion of a
+/// file it never saw.
+fn unrecognised(filepath: &str) -> Option<(usize, i32)> {
+    let mut buf = read_head(filepath, SECOND_PROBE_BYTES)?;
+
+    // The name is part of the question: `av_probe_input_format3` floors the score
+    // of any demuxer whose extension list matches it at 1, whatever the bytes
+    // say. That is the whole reason the second look exists -- and also why no
+    // file named like media can ever be turned away by the first one.
+    let cname = std::ffi::CString::new(filepath).ok()?;
+
+    let first = probe_head(&mut buf, FIRST_PROBE_BYTES, &cname);
+    if first > NO_EVIDENCE {
+        return None;
+    }
+    if first == 0 {
+        return Some((FIRST_PROBE_BYTES, first));
+    }
+
+    let second = probe_head(&mut buf, SECOND_PROBE_BYTES, &cname);
+    if second > NO_EVIDENCE {
+        return None;
+    }
+    Some((SECOND_PROBE_BYTES, second))
+}
+
+/// The first `want` bytes of a file, in a buffer with libavformat's probe
+/// padding on the end -- the zeroed tail every `read_probe` is allowed to read
+/// into. Short files come back short; the padding is still there.
+fn read_head(filepath: &str, want: usize) -> Option<Vec<u8>> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(filepath).ok()?;
+    let mut buf = vec![0u8; want + AVPROBE_PADDING_SIZE];
+    let mut filled = 0usize;
+    while filled < want {
+        match file.read(&mut buf[filled..want]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(_) => return None,
+        }
+    }
+    buf.truncate(filled + AVPROBE_PADDING_SIZE);
+    Some(buf)
+}
+
+/// What libavformat makes of the first `len` bytes of `buf`.
+///
+/// `is_opened = 1` is the value `av_probe_input_buffer2` passes, so this
+/// considers exactly the demuxers the real open will consider.
+fn probe_head(buf: &mut [u8], len: usize, filename: &std::ffi::CStr) -> i32 {
+    let len = len.min(buf.len().saturating_sub(AVPROBE_PADDING_SIZE));
+    let mut score: i32 = 0;
+    let probe = ffmpeg_next::ffi::AVProbeData {
+        filename: filename.as_ptr(),
+        buf: buf.as_mut_ptr(),
+        buf_size: len as i32,
+        mime_type: std::ptr::null(),
+    };
+    unsafe { ffmpeg_next::ffi::av_probe_input_format3(&probe, 1, &mut score) };
+    score
+}
+
+/// `open_input`, wrapped the way both callers want it -- except for the one
+/// error it would be wrong to wrap.
+///
+/// `NotMedia` is not a failure to open the file, it is a decision not to, so
+/// "Failed to open video file" describes something that never happened. It is
+/// also the one verdict `main` replays out of the cache, where there is no open
+/// to blame and nothing to add the prefix -- so wrapping it here made the same
+/// file read one way on the run that discovered it and another on the run that
+/// remembered it. Everything else keeps the context: an `ENOENT` or an `EACCES`
+/// is exactly a failure to open a file.
+fn open_video(filepath: &str) -> Result<ffmpeg_next::format::context::Input> {
+    open_input(filepath).map_err(|e| {
+        if not_media(&e).is_some() {
+            e
+        } else {
+            e.context("Failed to open video file")
+        }
+    })
+}
+
+/// Whether the demuxer has read everything there is, whatever error it chose to
+/// report instead of saying so.
+///
+/// `avio_feof` is the byte-level truth: the packet layer's `AVERROR_EOF` is a
+/// convention demuxers are free to ignore, and several do. Null-checked because
+/// `pb` is only guaranteed for a context that owns its I/O.
+fn input_is_spent(ictx: &ffmpeg_next::format::context::Input) -> bool {
+    unsafe {
+        let pb = (*ictx.as_ptr()).pb;
+        !pb.is_null() && ffmpeg_next::ffi::avio_feof(pb) != 0
+    }
+}
+
+/// `avformat_find_stream_info`: the probe `open_input` deliberately skips.
+///
+/// One function so the two callers cannot drift. The weighing pass reports a
+/// file the probe rejects on the decode's behalf, and a complaint the user has
+/// to match against a decode that never ran had better be the decode's own
+/// sentence rather than a paraphrase of it.
+///
+/// It does not take the path, and nothing here names one: every caller of every
+/// route out of this module already prints the file it was asked about, so a
+/// name in the message is the same name twice on one line.
+fn probe_streams(ictx: &mut ffmpeg_next::format::context::Input) -> Result<()> {
+    unsafe {
+        let e =
+            ffmpeg_next::ffi::avformat_find_stream_info(ictx.as_mut_ptr(), std::ptr::null_mut());
+        if e < 0 {
+            return Err(anyhow!(ffmpeg_next::Error::from(e)))
+                .context("Failed to read the streams");
+        }
+    }
+    Ok(())
 }
 
 /// Whether the header alone answered every question this file will be asked.
@@ -579,21 +894,69 @@ const WORK_PER_BYTE: f64 = 3.8;
 /// The spread between the 10th and 90th percentile falls from 5.5x to 2.2x --
 /// which is the figure that matters, since `share_for` reads nothing but ratios.
 ///
-/// The answer is an estimate and is always usable -- every rung of the ladder
-/// falls through to a cruder one rather than failing, because a file this cannot
-/// weigh still has to be scheduled, and the decode that follows is where a
-/// genuinely broken file gets reported.
-pub fn weigh_decode(filepath: &str, kf_interval: f64, min_kf_samples: f64, size: u64) -> u64 {
+/// The answer is an estimate and is always usable where it is a `Work` at all --
+/// every rung of the ladder falls through to a cruder one rather than failing,
+/// because a file this cannot MEASURE still has to be scheduled.
+///
+/// The one thing it does not fall through is a file that will not decode. That
+/// verdict is `Undecodable`, and it is not an estimate: see `weigh_from_container`
+/// for why every route to it is one `fingerprint_video` provably takes too.
+pub fn weigh_decode(
+    filepath: &str,
+    kf_interval: f64,
+    min_kf_samples: f64,
+    size: u64,
+) -> Weighed {
     let from_bytes = || ((size as f64 * WORK_PER_BYTE) as u64).max(1);
 
-    let Ok(measured) = weigh_from_container(filepath, kf_interval, min_kf_samples) else {
-        return from_bytes();
-    };
-    measured.unwrap_or_else(from_bytes)
+    match weigh_from_container(filepath, kf_interval, min_kf_samples) {
+        Ok(Some(work)) => Weighed::Work(work),
+        Ok(None) => Weighed::Work(from_bytes()),
+        Err(e) => Weighed::Undecodable(e),
+    }
+}
+
+/// What the weighing pass learned about one file.
+///
+/// It used to be a bare `u64`, and a file nothing could be learned about at all
+/// got the bottom rung of the ladder -- its size times `WORK_PER_BYTE` -- on the
+/// grounds that a file that cannot be weighed still has to be scheduled and the
+/// decode is where a broken one gets reported. That is right for a file whose
+/// container merely would not answer a question, and wrong for one no decoder
+/// will open, which was charged for a decode that could not happen and then
+/// probed a second time to discover what this pass already knew. Under
+/// `-x '*'` over a folder that is mostly not video, that is the whole run: every
+/// file opened twice, and a progress bar denominated in the bytes of files that
+/// finish the instant they are looked at.
+pub enum Weighed {
+    /// Estimated decode cost, in keyframe-pixels.
+    Work(u64),
+    /// No decode is going to happen, and this is the error it would have raised.
+    /// The caller reports it now and never opens the file again.
+    Undecodable(anyhow::Error),
 }
 
 /// The measurement half of `weigh_decode`: `Ok(None)` means the container opened
-/// but could not say enough to be weighed.
+/// and holds video, but could not say enough to be weighed.
+///
+/// An `Err` is not a failure to measure -- it is the verdict that this file has
+/// no fingerprint to give, carrying the error `fingerprint_video` would have
+/// raised. Only three things produce one, and each is a point that function
+/// provably reaches on the same file:
+///
+/// - `open_input` fails, which is its first call and its first failure.
+/// - the probe fails. It is run here only when the header did not answer (no
+///   video stream at all, or a stream with no picture size), and both of those
+///   make `header_is_complete` false -- so `fingerprint_video` runs the same
+///   probe on the same file and gets the same error.
+/// - the probe succeeds and there is still no video stream, which is exactly the
+///   `No video stream found in` that follows it there.
+///
+/// That correspondence is the whole safety argument for skipping the decode of
+/// such a file, so a fourth route must not be added casually: the cost of being
+/// wrong is a video reported as broken without anything having tried to read it.
+/// `test_the_weigher_and_the_decoder_agree_about_a_file_that_is_not_video` pins
+/// it against a real file.
 ///
 /// The keyframe count is taken FIRST, before anything that might read packets,
 /// and this order is load-bearing. An index is either complete or absent for the
@@ -609,14 +972,37 @@ fn weigh_from_container(
     kf_interval: f64,
     min_kf_samples: f64,
 ) -> Result<Option<u64>> {
-    let mut ictx = open_input(filepath)?;
+    let mut ictx = open_video(filepath)?;
 
-    let Some(stream_index) = ictx
+    let stream_index = match ictx
         .streams()
         .best(ffmpeg_next::media::Type::Video)
         .map(|s| s.index())
-    else {
-        return Ok(None);
+    {
+        Some(index) => index,
+        None => {
+            // Nothing in the header claims to be video, which is not yet a
+            // verdict: a few containers only publish their streams once packets
+            // have been read (raw H.264 in TS is the usual one). So ask the
+            // probe -- the same call `fingerprint_video` is about to make on
+            // this file, since a header with no video stream in it cannot be
+            // `header_is_complete`. Nothing here is extra work; it is that
+            // function's work, done once instead of twice.
+            probe_streams(&mut ictx)?;
+
+            if ictx.streams().best(ffmpeg_next::media::Type::Video).is_none() {
+                return Err(anyhow!("No video stream found"));
+            }
+
+            // A stream appeared, so this file is going to be decoded after all
+            // -- but the probe just read packets through it, and for a container
+            // with no index of its own libavformat has been building one out of
+            // them. Counting that now would read the first few seconds of an
+            // hour-long stream as the total, which is the underestimate the
+            // ordering at the top of this function exists to avoid. The bytes
+            // are the honest answer once the index cannot be trusted.
+            return Ok(None);
+        }
     };
 
     // MP4 and AVI have their index the moment the header is read; Matroska
@@ -641,16 +1027,11 @@ fn weigh_from_container(
     let mut facts = weighable_facts(&ictx, stream_index);
 
     // The header did not carry the picture's size. Probe -- the same probe
-    // `fingerprint_video` is about to run on this file for the same reason, and
-    // the alternative is weighing it by its bytes.
+    // `fingerprint_video` is about to run on this file for the same reason (a
+    // stream with no width is not `header_is_complete` either), and the
+    // alternative is weighing it by its bytes.
     if facts.is_none() {
-        unsafe {
-            let e =
-                ffmpeg_next::ffi::avformat_find_stream_info(ictx.as_mut_ptr(), std::ptr::null_mut());
-            if e < 0 {
-                return Err(anyhow!(ffmpeg_next::Error::from(e)));
-            }
-        }
+        probe_streams(&mut ictx)?;
         facts = weighable_facts(&ictx, stream_index);
     }
 
@@ -787,30 +1168,20 @@ pub fn fingerprint_video(
     progress: &dyn Fn(u64),
 ) -> Result<Option<VideoFingerprint>> {
     // 1. Native Zero-Copy Extraction (No Subprocess Overhead)
-    let mut ictx = open_input(filepath)
-        .with_context(|| format!("Failed to open video file: {}", filepath))?;
+    let mut ictx = open_video(filepath)?;
 
     // The probe is the expensive half of opening a file, and for an ordinary
     // MP4/MKV it is answering questions the header already answered. Run it
     // only when something is genuinely missing.
     if !header_is_complete(&ictx) {
         log::debug!("{}: header incomplete, probing streams.", filepath);
-        unsafe {
-            let e = ffmpeg_next::ffi::avformat_find_stream_info(
-                ictx.as_mut_ptr(),
-                std::ptr::null_mut(),
-            );
-            if e < 0 {
-                return Err(anyhow!(ffmpeg_next::Error::from(e)))
-                    .with_context(|| format!("Failed to read the streams of {}", filepath));
-            }
-        }
+        probe_streams(&mut ictx)?;
     }
 
     let input = ictx
         .streams()
         .best(ffmpeg_next::media::Type::Video)
-        .ok_or_else(|| anyhow!("No video stream found in {}", filepath))?;
+        .ok_or_else(|| anyhow!("No video stream found"))?;
     let video_stream_index = input.index();
 
     let duration_sec = duration_seconds(&input, &ictx);
@@ -1047,10 +1418,13 @@ pub fn fingerprint_video(
     let mut first_key_ts: Option<i64> = None;
     let mut demuxer_ignores_discard = false;
     let mut seeking_broken = false;
+    // Consecutive failed reads. Reset by any successful one, so a file that
+    // stumbles and recovers is unaffected however often it stumbles.
+    let mut demux_errors: u32 = 0;
 
     loop {
         if shutdown_requested() {
-            return Err(anyhow!("Interrupted while fingerprinting {}", filepath));
+            return Err(anyhow!("Interrupted while fingerprinting"));
         }
 
         // `av_read_frame` fills the packet it is handed WITHOUT releasing what
@@ -1074,11 +1448,38 @@ pub fn fingerprint_video(
         }
 
         match packet.read(&mut ictx) {
-            Ok(()) => {}
+            Ok(()) => demux_errors = 0,
             Err(ffmpeg_next::Error::Eof) => break,
-            // Mirrors the packet iterator this loop replaces: a recoverable
-            // demux error skips the packet rather than ending the video.
-            Err(_) => continue,
+            // A recoverable demux error skips the packet rather than ending the
+            // video -- but only while there is something left to skip TO.
+            //
+            // `AVERROR_EOF` is a convention, not a guarantee, and a demuxer that
+            // does not follow it turns this arm into an infinite loop: it is
+            // asked for a packet at the end of the file, says "invalid data"
+            // instead of "end of file", and is asked again forever. That is not
+            // hypothetical and it is not obscure -- `ncdec.c` ends
+            // `while (state != NC_VIDEO_FLAG) { if (avio_feof(pb)) return
+            // AVERROR_INVALIDDATA; ... }`, and the `nc` demuxer claims any file
+            // named `*.v` on an extension match alone. A 132-byte linker version
+            // script (`libavcodec.v`, one per FFmpeg build directory) probes as
+            // an mpeg4 video of unspecified size, and fingerprinting it span one
+            // core until the process was killed: 80 minutes, 2.9 MB RSS, no
+            // output. Under `-x '*'` a handful of those is the whole run, since
+            // every decode worker eventually lands on one.
+            //
+            // So the loop ends when the input is spent, whatever the demuxer
+            // calls that, and `MAX_CONSECUTIVE_DEMUX_ERRORS` catches the same
+            // shape of failure mid-file, where `feof` is not yet true. Both are
+            // ordinary ends of stream rather than errors: the file keeps the
+            // frames it did give up, and if that is none, the caller's existing
+            // "no frames" path reports it.
+            Err(_) => {
+                demux_errors += 1;
+                if demux_errors >= MAX_CONSECUTIVE_DEMUX_ERRORS || input_is_spent(&ictx) {
+                    break;
+                }
+                continue;
+            }
         }
 
         if packet.stream() != video_stream_index {
@@ -1251,7 +1652,7 @@ pub fn fingerprint_video(
     }
 
     if frame_idx == 0 {
-        return Err(anyhow!("No valid frames found or successfully decoded in {}", filepath));
+        return Err(anyhow!("No valid frames found or successfully decoded"));
     }
 
     // From the frames the decoder actually produced. Identical to what the
@@ -1584,7 +1985,135 @@ mod tests {
         );
     }
 
+    // --- Refusing files that are not media, cheaply and without spinning ------
+
+    /// The hang this guard exists for, reproduced exactly.
+    ///
+    /// `ncdec.c` ends `while (state != NC_VIDEO_FLAG) { if (avio_feof(pb))
+    /// return AVERROR_INVALIDDATA; ... }` -- at the end of the file it reports
+    /// invalid data rather than EOF, and the demux loop's "a recoverable error
+    /// skips the packet" arm then asks it again forever. Four bytes of
+    /// `00 00 01 A5` and a declared packet size larger than the file are enough
+    /// to be scored 25 by `nc_probe`, which is what carries this past the probe
+    /// gate and into the loop; that is not a contrivance, it is what a 132-byte
+    /// linker version script does when it is called `libavcodec.v`.
+    ///
+    /// Run on its own thread with a deadline, so that losing the guard fails
+    /// this test in ten seconds instead of hanging the suite the way it hung the
+    /// scan: 80 minutes of one core per file, with eight workers eventually
+    /// stuck on eight of them and no output at all.
+    #[test]
+    fn test_a_demuxer_that_cries_invalid_data_at_eof_does_not_spin_forever() {
+        init_ffmpeg_for_tests();
+
+        let dir = tempfile::tempdir().unwrap();
+        // `.v` because `nc` claims that extension, which is how the real files
+        // got here; the bytes are what make it score.
+        let path = dir.path().join("libavcodec.v");
+        let mut bytes = vec![0u8; 20];
+        bytes[0..4].copy_from_slice(&[0x00, 0x00, 0x01, 0xA5]);
+        // Declared packet size, little-endian at offset 5. Larger than the file,
+        // so `nc_probe` takes its "cannot check the next header" branch and
+        // returns AVPROBE_SCORE_MAX / 4.
+        bytes[5] = 0x60;
+        bytes[6] = 0xEA;
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        bytes.extend((0..4000).map(|_| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as u8
+        }));
+        std::fs::write(&path, &bytes).unwrap();
+
+        let filepath = path.to_string_lossy().to_string();
+        let size = bytes.len() as u64;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = fingerprint_video(&filepath, 0.0, 4.0, 1, 0.0, size, &|_| {});
+            let _ = tx.send(outcome.is_err());
+        });
+
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(errored) => assert!(errored, "there are no frames in this file to find"),
+            Err(_) => panic!(
+                "fingerprint_video did not return: the demux loop is asking a demuxer that \
+                 will never say EOF for another packet"
+            ),
+        }
+    }
+
+    /// The cheap half of the probe gate: nothing in the first 2 KB, and nothing
+    /// in the name either, so the file is refused without libavformat ever
+    /// opening it.
+    #[test]
+    fn test_a_file_no_demuxer_recognises_is_refused_at_the_first_probe() {
+        init_ffmpeg_for_tests();
+
+        let dir = tempfile::tempdir().unwrap();
+        // Not `.txt`: FFmpeg's `tty` demuxer claims that one, which is why a
+        // scan of a source tree decodes text files as ANSI art. `.rlib` is
+        // claimed by nothing, so the name contributes no score and the bytes
+        // have to earn one on their own.
+        let path = dir.path().join("notes.rlib");
+        std::fs::write(&path, "the quick brown fox\n".repeat(400)).unwrap();
+
+        let Weighed::Undecodable(e) = weigh_decode(&path.to_string_lossy(), 0.0, 4.0, 8000) else {
+            panic!("a text file is not a video");
+        };
+        let said = format!("{:#}", e);
+        assert!(said.contains("2048"), "refused at the first probe, and says so: {}", said);
+    }
+
+    /// The other half, and the reason there are two: a name some demuxer claims
+    /// scores 1 whatever the bytes say, so it can never be turned away at 2 KB.
+    ///
+    /// This is what stands between the gate and a real MP3 -- whose first frames
+    /// sit behind an ID3 tag, which scores 1 at 2 KB and 51 by 8 KB. The bytes
+    /// here never earn a score, so the file is still refused; what the test pins
+    /// is WHERE, because that is the difference between reading 2 KB and reading
+    /// enough.
+    #[test]
+    fn test_a_name_a_demuxer_claims_earns_a_second_look() {
+        init_ffmpeg_for_tests();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("song.mp3");
+        std::fs::write(&path, "the quick brown fox\n".repeat(400)).unwrap();
+
+        let Weighed::Undecodable(e) = weigh_decode(&path.to_string_lossy(), 0.0, 4.0, 8000) else {
+            panic!("this is text, whatever it is called");
+        };
+        let said = format!("{:#}", e);
+        assert!(
+            said.contains("16384"),
+            "a claimed extension has to reach the second probe: {}",
+            said
+        );
+    }
+
+    /// And the gate lets the real thing through untouched, which every other
+    /// test in this file would also catch -- stated here because it is the half
+    /// of the bargain the measurements cannot prove on their own.
+    #[test]
+    fn test_the_probe_gate_does_not_stand_in_front_of_a_real_video() {
+        init_ffmpeg_for_tests();
+        let path = fixture_path();
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            matches!(weigh_decode(&path.to_string_lossy(), 0.0, 4.0, size), Weighed::Work(_)),
+            "the fixture is a real MP4 and scores 100 on its first 2 KB"
+        );
+    }
+
     // --- Weighing the work before doing it -----------------------------------
+
+    /// The weight of a file that has one. Every test below this line is
+    /// asserting about a number, so the verdict is unwrapped in one place.
+    fn work_of(weighed: Weighed) -> u64 {
+        match weighed {
+            Weighed::Work(weight) => weight,
+            Weighed::Undecodable(e) => panic!("expected a weight, got a verdict: {:#}", e),
+        }
+    }
 
     /// The claim the scheduler rests on: the weight is the decode, counted
     /// before it happens. Cross-checked against the decode itself rather than
@@ -1599,7 +2128,7 @@ mod tests {
         let fp = fingerprint_fixture(1);
         let decoded_pixels = fp.valid_hashes.len() as u64 * (fp.width * fp.height) as u64;
 
-        let weight = weigh_decode(&filepath, 0.0, 4.0, size);
+        let weight = work_of(weigh_decode(&filepath, 0.0, 4.0, size));
         let expected = (decoded_pixels as f64 * codec_cost(&fp.codec)) as u64;
 
         // Not an equality: the decode drops frames that hash the same as their
@@ -1617,18 +2146,75 @@ mod tests {
         );
     }
 
-    /// The rung of the ladder that catches an unreadable file. It has to produce
-    /// something -- a file that cannot be weighed still has to be scheduled, and
-    /// the decode that follows is where the failure gets reported.
+    /// A file no decoder will open is a verdict, not a rung of the ladder. It
+    /// used to be weighed by its bytes and queued, which bought a second open
+    /// for the decode to fail at and a share of the progress bar for a decode
+    /// that could not happen.
     #[test]
-    fn test_a_file_that_cannot_be_opened_is_still_weighed() {
+    fn test_a_file_that_cannot_be_opened_is_a_verdict_rather_than_a_weight() {
         init_ffmpeg_for_tests();
-        let weight = weigh_decode("/nonexistent/not-a-video.mkv", 0.0, 4.0, 1_000_000);
 
-        assert_eq!(weight, (1_000_000.0 * WORK_PER_BYTE) as u64);
+        let Weighed::Undecodable(e) =
+            weigh_decode("/nonexistent/not-a-video.mkv", 0.0, 4.0, 1_000_000)
+        else {
+            panic!("a path with nothing behind it cannot be decoded, and this pass knows it");
+        };
+
+        // It says what went wrong and NOT which file: every caller prints the
+        // path it was asked about, and a message that repeated it produced
+        // "Failed to process X: Failed to open video file: X: ...", which is
+        // the same path twice on a line there can be a quarter of a million of.
+        let said = format!("{:#}", e);
+        assert!(said.contains("Failed to open video file"), "{}", said);
         assert!(
-            weigh_decode("/nonexistent/empty.mkv", 0.0, 4.0, 0) >= 1,
-            "a weight of zero would take a file out of the queue's arithmetic"
+            !said.contains("/nonexistent/not-a-video.mkv"),
+            "the caller owns the name, not the error: {}",
+            said
+        );
+    }
+
+    /// The property the skip rests on: where this pass says a file has no
+    /// fingerprint to give, the decode says the same thing in the same words.
+    ///
+    /// Written as an agreement rather than as an expected string on purpose --
+    /// which of the three routes a given FFmpeg build takes on a given pile of
+    /// bytes is not this tool's business (the linked library here opens random
+    /// data as a low-score format and fails at the probe, where ffprobe rejects
+    /// it outright), and any of them is fine. What is not fine is the two
+    /// disagreeing, because then a file is reported broken on the strength of a
+    /// question the decoder was never asked.
+    #[test]
+    fn test_the_weigher_and_the_decoder_agree_about_a_file_that_is_not_video() {
+        init_ffmpeg_for_tests();
+
+        // Deterministic bytes that are not any container: an LCG rather than
+        // anything random, so a failure here is reproducible.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-a-video.mkv");
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let bytes: Vec<u8> = (0..300_000)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (state >> 33) as u8
+            })
+            .collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let filepath = path.to_string_lossy().to_string();
+        let size = bytes.len() as u64;
+
+        let Weighed::Undecodable(weighed) = weigh_decode(&filepath, 0.0, 4.0, size) else {
+            panic!("300 kB of noise is not a video, and opening it twice will not make it one");
+        };
+
+        let Err(decoded) = fingerprint_video(&filepath, 0.0, 4.0, 1, 0.0, size, &|_| {}) else {
+            panic!("the decode has to fail on the same file");
+        };
+
+        assert_eq!(
+            format!("{:#}", weighed),
+            format!("{:#}", decoded),
+            "the weighing pass reports this file on the decode's behalf, so it has to be the \
+             decode's own complaint"
         );
     }
 
@@ -1642,10 +2228,10 @@ mod tests {
         let filepath = fixture_path().to_string_lossy().to_string();
         let size = std::fs::metadata(fixture_path()).unwrap().len();
 
-        let full = weigh_decode(&filepath, 0.0, 4.0, size);
+        let full = work_of(weigh_decode(&filepath, 0.0, 4.0, size));
         // One sample over the whole clip: the floor for short videos is what
         // decides this, exactly as it does inside the decode.
-        let thinned = weigh_decode(&filepath, 3600.0, 1.0, size);
+        let thinned = work_of(weigh_decode(&filepath, 3600.0, 1.0, size));
 
         assert!(
             thinned <= full,

@@ -15,10 +15,30 @@ use log::info;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-/// Worked examples kept per category. The full text of every one is in the
-/// log; these exist so the summary alone is actionable once the log has
-/// scrolled past the point of usefulness.
-const MAX_SAMPLES: usize = 3;
+/// Worked examples kept per category.
+///
+/// Twenty rather than the three it was, because the summary is now the ONLY
+/// place a counted problem is reported: the per-file lines that used to scroll
+/// past during the run are not printed at all any more (see `COUNTED`), so
+/// these examples are what the user actually reads. Twenty is about a screen,
+/// which is the most that can be read without scrolling and far more than the
+/// three that made sense when the full list was above.
+const MAX_SAMPLES: usize = 20;
+
+/// Log target for a failure this module is going to account for.
+///
+/// The console does not print these while the run is working. They would be the
+/// same finding twice -- once as it happens and once in the summary -- and on a
+/// `-x '*'` scan the first of those is 226,863 lines that push the results the
+/// run exists to print out of the scrollback entirely. `--log-file` still
+/// receives every one of them, in full and uncapped, because the whole point of
+/// that flag is to be the place the unabridged list lives.
+///
+/// Every `log::error!` whose message is also handed to `Tally::record` uses
+/// this, and the summary is where it surfaces. Anything logged WITHOUT it is
+/// something no tally counts -- a cache that would not compact, say -- and it
+/// still prints as it happens, because otherwise nothing would ever say it.
+pub const COUNTED: &str = "counted";
 
 /// A counter with a few examples attached.
 ///
@@ -101,7 +121,13 @@ impl RunStats {
             ),
             (&self.unwalkable, "folder(s) could not be read while scanning"),
             (&self.unreadable, "file(s) could not be read"),
-            (&self.fingerprint_failed, "video(s) could not be fingerprinted"),
+            // "file(s)", not "video(s)": what is in this bucket is precisely the
+            // things that turned out NOT to be video, and under `-x '*'` that is
+            // most of a home directory. A count of files is true in every mode,
+            // where a count of videos is false in the one mode that produces
+            // large counts. It costs nothing that the neighbouring label is also
+            // about files -- read and fingerprinted are different failures.
+            (&self.fingerprint_failed, "file(s) could not be fingerprinted"),
             // The files were fingerprinted and compared; what could not be done
             // is enumerating every group they form, because a set of files that
             // nearly all match each other has combinatorially many. Squarely a
@@ -253,7 +279,7 @@ fn render(tally: &Tally, label: &str) -> Vec<String> {
     if !samples.is_empty() {
         let hidden = count.saturating_sub(samples.len());
         if hidden > 0 {
-            out.push(format!("         - ... and {} more (see the errors above)", hidden));
+            out.push(format!("         - ... and {} more", hidden));
         }
     }
     out
@@ -317,14 +343,18 @@ mod tests {
     #[test]
     fn test_elision_is_reported_only_for_the_examples_beyond_the_cap() {
         let t = Tally::default();
-        for i in 0..10 {
+        for i in 0..MAX_SAMPLES + 7 {
             t.record(format!("file_{}.mp4", i));
         }
 
-        let lines = render(&t, "video(s) could not be fingerprinted");
+        let lines = render(&t, "file(s) could not be fingerprinted");
         // Header, MAX_SAMPLES examples, and one line for the remaining 7.
         assert_eq!(lines.len(), MAX_SAMPLES + 2);
         assert!(lines.last().unwrap().contains("and 7 more"));
+        assert!(
+            !lines.last().unwrap().contains("above"),
+            "there is nothing above any more: this line IS the report"
+        );
     }
 
     #[test]

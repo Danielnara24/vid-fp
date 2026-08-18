@@ -136,6 +136,7 @@ impl Rows {
         let lower = action.to_ascii_lowercase();
         if !KNOWN_ACTIONS.contains(&lower.as_str()) {
             log::error!(
+                target: crate::stats::COUNTED,
                 "{}: {} has an action of \"{}\", which is not one of {}. \
                  The file it names was left alone.",
                 report,
@@ -167,7 +168,7 @@ impl Rows {
         // Whitespace is still not a file name, so a cell holding only spaces is
         // treated as the empty one it plainly is.
         if row.file.trim().is_empty() {
-            log::error!("{}: {} is marked DELETE but names no file.", report, row.at);
+            log::error!(target: crate::stats::COUNTED, "{}: {} is marked DELETE but names no file.", report, row.at);
             stats
                 .report_unusable
                 .record(format!("{} {}: no full_path", report, row.at));
@@ -184,6 +185,7 @@ impl Rows {
             Ok(n) => n,
             Err(_) => {
                 log::error!(
+                target: crate::stats::COUNTED,
                     "{}: {} is marked DELETE but its size_bytes is \"{}\", which is not a \
                      byte count. {} was left alone: without the size it was measured at there is \
                      nothing to check it against before removing it.",
@@ -321,7 +323,7 @@ fn read_csv(path: &str, stats: &RunStats) -> Result<Report> {
         let record = match record {
             Ok(r) => r,
             Err(e) => {
-                log::error!("{}: line {} could not be parsed: {}", path, line, e);
+                log::error!(target: crate::stats::COUNTED, "{}: line {} could not be parsed: {}", path, line, e);
                 stats.report_unusable.record(format!("{} line {}", path, line));
                 continue;
             }
@@ -394,7 +396,7 @@ fn read_json(path: &str, stats: &RunStats) -> Result<Report> {
             .unwrap_or_else(|| format!("results[{}]", g));
 
         let Some(files) = group.get("files").and_then(|f| f.as_array()) else {
-            log::error!("{}: {} has no 'files' array; nothing in it was acted on.", path, group_name);
+            log::error!(target: crate::stats::COUNTED, "{}: {} has no 'files' array; nothing in it was acted on.", path, group_name);
             stats
                 .report_unusable
                 .record(format!("{} {}: no files array", path, group_name));

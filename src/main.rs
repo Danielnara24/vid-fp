@@ -39,6 +39,27 @@ use utils::{shutdown_requested, Priority};
 const CACHE_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("fingerprints_dct_ct_ff8_tail");
 
+/// Files this build looked at and refused before opening: see `NotMedia`.
+///
+/// A SEPARATE table, which is the whole reason this was affordable. The
+/// fingerprint table's layout is untouched, so adding this invalidates nothing
+/// and costs no re-decode -- and the two halves can be retired on completely
+/// different schedules, which they need to be.
+///
+/// The name carries the rules, and it is meant to be thrown away. A positive
+/// entry is expensive to rebuild (it is a decode) so `Stamp` guards it as
+/// tightly as it can and the table is renamed only when a field changes meaning.
+/// A refusal is worth half a millisecond, so it can be discarded on the merest
+/// suspicion -- and it has to be, because it depends on things `Stamp`
+/// deliberately does not record: the vendored FFmpeg's demuxer set (`ff8`) and
+/// this tool's own gate (`probe1` = `FIRST_PROBE_BYTES`/`SECOND_PROBE_BYTES`/
+/// `NO_EVIDENCE`). Change any of those and the entries are wrong in the
+/// direction that matters -- a file that would now be read as video, remembered
+/// as junk -- so bump the suffix and push the old name into `SUPERSEDED_TABLES`.
+/// That costs one cheap re-probe of the library and nothing else.
+const REFUSED_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("refused_ff8_probe2");
+
 /// Tables earlier builds wrote, all dead. They are dropped whole on the first
 /// run of this one.
 ///
@@ -89,6 +110,19 @@ const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 5] = [
     TableDefinition::new("fingerprints_dct_ct"),
     TableDefinition::new("fingerprints_dct_ct_ff8"),
 ];
+
+/// Refusal tables earlier builds wrote. Kept apart from the list above because
+/// what it costs to drop one is not comparable: retiring a fingerprint table is
+/// a re-decode of the whole library, retiring this is a re-probe measured in
+/// seconds, and the run says so in different words.
+///
+/// `refused_ff8_probe1` was retired for a reason no fingerprint table would
+/// ever be retired for: `Refusal::Said` stores the sentence the run printed, so
+/// the WORDING is part of what is in there. Trimming the duplicated path out of
+/// those messages would otherwise have left a cache printing two formats in one
+/// run, half of them naming the file twice.
+const SUPERSEDED_REFUSAL_TABLES: [TableDefinition<&str, &[u8]>; 1] =
+    [TableDefinition::new("refused_ff8_probe1")];
 
 /// Hard ceiling on the cache's page cache.
 ///
@@ -510,6 +544,17 @@ struct Args {
     #[arg(long = "clear-cache")]
     clear_cache: bool,
 
+    /// Write every log line to this file, including the failures the terminal
+    /// never shows. A failure that the end-of-run summary is going to account
+    /// for is not printed while the run works — under -x '*' every file that is
+    /// not a video is one, and a scan of a home directory produces hundreds of
+    /// thousands — so the summary's count and its examples are what you see.
+    /// This is where the unabridged list goes when you want to grep it. The
+    /// file is truncated at the start of each run.
+    #[arg(long = "log-file", value_name = "PATH",
+          value_hint = clap::ValueHint::FilePath)]
+    log_file: Option<String>,
+
     /// Drop the cached fingerprint of every file this scan did not find, so a
     /// cache stops growing with libraries that have moved on. It is skipped,
     /// loudly, when the scan was not complete enough to measure against: a scan
@@ -757,7 +802,7 @@ fn run_from_report(
                     log::debug!("Dropped {} cache entry(ies) for removed file(s).", forgotten)
                 }
                 Err(e) => {
-                    log::error!("Failed to drop cache entries for removed files: {:#}", e);
+                    log::error!(target: stats::COUNTED, "Failed to drop cache entries for removed files: {:#}", e);
                     stats.cache_purge_failed.record(format!("{:#}", e));
                 }
             },
@@ -852,6 +897,35 @@ fn work_rate(per_sec: f64) -> String {
         return unmeasurable();
     }
     format!("{} {}/s", number, unit)
+}
+
+/// The bar for the weighing pass, which counts FILES.
+///
+/// The decode bar measures work, and cannot be imitated here for the reason this
+/// pass exists at all: nothing has measured any work yet. A count is honest
+/// about that, and the two bars are visibly different jobs rather than one bar
+/// that appears to restart.
+///
+/// It exists because this pass is silent and, on the run it was written for, was
+/// most of the wall clock: 229k files under `-x '*'`, an `avformat_open_input`
+/// each, and the only thing on screen was a "Found 229112 files. Fingerprinting"
+/// printed minutes before any fingerprinting started. On an ordinary library it
+/// is over in well under a second and the bar is a flicker, which is the right
+/// trade in the direction that matters -- the case it explains is the slow one.
+fn weighing_bar(files: usize, quiet: bool) -> ProgressBar {
+    if quiet {
+        return ProgressBar::hidden();
+    }
+
+    let pb = ProgressBar::new(files as u64);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "{elapsed_precise} \u{2502} [{bar:28.cyan/blue}] \u{2502} {percent}% \u{2502} {pos}/{len} \u{2502} measuring decode cost",
+        )
+        .unwrap()
+        .progress_chars("=>-"),
+    );
+    pb
 }
 
 /// How wide the run actually gets to be, given what `--threads` asked for and
@@ -1092,6 +1166,7 @@ fn install_signal_handler() -> Result<()> {
 fn ensure_cache_table(db: &Database) -> Result<()> {
     let txn = db.begin_write().context("Failed to start a cache transaction")?;
     txn.open_table(CACHE_TABLE).context("Failed to create the cache table")?;
+    txn.open_table(REFUSED_TABLE).context("Failed to create the refusals table")?;
     txn.commit().context("Failed to commit the cache table")?;
     Ok(())
 }
@@ -1113,6 +1188,7 @@ fn ensure_cache_table(db: &Database) -> Result<()> {
 fn clear_cache(db: &mut Database) -> Result<()> {
     let txn = db.begin_write().context("Failed to start a cache transaction")?;
     txn.delete_table(CACHE_TABLE).context("Failed to clear cache database")?;
+    txn.delete_table(REFUSED_TABLE).context("Failed to clear the refusals table")?;
     txn.commit().context("Failed to commit the cache clear")?;
 
     // Dropping the table dropped its definition too; every later lookup needs
@@ -1133,16 +1209,31 @@ fn clear_cache(db: &mut Database) -> Result<()> {
 /// Returns whether there were any, so the caller can decide about reclaiming
 /// the space: deleting a table frees its pages inside the file but does not
 /// shrink the file, and only a compaction hands that back to the filesystem.
-fn retire_superseded_tables(db: &Database) -> Result<bool> {
+fn retire_superseded_tables(db: &Database) -> Result<Retired> {
     let txn = db.begin_write().context("Failed to start a cache transaction")?;
-    let mut existed = false;
+    // Tracked apart, because what the user is told it costs depends on which
+    // one went: a retired fingerprint table is a re-decode of the whole
+    // library, a retired refusals table is a re-probe measured in seconds.
+    let mut retired = Retired::default();
     for table in SUPERSEDED_TABLES {
-        existed |= txn
+        retired.fingerprints |= txn
             .delete_table(table)
             .context("Failed to remove a superseded cache table")?;
     }
+    for table in SUPERSEDED_REFUSAL_TABLES {
+        retired.refusals |= txn
+            .delete_table(table)
+            .context("Failed to remove a superseded refusals table")?;
+    }
     txn.commit().context("Failed to commit the cache table removal")?;
-    Ok(existed)
+    Ok(retired)
+}
+
+/// Which kinds of superseded table this run found and dropped.
+#[derive(Default)]
+struct Retired {
+    fingerprints: bool,
+    refusals: bool,
 }
 
 /// Read one fingerprint out of the cache, or `None` for anything that isn't a
@@ -1177,6 +1268,96 @@ fn cache_lookup(db: &Database, path: &str, stamp: &Stamp) -> Option<VideoFingerp
             None
         }
     }
+}
+
+/// The refusal on record for this path, if this exact file was refused before.
+///
+/// Guarded by the same `Stamp` a fingerprint is, so an edited file is re-asked;
+/// the sampling knobs are in there too, which is stricter than this verdict
+/// needs but costs nothing and cannot be wrong.
+fn refusal_lookup(db: &Database, path: &str, stamp: &Stamp) -> Option<Refusal> {
+    let read = db.begin_read().ok()?;
+    let table = read.open_table(REFUSED_TABLE).ok()?;
+    let stored = table.get(path).ok()??;
+
+    match bincode::deserialize::<(Stamp, Refusal)>(stored.value()) {
+        Ok((cached, verdict)) if cached.matches(stamp) => Some(verdict),
+        Ok(_) => None,
+        Err(_) => None,
+    }
+}
+
+/// Why a file will not be fingerprinted, in the form the cache keeps it.
+///
+/// Two shapes because the common one deserves to be small. The probe gate
+/// refuses hundreds of thousands of files in a single `-x '*'` run and its
+/// sentence is two numbers in a fixed template, so it is stored as the two
+/// numbers; everything else is a handful of files a run, and storing what they
+/// actually said is both cheaper to write and impossible to get wrong.
+#[derive(Serialize, Deserialize, Clone)]
+enum Refusal {
+    /// Nothing in the file looked like media. Regenerated for printing, so the
+    /// wording always belongs to the build doing the printing.
+    NotMedia(fingerprint::NotMedia),
+    /// It opened, and then something else was wrong with it -- no video stream,
+    /// streams that would not parse, no frame that decoded. The message is the
+    /// one the run printed when it found out.
+    Said(String),
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refusal::NotMedia(verdict) => write!(f, "{}", verdict),
+            Refusal::Said(said) => write!(f, "{}", said),
+        }
+    }
+}
+
+/// What to remember about a failure, if anything.
+///
+/// `None` for a failure that is about the moment rather than the file -- see
+/// `fingerprint::is_transient`. This is the only gate between an error and the
+/// cache, so both callers (the weighing pass and the decode) ask it rather than
+/// classifying for themselves.
+fn worth_remembering(error: &anyhow::Error) -> Option<Refusal> {
+    if let Some(verdict) = fingerprint::not_media(error) {
+        return Some(Refusal::NotMedia(verdict));
+    }
+    if fingerprint::is_transient(error) {
+        return None;
+    }
+    Some(Refusal::Said(format!("{:#}", error)))
+}
+
+/// Write a whole pass worth of refusals in ONE transaction.
+///
+/// Deliberately not shaped like `cache_store`, which commits per video because a
+/// decode costs seconds and an interrupt must not throw one away. A refusal
+/// costs half a millisecond, and there can be a quarter of a million of them in
+/// a single `-x '*'` run: one fsync each would cost far more than re-probing
+/// every file next time. Losing the lot to an interrupt is fine -- the next run
+/// simply pays the same half-millisecond again.
+fn refusals_store(db: &Database, refused: &[(String, Stamp, Refusal)]) -> Result<()> {
+    if refused.is_empty() {
+        return Ok(());
+    }
+
+    let txn = db.begin_write().context("Failed to start a cache transaction")?;
+    {
+        let mut table =
+            txn.open_table(REFUSED_TABLE).context("Failed to open the refusals table")?;
+        for (path, stamp, verdict) in refused {
+            let encoded = bincode::serialize(&(stamp, verdict))
+                .context("Failed to serialize a refusal")?;
+            table
+                .insert(path.as_str(), encoded.as_slice())
+                .context("Failed to record a refusal")?;
+        }
+    }
+    txn.commit().context("Failed to commit the refusals")?;
+
+    Ok(())
 }
 
 /// Write one fingerprint to the cache, durably, replacing whatever was filed
@@ -1239,11 +1420,18 @@ fn cache_forget(db: &Database, paths: &[String]) -> Result<usize> {
     let txn = db.begin_write().context("Failed to start a cache transaction")?;
     {
         let mut table = txn.open_table(CACHE_TABLE).context("Failed to open the cache table")?;
+        // Both tables: a file that was trashed or moved is no longer at this
+        // path whichever of the two had something to say about it, and a
+        // refusal left behind would outlive the bytes it was about exactly the
+        // way a fingerprint would.
+        let mut refused =
+            txn.open_table(REFUSED_TABLE).context("Failed to open the refusals table")?;
         for path in paths {
             let existed = table
                 .remove(path.as_str())
                 .context("Failed to remove a cache entry")?
                 .is_some();
+            refused.remove(path.as_str()).context("Failed to remove a refusal")?;
             if existed {
                 forgotten += 1;
             }
@@ -1486,14 +1674,45 @@ Interrupted with Ctrl-C.
         log::LevelFilter::Info
     };
 
+    // Opened before the logger exists, so a bad path is reported by the ordinary
+    // error path rather than by a logger that is not installed yet. Truncating
+    // rather than appending: the file describes THIS run, and the alternative is
+    // a file that silently grows by a quarter of a million lines a scan.
+    let log_file = match &args.log_file {
+        Some(path) => Some(Mutex::new(
+            std::fs::File::create(path)
+                .with_context(|| format!("Could not open the log file {}", path))?,
+        )),
+        None => None,
+    };
+
     env_logger::Builder::new()
         .filter_level(log_level)
-        .format(|buf, record| {
-            if record.level() == log::Level::Error {
-                writeln!(buf, "Error: {}", record.args())
+        .format(move |buf, record| {
+            let line = if record.level() == log::Level::Error {
+                format!("Error: {}", record.args())
             } else {
-                writeln!(buf, "{}", record.args()) // Clean output for CLI tools
+                format!("{}", record.args()) // Clean output for CLI tools
+            };
+
+            // The file gets everything, uncapped and unconditionally -- that is
+            // what it is for, and it is the only place the unabridged list of
+            // failures exists.
+            if let Some(file) = &log_file {
+                let mut file = file.lock().unwrap_or_else(|e| e.into_inner());
+                let _ = writeln!(file, "{}", line);
             }
+
+            // A failure the run is going to account for is not also announced
+            // as it happens: `stats::print_summary` reports it at the end, with
+            // a count and up to `MAX_SAMPLES` examples, and saying it twice is
+            // how a `-x '*'` scan buried its own results under 226,863 lines.
+            // See `stats::COUNTED` for what is and is not tagged this way.
+            if record.target() == stats::COUNTED {
+                return Ok(());
+            }
+
+            writeln!(buf, "{}", line)
         })
         .init();
 
@@ -1593,15 +1812,28 @@ Interrupted with Ctrl-C.
         // afterwards is the only thing that returns those pages to the
         // filesystem.
         match retire_superseded_tables(db) {
-            Ok(true) => {
-                info!(
-                    "Removed the superseded fingerprint cache; fingerprints will be rebuilt once."
-                );
+            Ok(retired) if retired.fingerprints || retired.refusals => {
+                if retired.fingerprints {
+                    info!(
+                        "Removed the superseded fingerprint cache; fingerprints will be rebuilt \
+                         once."
+                    );
+                } else {
+                    // Worth a different sentence rather than the one above:
+                    // nothing is being re-decoded, and a user who reads
+                    // "fingerprints will be rebuilt" before a scan of a large
+                    // library is being told to expect an hour that is not
+                    // coming.
+                    info!(
+                        "Removed the superseded record of files that are not video; they will be \
+                         re-checked once."
+                    );
+                }
                 if let Err(e) = db.compact() {
                     log::error!("Could not compact the fingerprint cache: {}", e);
                 }
             }
-            Ok(false) => {}
+            Ok(_) => {}
             Err(e) => log::error!("{:#}", e),
         }
 
@@ -1852,6 +2084,14 @@ fn run(
         }
     }
 
+    // What to call the things that came back. Under `-x '*'` the walk applied no
+    // extension filter, so calling them video files is a claim the run has not
+    // checked and, on the folder that flag exists for, usually a false one --
+    // "Found 229112 video files" over a home directory, of which a handful were
+    // video. Every other setting has already turned away anything not named like
+    // a video, so there the old wording was the accurate one and it is kept.
+    let found_noun = if library.any_extension { "files" } else { "video files" };
+
     // Every question about the REQUEST has been answered; from here on the run
     // works from what it found.
     let mut video_files = library.files;
@@ -1878,7 +2118,14 @@ fn run(
         // rather than filtered in place. Only this shape can abandon the scan
         // partway through on Ctrl-C without leaving a half-applied prune behind
         // -- the removals are one atomic commit or nothing at all.
+        // Both tables, for one reason: an entry the scan cannot see is an entry
+        // nothing will ever overwrite, and that is as true of a refusal as of a
+        // fingerprint. The refusals table is also the one that GROWS without
+        // bound -- a `-x '*'` run files one entry per file that is not video,
+        // so a library that moves around leaves far more of them behind than it
+        // ever leaves fingerprints.
         let mut stale: Vec<String> = Vec::new();
+        let mut stale_refusals: Vec<String> = Vec::new();
         {
             let read = db.begin_read().context("Failed to open the cache for reading")?;
             let table = read
@@ -1897,9 +2144,26 @@ fn run(
                     stale.push(path.to_string());
                 }
             }
+
+            let refused = read
+                .open_table(REFUSED_TABLE)
+                .context("Failed to open the refusals table")?;
+
+            for entry in refused.iter().context("Failed to iterate the refusals")? {
+                if shutdown_requested() {
+                    return Ok(Outcome::Interrupted);
+                }
+
+                let (key, _) = entry.context("Failed to read a refusal")?;
+                let path = key.value();
+
+                if !valid_files.contains(path) {
+                    stale_refusals.push(path.to_string());
+                }
+            }
         }
 
-        if !stale.is_empty() {
+        if !stale.is_empty() || !stale_refusals.is_empty() {
             let txn = db.begin_write().context("Failed to start a cache transaction")?;
             {
                 let mut table = txn
@@ -1910,16 +2174,35 @@ fn run(
                         .remove(key.as_str())
                         .context("Failed to remove a stale cache entry")?;
                 }
+
+                let mut refused = txn
+                    .open_table(REFUSED_TABLE)
+                    .context("Failed to open the refusals table")?;
+                for key in &stale_refusals {
+                    refused
+                        .remove(key.as_str())
+                        .context("Failed to remove a stale refusal")?;
+                }
             }
             txn.commit().context("Failed to apply cache pruning")?;
-            info!("Pruned {} stale entries from cache.", stale.len());
+            // Counted apart: they are different things, and a user watching the
+            // fingerprint count is watching the one that cost something.
+            if stale_refusals.is_empty() {
+                info!("Pruned {} stale entries from cache.", stale.len());
+            } else {
+                info!(
+                    "Pruned {} stale entries and {} stale refusal(s) from cache.",
+                    stale.len(),
+                    stale_refusals.len()
+                );
+            }
         } else {
             info!("No stale entries found to prune.");
         }
     }
 
     if video_files.is_empty() {
-        info!("No videos found.");
+        info!("No {} found.", found_noun);
         return Ok(Outcome::Completed);
     }
 
@@ -1956,6 +2239,10 @@ fn run(
     enum Lookup {
         Hit(VideoFingerprint),
         Miss(Job),
+        /// Refused before, by this build's rules, against these exact bytes.
+        /// The file never reaches the weighing pass -- which is the entire
+        /// saving, since on a `-x '*'` run that pass IS the run.
+        Refused((String, String)),
     }
 
     let lookups: Vec<Lookup> = video_files
@@ -1972,6 +2259,13 @@ fn run(
                 kf_interval,
                 min_kf_samples,
             };
+
+            if let Some(verdict) = refusal_lookup(db, &file.path, &stamp) {
+                // Regenerated rather than stored: the cache keeps the two
+                // numbers, so the sentence a re-run prints is this build's
+                // sentence and cannot drift from the one a first run prints.
+                return Lookup::Refused((format!("{}", verdict), file.path.clone()));
+            }
 
             match cache_lookup(db, &file.path, &stamp) {
                 Some(fp) => Lookup::Hit(fp),
@@ -1994,6 +2288,7 @@ fn run(
     // the budget has the most to give them.
     let mut fingerprints: Vec<VideoFingerprint> = Vec::with_capacity(total_videos);
     let mut todo: Vec<Job> = Vec::new();
+    let mut remembered_refusals = 0usize;
     for lookup in lookups {
         match lookup {
             Lookup::Hit(fp) => {
@@ -2008,18 +2303,37 @@ fn run(
                 }
             }
             Lookup::Miss(job) => todo.push(job),
+            // Counted and worded as if it had just been discovered, because it
+            // is the same finding about the same bytes -- the run simply did
+            // not have to read them again. Still a problem, still exit 2: the
+            // user asked for a fingerprint of this file and there is none.
+            Lookup::Refused(reason) => {
+                remembered_refusals += 1;
+                log::error!(target: stats::COUNTED, "Failed to process {}: {}", reason.1, reason.0);
+                stats.fingerprint_failed.record(format!("{}: {}", reason.1, reason.0));
+            }
         }
     }
     let cached_count = fingerprints.len();
     let todo_count = todo.len();
 
-    if cached_count > 0 {
+    // Said out loud because it is most of what a re-run does. A `-x '*'` scan of
+    // a home directory is a quarter of a million files that are not video, and
+    // "already known not to be video" is the difference between the four
+    // minutes the first run spent finding that out and the seconds this one did.
+    let remembered = if remembered_refusals > 0 {
+        format!(", {} already known not to be video", remembered_refusals)
+    } else {
+        String::new()
+    };
+
+    if cached_count > 0 || remembered_refusals > 0 {
         info!(
-            "Found {} video files; {} already cached, {} to fingerprint.",
-            total_videos, cached_count, todo_count
+            "Found {} {}; {} already cached{}, {} to fingerprint.",
+            total_videos, found_noun, cached_count, remembered, todo_count
         );
     } else {
-        info!("Found {} video files. Fingerprinting...", total_videos);
+        info!("Found {} {}. Fingerprinting...", total_videos, found_noun);
     }
 
     if shutdown_requested() {
@@ -2050,18 +2364,74 @@ fn run(
     // apportioned against the TOTAL, so both need every weight in hand before
     // the first file starts. Parallel because it is pure I/O latency -- open,
     // read a header, close -- and nothing here competes with a decode yet.
+    //
+    // It is also where a file that will not decode at all is now reported and
+    // dropped, rather than being given a weight and opened a second time to find
+    // out what this pass already found out -- see `Weighed`. Two things follow
+    // from that, and both are the point:
+    //
+    // - The open is paid once per file instead of twice. On the run that
+    //   prompted this (229k files under `-x '*'`, almost none of them video)
+    //   that is half of everything before the comparison.
+    // - What is left in `todo` is work that is really going to happen, so the
+    //   weights below add up to the run's actual decode. They did not before: an
+    //   unopenable file fell to the bottom rung of the ladder, `size *
+    //   WORK_PER_BYTE`, and then finished the instant it was looked at -- so on
+    //   a folder that is mostly not video the bar was denominated in the bytes
+    //   of files that cost nothing, sat at 100% while the few real videos
+    //   decoded, and reported five 20 MB junk files as 71% of the work.
+    //
+    // A bar of its own, because this pass is now where the time goes on such a
+    // run and it used to be minutes of silence between "Found ..." and the
+    // decode bar. It counts files rather than work: nothing here has measured
+    // anything yet, which is the whole reason the pass exists.
     if !todo.is_empty() {
-        let weighed: Vec<u64> = todo
+        let wb = weighing_bar(todo.len(), args.quiet);
+
+        let weighed: Vec<fingerprint::Weighed> = todo
             .par_iter()
             .map(|job| {
                 if shutdown_requested() {
-                    return job.size;
+                    return fingerprint::Weighed::Work(job.size);
                 }
-                fingerprint::weigh_decode(&job.path, kf_interval, min_kf_samples, job.size)
+                let weighed =
+                    fingerprint::weigh_decode(&job.path, kf_interval, min_kf_samples, job.size);
+                wb.inc(1);
+                weighed
             })
             .collect();
-        for (job, weight) in todo.iter_mut().zip(weighed) {
-            job.weight = weight;
+        wb.finish_and_clear();
+
+        let mut kept: Vec<Job> = Vec::with_capacity(todo.len());
+        let mut refused: Vec<(String, Stamp, Refusal)> = Vec::new();
+        for (mut job, weighed) in std::mem::take(&mut todo).into_iter().zip(weighed) {
+            match weighed {
+                fingerprint::Weighed::Work(weight) => {
+                    job.weight = weight;
+                    kept.push(job);
+                }
+                // Worded, counted and exit-coded exactly as the decode would
+                // have done it, because it IS the decode's error: the file is
+                // still one the run was asked to fingerprint and could not.
+                fingerprint::Weighed::Undecodable(e) => {
+                    log::error!(target: stats::COUNTED, "Failed to process {}: {:#}", job.path, e);
+                    stats.fingerprint_failed.record(format!("{}: {:#}", job.path, e));
+
+                    // Remembered unless it was about the moment rather than
+                    // the file -- see `worth_remembering` and `REFUSED_TABLE`.
+                    if let Some(verdict) = worth_remembering(&e) {
+                        refused.push((job.path.clone(), job.stamp, verdict));
+                    }
+                }
+            }
+        }
+        todo = kept;
+
+        // One transaction for the whole pass -- see `refusals_store`. A failure
+        // to write is not a failure of the run: everything these entries would
+        // have saved is time, and the next run simply spends it again.
+        if let Err(e) = refusals_store(db, &refused) {
+            log::debug!("Could not record {} refusal(s): {:#}", refused.len(), e);
         }
 
         // NOW the largest-first order the schedule depends on is real. It was
@@ -2071,6 +2441,12 @@ fn run(
         // barely at all in the direction size predicts.
         todo.sort_by_key(|job| std::cmp::Reverse(job.weight));
     }
+
+    // What the decode is actually facing, which is not what was queued for it:
+    // everything the pass above refused has been reported already. Shadowed
+    // rather than assigned so the count in the message above stays the count
+    // that was true when it was printed.
+    let todo_count = todo.len();
 
     if shutdown_requested() {
         return Ok(Outcome::Interrupted);
@@ -2105,6 +2481,9 @@ fn run(
         let cursor = AtomicUsize::new(0);
         let collected: Mutex<Vec<(usize, VideoFingerprint)>> =
             Mutex::new(Vec::with_capacity(todo_count));
+        // Failures worth remembering, gathered from every worker and written
+        // once when they have all joined -- see `refusals_store`.
+        let refused_here: Mutex<Vec<(String, Stamp, Refusal)>> = Mutex::new(Vec::new());
 
         // Files finished. The bar's own position is decode work, so it cannot
         // answer "how many videos is that?" -- and that is the number a user
@@ -2198,6 +2577,7 @@ fn run(
         let files_done = &files_done;
         let in_flight = &in_flight;
         let newly_cached = &newly_cached;
+        let refused_here = &refused_here;
 
         std::thread::scope(|scope| {
             for _ in 0..workers {
@@ -2352,10 +2732,24 @@ fn run(
                                 // description: the run was asked to fingerprint
                                 // it and could not.
                                 if !shutdown_requested() {
-                                    log::error!("Failed to process {}: {:#}", job.path, e);
+                                    log::error!(target: stats::COUNTED, "Failed to process {}: {:#}", job.path, e);
                                     stats
                                         .fingerprint_failed
                                         .record(format!("{}: {:#}", job.path, e));
+
+                                    // The half of the memory that saves a
+                                    // DECODE rather than a probe. These are the
+                                    // files that open and then turn out to hold
+                                    // nothing to fingerprint -- an image
+                                    // container with no frame, a stream that
+                                    // will not parse -- and re-reading them
+                                    // every run was the whole of a warm scan.
+                                    if let Some(verdict) = worth_remembering(&e) {
+                                        refused_here
+                                            .lock()
+                                            .unwrap_or_else(|p| p.into_inner())
+                                            .push((job.path.clone(), job.stamp, verdict));
+                                    }
                                 }
                                 finish(idx, job, charged_work.get()); // Work attempted
                                 continue;
@@ -2372,6 +2766,7 @@ fn run(
                             }
                             Err(e) => {
                                 log::error!(
+                                    target: stats::COUNTED,
                                     "Failed to cache fingerprint for {}: {:#}",
                                     job.path,
                                     e
@@ -2395,6 +2790,11 @@ fn run(
         });
 
         pb.finish_and_clear();
+
+        let remember = refused_here.lock().unwrap_or_else(|e| e.into_inner()).split_off(0);
+        if let Err(e) = refusals_store(db, &remember) {
+            log::debug!("Could not record {} refusal(s): {:#}", remember.len(), e);
+        }
 
         let mut fresh = collected
             .lock()
@@ -2479,7 +2879,7 @@ fn run(
                 log::debug!("Dropped {} cache entry(ies) for removed file(s).", forgotten)
             }
             Err(e) => {
-                log::error!("Failed to drop cache entries for removed files: {:#}", e);
+                log::error!(target: stats::COUNTED, "Failed to drop cache entries for removed files: {:#}", e);
                 stats.cache_purge_failed.record(format!("{:#}", e));
             }
         }
@@ -3130,6 +3530,160 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().0.value().to_string())
             .collect()
+    }
+
+    /// A file that is not video is reported by whichever pass discovers it, and
+    /// the run's account of itself does not depend on which one that was.
+    ///
+    /// This is the whole outside-visible surface of moving the discovery into
+    /// the weighing pass: the same count, the same bucket, the same exit code,
+    /// one open instead of two. The saving itself cannot be asserted from here
+    /// -- nothing counts `avformat_open_input` calls -- so what this pins is
+    /// that the file is still reported at all, which is the thing dropping it
+    /// from the decode queue could plausibly have lost.
+    #[test]
+    fn test_a_file_that_is_not_video_is_still_reported_by_the_run_that_skips_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+
+        // A folder of its own: `-x '*'` takes everything, and the cache this
+        // test just created lives in the temp directory too.
+        let library = dir.path().join("library");
+        std::fs::create_dir(&library).unwrap();
+        std::fs::write(library.join("notes.mkv"), b"this file is not a video at all").unwrap();
+
+        let args =
+            Args::parse_from(["vid-fp", &library.to_string_lossy(), "-x", "*"]);
+        let stats = RunStats::default();
+        assert!(matches!(
+            run(&args, Some(&db), Instant::now(), 1, &stats),
+            Ok(Outcome::Completed)
+        ));
+
+        assert_eq!(stats.fingerprint_failed.count(), 1, "the file is named as a problem");
+        assert!(stats.had_problems(), "so the run still exits 2");
+        assert!(cached_paths(&db).is_empty(), "and nothing about it is cached");
+    }
+
+    /// A refusal survives the run that made it, and is guarded by the same stamp
+    /// a fingerprint is -- so editing the file asks again rather than trusting a
+    /// verdict about bytes that are no longer there.
+    #[test]
+    fn test_a_refusal_is_remembered_until_the_file_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+        let path = "/videos/not-really.mkv";
+        let verdict = Refusal::NotMedia(fingerprint::NotMedia { bytes: 2048, score: 0 });
+        let written = stamp(1_700_000_000, 12_345);
+
+        refusals_store(&db, &[(path.to_string(), written, verdict)]).unwrap();
+
+        let remembered = refusal_lookup(&db, path, &written).expect("the same file is remembered");
+        assert!(format!("{}", remembered).contains("2048"), "and says what it saw");
+
+        assert!(
+            refusal_lookup(&db, path, &stamp(1_700_000_001, 12_345)).is_none(),
+            "an edit re-opens the question"
+        );
+        assert!(
+            refusal_lookup(&db, path, &stamp(1_700_000_000, 12_346)).is_none(),
+            "and so does a change of size"
+        );
+    }
+
+    /// The two tables are pruned together. The refusals table is the one that
+    /// grows without bound -- one entry per file that is not video -- so a prune
+    /// that only swept fingerprints would leave the larger half behind.
+    #[test]
+    fn test_pruning_collects_refusals_as_well_as_fingerprints() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = cache_with_an_orphan(&dir);
+        refusals_store(
+            &db,
+            &[(
+                ORPHAN.to_string(),
+                stamp(1_700_000_000, 12_345),
+                Refusal::NotMedia(fingerprint::NotMedia { bytes: 2048, score: 0 }),
+            )],
+        )
+        .unwrap();
+
+        let mut fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        fixture.push("tests/fixtures/test_video.mp4");
+        let scanned = dir.path().join("clip.mp4");
+        std::fs::copy(&fixture, &scanned).expect("the fixture video is part of the tree");
+
+        let stats = RunStats::default();
+        assert!(matches!(
+            run(&args_over(&dir, &["--prune-cache"]), Some(&db), Instant::now(), 1, &stats),
+            Ok(Outcome::Completed)
+        ));
+
+        assert!(!cached_paths(&db).iter().any(|p| p == ORPHAN), "the fingerprint is gone");
+        assert!(
+            refusal_lookup(&db, ORPHAN, &stamp(1_700_000_000, 12_345)).is_none(),
+            "and so is the refusal, which nothing else would ever overwrite"
+        );
+    }
+
+    /// Disposing of a file forgets both of the things the cache might know about
+    /// it. A refusal left behind outlives its bytes exactly the way a
+    /// fingerprint would, and the next file to land on that path would inherit
+    /// a verdict about a different one -- caught by the stamp, but only by luck.
+    #[test]
+    fn test_forgetting_a_file_forgets_its_refusal_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+        let path = "/videos/gone.mkv";
+        let written = stamp(1_700_000_000, 12_345);
+        refusals_store(
+            &db,
+            &[(
+                path.to_string(),
+                written,
+                Refusal::NotMedia(fingerprint::NotMedia { bytes: 16384, score: 1 }),
+            )],
+        )
+        .unwrap();
+
+        cache_forget(&db, &[path.to_string()]).unwrap();
+
+        assert!(refusal_lookup(&db, path, &written).is_none());
+    }
+
+    /// A remembered refusal has to read exactly like the one that discovered it.
+    ///
+    /// The two travel by completely different routes -- one is an `anyhow` chain
+    /// built as the file is examined, the other is regenerated from two numbers
+    /// in the cache -- so nothing but a test keeps them the same sentence. They
+    /// were not: the discovering run wrapped the verdict in "Failed to open
+    /// video file", which the replay had no way to add and which describes an
+    /// open that never happened, so the same file read one way on Monday and
+    /// another on Tuesday. See `fingerprint::open_video`.
+    #[test]
+    fn test_a_remembered_refusal_reads_exactly_like_a_fresh_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+
+        let library = dir.path().join("library");
+        std::fs::create_dir(&library).unwrap();
+        let path = library.join("notes.rlib");
+        std::fs::write(&path, "not a video at all\n".repeat(200)).unwrap();
+
+        let args = Args::parse_from(["vid-fp", &library.to_string_lossy(), "-x", "*"]);
+
+        let discovered = RunStats::default();
+        run(&args, Some(&db), Instant::now(), 1, &discovered).unwrap();
+        let remembered = RunStats::default();
+        run(&args, Some(&db), Instant::now(), 1, &remembered).unwrap();
+
+        assert_eq!(discovered.fingerprint_failed.count(), 1, "found the hard way");
+        assert_eq!(remembered.fingerprint_failed.count(), 1, "and then the cheap way");
+        assert_eq!(
+            discovered.fingerprint_failed.samples(),
+            remembered.fingerprint_failed.samples(),
+            "the same finding about the same file has to be the same sentence"
+        );
     }
 
     #[test]
