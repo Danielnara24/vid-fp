@@ -32,10 +32,12 @@ use crate::fingerprint::VideoFingerprint;
 use crate::stats::RunStats;
 use crate::utils::shutdown_requested;
 use std::collections::HashSet;
+use std::path::{Component, Path, PathBuf};
 
 /// How much of the clique search ONE connected component may cost, counted in
-/// set probes -- the work each recursion step is about to do, summed over the
-/// whole search. See `step_cost`, which is where the counting is defined.
+/// set probes -- every set operation the search performs, charged before it runs.
+/// See `Search::spend` and `intersection_cost`, which are where the counting is
+/// defined.
 ///
 /// Maximal-clique enumeration is 3^(n/3) in the worst case, and the worst case
 /// is reachable from the command line: a loose `--hamming-distance` over a large
@@ -52,12 +54,27 @@ use std::collections::HashSet;
 /// underneath both, because reaching depth `d` means `p` held at least `d - i`
 /// members at each level `i` above.
 ///
-/// Fifty million is a second or two of a single core and well under a gigabyte
-/// of live sets. It also bounds the depth tightly, which is what keeps the stack
-/// out of it: a clique of `d` members costs about `d^3 / 3` probes to enumerate
-/// (at level `i` every one of the `d - i` remaining candidates is intersected
-/// with the rest), so no search that fits in this budget can recurse past ~530
-/// frames.
+/// Fifty million is a second or two of a single core. It also bounds the depth:
+/// a clique of `d` members costs about `3d^2 / 2` probes to enumerate, since each
+/// of its `d` levels holds a `p` of at most `d` members and spends a small number
+/// of passes over it, so no search that fits in this budget can recurse past
+/// ~5,800 frames. The sets alive along that path are the same quantity again --
+/// `p`, `x` and the clique so far, at every level above -- which is what keeps the
+/// heap under it too. Measured on the local corpus, peak RSS at the point the
+/// budget is exhausted: 177 MB at `-d 24` and 562 MB at `-d 32`, the loosest
+/// input the flag admits at all.
+///
+/// That figure used to be ~530, because a level cost `d - i` INTERSECTIONS
+/// rather than a handful -- the pivot walk priced every candidate in `p ∪ x`
+/// against `p`, making the whole search `d^3 / 3`. The consequence was a ceiling
+/// that fired hardest on the easiest possible input: a complete component has
+/// exactly one maximal clique and one branch per level, so 600 copies of one
+/// file were refused by a budget meant for combinatorial explosions, and the
+/// advice the refusal gives -- tighten `--hamming-distance` -- cannot separate
+/// files that are identical. `choose_pivot` stops the walk as soon as it can and
+/// the budget now measures what is really spent, so a component like that is
+/// enumerated rather than abandoned. Nothing about which cliques are found
+/// changed: the pivot is still the maximum one.
 ///
 /// Measured against the local 756-file corpus, probes spent by the largest
 /// component: 5.4k at the default `-d 4`, 5.6k at `-d 12`, 75k at `-d 16`, and
@@ -79,6 +96,28 @@ const SEARCH_BUDGET_PER_COMPONENT: usize = 50_000_000;
 /// budget gives, arriving through the other door.
 const MAX_GROUPS_PER_COMPONENT: usize = 100_000;
 
+/// The stack the clique search is given, so that the budget above is the only
+/// thing that decides how deep it may go.
+///
+/// Recursion depth is the size of the clique being built, and reaching depth `d`
+/// costs at least `3d^2 / 2` probes -- every level walks `p` a small fixed number
+/// of times and `p` still holds at least `d - i` members -- so the budget caps
+/// the depth at about 5,800 frames. A frame of `bron_kerbosch` measures ~600
+/// bytes (three sets by value, the branch list, and the clique being cloned into),
+/// which puts the deepest search the ceilings permit at a little over 3 MB.
+///
+/// That fits the 8 MB a Linux main thread usually gets, and "usually" is doing
+/// far too much work in a sentence about a segfault: `ulimit -s` is 1 or 2 MB on
+/// plenty of build machines and containers, and a rayon worker gets 2 MB. Measured
+/// here, a complete component of 2,000 files needs more than 1 MB and one of 4,000
+/// needs more than 2 -- both well inside what the budget allows -- so on either of
+/// those the process would abort rather than report. Naming the stack makes the
+/// depth bound a property of this program instead of of the ambient limits, which
+/// is what lets `SEARCH_BUDGET_PER_COMPONENT` be the only ceiling that decides
+/// anything. It costs address space and not memory: a thread stack is committed a
+/// page at a time as it is used.
+const SEARCH_STACK_BYTES: usize = 64 * 1024 * 1024;
+
 /// Why a component's search stopped early. Any of these means the groups found
 /// so far are incomplete, and incomplete groups are dropped rather than reported
 /// -- see `find_duplicate_groups`.
@@ -92,35 +131,111 @@ enum Halt {
 }
 
 impl Halt {
-    /// What stopped the search, phrased for the Problems summary. `Interrupted`
-    /// never reaches it -- `RunStats` deliberately counts nothing that Ctrl-C
-    /// dropped -- but it is spelled out anyway rather than made unreachable.
-    fn ceiling(&self) -> &'static str {
+    /// What stopped the search and how far it had got, phrased for the Problems
+    /// summary. `Interrupted` never reaches it -- `RunStats` deliberately counts
+    /// nothing that Ctrl-C dropped -- but it is spelled out anyway rather than
+    /// made unreachable.
+    ///
+    /// Both ceilings can now say a number, and they deliberately say DIFFERENT
+    /// numbers, because "how many groups did it find" means different things
+    /// either side of them.
+    ///
+    /// Against the work budget the count is real information: the search stopped
+    /// wherever it happened to be, so `0 so far` says the component is so tangled
+    /// that not one clique could be finished, while `40,000 so far` says it was
+    /// enumerating perfectly well and simply had more to do than the budget
+    /// allowed. Those are different problems and the fix for them differs.
+    ///
+    /// Against the OUTPUT ceiling the count carries nothing: the search stops the
+    /// moment it exceeds the ceiling, so it is always exactly one past it and
+    /// printing it would be printing `MAX_GROUPS_PER_COMPONENT + 1` dressed up as
+    /// a measurement. What is worth saying there is the threshold itself -- the
+    /// scale the user is up against, and a figure they can compare their `-d`
+    /// ladder to -- with "more than" doing the work the count cannot.
+    fn ceiling(&self, found: usize, ceilings: Ceilings) -> String {
         match self {
-            Halt::Budget => "the search for groups ran past its work ceiling",
-            Halt::Groups => "they form more overlapping groups than can be reported",
-            Halt::Interrupted => "the run was interrupted",
+            Halt::Budget => format!(
+                "the search for groups ran past its work ceiling, with {} found so far",
+                found
+            ),
+            Halt::Groups => format!(
+                "they form more than {} overlapping groups, which is more than can be reported",
+                ceilings.groups
+            ),
+            Halt::Interrupted => "the run was interrupted".to_string(),
         }
     }
 }
 
-/// The line the Problems summary shows for an abandoned component: how many
-/// files were in it, which ceiling stopped it, and one of them by name, so the
-/// user has somewhere to look. The lowest path rather than an arbitrary member,
-/// because the summary should read the same on a re-run.
-fn abandoned_detail(component: &[usize], reason: &Halt, fps: &[VideoFingerprint]) -> String {
-    let example = component
-        .iter()
-        .map(|&i| fps[i].path.as_str())
-        .min()
-        .unwrap_or("?");
+/// The deepest folder every one of `paths` sits under, or `None` if they share
+/// none.
+///
+/// Compared a whole path COMPONENT at a time rather than as strings, which is
+/// the difference between `/lib/season1` and `/lib/season2` sharing `/lib` and
+/// their appearing to share `/lib/season` -- a folder that does not exist and
+/// that the user would go looking for.
+///
+/// The file names themselves are dropped first: what this answers is "where do I
+/// go and look", and a file is not somewhere to look.
+///
+/// Every path a scan produces is absolute (`sources::collect` canonicalizes each
+/// one), so real input always shares at least the root and this always answers.
+/// `None` is for a caller that got something else.
+fn common_parent<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Option<PathBuf> {
+    let mut shared: Option<Vec<Component<'a>>> = None;
 
-    format!(
-        "{} file(s) linked too densely to group -- {}; e.g. {}",
+    for path in paths {
+        let folder: Vec<Component> = path.parent().unwrap_or(Path::new("")).components().collect();
+
+        shared = Some(match shared {
+            None => folder,
+            Some(so_far) => {
+                let agreed = so_far.iter().zip(&folder).take_while(|(a, b)| a == b).count();
+                so_far.into_iter().take(agreed).collect()
+            }
+        });
+    }
+
+    let shared = shared?;
+    (!shared.is_empty()).then(|| shared.into_iter().collect())
+}
+
+/// The line the Problems summary shows for an abandoned component: how many
+/// files were in it, which ceiling stopped it and how far it had got, and where
+/// they are, so the user has somewhere to look.
+///
+/// A folder rather than one of the files. Naming a member was only ever a handle
+/// on a set the report says nothing else about, and it was a poor one: nothing is
+/// wrong with the file it named, and on the case that produces these lines most
+/// often -- a tolerance loose enough to link a whole library into one component
+/// -- it degenerated into whichever path happened to sort first. The shared
+/// folder is the thing a user can act on, because it is what `--exclude` and a
+/// narrower scan take as an argument, and it narrows by itself exactly when the
+/// answer is worth having: one dense folder inside a large library names that
+/// folder, while a library that is dense throughout names the scan root and says
+/// so honestly.
+///
+/// It is also stable by construction rather than by convention. Which files land
+/// in a component comes out of `HashSet` iteration, so picking a member needed
+/// the lowest path to read the same on a re-run; a common prefix does not depend
+/// on the order it is computed in.
+fn abandoned_detail(
+    component: &[usize],
+    reason: &Halt,
+    found: usize,
+    ceilings: Ceilings,
+    fps: &[VideoFingerprint],
+) -> String {
+    let line = format!(
+        "{} file(s) linked too densely to group -- {}",
         component.len(),
-        reason.ceiling(),
-        example
-    )
+        reason.ceiling(found, ceilings)
+    );
+
+    match common_parent(component.iter().map(|&i| Path::new(&fps[i].path))) {
+        Some(folder) => format!("{}; all under {}", line, folder.display()),
+        None => line,
+    }
 }
 
 /// What one component's search is allowed to spend.
@@ -151,37 +266,25 @@ struct Search<'a> {
     adjacency: &'a [HashSet<usize>],
     cliques: Vec<HashSet<usize>>,
     ceilings: Ceilings,
-    /// Candidate slots left; the search stops when it runs out.
+    /// Set probes left; the search stops when it runs out.
     budget: usize,
     halted: Option<Halt>,
 }
 
-/// What the step about to run will cost, in set probes.
+/// What one `HashSet::intersection` between a vertex's neighbours and `other`
+/// costs, in probes.
 ///
-/// The dominant term is pivot selection: for every candidate in `p ∪ x` it
-/// intersects that vertex's neighbours with `p`, and `HashSet::intersection`
-/// walks the smaller of the two -- so one candidate costs `min(deg(v), |p|)`
-/// probes rather than one. Charging the flat size of the sets undercounts a
-/// dense component by a factor of `|p|`, and that is not a rounding error: a
-/// NEARLY complete graph has few enough maximal cliques to stay under the group
-/// ceiling while every one of its steps carries hundreds of thousands of probes,
-/// so it used to spend minutes inside a budget that believed it had spent
-/// thousands. (`-d 40` on the local corpus, before `--hamming-distance` was
-/// capped at chance: eleven minutes and climbing, single-threaded, uninterrupted
-/// by either ceiling.)
-///
-/// The branch loop and the two intersections it does per branch are the same
-/// shape as the pivot walk and within a small constant of it, so they ride on
-/// this rather than being counted separately. Pricing the walk costs a walk, but
-/// a linear one, ahead of a step whose own work is the product.
-fn step_cost(p: &HashSet<usize>, x: &HashSet<usize>, adjacency: &[HashSet<usize>]) -> usize {
-    let cap = p.len();
-    // The `1` is what a step that examines nothing still costs, so a search
-    // cannot recurse for free.
-    1 + p
-        .union(x)
-        .map(|&v| adjacency[v].len().min(cap))
-        .sum::<usize>()
+/// `intersection` walks the smaller of the two sets and looks each member up in
+/// the larger, so one of these is `min(deg(v), |other|)` probes rather than one.
+/// Charging the flat size of the sets undercounts a dense component by a factor
+/// of `|p|`, and that is not a rounding error: a NEARLY complete graph has few
+/// enough maximal cliques to stay under the group ceiling while every one of its
+/// steps carries hundreds of thousands of probes, so it used to spend minutes
+/// inside a budget that believed it had spent thousands. (`-d 40` on the local
+/// corpus, before `--hamming-distance` was capped at chance: eleven minutes and
+/// climbing, single-threaded, uninterrupted by either ceiling.)
+fn intersection_cost(neighbours: &HashSet<usize>, other: &HashSet<usize>) -> usize {
+    neighbours.len().min(other.len())
 }
 
 impl<'a> Search<'a> {
@@ -195,17 +298,18 @@ impl<'a> Search<'a> {
         }
     }
 
-    /// Charge one recursion step and check every ceiling. `false` means the
-    /// search has stopped and the caller should unwind.
-    fn may_continue(&mut self, cost: usize) -> bool {
+    /// The ceilings that are not about the work: has something already stopped
+    /// the search, has the user, has it produced more groups than can be
+    /// reported. `false` means the caller should unwind.
+    ///
+    /// Asked once per recursion step, which is the finest granularity the search
+    /// has -- a single step is a handful of set operations, so an interrupt is
+    /// answered immediately even on a component that would otherwise run for
+    /// minutes. It is a relaxed atomic load against work that clones sets.
+    fn may_continue(&mut self) -> bool {
         if self.halted.is_some() {
             return false;
         }
-        // Polled here rather than in the branch loop because this runs once per
-        // recursion step, which is the finest granularity the search has -- a
-        // single step is a handful of set operations, so an interrupt is
-        // answered immediately even on a component that would otherwise run for
-        // minutes. It is a relaxed atomic load against work that clones sets.
         if shutdown_requested() {
             self.halted = Some(Halt::Interrupted);
             return false;
@@ -214,13 +318,87 @@ impl<'a> Search<'a> {
             self.halted = Some(Halt::Groups);
             return false;
         }
-        let Some(left) = self.budget.checked_sub(cost) else {
+        true
+    }
+
+    /// Charge `probes` of set work against the budget. `false` means it ran out
+    /// and the caller should unwind.
+    ///
+    /// Charged per OPERATION rather than per step, and always before the
+    /// operation it pays for. A step's cost used to be priced up front, which
+    /// worked only for as long as every step spent the same shape of work; the
+    /// pivot walk now stops as soon as it can (see `choose_pivot`), so what a
+    /// step is about to spend is no longer knowable before it spends it. Metering
+    /// each operation instead keeps the budget an account of what the search
+    /// really did -- and tightens the overrun from one whole step to one set
+    /// intersection.
+    fn spend(&mut self, probes: usize) -> bool {
+        let Some(left) = self.budget.checked_sub(probes) else {
             self.halted = Some(Halt::Budget);
             return false;
         };
         self.budget = left;
         true
     }
+}
+
+/// The pivot for this step: the candidate in `p ∪ x` adjacent to the most of
+/// `p`. `None` means the budget ran out while looking (`p` is never empty here,
+/// so there is always a candidate otherwise).
+///
+/// Every `u` in `p ∪ x` is a VALID pivot -- the maximum is only what makes the
+/// branching narrow -- and the walk that finds the maximum is the single most
+/// expensive thing a step does: one intersection per candidate, each costing up
+/// to `|p|`, which is what makes a step quadratic in `|p|` and a deep search
+/// cubic in the size of its clique.
+///
+/// So the walk stops the moment a candidate reaches the most that anything still
+/// to come could reach. `x` is walked FIRST because the two halves have
+/// different ceilings: a candidate drawn from `x` can be adjacent to the whole of
+/// `p`, while one drawn from `p` is never its own neighbour and tops out one
+/// short. In that order a candidate hitting its own ceiling is provably the best
+/// of the whole set, so this is an early exit rather than an approximation --
+/// the pivot is exactly the one the exhaustive walk would have chosen, up to
+/// ties, which `HashSet` iteration order already decided.
+///
+/// What it buys is the case the ceilings were misfiring on. In a complete
+/// component -- 600 copies of one file, a folder where everything matches
+/// everything -- `x` is empty and the first candidate covers all of `p` but
+/// itself, so the walk is one intersection instead of `|p|` of them. That takes
+/// the whole search from `~d^3 / 3` probes to `~d^2` for a clique of `d`
+/// members, which is the difference between a group of 600 being reported and
+/// being abandoned as too dense to enumerate.
+fn choose_pivot(
+    p: &HashSet<usize>,
+    x: &HashSet<usize>,
+    adjacency: &[HashSet<usize>],
+    search: &mut Search,
+) -> Option<usize> {
+    // Disjoint by construction, so chaining them is `p ∪ x` with nothing
+    // repeated -- and unlike `HashSet::union` it keeps the two halves apart,
+    // which is what lets each carry its own ceiling.
+    let candidates = x
+        .iter()
+        .map(|&v| (v, p.len()))
+        .chain(p.iter().map(|&v| (v, p.len().saturating_sub(1))));
+
+    let mut best: Option<(usize, usize)> = None;
+
+    for (v, ceiling) in candidates {
+        if !search.spend(intersection_cost(&adjacency[v], p)) {
+            return None;
+        }
+        let covered = adjacency[v].intersection(p).count();
+
+        if best.is_none_or(|(_, seen)| covered > seen) {
+            best = Some((v, covered));
+        }
+        if covered >= ceiling {
+            break;
+        }
+    }
+
+    best.map(|(v, _)| v)
 }
 
 /// Bron-Kerbosch with Tomita pivoting.
@@ -235,20 +413,26 @@ impl<'a> Search<'a> {
 /// maximal clique must contain the pivot or one of its non-neighbours, so
 /// branching on only the non-neighbours skips whole subtrees that could not
 /// produce anything new. Picking the pivot with the most neighbours still in
-/// `p` skips the most.
+/// `p` skips the most -- see `choose_pivot`, which is where most of a step's
+/// work goes and where it is metered.
 ///
-/// Every step is charged against the search's budget and checked against its
-/// ceilings before it does any work, so a component that turns out to be dense
-/// enough to enumerate forever stops instead -- and so Ctrl-C is answered here
-/// like it is in every other stage. See `Search`.
+/// Every set operation is charged against the search's budget before it runs,
+/// and every step is checked against the ceilings that are not about work, so a
+/// component that turns out to be dense enough to enumerate forever stops
+/// instead -- and so Ctrl-C is answered here like it is in every other stage.
+/// See `Search`.
 fn bron_kerbosch(
     r: HashSet<usize>,
     mut p: HashSet<usize>,
     mut x: HashSet<usize>,
     search: &mut Search,
 ) {
-    let cost = step_cost(&p, &x, search.adjacency);
-    if !search.may_continue(cost) {
+    if !search.may_continue() {
+        return;
+    }
+    // What a step that examines nothing still costs, so a search cannot recurse
+    // for free.
+    if !search.spend(1) {
         return;
     }
 
@@ -264,20 +448,29 @@ fn bron_kerbosch(
 
     let adjacency = search.adjacency;
 
-    // `p` is non-empty, so the union is too and this always yields a pivot; the
-    // fallback below is only there to keep the function total.
-    let pivot = p
-        .union(&x)
-        .max_by_key(|&&v| adjacency[v].intersection(&p).count())
-        .copied();
-
-    let branches: Vec<usize> = match pivot {
-        Some(u) => p.difference(&adjacency[u]).copied().collect(),
-        None => p.iter().copied().collect(),
+    // `p` is non-empty, so there is always a candidate: `None` here means the
+    // budget ran out inside the walk, and `halted` already says so.
+    let Some(pivot) = choose_pivot(&p, &x, adjacency, search) else {
+        return;
     };
+
+    // `HashSet::difference` walks `p`, looking each member up in the pivot's
+    // neighbours.
+    if !search.spend(p.len()) {
+        return;
+    }
+    let branches: Vec<usize> = p.difference(&adjacency[pivot]).copied().collect();
 
     for v in branches {
         let neighbors = &adjacency[v];
+
+        // The two intersections this branch is about to build. They used to ride
+        // on the pivot walk, which was always the larger of the two by a factor
+        // of `|p ∪ x|`; now that the walk can stop after a single candidate they
+        // have to answer for themselves.
+        if !search.spend(intersection_cost(neighbors, &p) + intersection_cost(neighbors, &x)) {
+            return;
+        }
 
         let mut next_r = r.clone();
         next_r.insert(v);
@@ -375,6 +568,83 @@ pub fn find_duplicate_groups(
     group_within(n, edges, fingerprints, stats, Ceilings::shipped())
 }
 
+/// Every maximal clique of every component, or `None` if Ctrl-C arrived.
+///
+/// A component whose search halts on a ceiling contributes nothing and is
+/// recorded as a problem; an interrupt abandons the lot, because a library
+/// grouped from half its components is not the library the user asked about.
+fn enumerate(
+    adjacency: &[HashSet<usize>],
+    fingerprints: &[VideoFingerprint],
+    stats: &RunStats,
+    ceilings: Ceilings,
+) -> Option<Vec<HashSet<usize>>> {
+    let mut cliques = Vec::new();
+
+    for component in components(adjacency) {
+        let mut search = Search::new(adjacency, ceilings);
+
+        bron_kerbosch(
+            HashSet::new(),
+            component.iter().copied().collect(),
+            HashSet::new(),
+            &mut search,
+        );
+
+        // Taken before the match: the abandoned arm reports it, and the clean arm
+        // is about to drain the vector it comes from.
+        let found = search.cliques.len();
+
+        match search.halted {
+            None => cliques.append(&mut search.cliques),
+            Some(Halt::Interrupted) => return None,
+            Some(reason) => stats.clustering_abandoned.record(abandoned_detail(
+                &component,
+                &reason,
+                found,
+                ceilings,
+                fingerprints,
+            )),
+        }
+    }
+
+    Some(cliques)
+}
+
+/// `enumerate`, on a stack sized by this program rather than by `ulimit -s`.
+///
+/// See `SEARCH_STACK_BYTES` for why the search does not simply run on the
+/// caller's stack. A thread that will not spawn -- `RLIMIT_NPROC`, no memory for
+/// the mapping -- is no reason to refuse the work, so that case falls back to the
+/// caller's own stack, which is exactly what every build before this one used.
+fn enumerate_deeply(
+    adjacency: &[HashSet<usize>],
+    fingerprints: &[VideoFingerprint],
+    stats: &RunStats,
+    ceilings: Ceilings,
+) -> Option<Vec<HashSet<usize>>> {
+    std::thread::scope(|scope| {
+        let spawned = std::thread::Builder::new()
+            .stack_size(SEARCH_STACK_BYTES)
+            .spawn_scoped(scope, || enumerate(adjacency, fingerprints, stats, ceilings));
+
+        match spawned {
+            // A panic in there is this program's bug, and it belongs on the way
+            // out rather than quietly rendered as "no groups found".
+            Ok(handle) => handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            Err(e) => {
+                log::debug!(
+                    "Could not give the group search a stack of its own ({}); using this thread's.",
+                    e
+                );
+                enumerate(adjacency, fingerprints, stats, ceilings)
+            }
+        }
+    })
+}
+
 /// `find_duplicate_groups` with the ceilings supplied. The run always passes
 /// `Ceilings::shipped()`; only the tests pass anything else.
 fn group_within(
@@ -390,26 +660,10 @@ fn group_within(
         adjacency[j].insert(i);
     }
 
-    let mut cliques = Vec::new();
-
-    for component in components(&adjacency) {
-        let mut search = Search::new(&adjacency, ceilings);
-
-        bron_kerbosch(
-            HashSet::new(),
-            component.iter().copied().collect(),
-            HashSet::new(),
-            &mut search,
-        );
-
-        match search.halted {
-            None => cliques.append(&mut search.cliques),
-            Some(Halt::Interrupted) => return Vec::new(),
-            Some(reason) => stats
-                .clustering_abandoned
-                .record(abandoned_detail(&component, &reason, fingerprints)),
-        }
-    }
+    let Some(cliques) = enumerate_deeply(&adjacency, fingerprints, stats, ceilings) else {
+        // Ctrl-C. A partial enumeration is not a report.
+        return Vec::new();
+    };
 
     // Note there is no subset-elimination pass here. Every clique above is
     // maximal by construction, and a maximal clique cannot be contained in
@@ -464,11 +718,18 @@ mod tests {
         }
     }
 
+    /// The folder `mock_library` puts its files in.
+    ///
+    /// Absolute, because every path reaching this module is: `sources::collect`
+    /// canonicalizes each one. Bare file names would leave `abandoned_detail`
+    /// looking for a shared folder that a real run always has.
+    const MOCK_DIR: &str = "/library";
+
     /// `n` fingerprints whose paths sort in index order, so a group printed as
     /// `[0, 1, 2]` is also the path order the real sort would produce.
     fn mock_library(n: usize) -> Vec<VideoFingerprint> {
         (0..n)
-            .map(|i| mock_fingerprint(&format!("{:04}.mp4", i)))
+            .map(|i| mock_fingerprint(&format!("{}/{:04}.mp4", MOCK_DIR, i)))
             .collect()
     }
 
@@ -799,10 +1060,11 @@ mod tests {
     }
 
     #[test]
-    fn test_the_problem_line_names_a_file_and_a_count() {
+    fn test_the_problem_line_names_a_folder_and_a_count() {
         // The summary is the only place a user learns that files went
-        // unreported, so it has to say how many and point at one of them. The
-        // example is the lowest path so that a re-run reads the same.
+        // unreported, so it has to say how many and where they are. A folder
+        // rather than a member: `--exclude` and a narrower scan both take one,
+        // and nothing was ever wrong with the file this used to name.
         let (n, edges) = moon_moser(20);
         let fps = mock_library(n);
         let stats = RunStats::default();
@@ -812,7 +1074,120 @@ mod tests {
         let lines = stats.clustering_abandoned.samples();
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains(&format!("{} file(s)", n)), "got: {}", lines[0]);
-        assert!(lines[0].contains("0000.mp4"), "got: {}", lines[0]);
+        assert!(lines[0].ends_with(&format!("all under {}", MOCK_DIR)), "got: {}", lines[0]);
+        assert!(!lines[0].contains(".mp4"), "no member is named any more: {}", lines[0]);
+    }
+
+    #[test]
+    fn test_the_shared_folder_narrows_to_the_part_of_the_library_that_is_dense() {
+        // What the folder buys over a member: one dense folder inside a larger
+        // scan names THAT folder, so the fix -- tighten `-d`, exclude it, scan it
+        // on its own -- has an argument. The files here are spread over two
+        // seasons and only one of them is a tangle.
+        let paths = [
+            "/lib/season1/a.mkv",
+            "/lib/season2/b.mkv",
+            "/lib/season2/extras/c.mkv",
+            "/lib/season2/d.mkv",
+        ];
+        let fps: Vec<VideoFingerprint> = paths.iter().map(|p| mock_fingerprint(p)).collect();
+
+        // The dense component is the three files under season2.
+        let dense = [1usize, 2, 3];
+        let line = abandoned_detail(&dense, &Halt::Groups, 0, Ceilings::shipped(), &fps);
+        assert!(line.ends_with("all under /lib/season2"), "got: {}", line);
+
+        // Drag in the file from the other season and it can only name the root
+        // they share, which is the honest answer rather than a narrower guess.
+        let whole = [0usize, 1, 2, 3];
+        let line = abandoned_detail(&whole, &Halt::Groups, 0, Ceilings::shipped(), &fps);
+        assert!(line.ends_with("all under /lib"), "got: {}", line);
+    }
+
+    #[test]
+    fn test_the_shared_folder_is_compared_a_path_component_at_a_time() {
+        // The trap a string prefix falls into: `/lib/season1` and `/lib/season2`
+        // share the CHARACTERS `/lib/season`, which is not a folder and is not
+        // anywhere the user can go and look.
+        let shared = common_parent(
+            [
+                Path::new("/lib/season1/a.mkv"),
+                Path::new("/lib/season2/b.mkv"),
+            ]
+        );
+        assert_eq!(shared, Some(PathBuf::from("/lib")));
+
+        // A single file answers with the folder it is in, not with itself.
+        let one = common_parent([Path::new("/lib/season1/a.mkv")]);
+        assert_eq!(one, Some(PathBuf::from("/lib/season1")));
+
+        // Files that share nothing but the root say so.
+        let apart = common_parent([Path::new("/a/x.mkv"), Path::new("/b/y.mkv")]);
+        assert_eq!(apart, Some(PathBuf::from("/")));
+
+        // And a caller that hands over something a scan never produces -- a bare
+        // name, with no folder at all -- gets no answer rather than a wrong one.
+        assert_eq!(common_parent([Path::new("x.mkv")]), None);
+        assert_eq!(common_parent(std::iter::empty()), None);
+    }
+
+    /// The one abandoned line a run of these ceilings produces.
+    fn abandoned_line(ceilings: Ceilings) -> String {
+        let (n, edges) = moon_moser(20);
+        let fps = mock_library(n);
+        let stats = RunStats::default();
+
+        group_within(n, edges, &fps, &stats, ceilings);
+
+        let lines = stats.clustering_abandoned.samples();
+        assert_eq!(lines.len(), 1, "one component, one line");
+        lines.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn test_the_work_ceiling_says_how_many_groups_it_had_found() {
+        // The figure that distinguishes the two shapes of "too dense". A budget
+        // large enough to enumerate for a while stops partway through a real
+        // enumeration; one that is not gets nowhere at all. Both are refused, and
+        // a user who cannot tell them apart cannot tell whether a looser budget
+        // would have helped.
+        let barely = abandoned_line(Ceilings { budget: 200, groups: usize::MAX });
+        assert!(
+            barely.contains("ran past its work ceiling, with 0 found so far"),
+            "got: {}",
+            barely
+        );
+
+        let further = abandoned_line(Ceilings { budget: 2_000_000, groups: usize::MAX });
+        let found: usize = further
+            .split("with ")
+            .nth(1)
+            .and_then(|tail| tail.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no count in: {}", further));
+        assert!(found > 0, "a budget this size gets somewhere: {}", further);
+    }
+
+    #[test]
+    fn test_the_group_ceiling_says_the_threshold_rather_than_a_count() {
+        // The count is worthless here and the threshold is not: the search stops
+        // the first time it EXCEEDS the ceiling, so the number of groups in hand
+        // is always exactly one past it. Printing that would be printing the
+        // constant back at the user as though it had been measured. What the line
+        // has to carry is the scale -- the figure a `-d` ladder can be compared
+        // against.
+        let line = abandoned_line(Ceilings { budget: usize::MAX, groups: 5 });
+
+        assert!(
+            line.contains("they form more than 5 overlapping groups"),
+            "got: {}",
+            line
+        );
+        assert!(
+            !line.contains("6 overlapping groups"),
+            "one past the ceiling is what it holds, not what it means: {}",
+            line
+        );
     }
 
     #[test]
@@ -838,4 +1213,120 @@ mod tests {
         assert_eq!(groups[0].len(), 40, "the folder of re-encodes is one group");
         assert_eq!(groups.len(), 1 + 81);
     }
+
+    /// Every file matches every other, which is what a folder of copies is.
+    fn complete(n: usize) -> Vec<(usize, usize)> {
+        let mut edges = Vec::with_capacity(n * (n - 1) / 2);
+        for a in 0..n {
+            for b in (a + 1)..n {
+                edges.push((a, b));
+            }
+        }
+        edges
+    }
+
+    #[test]
+    fn test_a_folder_of_identical_files_is_one_group_however_many_of_them_there_are() {
+        // The case the ceilings used to fire hardest on, and the easiest one
+        // there is: a complete component has exactly ONE maximal clique and one
+        // branch per level, so there is nothing combinatorial here to refuse.
+        // The old pivot walk priced every candidate in `p ∪ x` against `p` at
+        // every level anyway, which is `d^3 / 3` probes, so anything past ~530
+        // copies exhausted the budget and the whole group vanished from the
+        // report -- under a message telling the user to tighten
+        // `--hamming-distance`, which cannot separate files that are identical.
+        //
+        // 700 is past that line and nowhere near the ~5,800 the budget now
+        // allows, so this is the shipped ceilings answering the question rather
+        // than a test-sized version of them.
+        let n = 700;
+        let fps = mock_library(n);
+        let stats = RunStats::default();
+
+        let groups = group_within(n, complete(n), &fps, &stats, Ceilings::shipped());
+
+        assert_eq!(stats.clustering_abandoned.count(), 0, "nothing here is too dense to answer");
+        assert_eq!(groups.len(), 1, "a complete graph has exactly one maximal clique");
+        assert_eq!(groups[0].len(), n, "and every file is in it");
+    }
+
+    #[test]
+    fn test_the_pivot_is_still_the_one_adjacent_to_the_most_candidates() {
+        // `choose_pivot` stops early, and it is only allowed to because the
+        // candidate it stops on is provably the best of the whole set -- `x` is
+        // walked first because a candidate drawn from it can cover the whole of
+        // `p`, while one drawn from `p` is never its own neighbour and tops out
+        // one short. If that ordering is ever lost the walk starts settling for
+        // a worse pivot, which is not wrong but is slower in exactly the case
+        // the pivot exists for, and nothing else here would notice.
+        //
+        // Vertex 0 is adjacent to all of `p` and sits in `x`; vertex 1 is in `p`
+        // and adjacent to the rest of it; the others reach one member each.
+        let n = 8;
+        let p: HashSet<usize> = (1..=5).collect();
+        let x: HashSet<usize> = [0usize, 6, 7].into_iter().collect();
+
+        let mut edges: Vec<(usize, usize)> = (1..=5).map(|v| (0, v)).collect();
+        for a in 1..=5 {
+            for b in (a + 1)..=5 {
+                edges.push((a, b));
+            }
+        }
+        edges.push((6, 2));
+        edges.push((7, 3));
+
+        let adjacency = adjacency_of(n, &edges);
+        let mut search = Search::new(&adjacency, Ceilings::shipped());
+
+        let pivot = choose_pivot(&p, &x, &adjacency, &mut search).expect("a pivot exists");
+        assert_eq!(pivot, 0, "the only candidate covering the whole of p");
+
+        // And it stopped when it found it, rather than pricing every candidate.
+        let exhaustive: usize = p
+            .union(&x)
+            .map(|&v| intersection_cost(&adjacency[v], &p))
+            .sum();
+        let spent = Ceilings::shipped().budget - search.budget;
+        assert!(spent < exhaustive, "spent {} of an exhaustive {}", spent, exhaustive);
+    }
+
+    #[test]
+    fn test_a_complete_neighbourhood_costs_one_intersection_to_pivot() {
+        // The saving stated as the property the fix rests on. Everything is
+        // adjacent to everything, so the first candidate examined already covers
+        // the most anything could -- one short of `p`, since a vertex is never
+        // its own neighbour -- and the walk has no reason to look at the rest.
+        // Order cannot matter here: `x` is empty and every candidate is alike.
+        let n = 40;
+        let adjacency = adjacency_of(n, &complete(n));
+        let p: HashSet<usize> = (0..n).collect();
+        let x: HashSet<usize> = HashSet::new();
+
+        let mut search = Search::new(&adjacency, Ceilings::shipped());
+        assert!(choose_pivot(&p, &x, &adjacency, &mut search).is_some());
+
+        let spent = Ceilings::shipped().budget - search.budget;
+        assert_eq!(
+            spent,
+            intersection_cost(&adjacency[0], &p),
+            "one intersection, not one per candidate"
+        );
+    }
+
+    #[test]
+    fn test_the_budget_still_refuses_a_genuinely_explosive_component() {
+        // The other half of the same change: metering each set operation instead
+        // of pricing a step up front must not have made the ceiling toothless.
+        // Moon-Moser at 20 parts is 3^20 maximal cliques out of 60 files, and no
+        // amount of waiting turns that into a usable report.
+        let (n, edges) = moon_moser(20);
+        let fps = mock_library(n);
+        let stats = RunStats::default();
+
+        let groups = group_within(n, edges, &fps, &stats, Ceilings::shipped());
+
+        assert!(groups.is_empty(), "a partial enumeration must not be reported");
+        assert_eq!(stats.clustering_abandoned.count(), 1);
+    }
 }
+
