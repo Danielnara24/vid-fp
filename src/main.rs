@@ -772,6 +772,68 @@ fn announce(disposal: Option<&Disposal>) {
     }
 }
 
+/// End a run that never reached the comparison, having written the report it
+/// was asked for.
+///
+/// A scan that finds fewer than two videos has nothing to group, and both
+/// routes to that used to return before `output_results` -- so `--output` was
+/// silently not written and the run exited 0. The file it names is then an
+/// EARLIER run's report, and the documented workflow is to hand exactly that
+/// file back with `--from-report --delete`. A second scan that comes up short
+/// (an unmounted share, a `--min-duration` that swallowed the lot, an
+/// `--extensions` list that matches nothing any more) therefore replayed a plan
+/// for a library that is no longer there: `dispose_one`'s size check spares
+/// only the files whose bytes moved, and a file that is unchanged but no longer
+/// has a duplicate beside it is removed against a measurement nothing in this
+/// run made. It could take the last copy -- run 1 marks `b` DELETE against `a`,
+/// `a` is moved away, run 2 sees one file and says nothing, and the replay
+/// removes `b`.
+///
+/// So the rule is that a run which COMPLETES writes its report, whether or not
+/// it found anything, exactly as a scan of two unrelated videos already does:
+/// zero groups, and a report that says so. Nothing is special-cased about the
+/// content -- `output_results` is asked for a run with no groups, which is what
+/// keeps the three formats' empty bodies the same shape as their full ones and
+/// what makes the overwrite visible ("Results saved to ...") rather than
+/// silent. An interrupted run still writes nothing, and says so with exit 130.
+///
+/// The disposal is passed through rather than dropped so the summary and the
+/// JSON `mode` describe the run that was asked for; with no groups there is
+/// nothing for it to act on, and no confirmation is asked.
+///
+/// A scan that fell short -- an unresolved root, an unreadable folder -- writes
+/// its empty report too, which is the OPPOSITE of what `prune_obstacle` decides
+/// about the same run, and deliberately. The two are not the same trade: a
+/// prune against an incomplete scan destroys hours of decode that only a
+/// re-decode brings back, while an emptied report costs a second scan against a
+/// warm cache. What the report has that the cache does not is the other
+/// failure mode -- leaving it alone is what stands a deletion plan up in front
+/// of a user as though this run had endorsed it. `-o` says where this run
+/// writes, a successful scan would overwrite the file just the same, and the
+/// overwrite is announced ("Results saved to ...") on a run that is already
+/// exiting 2 and saying why.
+fn conclude_without_comparing(
+    report_target: Option<&ReportTarget>,
+    disposal: Option<&Disposal>,
+    args: &Args,
+    start_time: Instant,
+    stats: &RunStats,
+) -> Result<Outcome> {
+    export::output_results(
+        &[],
+        &[],
+        &MatchIndex::new(Vec::new()),
+        report_target,
+        start_time.elapsed().as_secs(),
+        args.priority,
+        disposal,
+        args.yes,
+        stats,
+    )?;
+
+    Ok(Outcome::Completed)
+}
+
 /// `--from-report`: dispose of what a previous run's report marks DELETE, and
 /// nothing else.
 ///
@@ -2224,7 +2286,16 @@ fn run(
 
     if video_files.is_empty() {
         info!("No {} found.", found_noun);
-        return Ok(Outcome::Completed);
+        // Still this run's report: see `conclude_without_comparing` for why an
+        // earlier run's is not allowed to stand in for it.
+        let disposal = disposal_for(move_to, args.delete, args.permanent);
+        return conclude_without_comparing(
+            report_target.as_ref(),
+            disposal.as_ref(),
+            args,
+            start_time,
+            stats,
+        );
     }
 
     // Largest first, so the cache pass below hands `todo` back in roughly the
@@ -2840,12 +2911,17 @@ fn run(
     let n = fingerprints.len();
     if n < 2 {
         info!("Not enough valid videos to compare.");
-        // Print time elapsed anyway in same format.
-        let total_hours = start_time.elapsed().as_secs() / 3600;
-        let total_minutes = (start_time.elapsed().as_secs() % 3600) / 60;
-        let total_seconds = start_time.elapsed().as_secs() % 60;
-        info!("Total time elapsed: {:02}:{:02}:{:02}", total_hours, total_minutes, total_seconds);
-        return Ok(Outcome::Completed);
+        // The elapsed time used to be formatted again here so this ending would
+        // say it too; the report's summary carries it, in the same format, for
+        // every other ending.
+        let disposal = disposal_for(move_to, args.delete, args.permanent);
+        return conclude_without_comparing(
+            report_target.as_ref(),
+            disposal.as_ref(),
+            args,
+            start_time,
+            stats,
+        );
     }
 
     info!("\nFingerprinting complete. Cross-analyzing {} videos...", n);
@@ -3811,6 +3887,103 @@ mod tests {
         let left = cached_paths(&db);
         assert!(!left.iter().any(|p| p == ORPHAN), "the orphan is gone: {:?}", left);
         assert_eq!(stats.cache_prune_skipped.count(), 0, "nothing stood in the way");
+    }
+
+    /// A library of two identical clips and the report that plans their merge.
+    fn library_with_a_pair(dir: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+        let library = dir.path().join("library");
+        std::fs::create_dir(&library).unwrap();
+
+        let mut fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        fixture.push("tests/fixtures/test_video.mp4");
+        for name in ["a.mp4", "b.mp4"] {
+            std::fs::copy(&fixture, library.join(name))
+                .expect("the fixture video is part of the tree");
+        }
+
+        (library, dir.path().join("plan.csv"))
+    }
+
+    #[test]
+    fn test_a_scan_with_nothing_left_to_compare_replaces_the_plan_it_was_asked_for() {
+        // The hazard is the documented two-step workflow: scan with -o, review
+        // the report, hand it back with --from-report --delete. A second scan
+        // that comes up short used to write no report at all and exit 0, so the
+        // file the user then replayed was the FIRST run's plan for a library
+        // that no longer exists. `dispose_one`'s size check spares only files
+        // whose bytes moved; a file that is unchanged but no longer has a
+        // duplicate beside it is removed against a measurement nothing in the
+        // second run made, and here that is the last copy of it.
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+        let (library, report) = library_with_a_pair(&dir);
+
+        let args = Args::parse_from([
+            "vid-fp",
+            &library.to_string_lossy(),
+            "-o",
+            &report.to_string_lossy(),
+        ]);
+
+        run(&args, Some(&db), Instant::now(), 1, &RunStats::default()).unwrap();
+        let plan = std::fs::read_to_string(&report).unwrap();
+        assert!(plan.contains("DELETE"), "the first run leaves something to replay:\n{}", plan);
+
+        // The file that won is taken out from under the plan, which leaves the
+        // one it condemned as the only copy there is.
+        std::fs::remove_file(library.join("a.mp4")).unwrap();
+
+        let stats = RunStats::default();
+        assert!(matches!(
+            run(&args, Some(&db), Instant::now(), 1, &stats),
+            Ok(Outcome::Completed)
+        ));
+        assert!(!stats.had_problems(), "a library of one file is not a failed run");
+
+        let refreshed = std::fs::read_to_string(&report).unwrap();
+        assert!(
+            !refreshed.contains("DELETE"),
+            "the second run found no duplicate, so its report may not name one:\n{}",
+            refreshed
+        );
+        assert!(
+            refreshed.contains("full_path"),
+            "and it is still a report, readable by --from-report:\n{}",
+            refreshed
+        );
+    }
+
+    #[test]
+    fn test_a_scan_that_finds_no_videos_at_all_replaces_the_plan_too() {
+        // The other route to the same silence, and the one an unmounted share
+        // takes: the run ends before it has fingerprinted anything rather than
+        // before it has compared anything. Both used to return ahead of
+        // `output_results`.
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+        let (library, report) = library_with_a_pair(&dir);
+
+        let args = Args::parse_from([
+            "vid-fp",
+            &library.to_string_lossy(),
+            "-o",
+            &report.to_string_lossy(),
+        ]);
+        run(&args, Some(&db), Instant::now(), 1, &RunStats::default()).unwrap();
+        assert!(std::fs::read_to_string(&report).unwrap().contains("DELETE"));
+
+        for name in ["a.mp4", "b.mp4"] {
+            std::fs::remove_file(library.join(name)).unwrap();
+        }
+
+        run(&args, Some(&db), Instant::now(), 1, &RunStats::default()).unwrap();
+
+        let refreshed = std::fs::read_to_string(&report).unwrap();
+        assert!(
+            !refreshed.contains("DELETE"),
+            "an empty library is not a reason to leave yesterday's deletions standing:\n{}",
+            refreshed
+        );
     }
 
     #[test]
