@@ -1276,7 +1276,16 @@ pub fn fingerprint_video(
     // and this was always the more honest source anyway, since the decoder, not
     // the header, is the authority on what it is emitting.
     let mut scaler: Option<ffmpeg_next::software::scaling::context::Context> = None;
+    // The geometry of the FIRST frame, which is what the report and the
+    // resolution ranking read. A file that rescales part way through has no one
+    // true answer and this is the one the header would have given, so no file's
+    // reported resolution moves because of the rebuild below.
     let mut frame_dims: Option<(u32, u32)> = None;
+    // Frames the decoder produced that could not be turned into a sample. Not a
+    // count to report: any at all and the fingerprint covers less footage than
+    // it claims to, which is the whole failure this guards against, so the file
+    // is failed at the end and re-read next run rather than cached short.
+    let mut unscalable: Option<ffmpeg_next::Error> = None;
 
     // All unique frames packed back-to-back, FRAME_STRIDE bytes each. One growable
     // allocation instead of N tiny ones -> no heap fragmentation/retention, and the
@@ -1312,8 +1321,31 @@ pub fn fingerprint_video(
     let mut scaled = ffmpeg_next::frame::Video::empty();
     let mut current_frame = vec![0u8; 4096];
 
+    // Rebuilt whenever the decoder's output changes shape, not merely built once.
+    // A stream is allowed to change resolution or pixel format mid-file -- a
+    // broadcaster switching feeds, a camcorder dropping to a lower mode, two
+    // recordings concatenated -- and `Context::run` refuses outright any frame
+    // that is not the shape its context was built for. Built once and never
+    // rebuilt, every frame after such a change returned `Error::InputChanged`,
+    // both call sites discarded that, and the file simply stopped being sampled
+    // at the change: nothing counted, nothing logged, exit code 0, and the
+    // half-length fingerprint cached for every run after. That is the same
+    // silent half-a-video as the splice bug and it needs no clock restart to
+    // reach -- one `cat` of two encodes at different sizes is enough.
+    //
+    // The check is asked of the context's own record of what it was built for
+    // rather than of a second copy kept beside it, so there is nothing to drift.
     let mut process_frame = |dec: &ffmpeg_next::frame::Video| -> Result<(), ffmpeg_next::Error> {
-        if scaler.is_none() {
+        let rebuild = match &scaler {
+            None => true,
+            Some(built) => {
+                let input = built.input();
+                input.format != dec.format()
+                    || input.width != dec.width()
+                    || input.height != dec.height()
+            }
+        };
+        if rebuild {
             scaler = Some(ffmpeg_next::software::scaling::context::Context::get(
                 dec.format(),
                 dec.width(),
@@ -1323,7 +1355,7 @@ pub fn fingerprint_video(
                 64,
                 ffmpeg_next::software::scaling::flag::Flags::FAST_BILINEAR,
             )?);
-            frame_dims = Some((dec.width(), dec.height()));
+            frame_dims.get_or_insert((dec.width(), dec.height()));
         }
         let scaler = scaler.as_mut().unwrap();
 
@@ -1688,7 +1720,9 @@ pub fn fingerprint_video(
 
         if kept && decoder.send_packet(&packet).is_ok() {
             while decoder.receive_frame(&mut decoded).is_ok() {
-                let _ = process_frame(&decoded);
+                if let Err(e) = process_frame(&decoded) {
+                    unscalable.get_or_insert(e);
+                }
             }
         }
 
@@ -1742,7 +1776,26 @@ pub fn fingerprint_video(
     // the frames arrive.
     let _ = decoder.send_eof();
     while decoder.receive_frame(&mut decoded).is_ok() {
-        let _ = process_frame(&decoded);
+        if let Err(e) = process_frame(&decoded) {
+            unscalable.get_or_insert(e);
+        }
+    }
+
+    // A frame the decoder produced and this pass could not use. Failed rather
+    // than returned short, because a fingerprint quietly missing its second
+    // half is not a smaller answer but a wrong one: it reads as the same length
+    // as the file it was cut from, wins the ranking on encoder quality, and
+    // marks that file DELETE -- and cached, it does so on every run after.
+    //
+    // Asked before the "no valid frames" line below rather than after it, so a
+    // file that decoded and could not be scaled says which of the two happened.
+    // The rebuild above answers the one cause of this that is a normal property
+    // of a stream, so what is left is a pixel format libswscale will not take
+    // or a frame with no size -- neither of which a single frame can have on
+    // its own, which is why in practice this fires for a whole file or not at
+    // all. Nothing in the 756-file local corpus reaches it.
+    if let Some(e) = unscalable {
+        return Err(anyhow!(e).context("Failed to convert a decoded frame"));
     }
 
     if frame_idx == 0 {
@@ -2222,6 +2275,68 @@ mod tests {
             "a file holding two recordings is longer than one of them: {} against {}",
             two.duration,
             one.duration
+        );
+    }
+
+    /// A stream that changes resolution part way through keeps the frames on
+    /// both sides of the change.
+    ///
+    /// The scaler is built from the first frame the decoder produces, and
+    /// `Context::run` refuses a frame whose format or geometry is not the one
+    /// it was built for -- so a rescale mid-stream turns every later frame into
+    /// `Error::InputChanged`. Both call sites used to discard that, so the file
+    /// simply stopped being sampled at the change: no frame counted, nothing
+    /// logged, exit code 0, and the truncated fingerprint cached for every run
+    /// after. It is the same silent half-a-video as the splice bug and it needs
+    /// no clock restart to happen -- a broadcaster switching resolution, a
+    /// camcorder that drops to a lower mode, or an encode of two sources
+    /// concatenated is enough.
+    ///
+    /// The fixture is the `.ts` segment above followed by the same footage at
+    /// 320x240, so the answer is exact: three keyframes on each side of a join
+    /// that changes both the clock and the geometry.
+    #[test]
+    fn test_a_stream_that_changes_resolution_mid_file_keeps_sampling() {
+        init_ffmpeg_for_tests();
+
+        let one = fingerprint_path(&fixture_named("test_video_segment.ts"));
+        let two = fingerprint_path(&fixture_named("test_video_rescaled.ts"));
+
+        assert_eq!(
+            two.valid_hashes.len(),
+            one.valid_hashes.len() * 2,
+            "both halves are sampled: {} hashes against {} for the first half alone",
+            two.valid_hashes.len(),
+            one.valid_hashes.len()
+        );
+
+        // A count on its own would also pass on a rebuilt scaler writing
+        // garbage, so the two halves are held against each other: they are the
+        // same footage at twice the size, keyframe for keyframe, and after the
+        // 64x64 box filter they have to land close. Stated in sigma of the
+        // hash's own width -- the same arithmetic as `compare::sigma()`, which
+        // is private -- so the bound travels if the hash ever widens.
+        let sigma = (crate::compare::HASH_BITS as f64).sqrt() / 2.0;
+        for (i, (a, b)) in two.valid_hashes[..one.valid_hashes.len()]
+            .iter()
+            .zip(&two.valid_hashes[one.valid_hashes.len()..])
+            .enumerate()
+        {
+            let distance = (a ^ b).count_ones() as f64;
+            assert!(
+                distance <= 3.0 * sigma,
+                "keyframe {} of the rescaled half is the same footage as the first half: \
+                 {} bits apart",
+                i,
+                distance
+            );
+        }
+
+        let ascending = two.valid_t_start.windows(2).all(|w| w[0] < w[1]);
+        assert!(
+            ascending,
+            "the sample clock only ever goes forwards: {:?}",
+            two.valid_t_start
         );
     }
 

@@ -37,7 +37,7 @@ use utils::{shutdown_requested, Priority};
 /// re-encoded, re-muxed, or scanned with different sampling settings replaces
 /// its own entry instead of growing a second one beside it.
 const CACHE_TABLE: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("fingerprints_dct_ct_ff8_splice");
+    TableDefinition::new("fingerprints_dct_ct_ff8_rescale");
 
 /// Files this build looked at and refused before opening: see `NotMedia`.
 ///
@@ -115,13 +115,24 @@ const REFUSED_TABLE: TableDefinition<&str, &[u8]> =
 ///   perfectly. Nothing else moved -- the 756-file local corpus reports
 ///   byte-identical CSVs either side -- which is precisely why the name had to
 ///   change rather than the layout.
-const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 6] = [
+/// - `fingerprints_dct_ct_ff8_splice` holds, for any file whose stream changes
+///   resolution or pixel format part way through, everything up to the change
+///   and nothing after it. The scaler was built from the first frame the
+///   decoder produced and never rebuilt, and libswscale refuses a frame that is
+///   not the shape its context was built for -- so every later frame came back
+///   `InputChanged`, both call sites discarded it, and the file stopped being
+///   sampled where it changed size. Same shape of damage as the entry above and
+///   reached by an entirely separate route: no clock restart is needed, only a
+///   broadcaster switching feeds or two encodes concatenated. Same fields, same
+///   units, half the values, invisible to the `Stamp`.
+const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 7] = [
     TableDefinition::new("fingerprints"),
     TableDefinition::new("fingerprints_by_path"),
     TableDefinition::new("fingerprints_dct"),
     TableDefinition::new("fingerprints_dct_ct"),
     TableDefinition::new("fingerprints_dct_ct_ff8"),
     TableDefinition::new("fingerprints_dct_ct_ff8_tail"),
+    TableDefinition::new("fingerprints_dct_ct_ff8_splice"),
 ];
 
 /// Refusal tables earlier builds wrote. Kept apart from the list above because
