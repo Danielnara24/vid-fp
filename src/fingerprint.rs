@@ -761,6 +761,23 @@ fn input_is_spent(ictx: &ffmpeg_next::format::context::Input) -> bool {
     }
 }
 
+/// Whether libavformat says this container is allowed to restart its clock
+/// part way through.
+///
+/// `AVFMT_TS_DISCONT` is the demuxer's own declaration that the timestamps it
+/// produces need not run forwards, and it is set on exactly the formats that
+/// can be built by joining two recordings end to end: MPEG-TS (`.ts`, `.mts`,
+/// `.m2ts` -- DVB captures, camcorder splits) and MPEG-PS (`.mpg`, `.vob`).
+/// Every container that has to be remuxed rather than concatenated -- MP4,
+/// Matroska, AVI, ASF -- leaves it clear, so the seek path this gates keeps the
+/// file it was written for.
+fn clock_may_restart(ictx: &ffmpeg_next::format::context::Input) -> bool {
+    unsafe {
+        let iformat = (*ictx.as_ptr()).iformat;
+        !iformat.is_null() && ((*iformat).flags & ffmpeg_next::ffi::AVFMT_TS_DISCONT) != 0
+    }
+}
+
 /// `avformat_find_stream_info`: the probe `open_input` deliberately skips.
 ///
 /// One function so the two callers cannot drift. The weighing pass reports a
@@ -1409,18 +1426,57 @@ pub fn fingerprint_video(
     //     the loop finishes as a plain linear scan, which is exactly the old
     //     behaviour.
     //
+    // A container whose clock is allowed to restart never enters the seek path
+    // at all, because a timestamp there is no guide to what is further into the
+    // file. `cat s1.ts s2.ts > capture.ts` gives the second segment the same
+    // timestamps as the first, and every way of navigating by them lands
+    // somewhere wrong: a forward seek out of segment one binary-searched its
+    // way into the middle of segment two (three of six keyframes read, two of
+    // them never looked at), and on the mpeg-ps build of the same file it
+    // reached the end of segment one and then reported EOF. What the seek does
+    // wrong varies with the demuxer; that it cannot be trusted does not.
+    //
     // The decoder is deliberately NOT flushed across a seek. Every packet it is
     // fed is a keyframe and therefore self-contained, so there is no state to
     // invalidate, and flushing would throw away frames still in flight.
     let mut packet = ffmpeg_next::codec::packet::Packet::empty();
     let mut last_key_ts: Option<i64> = None;
-    // The first keyframe's timestamp, which every later one is measured from.
-    let mut first_key_ts: Option<i64> = None;
+    // Whether a seek has been issued that no keyframe has been accepted after
+    // yet. The dedup guard is asked only while this is set: a seek is the only
+    // thing that can hand the loop a frame it has already had, and asking it of
+    // a plain linear read is what used to truncate a spliced file at the join.
+    let mut after_seek = false;
     let mut demuxer_ignores_discard = false;
-    let mut seeking_broken = false;
+    let mut seeking_broken = clock_may_restart(&ictx);
     // Consecutive failed reads. Reset by any successful one, so a file that
     // stumbles and recovers is unaffected however often it stumbles.
     let mut demux_errors: u32 = 0;
+
+    // --- The sample clock ----------------------------------------------------
+    //
+    // Kept as a running total of the gaps between keyframes rather than as an
+    // offset from the first one, because a container's clock is not guaranteed
+    // to run forwards for the whole file. Concatenating two recordings -- how a
+    // DVB capture, a camcorder split and half the `.ts` files on a disk are
+    // made -- restarts it at the join, and measuring from the first keyframe
+    // then puts the whole second half back on top of the first half's times.
+    // Accumulating gaps instead means the clock only ever moves forward, and a
+    // restart costs one estimated gap rather than every sample after it.
+    //
+    // For a file whose clock does run forwards -- every file with one segment,
+    // which is nearly all of them -- this is `ts - first_key_ts` exactly, term
+    // by term, and no sample time moves.
+    let mut prev_raw_ts: Option<i64> = None;
+    let mut elapsed: i64 = 0;
+    // The last forward gap seen, which is what a restart is charged. There is
+    // no way to know how long the join really was: the second segment's own
+    // clock says only where it starts, not when that was.
+    let mut last_gap: i64 = 0;
+    // Set the first time the clock goes backwards. Two things read it: seeking,
+    // which is answered from that clock and is therefore no longer trustworthy,
+    // and the runtime this file reports (see below), which was measured from
+    // the same broken arithmetic.
+    let mut clock_restarted = false;
 
     loop {
         if shutdown_requested() {
@@ -1521,10 +1577,22 @@ pub fn fingerprint_video(
 
         // A seek may land on or before a keyframe already decoded. Skip those
         // rather than hashing the same frame twice.
-        if let (Some(ts), Some(last)) = (index_ts, last_key_ts) {
-            if ts <= last {
+        //
+        // Asked only after a seek, because a seek is the only thing that can
+        // produce one. Asked of every keyframe -- which is what it used to be
+        // -- it reads a container whose clock restarts mid-file as a seek that
+        // keeps landing short, and throws away everything after the restart:
+        // `cat s1.ts s2.ts > capture.ts` kept the five keyframes of its first
+        // segment and silently dropped all five of its second. A file that
+        // CONTAINED another was then fingerprinted as its equal, ranked below
+        // it on encoder quality, and marked DELETE against it -- exit code 0,
+        // nothing in the problem summary, and the truncated fingerprint cached
+        // for every run after.
+        if after_seek {
+            if matches!((index_ts, last_key_ts), (Some(ts), Some(last)) if ts <= last) {
                 continue;
             }
+            after_seek = false;
         }
 
         // --- When this keyframe happens -------------------------------------
@@ -1556,13 +1624,37 @@ pub fn fingerprint_video(
         // used to fail the `pts >= 0` test and drop the whole video to evenly
         // spaced samples, and a stream whose clock does not start at zero used
         // to measure its samples against a runtime that does.
-        let sample_ts = match (index_ts, first_key_ts) {
-            (Some(ts), Some(first)) => Some(ts.saturating_sub(first).max(0)),
-            (Some(ts), None) => {
-                first_key_ts = Some(ts);
-                Some(0)
+        //
+        // The gap is accumulated rather than subtracted so that a clock which
+        // restarts mid-file still produces times that only go forwards -- see
+        // `prev_raw_ts` above. A backwards step is a splice, never a late
+        // packet: only keyframes reach this point, and they are handed over in
+        // decode order.
+        let sample_ts = match index_ts {
+            Some(ts) => {
+                match prev_raw_ts {
+                    None => elapsed = 0,
+                    Some(prev) if ts >= prev => {
+                        let gap = ts - prev;
+                        if gap > 0 {
+                            last_gap = gap;
+                        }
+                        elapsed = elapsed.saturating_add(gap);
+                    }
+                    // The clock restarted. Charge the join the last gap this
+                    // file showed -- an estimate, and the only one available --
+                    // and stop navigating by timestamps, which have just been
+                    // shown to be no guide to what is further into the file.
+                    Some(_) => {
+                        clock_restarted = true;
+                        seeking_broken = true;
+                        elapsed = elapsed.saturating_add(last_gap.max(1));
+                    }
+                }
+                prev_raw_ts = Some(ts);
+                Some(elapsed)
             }
-            (None, _) => None,
+            None => None,
         };
 
         // Hand the corrected clock to the decoder, which copies a packet's pts
@@ -1632,7 +1724,9 @@ pub fn fingerprint_video(
                             0,
                         ) >= 0
                     };
-                    if !ok {
+                    if ok {
+                        after_seek = true;
+                    } else {
                         // Past the last keyframe a forward seek fails, which is
                         // indistinguishable from a container that cannot seek at
                         // all. Either way, finish by reading.
@@ -1738,6 +1832,29 @@ pub fn fingerprint_video(
 
     let (times, total_ms) = sample_times(&unique_frame_times, duration_sec);
 
+    // A container whose clock restarted mis-stated its runtime by the same
+    // arithmetic: what a demuxer reports is its last timestamp minus its first,
+    // and across a splice both of those belong to segments, not to the file --
+    // two five-second recordings cat'ed together report five seconds. The
+    // samples are the better witness here, because they were taken by walking
+    // the whole file, so where they outrun the header the header is what is
+    // wrong.
+    //
+    // This is a ranking metric, not a cosmetic one. Length is the first thing
+    // `utils::find_best` compares and the property that normally keeps a long
+    // file safe from the clip cut out of it; left at the header's figure, a
+    // capture that CONTAINS another video reads as no longer than it, loses the
+    // comparison on encoder quality or size, and is the one marked DELETE.
+    //
+    // Only a file that was seen to restart its clock is touched, so no runtime
+    // that was merely rounded moves, and `total_ms >= duration * 1000` -- which
+    // `MatchIndex::matched_seconds` rests on -- still holds, with equality.
+    let duration_sec = if clock_restarted {
+        duration_sec.max(total_ms as f64 / 1000.0)
+    } else {
+        duration_sec
+    };
+
     // Keyframes do not always leave the decoder in presentation order -- an open
     // GOP or a B-pyramid can put a later one out first -- and every span below
     // is "until the next sample", so the samples are put in time order before
@@ -1824,6 +1941,17 @@ mod tests {
         p.push("fixtures");
         p.push(name);
         p
+    }
+
+    /// One file, sampled at every keyframe it has.
+    fn fingerprint_path(path: &std::path::Path) -> VideoFingerprint {
+        init_ffmpeg_for_tests();
+
+        let filepath = path.to_string_lossy().to_string();
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        fingerprint_video(&filepath, 0.0, 4.0, 1, 0.0, size, &|_| {})
+            .unwrap_or_else(|e| panic!("failed to fingerprint {}: {:?}", filepath, e))
+            .expect("min_duration is off, nothing should be skipped")
     }
 
     fn fingerprint_fixture(threads: usize) -> VideoFingerprint {
@@ -2038,6 +2166,86 @@ mod tests {
                 "fingerprint_video did not return: the demux loop is asking a demuxer that \
                  will never say EOF for another packet"
             ),
+        }
+    }
+
+    /// A file whose clock restarts part way through keeps everything after the
+    /// restart.
+    ///
+    /// `cat` of two recordings is how a DVB capture, a camcorder split and half
+    /// the `.ts` files on a disk are laid out, and the second recording carries
+    /// the same timestamps the first one already used. Everything after the
+    /// join used to be discarded -- by the dedup guard, which read the restart
+    /// as a seek landing short, and by the seek path, which navigates by the
+    /// very clock that just lied. The file then fingerprinted as its own first
+    /// segment: same hashes and same runtime as a file it CONTAINS, ranked
+    /// below it on encoder quality, and marked DELETE against it.
+    ///
+    /// The fixture is doubled rather than paired with a second one so the
+    /// expected answer is exact: the whole of the first half's fingerprint,
+    /// twice, on a clock that only goes forwards.
+    #[test]
+    fn test_a_clock_that_restarts_mid_file_does_not_truncate_the_fingerprint() {
+        init_ffmpeg_for_tests();
+
+        let segment = fixture_named("test_video_segment.ts");
+        let bytes = std::fs::read(&segment)
+            .unwrap_or_else(|e| panic!("fixture {} unreadable: {}", segment.display(), e));
+
+        let dir = tempfile::tempdir().unwrap();
+        let spliced = dir.path().join("capture.ts");
+        std::fs::write(&spliced, [bytes.as_slice(), bytes.as_slice()].concat()).unwrap();
+
+        let one = fingerprint_path(&segment);
+        let two = fingerprint_path(&spliced);
+
+        assert_eq!(
+            two.valid_hashes,
+            [one.valid_hashes.clone(), one.valid_hashes.clone()].concat(),
+            "a spliced capture holds both segments: {} hashes against {} for one segment",
+            two.valid_hashes.len(),
+            one.valid_hashes.len()
+        );
+
+        let ascending = two.valid_t_start.windows(2).all(|w| w[0] < w[1]);
+        assert!(
+            ascending,
+            "the sample clock only ever goes forwards, splice or no splice: {:?}",
+            two.valid_t_start
+        );
+
+        // Length is the first thing the ranking compares and the reason a long
+        // file survives the clip cut out of it. Left at what the container
+        // says, this file is the same length as the one inside it.
+        assert!(
+            two.duration > one.duration * 1.5,
+            "a file holding two recordings is longer than one of them: {} against {}",
+            two.duration,
+            one.duration
+        );
+    }
+
+    /// The seek path is answered from the container's clock, so it is kept away
+    /// from the containers whose clock is allowed to restart -- which is a
+    /// property libavformat states about the format, not a guess about the
+    /// file.
+    #[test]
+    fn test_only_the_containers_that_can_be_spliced_are_kept_out_of_the_seek_path() {
+        init_ffmpeg_for_tests();
+
+        for (name, expected) in [
+            ("test_video_segment.ts", true),
+            ("test_video.mp4", false),
+        ] {
+            let path = fixture_named(name);
+            let ictx = open_video(&path.to_string_lossy()).expect("fixture opens");
+            assert_eq!(
+                clock_may_restart(&ictx),
+                expected,
+                "{} is {}a container that may restart its clock",
+                name,
+                if expected { "" } else { "not " }
+            );
         }
     }
 

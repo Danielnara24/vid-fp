@@ -37,7 +37,7 @@ use utils::{shutdown_requested, Priority};
 /// re-encoded, re-muxed, or scanned with different sampling settings replaces
 /// its own entry instead of growing a second one beside it.
 const CACHE_TABLE: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("fingerprints_dct_ct_ff8_tail");
+    TableDefinition::new("fingerprints_dct_ct_ff8_splice");
 
 /// Files this build looked at and refused before opening: see `NotMedia`.
 ///
@@ -103,12 +103,25 @@ const REFUSED_TABLE: TableDefinition<&str, &[u8]> =
 ///   the number of gaps between them. The field keeps its name and its units and
 ///   only its value moves, which is precisely the case a layout check cannot
 ///   catch -- and it moves for real files, three of the 727 in the local corpus.
-const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 5] = [
+/// - `fingerprints_dct_ct_ff8_tail` holds, for any file whose container
+///   restarts its clock part way through, the first segment of that file and
+///   nothing else. Both halves of the demux loop navigated by timestamps that
+///   a spliced capture reuses -- the dedup guard read the restart as a seek
+///   landing short and dropped every keyframe after it, and the seek path
+///   aimed past a timestamp that exists twice -- so `cat s1.ts s2.ts` was
+///   fingerprinted as `s1.ts`, with `s1.ts`'s runtime, and lost the ranking to
+///   the file it contains. Same fields, same units, half the values, and the
+///   `Stamp` cannot see it: the entry matches its file's mtime and size
+///   perfectly. Nothing else moved -- the 756-file local corpus reports
+///   byte-identical CSVs either side -- which is precisely why the name had to
+///   change rather than the layout.
+const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 6] = [
     TableDefinition::new("fingerprints"),
     TableDefinition::new("fingerprints_by_path"),
     TableDefinition::new("fingerprints_dct"),
     TableDefinition::new("fingerprints_dct_ct"),
     TableDefinition::new("fingerprints_dct_ct_ff8"),
+    TableDefinition::new("fingerprints_dct_ct_ff8_tail"),
 ];
 
 /// Refusal tables earlier builds wrote. Kept apart from the list above because
