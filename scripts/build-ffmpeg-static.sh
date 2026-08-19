@@ -43,7 +43,17 @@
 set -euo pipefail
 
 FFMPEG_VERSION="n8.1.2"
+# The commit that tag points at, checked after the clone, for the same reason
+# the dav1d pin below exists: a tag is a moving target and a mirror is not the
+# thing being trusted. Cross-checked against FFmpeg's canonical host
+# (git.ffmpeg.org), which agrees with GitHub on both the tag object and the
+# commit it peels to.
+FFMPEG_COMMIT="38b88335f99e76ed89ff3c93f877fdefce736c13"
 DAV1D_VERSION="1.5.4"
+# The commit that tag points at, checked after the clone. It is what pins the
+# bytes rather than the URL, and the reason dav1d is fetched from a mirror at
+# all is by the clone below.
+DAV1D_COMMIT="54706fc6bc0cdecab7e9593974a4039cc038fca7"
 
 PREFIX=""
 FORCE=0
@@ -118,10 +128,41 @@ JOBS="$(nproc 2>/dev/null || echo 4)"
 #
 # Static only, and with its own tools/tests off: we want libdav1d.a and its
 # headers, nothing else. BSD-2-Clause, so it adds attribution but no copyleft.
+#
+# Fetched from VideoLAN's GitHub mirror rather than from code.videolan.org,
+# which is upstream's canonical host and cannot be cloned any more: it sits
+# behind Anubis, a proof-of-work bot check that answers every request without a
+# solved-challenge cookie with an HTML page under HTTP 200. Git reads that where
+# it expected the smart-HTTP ref advertisement and fails with "not valid: could
+# not determine hash algorithm; is this a git repository?", which is what broke
+# the v0.32.0 release build. It is not transient and no amount of retrying helps
+# -- solving the challenge needs a browser running JavaScript.
+#
+# So the source of truth is a mirror, and the commit is pinned to say which
+# bytes that mirror is expected to hand over. The pin is the verification, not
+# the URL: the tag alone is a moving target (a tag can be repointed), and with
+# the commit checked it does not matter which host serves it. That the mirror is
+# faithful was established by comparing the checkout against VideoLAN's own
+# release tarball -- 359 files, byte for byte identical:
+#
+#   https://downloads.videolan.org/pub/videolan/dav1d/1.5.4/dav1d-1.5.4.tar.xz
+#   sha256 686616b7c69eb88d44459391ab25cac13b6647a3b288835c5784e71c1514a5c5
+#
+# That host is a plain file mirror and is NOT behind Anubis, so it is the place
+# to look if the GitHub mirror is ever missing a tag this script wants.
 echo "==> building dav1d $DAV1D_VERSION"
 if [[ ! -d "$BUILD/dav1d" ]]; then
     git clone --depth 1 -b "$DAV1D_VERSION" \
-        https://code.videolan.org/videolan/dav1d.git "$BUILD/dav1d"
+        https://github.com/videolan/dav1d.git "$BUILD/dav1d"
+fi
+got="$(git -C "$BUILD/dav1d" rev-parse HEAD)"
+if [[ "$got" != "$DAV1D_COMMIT" ]]; then
+    echo "error: dav1d $DAV1D_VERSION is not the commit this script expects." >&2
+    echo "  expected $DAV1D_COMMIT" >&2
+    echo "  got      $got" >&2
+    echo "  Either the tag moved, or $BUILD/dav1d is a stale checkout: delete it" >&2
+    echo "  and re-run. Do not update DAV1D_COMMIT without checking what changed." >&2
+    exit 1
 fi
 rm -rf "$BUILD/dav1d/build"
 meson setup "$BUILD/dav1d/build" "$BUILD/dav1d" \
@@ -157,6 +198,17 @@ echo "==> building FFmpeg $FFMPEG_VERSION"
 if [[ ! -d "$BUILD/ffmpeg" ]]; then
     git clone --depth 1 -b "$FFMPEG_VERSION" \
         https://github.com/FFmpeg/FFmpeg "$BUILD/ffmpeg"
+fi
+got="$(git -C "$BUILD/ffmpeg" rev-parse HEAD)"
+if [[ "$got" != "$FFMPEG_COMMIT" ]]; then
+    echo "error: FFmpeg $FFMPEG_VERSION is not the commit this script expects." >&2
+    echo "  expected $FFMPEG_COMMIT" >&2
+    echo "  got      $got" >&2
+    echo "  Either the tag moved, or $BUILD/ffmpeg is a stale checkout: delete it" >&2
+    echo "  and re-run. Bumping FFMPEG_VERSION across a major also costs a" >&2
+    echo "  CACHE_TABLE rename and a re-taken accuracy baseline -- see the note" >&2
+    echo "  at the top of this script." >&2
+    exit 1
 fi
 
 pushd "$BUILD/ffmpeg" >/dev/null

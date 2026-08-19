@@ -57,6 +57,10 @@ is at <https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html>.
 <https://code.videolan.org/videolan/dav1d>
 
 Statically linked, at the version pinned in `scripts/build-ffmpeg-static.sh`.
+That is upstream's home but no longer where the build fetches from: it sits
+behind a proof-of-work bot check that `git clone` cannot answer, so the source
+comes from VideoLAN's GitHub mirror at a pinned commit, verified against the
+official release tarball. The script records both.
 
 dav1d is **not optional**, and the reason is worth recording: FFmpeg's built-in
 AV1 decoder is hardware-accelerated only, so a software build without dav1d
