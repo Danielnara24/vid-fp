@@ -696,16 +696,22 @@ fn format_from_extension(path: &Path) -> Format {
 /// /nonexistant/report.csv` did the entire scan and then threw the results
 /// away, and with `--delete` armed it did so *after* the files were gone.
 ///
-/// Deliberately does not create anything. `--move-to` names a folder the user
-/// wants files put in, so creating it is the request; `-o` names a file, and
-/// conjuring parent directories for it is not. Nor does it touch the target
-/// itself -- an existing report stays intact until the new one replaces it, and
-/// an interrupted run leaves no empty file behind.
+/// Deliberately does not create anything that outlives the check. `--move-to`
+/// names a folder the user wants files put in, so creating it is the request;
+/// `-o` names a file, and conjuring parent directories for it is not. Nor does
+/// it truncate the target -- an existing report stays intact until the new one
+/// replaces it, and an interrupted run leaves no empty file behind.
 ///
-/// What it cannot see is permissions, which still surface at the end. That is
-/// now the only late failure, and it is the rare one: a mistyped path is a
-/// typo, an unwritable directory you own is a decision. None of it applies to
-/// stdout, which is already open.
+/// Permissions are part of what it proves, because they were the one failure
+/// left that a destructive run could not survive: the report is written as the
+/// last statement of `output_results`, *after* the disposal pass, so `-o
+/// ro/rep.csv --delete --permanent` into a directory it cannot write reported
+/// "Permanently deleted 1 file(s)" and then lost the only record of which file
+/// that was. Exit 2 and a line in the problem summary do not bring it back.
+/// `ensure_writable` is what closes it, and it is worth the two syscalls at
+/// start-up for the same reason the rest of this function is: an hour of
+/// decoding is a bad time to find out where the report was going to go. None
+/// of it applies to stdout, which is already open.
 fn report_target_for(output: Option<&str>, format: Option<Format>) -> Result<Option<ReportTarget>> {
     let Some(out) = output else {
         if format.is_some() {
@@ -748,10 +754,70 @@ fn report_target_for(output: Option<&str>, format: Option<Format>) -> Result<Opt
         );
     }
 
+    ensure_writable(path)?;
+
     Ok(Some(ReportTarget {
         sink: Sink::File(path.to_path_buf()),
         format: format.unwrap_or_else(|| format_from_extension(path)),
     }))
+}
+
+/// Prove the report can be written where it is going, without writing anything
+/// that is still there afterwards.
+///
+/// One `open` answers it, and which of the two cases it lands in is the file
+/// system's to decide rather than something to race on with a prior `exists()`:
+///
+/// * The file is not there yet, so `create_new` makes it -- which is exactly
+///   the permission the real write needs, on exactly the name it will use --
+///   and it is removed again immediately. Creating and keeping it would break
+///   the promise above (an interrupted run leaves nothing behind) and would
+///   also stand an empty file where a previous run's report used to be.
+/// * The file is already there, so the create loses to `EEXIST` (POSIX checks
+///   O_EXCL before the directory's write bit, so this arm is reached even in a
+///   folder that would refuse a new file) and it is re-opened for writing
+///   instead. Deliberately WITHOUT `truncate`: the old report is a document the
+///   user may still be working from, and emptying it at start-up to prove the
+///   run could have filled it is the opposite of the point. Note this is the
+///   case where a read-only *folder* is fine and must stay allowed -- writing
+///   over an existing file needs no permission on the directory holding it.
+///
+/// What no check can rule out is the permissions changing under a run that is
+/// already going, or the disk filling up. Those are still late failures, and
+/// `output_results` still records them as problems rather than propagating
+/// them; the difference is that they are now accidents of timing rather than
+/// the state the run started in.
+fn ensure_writable(path: &Path) -> Result<()> {
+    use std::fs::OpenOptions;
+
+    let refuse = |e: std::io::Error| -> anyhow::Error {
+        anyhow::anyhow!("--output {} cannot be written: {}.", path.display(), e)
+    };
+
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(file) => {
+            drop(file);
+            // Best effort: the run is going to write this path in a moment
+            // whatever happens here, so a probe that cannot clean up after
+            // itself is not a reason to refuse the run.
+            let _ = std::fs::remove_file(path);
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Only a regular file is opened to be asked. Opening a FIFO for
+            // writing BLOCKS until a reader arrives, and then closing the probe
+            // hands that reader an EOF -- so `mkfifo p; vid-fp lib -o p & cat p`
+            // would have the check consume the reader the report was for. A
+            // device or a socket is the same kind of thing: whether it can be
+            // written is not a question that can be asked without doing it.
+            // Those keep the behaviour they had before this check existed.
+            match std::fs::metadata(path) {
+                Ok(m) if !m.is_file() => Ok(()),
+                _ => OpenOptions::new().write(true).open(path).map(drop).map_err(refuse),
+            }
+        }
+        Err(e) => Err(refuse(e)),
+    }
 }
 
 /// Say up front what is going to happen to the files marked DELETE, so it is
@@ -4118,13 +4184,119 @@ mod tests {
     fn test_an_ordinary_report_path_is_accepted() {
         // Including the bare relative name, whose parent is the empty string
         // rather than a directory -- the one shape this check could plausibly
-        // get wrong in the direction that refuses a perfectly good run.
+        // get wrong in the direction that refuses a perfectly good run. Given a
+        // name of its own because the check now touches the file system, and a
+        // fixed one would collide with whatever else the suite is doing in the
+        // working directory.
         assert!(report_target_for(None, None).unwrap().is_none());
-        assert!(report_target_for(Some("report.csv"), None).unwrap().is_some());
+        let bare = format!("vid-fp-test-report-{}.csv", std::process::id());
+        assert!(report_target_for(Some(&bare), None).unwrap().is_some());
+        // And the probe took nothing with it and left nothing behind: an
+        // interrupted run must not leave an empty report standing where the
+        // real one was going to go.
+        assert!(!Path::new(&bare).exists(), "the write check left {} behind", bare);
 
         let dir = tempfile::tempdir().unwrap();
         let inside = dir.path().join("report.csv").to_string_lossy().to_string();
         assert!(report_target_for(Some(&inside), None).unwrap().is_some());
+        assert!(!Path::new(&inside).exists());
+    }
+
+    #[test]
+    fn test_a_report_that_cannot_be_written_is_refused_before_the_run_not_after_it() {
+        // The failure this closes: the report is written after the disposal
+        // pass, so a destination that refuses it costs the user the record of
+        // an irreversible run rather than costing them the run.
+        let dir = tempfile::tempdir().unwrap();
+        let ro = dir.path().join("ro");
+        std::fs::create_dir(&ro).unwrap();
+        std::fs::set_permissions(&ro, std::os::unix::fs::PermissionsExt::from_mode(0o500))
+            .unwrap();
+
+        let target = ro.join("rep.csv").to_string_lossy().to_string();
+        let err = format!("{:#}", report_target_for(Some(&target), None).unwrap_err());
+        assert!(err.contains(&target), "{}", err);
+        assert!(err.contains("cannot be written"), "{}", err);
+
+        // Same folder, but the report already exists and is writable: writing
+        // over a file needs no permission on the directory holding it, so this
+        // run is fine and refusing it would be a regression of its own.
+        std::fs::set_permissions(&ro, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        let existing = ro.join("old.csv");
+        std::fs::write(&existing, b"an earlier run\n").unwrap();
+        std::fs::set_permissions(&ro, std::os::unix::fs::PermissionsExt::from_mode(0o500))
+            .unwrap();
+
+        let as_str = existing.to_string_lossy().to_string();
+        assert!(report_target_for(Some(&as_str), None).unwrap().is_some());
+        // And the check did not empty it on the way past. The new report
+        // replaces the old one when it is written, not before.
+        assert_eq!(std::fs::read(&existing).unwrap(), b"an earlier run\n");
+
+        // A file nothing can write is refused whatever the folder says.
+        std::fs::set_permissions(&ro, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        std::fs::set_permissions(&existing, std::os::unix::fs::PermissionsExt::from_mode(0o400))
+            .unwrap();
+        let err = format!("{:#}", report_target_for(Some(&as_str), None).unwrap_err());
+        assert!(err.contains("cannot be written"), "{}", err);
+    }
+
+    #[test]
+    fn test_a_destination_that_cannot_be_asked_is_not_asked() {
+        // A FIFO opened for writing blocks until someone reads it, and the
+        // close that ends the probe would then be an EOF for that reader --
+        // the check would consume the pipe the report was meant to go down.
+        // So a target that is not a regular file is accepted unexamined, which
+        // is exactly the behaviour it had before this check existed. The test
+        // is that it RETURNS: under the plain open it never would.
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        let c_path = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).unwrap();
+        // SAFETY: a path this process just made up, inside a temp dir it owns.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        let as_str = fifo.to_string_lossy().to_string();
+        assert!(report_target_for(Some(&as_str), None).unwrap().is_some());
+        // And it is still a pipe afterwards, not a regular file the probe
+        // replaced.
+        assert!(!std::fs::metadata(&fifo).unwrap().is_file());
+    }
+
+    #[test]
+    fn test_an_irreversible_run_whose_report_has_nowhere_to_go_never_starts() {
+        // The same guard from the outside, which is the only place the cost of
+        // losing it is visible: `run` has to refuse before the disposal pass,
+        // because the report is written after it. Reproduced with the exact
+        // shape reported -- two copies of one video, a folder the report cannot
+        // be written into, and --delete --permanent -y.
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+
+        let fixture = std::fs::read("tests/fixtures/test_video.mp4").unwrap();
+        let copies = ["a.mp4", "b.mp4"].map(|name| dir.path().join(name));
+        for copy in &copies {
+            std::fs::write(copy, &fixture).unwrap();
+        }
+
+        // Not scanned itself: the walk is non-recursive here, and a subfolder
+        // of the library is where a user would naturally put the report.
+        let ro = dir.path().join("ro");
+        std::fs::create_dir(&ro).unwrap();
+        std::fs::set_permissions(&ro, std::os::unix::fs::PermissionsExt::from_mode(0o500))
+            .unwrap();
+        let target = ro.join("rep.csv").to_string_lossy().to_string();
+
+        let err = run_error(&dir, &db, &["-o", &target, "--delete", "--permanent", "-y"]);
+        assert!(err.contains("cannot be written"), "{}", err);
+
+        // The refusal is worth nothing if it arrives after the deletion. Both
+        // copies are still here, and the run that would have removed one of
+        // them never reached the point of deciding which.
+        for copy in &copies {
+            assert!(copy.exists(), "{} was removed by a run that could not report it", copy.display());
+        }
     }
 
     /// What a resolved target came out as, in the two words the test cares

@@ -1089,8 +1089,9 @@ pub fn output_results(
     // (exit 2, and a line in the Problems summary) -- it is not a reason to
     // forget what the run did to the filesystem.
     //
-    // `report_target_for` has already rejected the mistyped paths before any
-    // work started, so what reaches here is a permission or a full disk.
+    // `report_target_for` has already rejected the mistyped paths AND proved
+    // this destination writable before any work started, so what reaches here
+    // is a full disk, or permissions that changed while the run was going.
     if let Some(target) = report_target {
         let written = (move || -> Result<()> {
             let bytes = match target.format {
