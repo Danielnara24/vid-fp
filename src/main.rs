@@ -701,6 +701,75 @@ fn disposal_for(move_to: Option<PathBuf>, delete: bool, permanent: bool) -> Opti
     }
 }
 
+/// The folders this run had to make for `--move-to`, and its promise to take
+/// them back if it then refuses to run.
+///
+/// Creating the destination IS the request, but only for a run that goes on to
+/// use it. The destination has to exist before anything can be decided about it
+/// -- `canonicalize` needs a real inode, and an `-e` naming the same folder is
+/// canonicalized too, so a destination that does not exist yet cannot be
+/// excluded -- and the checks that can refuse the run all come after that.
+/// `vid-fp lib -r --move-to lib/dupes` is refused by the loop guard in `run`
+/// having already created `lib/dupes` INSIDE the scan root: correct refusal,
+/// workable advice, and an empty directory left behind by a run that did
+/// nothing, which the user now has to clean up before the folder stops being
+/// part of their library. Every start-up refusal between the two left the same
+/// thing -- an `--output` that cannot be written, a scan path that will not
+/// resolve.
+///
+/// Taking it back can never destroy anything, which is what makes it safe to
+/// fire on every early return: `remove_dir` refuses a directory that is not
+/// empty, so anything that appeared inside one meanwhile -- including files
+/// this run moved -- keeps it. `keep` is called once the run has passed
+/// everything that could turn it away.
+#[derive(Default)]
+struct Conjured {
+    /// Deepest first, which is the order they have to be removed in.
+    dirs: Vec<PathBuf>,
+}
+
+impl Conjured {
+    /// The run is committed: the folder is the user's now.
+    fn keep(&mut self) {
+        self.dirs.clear();
+    }
+}
+
+impl Drop for Conjured {
+    fn drop(&mut self) {
+        for dir in &self.dirs {
+            // Best effort by design. A destination that is no longer empty is
+            // one this run must not touch, and a run that is already on its way
+            // out with an error to report has nothing to say about a directory
+            // it could not tidy up.
+            let _ = std::fs::remove_dir(dir);
+        }
+    }
+}
+
+/// The directories `create_dir_all(dir)` will have to make, deepest first.
+///
+/// Asked BEFORE the creation, because afterwards there is nothing left to tell
+/// what was already there from what this run conjured -- and only the latter is
+/// this run's to remove.
+fn missing_ancestors(dir: &Path) -> Vec<PathBuf> {
+    let mut missing = Vec::new();
+    let mut cursor = dir;
+
+    // `exists` follows symlinks, which is the right question here: a link to an
+    // existing folder is not something this run made, and a dangling one is
+    // something `create_dir_all` will refuse rather than replace.
+    while !cursor.as_os_str().is_empty() && !cursor.exists() {
+        missing.push(cursor.to_path_buf());
+        match cursor.parent() {
+            Some(parent) => cursor = parent,
+            None => break,
+        }
+    }
+
+    missing
+}
+
 /// Turn `--move-to DIR` into the absolute folder the files will land under.
 ///
 /// Resolved BEFORE any work on purpose: a destination that cannot be created is
@@ -708,8 +777,15 @@ fn disposal_for(move_to: Option<PathBuf>, delete: bool, permanent: bool) -> Opti
 /// out several hours too late. Canonical, so the containment check and the
 /// mirrored landing paths are both working from the same absolute form the
 /// scanner produces.
-fn resolve_move_to(dir: Option<&String>) -> Result<Option<PathBuf>> {
-    let Some(dir) = dir else { return Ok(None) };
+///
+/// The `Conjured` it returns beside the path is what undoes the creation if the
+/// run is refused after all; see there for why that is not simply deferred
+/// until the checks have run. Its own failures need no `keep`: dropping it on
+/// the way out is exactly what a half-made destination deserves.
+fn resolve_move_to(dir: Option<&String>) -> Result<(Option<PathBuf>, Conjured)> {
+    let Some(dir) = dir else { return Ok((None, Conjured::default())) };
+
+    let conjured = Conjured { dirs: missing_ancestors(Path::new(dir)) };
 
     std::fs::create_dir_all(dir)
         .with_context(|| format!("Failed to create the --move-to folder {}", dir))?;
@@ -718,7 +794,7 @@ fn resolve_move_to(dir: Option<&String>) -> Result<Option<PathBuf>> {
     if !resolved.is_dir() {
         anyhow::bail!("--move-to {} is not a folder.", dir);
     }
-    Ok(Some(resolved))
+    Ok((Some(resolved), conjured))
 }
 
 /// The format an `--output` path implies when `--format` is silent.
@@ -988,7 +1064,7 @@ fn run_from_report(
     report_path: &str,
     stats: &RunStats,
 ) -> Result<Outcome> {
-    let move_to = resolve_move_to(args.move_to.as_ref())?;
+    let (move_to, mut conjured) = resolve_move_to(args.move_to.as_ref())?;
 
     let Some(disposal) = disposal_for(move_to, args.delete, args.permanent) else {
         anyhow::bail!(
@@ -1004,6 +1080,9 @@ fn run_from_report(
     // This mode has no scan roots, so there is nothing it could be checked
     // against and nothing it could conclude.
     let deleted_paths = report::apply(report_path, &disposal, args.yes, stats)?;
+    // Past every refusal this mode has: a report it could not read is one of
+    // them, and it leaves no more behind than a scan refused by the loop guard.
+    conjured.keep();
 
     if !deleted_paths.is_empty() {
         match db {
@@ -2211,7 +2290,7 @@ fn run(
         );
     }
 
-    let move_to = resolve_move_to(args.move_to.as_ref())?;
+    let (move_to, mut conjured) = resolve_move_to(args.move_to.as_ref())?;
     let report_target = report_target_for(args.output.as_deref(), args.format)?;
 
     // Say out loud which flags are not doing anything. A user who passed
@@ -2302,6 +2381,10 @@ fn run(
             );
         }
     }
+
+    // Nothing left that can turn this run away over where it was told to put
+    // things, so a destination it had to create is the user's from here.
+    conjured.keep();
 
     // What to call the things that came back. Under `-x '*'` the walk applied no
     // extension filter, so calling them video files is a claim the run has not
@@ -4392,6 +4475,80 @@ mod tests {
             .unwrap();
         let err = format!("{:#}", report_target_for(Some(&as_str), None).unwrap_err());
         assert!(err.contains("cannot be written"), "{}", err);
+    }
+
+    #[test]
+    fn test_a_move_to_folder_a_refused_run_made_is_not_left_behind() {
+        // `vid-fp lib -r --move-to lib/dupes`: the loop guard is right to refuse
+        // it, and the folder was already there by the time it did. What that
+        // costs is the advice the refusal gives -- the destination is now INSIDE
+        // the library, so the second attempt at the same command has an empty
+        // directory of this tool's making to clean up first.
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+
+        let dupes = dir.path().join("dupes");
+        let err = run_error(&dir, &db, &["-r", "--move-to", &dupes.to_string_lossy()]);
+        assert!(err.contains("would be scanned again"), "{}", err);
+        assert!(!dupes.exists(), "the refused run left {} behind", dupes.display());
+
+        // Every level it had to conjure goes, not just the last one.
+        let nested = dir.path().join("a/b/c");
+        let err = run_error(&dir, &db, &["-r", "--move-to", &nested.to_string_lossy()]);
+        assert!(err.contains("would be scanned again"), "{}", err);
+        assert!(!dir.path().join("a").exists(), "the whole chain is this run's to take back");
+
+        // And a destination that was already there is never this run's to
+        // remove, however it feels about being pointed at it.
+        let existing = dir.path().join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        let err = run_error(&dir, &db, &["-r", "--move-to", &existing.to_string_lossy()]);
+        assert!(err.contains("would be scanned again"), "{}", err);
+        assert!(existing.is_dir(), "a folder this run did not make is not its to delete");
+    }
+
+    #[test]
+    fn test_a_move_to_folder_a_run_accepts_stays_even_when_nothing_moves() {
+        // The other half: creating the folder IS the request, and a run that
+        // gets past every check keeps it whether or not it found anything to
+        // put in there. An empty scan reaches the same place, which is what
+        // this uses -- there is nothing to move and the folder is still made.
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+        let elsewhere = tempfile::tempdir().unwrap();
+
+        let dest = elsewhere.path().join("dupes");
+        let stats = RunStats::default();
+        assert!(matches!(
+            run(
+                &args_over(&dir, &["--move-to", &dest.to_string_lossy()]),
+                Some(&db),
+                Instant::now(),
+                1,
+                &stats
+            ),
+            Ok(Outcome::Completed)
+        ));
+        assert!(dest.is_dir(), "the run was accepted, so the folder is the user's now");
+    }
+
+    #[test]
+    fn test_only_the_folders_a_run_had_to_make_are_taken_back() {
+        // The list has to be read off the filesystem BEFORE anything is created,
+        // and it stops at the first thing that is already there. The empty
+        // parent of a bare relative name is the shape that could hang it.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(missing_ancestors(dir.path()).is_empty(), "nothing to make");
+
+        let leaf = dir.path().join("x/y");
+        assert_eq!(
+            missing_ancestors(&leaf),
+            vec![leaf.clone(), dir.path().join("x")],
+            "deepest first, stopping at the folder that already exists"
+        );
+
+        let bare = Path::new("vid-fp-test-no-such-folder");
+        assert_eq!(missing_ancestors(bare), vec![bare.to_path_buf()]);
     }
 
     #[test]
