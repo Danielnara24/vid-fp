@@ -491,6 +491,11 @@ pub fn output_results(
 
         let standoff = codecs.len() > 1;
 
+        // Whether the standoff has anything to say about the pick at all: it
+        // ranks contenders, and a pick that is not one of them never stood in
+        // its codec's election.
+        let pick_contends = contenders.contains(&keep_idx);
+
         if standoff {
             for codec in codecs {
                 let same_codec: Vec<usize> = contenders
@@ -499,8 +504,35 @@ pub fn output_results(
                     .filter(|&idx| fingerprints[idx].codec == codec)
                     .collect();
 
-                let codec_maxima = GroupMaxima::of(&same_codec, fingerprints);
-                group_review.insert(find_best(&same_codec, fingerprints, priority, &codec_maxima));
+                // The KEEP pick IS its own codec's champion, by decree rather
+                // than by re-election. Re-tiering against the codec's own
+                // contenders can only widen the top band (dropping files lowers
+                // every maximum, and a lower maximum admits more of them), so
+                // the smaller election sees ties the group-wide one had already
+                // broken -- and breaks them again, on a metric that comes
+                // EARLIER in the order than the one which settled the group.
+                // Two full-length h264 copies half a second apart, with a dense
+                // clip owning the group's h264 quality bar: group-wide both are
+                // tier 0 on quality and length decides, among contenders alone
+                // the denser one takes the quality tier and wins. The champion
+                // then replaced the pick below and the pick -- the file this
+                // group's own ranking chose -- was deleted in favour of one it
+                // had just outranked. Armed, that is the KEEP copy destroyed.
+                //
+                // Deferring to the pick keeps both rules whole: still exactly
+                // one survivor per codec, and the survivor of the pick's codec
+                // is the same file a group with no foreign codec in it would
+                // have kept. Every other codec is elected as before, because
+                // nothing group-wide ever ranked those files against each other
+                // -- that is what the standoff means.
+                let champion = if pick_contends && fingerprints[keep_idx].codec == codec {
+                    keep_idx
+                } else {
+                    let codec_maxima = GroupMaxima::of(&same_codec, fingerprints);
+                    find_best(&same_codec, fingerprints, priority, &codec_maxima)
+                };
+
+                group_review.insert(champion);
             }
         }
 
@@ -508,17 +540,20 @@ pub fn output_results(
         // candidate. DELETE wins over KEEP globally, so we don't care whether
         // the file is a KEEP pick in some other group.
         //
-        // In a standoff the champions REPLACE the group's KEEP pick rather than
-        // joining it: the pick is one of the contenders, and holding it as well
-        // would leave two survivors of the same codec -- one because it won its
-        // codec, one because it happened to sort first. The exception is a pick
-        // that is not a contender at all (it leads on the prioritised metric but
-        // lost a codec-blind one); the standoff says nothing about that file, so
-        // it keeps its usual protection.
+        // The KEEP pick is protected unconditionally, and a standoff does not
+        // change that. It used to: the champions REPLACED the pick rather than
+        // joining it, so that a group could not end with two survivors of one
+        // codec -- one because it won its codec, one because it won the group.
+        // That reasoning holds, but the way to have it is to make the pick its
+        // own codec's champion (above), not to leave it unprotected on the
+        // strength of an election it did not stand in. The insert is therefore
+        // redundant whenever the pick contends, and load-bearing when it does
+        // not (a pick that leads on the prioritised metric but lost a
+        // codec-blind one is no contender, and the standoff says nothing about
+        // it) -- so it is stated once, for every group, and the group's own
+        // ranking can never be overturned by a smaller one.
         let mut protected: HashSet<usize> = group_review.clone();
-        if !standoff || !contenders.contains(&keep_idx) {
-            protected.insert(keep_idx);
-        }
+        protected.insert(keep_idx);
 
         for &idx in group {
             if !protected.contains(&idx) {
@@ -2722,6 +2757,57 @@ matched_from_seconds;matched_to_seconds";
             !Path::new(&a_worse).exists(),
             "sorting first is not a reason to survive a copy that beat you on bits"
         );
+    }
+
+    #[test]
+    fn test_a_standoff_cannot_delete_the_copy_the_group_ranked_first() {
+        // The two elections disagree, and the disagreement used to condemn the
+        // file the group itself chose to keep.
+        //
+        // `a_pick` and `c_denser` are both full-length, full-resolution h264
+        // copies, half a second apart -- inside DURATION_TOLERANCE_SECS, so
+        // both are contenders. The two short clips are not, and they are what
+        // sets the trap: each is dense enough to own its codec's quality and
+        // size maxima outright, so group-wide every long copy is tier 0 on both
+        // and the ranking falls through to raw length, where `a_pick` wins by
+        // its extra half second. Re-tiered against the h264 contenders ALONE
+        // the clip is gone, `c_denser` owns the bar, and the election crowns it
+        // instead -- so the champion replaced the pick, and `a_pick` was left
+        // unprotected and deleted in favour of a copy it had just outranked.
+        let dir = tempfile::tempdir().unwrap();
+        let a_pick = at(&dir, "a_pick.mkv");
+        let c_denser = at(&dir, "c_denser.mkv");
+        let b_av1 = at(&dir, "b_av1.mkv");
+        let h264_clip = at(&dir, "h264_clip.mkv");
+        let av1_clip = at(&dir, "av1_clip.mkv");
+
+        let fps = vec![
+            mock_fp_sized(&a_pick, 60.0, "h264", 27_000_000),
+            mock_fp_sized(&c_denser, 59.5, "h264", 30_000_000),
+            mock_fp_sized(&b_av1, 60.0, "av1", 12_000_000),
+            mock_fp_sized(&h264_clip, 5.0, "h264", 40_000_000),
+            mock_fp_sized(&av1_clip, 5.0, "av1", 40_000_000),
+        ];
+        materialize_all(&fps);
+
+        let groups = vec![vec![0, 1, 2, 3, 4]];
+
+        output_results(
+            &groups, &fps, &all_compared(fps.len()), None, 0, Priority::Length,
+            Some(&Disposal::Permanent), true, &RunStats::default(),
+        ).unwrap();
+
+        assert!(
+            Path::new(&a_pick).exists(),
+            "the file the group's own ranking chose must never be the one deleted"
+        );
+        assert!(Path::new(&b_av1).exists(), "the av1 contender is its codec's champion");
+        assert!(
+            !Path::new(&c_denser).exists(),
+            "losing the group ranking is still a loss: one survivor per codec"
+        );
+        assert!(!Path::new(&h264_clip).exists(), "a clip is not a contender");
+        assert!(!Path::new(&av1_clip).exists(), "nor is the other one");
     }
 
     #[test]
