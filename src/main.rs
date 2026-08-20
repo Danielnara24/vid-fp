@@ -2078,20 +2078,29 @@ Interrupted with Ctrl-C.
     // entries the run will not refill, by design. A cleared cache was already
     // compacted while it was empty, and everything in the file now is live.
     //
-    // Hence `!args.clear_cache`, which this condition used to be missing even
-    // though the sentence above already stated the rule. `--prune-cache` and
-    // `--clear-cache` together skip the prune itself (see `run`: after a clear
-    // there is nothing stale, because there is nothing at all), so the run
-    // removed no entries -- and then compacted anyway, copying every live page
-    // of a cache the scan had just rewritten from scratch to reclaim exactly
-    // nothing. That is the same waste compaction was moved out of the tail of
-    // the run to avoid; it is invisible on a small cache and is a full rewrite
-    // plus an fsync on a large one.
+    // So the condition is what the prune REMOVED, not what the flags asked for.
+    // The flags cannot answer it: `--prune-cache` is a request, and there are
+    // three ways a run can decline it after taking one. With `--clear-cache`
+    // beside it the prune is skipped outright (see `run`: after a clear there
+    // is nothing stale, because there is nothing at all). A scan that fell
+    // short refuses to prune and says so -- `prune_obstacle` -- and that run
+    // then printed "Not pruning the cache: ..." and "Compacted the fingerprint
+    // cache." one after the other, a full rewrite of every live page to reclaim
+    // exactly nothing. And a prune with nothing stale in front of it removes
+    // nothing either. `run` failing before it reaches the prune is a fourth,
+    // since this line is above the `outcome?` that returns the error.
+    //
+    // All four are the same waste compaction was moved out of the tail of the
+    // run to avoid: invisible on a small cache, a full rewrite plus an fsync on
+    // a large one. A counted removal is the only thing that says there is dead
+    // space, and it is the only thing that can be wrong in the direction that
+    // costs anything -- a compaction skipped is space handed back by the next
+    // prune, where a compaction taken is a rewrite the user waits for now.
     //
     // `db` is None only under `--from-report`, which cannot be given
     // `--prune-cache` at all, so this never silently skips a compaction the
     // user asked for.
-    if !shutdown_requested() && args.prune_cache && !args.clear_cache {
+    if !shutdown_requested() && stats.entries_pruned() > 0 {
         if let Some(db) = db.as_mut() {
             match db.compact() {
                 Ok(true) => info!("Compacted the fingerprint cache."),
@@ -2395,6 +2404,11 @@ fn run(
                 }
             }
             txn.commit().context("Failed to apply cache pruning")?;
+            // The one thing `main` needs from this block: entries were really
+            // removed, so the file now holds dead pages and the compaction it
+            // does after `run` returns has something to reclaim. Both tables
+            // count, because a page freed by a refusal is the same page.
+            stats.record_prune(stale.len() + stale_refusals.len());
             // Counted apart: they are different things, and a user watching the
             // fingerprint count is watching the one that cost something.
             if stale_refusals.is_empty() {
@@ -4040,6 +4054,56 @@ mod tests {
         let left = cached_paths(&db);
         assert!(!left.iter().any(|p| p == ORPHAN), "the orphan is gone: {:?}", left);
         assert_eq!(stats.cache_prune_skipped.count(), 0, "nothing stood in the way");
+    }
+
+    /// The compaction `main` runs afterwards is decided by what the prune
+    /// removed, never by the flag that asked for one.
+    ///
+    /// A compaction copies every live page into a fresh file and fsyncs it, so
+    /// on a large cache it is the most expensive thing a warm run does. It used
+    /// to be gated on `--prune-cache` alone, which is a request rather than an
+    /// outcome: a run that fell short printed "Not pruning the cache: 1 scan
+    /// path(s) could not be resolved" and "Compacted the fingerprint cache."
+    /// one after the other, having removed nothing and rewritten everything.
+    /// A prune with nothing stale in front of it is the same trade.
+    #[test]
+    fn test_a_prune_that_removed_nothing_leaves_nothing_to_compact() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = cache_with_an_orphan(&dir);
+
+        let missing = dir.path().join("vidz").to_string_lossy().to_string();
+        let refused = RunStats::default();
+        run(
+            &Args::parse_from(["vid-fp", &missing, "--prune-cache"]),
+            Some(&db),
+            Instant::now(),
+            1,
+            &refused,
+        )
+        .unwrap();
+
+        assert_eq!(refused.cache_prune_skipped.count(), 1, "the prune was declined");
+        assert_eq!(refused.entries_pruned(), 0, "so there is no dead space to reclaim");
+
+        // The same cache, scanned completely: now the orphan really goes, and
+        // the pages it held are what the compaction is for.
+        let mut fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        fixture.push("tests/fixtures/test_video.mp4");
+        std::fs::copy(&fixture, dir.path().join("clip.mp4"))
+            .expect("the fixture video is part of the tree");
+
+        let pruned = RunStats::default();
+        run(&args_over(&dir, &["--prune-cache"]), Some(&db), Instant::now(), 1, &pruned).unwrap();
+
+        assert_eq!(pruned.entries_pruned(), 1, "one orphan removed, so one thing to reclaim");
+
+        // And a second pass over the same complete scan: the prune runs, finds
+        // the cache already accounted for, and removes nothing.
+        let again = RunStats::default();
+        run(&args_over(&dir, &["--prune-cache"]), Some(&db), Instant::now(), 1, &again).unwrap();
+
+        assert_eq!(again.cache_prune_skipped.count(), 0, "nothing stood in the way this time");
+        assert_eq!(again.entries_pruned(), 0, "there was simply nothing stale left");
     }
 
     /// A library of two identical clips and the report that plans their merge.

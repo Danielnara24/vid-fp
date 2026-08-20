@@ -107,6 +107,18 @@ pub struct RunStats {
     pub skipped_short: Tally,
     pub skipped_alias: Tally,
     pub skipped_excluded: Tally,
+
+    // --- neither: what the run DID, for the one caller that has to know ------
+    /// How many cache entries the prune removed.
+    ///
+    /// Not a problem and not a skip, so it is in neither list and never
+    /// printed: it exists because compaction happens in `main`, after `run` has
+    /// returned, and a compaction is a full rewrite of the cache plus an fsync.
+    /// The flags alone cannot answer whether that rewrite would reclaim
+    /// anything -- `--prune-cache` is a request, and the prune declines it
+    /// whenever the scan fell short (see `main::prune_obstacle`) -- so the
+    /// count of what was actually removed is what the decision is taken on.
+    pub cache_entries_pruned: AtomicUsize,
 }
 
 impl RunStats {
@@ -220,6 +232,16 @@ impl RunStats {
                 "named path(s) skipped because --exclude covers them",
             ),
         ]
+    }
+
+    /// Record entries removed by `--prune-cache`.
+    pub fn record_prune(&self, entries: usize) {
+        self.cache_entries_pruned.fetch_add(entries, Ordering::Relaxed);
+    }
+
+    /// How many entries this run's prune removed -- 0 if it did not run at all.
+    pub fn entries_pruned(&self) -> usize {
+        self.cache_entries_pruned.load(Ordering::Relaxed)
     }
 
     pub fn problem_count(&self) -> usize {
