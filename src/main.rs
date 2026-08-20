@@ -37,7 +37,7 @@ use utils::{shutdown_requested, Priority};
 /// re-encoded, re-muxed, or scanned with different sampling settings replaces
 /// its own entry instead of growing a second one beside it.
 const CACHE_TABLE: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("fingerprints_dct_ct_ff8_rescale");
+    TableDefinition::new("fingerprints_dct_ct_ff8_kffloor");
 
 /// Files this build looked at and refused before opening: see `NotMedia`.
 ///
@@ -125,7 +125,18 @@ const REFUSED_TABLE: TableDefinition<&str, &[u8]> =
 ///   reached by an entirely separate route: no clock restart is needed, only a
 ///   broadcaster switching feeds or two encodes concatenated. Same fields, same
 ///   units, half the values, invisible to the `Stamp`.
-const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 7] = [
+/// - `fingerprints_dct_ct_ff8_rescale` holds, for a run that asked for
+///   `--keyframe-interval N --min-keyframes 0` (or a negative, or NaN), every
+///   keyframe in the file rather than one every N seconds. `--min-keyframes` is
+///   a floor on the interval, so a floor of nothing means the interval stands;
+///   it used to mean the interval was dropped as well. The stamp cannot see it:
+///   it records `kf_interval = N` either way, so the entries an old build wrote
+///   under those flags match a new run's stamp exactly and would be handed back
+///   with roughly N times too many hashes. Narrower than every entry above --
+///   it needs that flag pair to have been typed, and a cache that never saw it
+///   holds nothing wrong -- but there is no bit in the stamp that separates the
+///   two, which is the only test that has ever decided this.
+const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 8] = [
     TableDefinition::new("fingerprints"),
     TableDefinition::new("fingerprints_by_path"),
     TableDefinition::new("fingerprints_dct"),
@@ -133,6 +144,7 @@ const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 7] = [
     TableDefinition::new("fingerprints_dct_ct_ff8"),
     TableDefinition::new("fingerprints_dct_ct_ff8_tail"),
     TableDefinition::new("fingerprints_dct_ct_ff8_splice"),
+    TableDefinition::new("fingerprints_dct_ct_ff8_rescale"),
 ];
 
 /// Refusal tables earlier builds wrote. Kept apart from the list above because
@@ -296,7 +308,7 @@ impl Stamp {
             // frame. Either both intervals are known equal by here or both are
             // off, so testing either side's flag is the same test.
             && (!sampling_is_on(other.kf_interval)
-                || same_setting(self.min_kf_samples, other.min_kf_samples))
+                || same_floor(self.min_kf_samples, other.min_kf_samples))
     }
 }
 
@@ -334,6 +346,30 @@ fn same_sampling(a: f64, b: f64) -> bool {
 /// instead of as a comparison against a float that might not be comparable.
 fn sampling_is_on(kf_interval: f64) -> bool {
     kf_interval > 0.0
+}
+
+/// Whether two runs floor the interval the same way.
+///
+/// The third of these predicates, and the same argument as `same_sampling` one
+/// step down: `effective_interval` computes the floor only when
+/// `min_kf_samples > 0.0`, so 0.0, any negative and NaN all mean "no floor" and
+/// leave the interval exactly as the user typed it. They cannot be told apart
+/// from the fingerprint they produce, so none of them may invalidate another's
+/// entry. Only reached with an interval in force, which is the only time this
+/// flag decides anything at all.
+fn same_floor(a: f64, b: f64) -> bool {
+    if !floor_is_on(a) && !floor_is_on(b) {
+        return true;
+    }
+    same_setting(a, b)
+}
+
+/// Whether `--min-keyframes` actually floors anything at this value.
+///
+/// Mirrors the `min_kf_samples > 0.0` test in `fingerprint::fingerprint_video`,
+/// NaN and all, for the same reason `sampling_is_on` mirrors the one beside it.
+fn floor_is_on(min_kf_samples: f64) -> bool {
+    min_kf_samples > 0.0
 }
 
 /// What one cache value holds.
@@ -496,7 +532,8 @@ struct Args {
     /// sample makes each hash stand for a shorter span, so extra frames that
     /// match nothing dilute a pair's coverage and can push it under
     /// --match-percent. 4, 12, 20 and 28 all measure well; 8 and 16 lose pairs
-    /// that way. Only used when --keyframe-interval is > 0.0.
+    /// that way. Only used when --keyframe-interval is > 0.0; 0 here removes the
+    /// floor and leaves that interval to stand on its own.
     #[arg(long = "min-keyframes", default_value_t = 12.0)]
     min_kf_samples: f64,
 
@@ -3542,6 +3579,32 @@ mod tests {
         let fewer = Stamp { min_kf_samples: 2.0, ..negative };
 
         assert!(negative.matches(&fewer), "no interval to floor, so this floors nothing");
+    }
+
+    #[test]
+    fn test_every_floor_that_floors_nothing_is_the_same_setting() {
+        // One rung down from the interval test above, and the same argument:
+        // `effective_interval` computes the floor only when
+        // `min_kf_samples > 0.0`, so 0.0, a negative and NaN all leave the
+        // interval exactly as typed and produce identical fingerprints. Told
+        // apart, `-i 5 -m 0` and `-i 5 -m nan` would each overwrite the other's
+        // entry and neither would ever hit.
+        let sampled = Stamp { kf_interval: 5.0, ..stamp(1_700_000_000, 12_345) };
+        let unfloored = [
+            Stamp { min_kf_samples: 0.0, ..sampled },
+            Stamp { min_kf_samples: -5.0, ..sampled },
+            Stamp { min_kf_samples: f64::NAN, ..sampled },
+        ];
+
+        for a in unfloored {
+            for b in unfloored {
+                assert!(a.matches(&b), "both leave the 5 s interval standing alone");
+            }
+            // A real floor is a real change, in both directions: it makes the
+            // interval finer for anything shorter than 5 s x 12.
+            assert!(!a.matches(&sampled), "12 samples is a floor, none is not");
+            assert!(!sampled.matches(&a));
+        }
     }
 
     fn mock_fp(path: &str) -> VideoFingerprint {

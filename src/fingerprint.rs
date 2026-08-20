@@ -1071,8 +1071,9 @@ fn weigh_from_container(
     // way, since the interval cuts a sparsely-keyframed file's work not at all
     // and a densely-keyframed one's by 90%. The rule mirrors `effective_interval`
     // in `fingerprint_video`, including its floor for short videos.
-    if kf_interval > 0.0 && duration > 0.0 && min_kf_samples > 0.0 {
-        let interval = kf_interval.min(duration / min_kf_samples);
+    if kf_interval > 0.0 && duration > 0.0 {
+        let floor = if min_kf_samples > 0.0 { duration / min_kf_samples } else { f64::INFINITY };
+        let interval = kf_interval.min(floor);
         if interval > 0.0 {
             keyframes = keyframes.min((duration / interval).ceil().max(1.0) as i64);
         }
@@ -1424,10 +1425,24 @@ pub fn fingerprint_video(
     // window, so the clip's hashes find nothing to match. So we bound the interval
     // in absolute time (protecting clip detection in long hosts) and FLOOR it for
     // short videos so they always keep at least min_kf_samples frames.
-    // min_kf_samples guards short videos: they get a finer interval so they always
-    // keep at least this many frames. Guard against <= 0 to avoid div-by-zero / NaN.
-    let effective_interval = if kf_interval > 0.0 && duration_sec > 0.0 && min_kf_samples > 0.0 {
-        kf_interval.min(duration_sec / min_kf_samples)
+    //
+    // The interval is the setting; the floor only ever makes it FINER. So a
+    // floor that cannot be computed -- 0, a negative, NaN -- means "no floor",
+    // and the interval stands on its own. It used to mean "no interval either":
+    // `-i 3 -m 0` decoded every keyframe, which is the one reading of a
+    // MINIMUM that turns the maximum spacing off as well, and it stamped those
+    // every-keyframe fingerprints with `kf_interval = 3.0` -- so alternating
+    // `-i 3 -m 0` with a default run re-decoded the whole library each way for
+    // a setting that provably changed not one frame. Same class of bug as the
+    // one `main::same_sampling` fixed for the interval itself.
+    //
+    // A duration of zero is deliberately still "sample everything", and that is
+    // not the same question: with no runtime there is nothing for the interval
+    // to be measured against here either, and `sample_times` is what recovers
+    // such a file's clock afterwards.
+    let floor = if min_kf_samples > 0.0 { duration_sec / min_kf_samples } else { f64::INFINITY };
+    let effective_interval = if kf_interval > 0.0 && duration_sec > 0.0 {
+        kf_interval.min(floor)
     } else {
         0.0
     };
@@ -2338,6 +2353,61 @@ mod tests {
             "the sample clock only ever goes forwards: {:?}",
             two.valid_t_start
         );
+    }
+
+    /// `--min-keyframes 0` removes the FLOOR, not the interval.
+    ///
+    /// The flag is a minimum sample count for short videos, imposed by making
+    /// the interval finer; a minimum of none is a minimum that never binds, so
+    /// what is left is `--keyframe-interval` on its own. It used to turn that
+    /// off as well and decode every keyframe, which is the one reading of the
+    /// flag under which raising `--keyframe-interval` and lowering
+    /// `--min-keyframes` -- each of them a request for FEWER samples -- combine
+    /// into a request for all of them.
+    ///
+    /// The cache is the half that made it more than a curiosity: those
+    /// every-keyframe fingerprints were stamped with the interval the user
+    /// asked for, so `-i 2 -m 0` and a default run produced byte-identical
+    /// fingerprints under stamps that disagree, and alternating the two
+    /// re-decoded the whole library each way.
+    ///
+    /// The fixture is 3 seconds with a keyframe every second, so the answer is
+    /// exact at every rung below.
+    #[test]
+    fn test_a_floor_of_nothing_leaves_the_keyframe_interval_standing() {
+        init_ffmpeg_for_tests();
+
+        let path = fixture_named("test_video_segment.ts");
+        let filepath = path.to_string_lossy().to_string();
+        let size = std::fs::metadata(&path).unwrap().len();
+        let samples = |kf_interval: f64, min_kf_samples: f64| {
+            fingerprint_video(&filepath, kf_interval, min_kf_samples, 1, 0.0, size, &|_| {})
+                .expect("the fixture decodes")
+                .expect("min_duration is off")
+                .valid_hashes
+                .len()
+        };
+
+        let every = samples(0.0, 12.0);
+        assert_eq!(every, 3, "the fixture is 3 keyframes, one a second");
+
+        // 3 s / 12 is finer than 2 s, so the floor wins and nothing is dropped.
+        assert_eq!(samples(2.0, 12.0), every, "a floor this fine keeps every keyframe");
+
+        // With no floor the interval decides alone: keep at 0 s, drop at 1 s,
+        // keep at 2 s.
+        for off in [0.0, -5.0, f64::NAN] {
+            assert_eq!(
+                samples(2.0, off),
+                2,
+                "--min-keyframes {} removes the floor, so a 2 s interval still applies",
+                off
+            );
+        }
+
+        // And it is the floor that is gone, not the flag: an interval of
+        // nothing is still every keyframe, whatever this says.
+        assert_eq!(samples(0.0, 0.0), every, "no interval to floor, so nothing is dropped");
     }
 
     /// The seek path is answered from the container's clock, so it is kept away
