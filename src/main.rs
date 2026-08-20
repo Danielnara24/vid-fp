@@ -1592,6 +1592,29 @@ enum Refusal {
     /// streams that would not parse, no frame that decoded. The message is the
     /// one the run printed when it found out.
     Said(String),
+    /// The runtime the header reported, for a file the weighing pass found
+    /// shorter than `--min-duration`.
+    ///
+    /// The odd one out, and deliberately so: the other two are verdicts and this
+    /// is a MEASUREMENT, because "too short" is not a fact about the file.
+    /// `--min-duration` is comparison-time and is kept out of the `Stamp` for
+    /// the same reason `-d` and `-p` are, so a run that remembered the verdict
+    /// would hand the same skip to a later run that asked for a lower threshold.
+    /// Remembering the number instead lets every run decide for itself, from the
+    /// same figure the decode would have read, without opening the file.
+    ///
+    /// It is not a problem and is never counted as one: `Tally::record` is not
+    /// reached for it and the exit code does not move. It shares this table
+    /// because it is the same kind of entry -- one per file this build looked at
+    /// and will not fingerprint, guarded by the same `Stamp`, worth half a
+    /// millisecond to rebuild -- and a file that has one of these can have no
+    /// fingerprint beside it, since a fingerprinted file never reaches the
+    /// weighing pass at all.
+    ///
+    /// Appended last on purpose: bincode tags a variant by its position, so the
+    /// two above keep their numbers and caches written before this existed are
+    /// still read.
+    TooShort(f64),
 }
 
 impl std::fmt::Display for Refusal {
@@ -1599,6 +1622,13 @@ impl std::fmt::Display for Refusal {
         match self {
             Refusal::NotMedia(verdict) => write!(f, "{}", verdict),
             Refusal::Said(said) => write!(f, "{}", said),
+            // Never printed as a failure -- the cache pass takes this one apart
+            // before anything asks it for a sentence. Written out anyway so
+            // that a future caller that does ask gets something true rather
+            // than whatever an `_` arm would have said on its behalf.
+            Refusal::TooShort(duration) => {
+                write!(f, "shorter than --min-duration ({:.2}s)", duration)
+            }
         }
     }
 }
@@ -2559,6 +2589,11 @@ fn run(
         /// The file never reaches the weighing pass -- which is the entire
         /// saving, since on a `-x '*'` run that pass IS the run.
         Refused((String, String)),
+        /// Measured before, and shorter than THIS run's `--min-duration`. The
+        /// same saving as `Refused` for the same reason, and the reason the
+        /// runtime is what the cache keeps: the threshold is this run's, so the
+        /// decision has to be taken here rather than remembered.
+        Short,
     }
 
     let lookups: Vec<Lookup> = video_files
@@ -2576,11 +2611,24 @@ fn run(
                 min_kf_samples,
             };
 
-            if let Some(verdict) = refusal_lookup(db, &file.path, &stamp) {
+            match refusal_lookup(db, &file.path, &stamp) {
+                // A remembered runtime, not a remembered verdict -- see
+                // `Refusal::TooShort`. Too short for this run's threshold is a
+                // skip; long enough for it falls through to the lookup below and
+                // is decoded like any other miss, which is what makes lowering
+                // `--min-duration` work from a warm cache.
+                Some(Refusal::TooShort(duration)) => {
+                    if min_duration > 0.0 && duration > 0.0 && duration < min_duration {
+                        return Lookup::Short;
+                    }
+                }
                 // Regenerated rather than stored: the cache keeps the two
                 // numbers, so the sentence a re-run prints is this build's
                 // sentence and cannot drift from the one a first run prints.
-                return Lookup::Refused((format!("{}", verdict), file.path.clone()));
+                Some(verdict) => {
+                    return Lookup::Refused((format!("{}", verdict), file.path.clone()))
+                }
+                None => {}
             }
 
             match cache_lookup(db, &file.path, &stamp) {
@@ -2619,6 +2667,9 @@ fn run(
                 }
             }
             Lookup::Miss(job) => todo.push(job),
+            // Same bucket as every other way a file turns out to be too short,
+            // and the same silence: it is a skip the user asked for.
+            Lookup::Short => stats.skipped_short.bump(),
             // Counted and worded as if it had just been discovered, because it
             // is the same finding about the same bytes -- the run simply did
             // not have to read them again. Still a problem, still exit 2: the
@@ -2710,8 +2761,13 @@ fn run(
                 if shutdown_requested() {
                     return fingerprint::Weighed::Work(job.size);
                 }
-                let weighed =
-                    fingerprint::weigh_decode(&job.path, kf_interval, min_kf_samples, job.size);
+                let weighed = fingerprint::weigh_decode(
+                    &job.path,
+                    kf_interval,
+                    min_kf_samples,
+                    min_duration,
+                    job.size,
+                );
                 wb.inc(1);
                 weighed
             })
@@ -2738,6 +2794,21 @@ fn run(
                     if let Some(verdict) = worth_remembering(&e) {
                         refused.push((job.path.clone(), job.stamp, verdict));
                     }
+                }
+                // Not a failure and not decode work: the file is shorter than
+                // `--min-duration` and the decode's first act would have been to
+                // read this same header and say so. Counted where every other
+                // too-short file is counted, and dropped from `todo` so it is
+                // never opened again -- which is the whole of the fix, since a
+                // skipped file writes no fingerprint and so was a cache miss
+                // every run, paying this open AND the decode's.
+                //
+                // The runtime is remembered rather than the verdict, so the next
+                // run does not pay even this open, and a run with a different
+                // threshold still decides for itself. See `Refusal::TooShort`.
+                fingerprint::Weighed::TooShort(duration) => {
+                    stats.skipped_short.bump();
+                    refused.push((job.path.clone(), job.stamp, Refusal::TooShort(duration)));
                 }
             }
         }
@@ -3972,6 +4043,37 @@ mod tests {
         assert!(
             refusal_lookup(&db, path, &stamp(1_700_000_000, 12_346)).is_none(),
             "and so does a change of size"
+        );
+    }
+
+    /// What the cache keeps about a file under `--min-duration` is its RUNTIME,
+    /// not the skip -- because the threshold belongs to the run and is kept out
+    /// of the `Stamp` along with every other comparison-time flag. Remembering
+    /// the verdict would hand a run that lowered the flag a skip it never asked
+    /// for, and there is no bit in the stamp that would catch it.
+    #[test]
+    fn test_a_remembered_runtime_is_re_decided_against_each_run_s_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+        let path = "/videos/clip.mp4";
+        let written = stamp(1_700_000_000, 12_345);
+
+        refusals_store(&db, &[(path.to_string(), written, Refusal::TooShort(8.84))]).unwrap();
+
+        let Some(Refusal::TooShort(duration)) = refusal_lookup(&db, path, &written) else {
+            panic!("the runtime is what comes back");
+        };
+        assert_eq!(duration, 8.84, "verbatim, so every run can decide for itself");
+
+        // Which is the whole point: one threshold skips this file and the other
+        // sends it to the decode, off one entry neither run had to open a file
+        // to read.
+        assert!(duration < 60.0, "--min-duration 60 skips it");
+        assert!(duration >= 5.0, "--min-duration 5 does not");
+
+        assert!(
+            refusal_lookup(&db, path, &stamp(1_700_000_001, 12_345)).is_none(),
+            "and an edit re-opens the question, exactly as for a refusal"
         );
     }
 

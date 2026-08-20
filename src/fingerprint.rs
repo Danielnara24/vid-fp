@@ -915,19 +915,26 @@ const WORK_PER_BYTE: f64 = 3.8;
 /// every rung of the ladder falls through to a cruder one rather than failing,
 /// because a file this cannot MEASURE still has to be scheduled.
 ///
-/// The one thing it does not fall through is a file that will not decode. That
-/// verdict is `Undecodable`, and it is not an estimate: see `weigh_from_container`
-/// for why every route to it is one `fingerprint_video` provably takes too.
+/// The two things it does not fall through are the file that will not decode
+/// and the file that is not going to be decoded. `Undecodable` is not an
+/// estimate: see `weigh_from_container` for why every route to it is one
+/// `fingerprint_video` provably takes too. `TooShort` is not an estimate either,
+/// and rests on the same kind of argument -- see the same function.
+///
+/// `min_duration` is the `--min-duration` this run was given (seconds, 0 = off),
+/// and it is here for the same reason the keyframe interval is: it decides how
+/// much decoding this file implies, and for a file under it the answer is none.
 pub fn weigh_decode(
     filepath: &str,
     kf_interval: f64,
     min_kf_samples: f64,
+    min_duration: f64,
     size: u64,
 ) -> Weighed {
     let from_bytes = || ((size as f64 * WORK_PER_BYTE) as u64).max(1);
 
-    match weigh_from_container(filepath, kf_interval, min_kf_samples) {
-        Ok(Some(work)) => Weighed::Work(work),
+    match weigh_from_container(filepath, kf_interval, min_kf_samples, min_duration) {
+        Ok(Some(weighed)) => weighed,
         Ok(None) => Weighed::Work(from_bytes()),
         Err(e) => Weighed::Undecodable(e),
     }
@@ -951,10 +958,41 @@ pub enum Weighed {
     /// No decode is going to happen, and this is the error it would have raised.
     /// The caller reports it now and never opens the file again.
     Undecodable(anyhow::Error),
+    /// Shorter than `--min-duration`, carrying the runtime the header reported.
+    ///
+    /// The same finding `fingerprint_video` makes when it returns `Ok(None)`,
+    /// made here so the file is opened once rather than twice: the decode's
+    /// first act on such a file is to read the header this pass has just read,
+    /// see the runtime this pass has just seen, and give up. It is a skip, not a
+    /// problem, and the caller counts it as such.
+    ///
+    /// The runtime comes back with it because it is the only thing that makes
+    /// this verdict worth remembering. `--min-duration` is a comparison-time
+    /// flag and is deliberately not in the cache `Stamp`, so "too short" is not
+    /// a fact about the file and cannot be cached; the number it was measured
+    /// against is, and a later run with a different threshold can re-decide from
+    /// it without opening anything.
+    TooShort(f64),
 }
 
 /// The measurement half of `weigh_decode`: `Ok(None)` means the container opened
 /// and holds video, but could not say enough to be weighed.
+///
+/// `Ok(Some(Weighed::TooShort))` is the second verdict this pass is allowed to
+/// reach, and it rests on the same kind of correspondence as the `Err` below:
+/// it is issued
+/// only when `header_is_complete` says this header answers every question the
+/// decode asks of it, which is exactly the condition under which
+/// `fingerprint_video` will NOT probe -- so it reads its `min_duration` against
+/// the same `duration_seconds` of the same stream of the same header, and
+/// reaches the same conclusion. Where the header is not complete the question is
+/// left alone entirely, because a probe can move the runtime and the direction
+/// that matters is the one where this pass would skip a file the decode would
+/// have kept.
+///
+/// It is asked before the index is counted and before the seek that forces
+/// Matroska's Cues, because a file that is not going to be decoded does not need
+/// a weight.
 ///
 /// An `Err` is not a failure to measure -- it is the verdict that this file has
 /// no fingerprint to give, carrying the error `fingerprint_video` would have
@@ -988,7 +1026,8 @@ fn weigh_from_container(
     filepath: &str,
     kf_interval: f64,
     min_kf_samples: f64,
-) -> Result<Option<u64>> {
+    min_duration: f64,
+) -> Result<Option<Weighed>> {
     let mut ictx = open_video(filepath)?;
 
     let stream_index = match ictx
@@ -1021,6 +1060,19 @@ fn weigh_from_container(
             return Ok(None);
         }
     };
+
+    // Shorter than the shortest match this run is willing to report, decided
+    // here rather than by the decode that would otherwise open this file a
+    // second time to decide it. Only a header the decode would trust unprobed
+    // may answer -- see the note above.
+    if min_duration > 0.0 && header_is_complete(&ictx) {
+        if let Some(stream) = ictx.stream(stream_index) {
+            let duration = duration_seconds(&stream, &ictx);
+            if duration > 0.0 && duration < min_duration {
+                return Ok(Some(Weighed::TooShort(duration)));
+            }
+        }
+    }
 
     // MP4 and AVI have their index the moment the header is read; Matroska
     // parses its Cues on the first seek and reports nothing until then, so the
@@ -1079,9 +1131,9 @@ fn weigh_from_container(
         }
     }
 
-    Ok(Some(
+    Ok(Some(Weighed::Work(
         ((keyframes as f64) * (pixels as f64) * cost).max(1.0) as u64,
-    ))
+    )))
 }
 
 /// Pixels per frame, runtime, and the codec's price, or `None` when the picture
@@ -2103,6 +2155,55 @@ mod tests {
         assert!(skipped.is_none(), "a short video must be skipped, not fingerprinted");
     }
 
+    /// A file under `--min-duration` is not going to be decoded, so the weighing
+    /// pass says so and the decode never opens it -- one open instead of two,
+    /// on every run, for every file the flag skips (such a file writes no
+    /// fingerprint, so it is a cache miss for ever).
+    ///
+    /// That is only allowed because both passes read the same runtime out of the
+    /// same header. Pinned as a bracket rather than as a float comparison
+    /// between the two: a threshold either side of the runtime the weigher
+    /// reports has to move BOTH passes, and the same way.
+    #[test]
+    fn test_the_weigher_and_the_decoder_agree_about_a_file_that_is_too_short() {
+        init_ffmpeg_for_tests();
+        let path = fixture_path();
+        let size = std::fs::metadata(&path).unwrap().len();
+        let filepath = path.to_string_lossy().to_string();
+
+        let Weighed::TooShort(duration) = weigh_decode(&filepath, 0.0, 4.0, 3600.0, size) else {
+            panic!("the fixture is about a second long and an hour-long floor rejects it");
+        };
+        assert!(duration > 0.0, "the verdict carries the runtime it was measured against");
+
+        let under = duration - 0.01;
+        assert!(
+            matches!(weigh_decode(&filepath, 0.0, 4.0, under, size), Weighed::Work(_)),
+            "a floor under the runtime is not one this file falls under"
+        );
+        assert!(
+            fingerprint_video(&filepath, 0.0, 4.0, 1, under, size, &|_| {})
+                .unwrap()
+                .is_some(),
+            "and the decode reads it the same way, which is what lets the weigher answer at all"
+        );
+
+        let over = duration + 0.01;
+        assert!(
+            matches!(weigh_decode(&filepath, 0.0, 4.0, over, size), Weighed::TooShort(_)),
+            "a floor over the runtime is"
+        );
+        assert!(
+            fingerprint_video(&filepath, 0.0, 4.0, 1, over, size, &|_| {}).unwrap().is_none(),
+            "and again the decode agrees, on the same side of the same number"
+        );
+
+        assert!(
+            matches!(weigh_decode(&filepath, 0.0, 4.0, 0.0, size), Weighed::Work(_)),
+            "0 turns the flag off and nothing is short"
+        );
+    }
+
     /// The hook exists so a bar can move during a decode rather than only when
     /// one ends, and the way that silently regresses is the hook never firing --
     /// which looks identical from outside except that a long file appears hung.
@@ -2449,7 +2550,7 @@ mod tests {
         let path = dir.path().join("notes.rlib");
         std::fs::write(&path, "the quick brown fox\n".repeat(400)).unwrap();
 
-        let Weighed::Undecodable(e) = weigh_decode(&path.to_string_lossy(), 0.0, 4.0, 8000) else {
+        let Weighed::Undecodable(e) = weigh_decode(&path.to_string_lossy(), 0.0, 4.0, 0.0, 8000) else {
             panic!("a text file is not a video");
         };
         let said = format!("{:#}", e);
@@ -2472,7 +2573,7 @@ mod tests {
         let path = dir.path().join("song.mp3");
         std::fs::write(&path, "the quick brown fox\n".repeat(400)).unwrap();
 
-        let Weighed::Undecodable(e) = weigh_decode(&path.to_string_lossy(), 0.0, 4.0, 8000) else {
+        let Weighed::Undecodable(e) = weigh_decode(&path.to_string_lossy(), 0.0, 4.0, 0.0, 8000) else {
             panic!("this is text, whatever it is called");
         };
         let said = format!("{:#}", e);
@@ -2492,7 +2593,7 @@ mod tests {
         let path = fixture_path();
         let size = std::fs::metadata(&path).unwrap().len();
         assert!(
-            matches!(weigh_decode(&path.to_string_lossy(), 0.0, 4.0, size), Weighed::Work(_)),
+            matches!(weigh_decode(&path.to_string_lossy(), 0.0, 4.0, 0.0, size), Weighed::Work(_)),
             "the fixture is a real MP4 and scores 100 on its first 2 KB"
         );
     }
@@ -2505,6 +2606,7 @@ mod tests {
         match weighed {
             Weighed::Work(weight) => weight,
             Weighed::Undecodable(e) => panic!("expected a weight, got a verdict: {:#}", e),
+            Weighed::TooShort(d) => panic!("expected a weight, got a {:.2}s skip", d),
         }
     }
 
@@ -2521,7 +2623,7 @@ mod tests {
         let fp = fingerprint_fixture(1);
         let decoded_pixels = fp.valid_hashes.len() as u64 * (fp.width * fp.height) as u64;
 
-        let weight = work_of(weigh_decode(&filepath, 0.0, 4.0, size));
+        let weight = work_of(weigh_decode(&filepath, 0.0, 4.0, 0.0, size));
         let expected = (decoded_pixels as f64 * codec_cost(&fp.codec)) as u64;
 
         // Not an equality: the decode drops frames that hash the same as their
@@ -2548,7 +2650,7 @@ mod tests {
         init_ffmpeg_for_tests();
 
         let Weighed::Undecodable(e) =
-            weigh_decode("/nonexistent/not-a-video.mkv", 0.0, 4.0, 1_000_000)
+            weigh_decode("/nonexistent/not-a-video.mkv", 0.0, 4.0, 0.0, 1_000_000)
         else {
             panic!("a path with nothing behind it cannot be decoded, and this pass knows it");
         };
@@ -2595,7 +2697,7 @@ mod tests {
         let filepath = path.to_string_lossy().to_string();
         let size = bytes.len() as u64;
 
-        let Weighed::Undecodable(weighed) = weigh_decode(&filepath, 0.0, 4.0, size) else {
+        let Weighed::Undecodable(weighed) = weigh_decode(&filepath, 0.0, 4.0, 0.0, size) else {
             panic!("300 kB of noise is not a video, and opening it twice will not make it one");
         };
 
@@ -2621,10 +2723,10 @@ mod tests {
         let filepath = fixture_path().to_string_lossy().to_string();
         let size = std::fs::metadata(fixture_path()).unwrap().len();
 
-        let full = work_of(weigh_decode(&filepath, 0.0, 4.0, size));
+        let full = work_of(weigh_decode(&filepath, 0.0, 4.0, 0.0, size));
         // One sample over the whole clip: the floor for short videos is what
         // decides this, exactly as it does inside the decode.
-        let thinned = work_of(weigh_decode(&filepath, 3600.0, 1.0, size));
+        let thinned = work_of(weigh_decode(&filepath, 3600.0, 1.0, 0.0, size));
 
         assert!(
             thinned <= full,
