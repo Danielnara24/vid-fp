@@ -59,8 +59,9 @@ const ACT_ON: &str = "delete";
 /// The past-tense ones matter as much as the rest: feeding back a report from a
 /// run that already deleted things must be a no-op, not a second pass over
 /// files that are already gone.
-const KNOWN_ACTIONS: [&str; 9] = [
-    "keep", "kept", "review", "delete", "deleted", "moved", "failed", "changed", "skipped",
+const KNOWN_ACTIONS: [&str; 10] = [
+    "keep", "kept", "review", "delete", "deleted", "unlinked", "moved", "failed", "changed",
+    "skipped",
 ];
 
 /// A row that asked for its file to be disposed of.
@@ -503,6 +504,8 @@ pub fn apply(
     let mut removed_count = 0usize;
     let mut failed_count = 0usize;
     let mut changed_count = 0usize;
+    let mut aliased_count = 0usize;
+    let mut aliased_bytes = 0u64;
     let mut removed_bytes = 0u64;
     let mut deleted_paths: Vec<String> = Vec::new();
 
@@ -517,11 +520,20 @@ pub fn apply(
         }
 
         let label = match export::dispose_one(&m.path, m.size, disposal, stats) {
-            Fate::Done => {
+            Fate::Done { aliased } => {
                 removed_count += 1;
-                removed_bytes += m.size;
+                // Only bytes that actually went away. See `export::OnDisk`:
+                // this mode reaches the same files by the same paths, and a
+                // report row records a size for a file that may have had
+                // another name all along.
+                if aliased {
+                    aliased_count += 1;
+                    aliased_bytes += m.size;
+                } else {
+                    removed_bytes += m.size;
+                }
                 deleted_paths.push(m.path.clone());
-                disposal.done_label()
+                disposal.done_label(aliased)
             }
             Fate::Changed => {
                 changed_count += 1;
@@ -539,6 +551,7 @@ pub fn apply(
     }
 
     let mut summary = export::disposed_line(disposal, removed_count, removed_bytes);
+    summary.push_str(&export::aliased_line(aliased_count, aliased_bytes));
     summary.push_str(&export::trouble_lines(failed_count, changed_count));
     info!("\n{}", summary);
 
@@ -787,14 +800,20 @@ shared_to_seconds";
     fn test_an_already_acted_report_is_a_no_op() {
         // Feeding back the report of a --delete run must not try again. Those
         // files are gone; DELETED is not DELETE.
+        //
+        // UNLINKED is one of ours too: it is what a DELETE row becomes when the
+        // data had another name. Leaving it out of the list would not make the
+        // run act on those rows -- it would report every one of them as a word
+        // this tool does not recognise, and exit 2 for a report it wrote.
         let dir = tempfile::tempdir().unwrap();
         let body = format!(
-            "{}\n{}\n{}\n{}\n{}\n",
+            "{}\n{}\n{}\n{}\n{}\n{}\n",
             HEADER,
             row("/a.mkv", 10, "KEPT"),
             row("/b.mkv", 20, "DELETED"),
             row("/c.mkv", 30, "MOVED"),
             row("/d.mkv", 40, "CHANGED"),
+            row("/e.mkv", 50, "UNLINKED"),
         );
         let path = write_report(&dir, &body);
 

@@ -489,8 +489,11 @@ them, resolved as REVIEW > DELETE > KEEP.
   deleted.
 
 Once armed, DELETE rows report what actually happened: **DELETED** (trashed or
-removed), **MOVED** (relocated by `--move-to`), **FAILED**, or **CHANGED**,
-meaning the file changed on disk after it was scanned and was left alone.
+removed), **MOVED** (relocated by `--move-to`), **UNLINKED**, **FAILED**, or
+**CHANGED**, meaning the file changed on disk after it was scanned and was left
+alone. UNLINKED means the path was one of several names for the same data, a
+hard link or a symlink whose other name lies outside the scan: the name is gone,
+the bytes are not, and no space was reclaimed.
 
 ### Errors
 
@@ -562,7 +565,10 @@ words, so those groups are mostly noise. A one-frame file also reads as 0% or
   compared with every other, so a file marked DELETE lost the ranking to a copy
   it was actually measured against.
 - **No double-counting.** Hard links and symlinks to the same file collapse into
-  a single entry, so the reported space freed reflects bytes actually reclaimed.
+  a single entry, so no set of bytes is fingerprinted or counted twice.
+- **"Freed" means freed.** A file whose data has another name outside the scan
+  is removed like any other, but nothing is reclaimed by it. Those bytes stay
+  out of the total and the row is marked UNLINKED.
 - **Tab-complete your `-e` paths.** An exclude path that can't be resolved
   excludes nothing.
 - **`-e` protects the file, not the spelling.** An excluded file stays excluded

@@ -11,6 +11,7 @@ use crate::utils::{
 use std::collections::{HashMap, HashSet};
 use std::fs::{FileTimes, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 /// Which of the three layouts a report is written in.
@@ -132,7 +133,17 @@ pub enum Disposal {
 
 impl Disposal {
     /// Label for the results table once the file has been dealt with.
-    pub fn done_label(&self) -> &'static str {
+    ///
+    /// A file that was only a name for data reachable elsewhere gets its own
+    /// word rather than the mode's, because that row is the whole explanation
+    /// for a byte total smaller than the sum of the rows above it. UNLINKED is
+    /// literally what happened in all three modes: `remove_file`, the trash's
+    /// rename, and `--move-to`'s rename all take the name off this path, and in
+    /// this one case that is all they take.
+    pub fn done_label(&self, aliased: bool) -> &'static str {
+        if aliased {
+            return "UNLINKED";
+        }
         match self {
             Disposal::Trash | Disposal::Permanent => "DELETED",
             Disposal::MoveTo(_) => "MOVED",
@@ -159,6 +170,49 @@ fn csv_seconds(value: Option<f64>) -> String {
     value.map(|s| format!("{:.2}", s)).unwrap_or_default()
 }
 
+/// What one look at the disk says about a file, taken immediately before the
+/// irreversible step.
+///
+/// Two questions, one `symlink_metadata`: is this still the file that was
+/// judged, and would removing this path actually give its bytes back.
+struct OnDisk {
+    /// The file's current length, or `None` when it could not be read. See
+    /// `changed_since` for why that is not treated as a change.
+    size: Option<u64>,
+    /// True when this path is one of several names for the same data -- a
+    /// symlink, or a hard link with siblings -- so unlinking it takes the name
+    /// and leaves the bytes.
+    aliased: bool,
+}
+
+/// Read both of them.
+///
+/// A symlink needs the second stat: the scan measured the file the link leads
+/// to (its own stat followed the link, which is how the link entered the
+/// library carrying the target's size and codec), so the staleness check has to
+/// follow it as well or every symlinked target would read as CHANGED. Nothing
+/// else pays for that, and links are rare.
+///
+/// `nlink` is the hard-link half and costs nothing at all -- it is in the stat
+/// that was already being taken. It cannot fire on a file whose other names are
+/// in this same run: `sources::collect` deduplicates on (device, inode), so at
+/// most one name for any set of bytes ever reaches a DELETE decision. A file
+/// that still reads `nlink > 1` here has a name OUTSIDE the run, which is
+/// exactly the case where removing this one frees nothing.
+fn on_disk(path: &str) -> OnDisk {
+    let Ok(md) = std::fs::symlink_metadata(path) else {
+        return OnDisk { size: None, aliased: false };
+    };
+
+    if md.file_type().is_symlink() {
+        // A broken link has no size to check and is still an alias: what goes
+        // when it goes is a pointer.
+        OnDisk { size: std::fs::metadata(path).ok().map(|m| m.len()), aliased: true }
+    } else {
+        OnDisk { size: Some(md.len()), aliased: md.nlink() > 1 }
+    }
+}
+
 /// Whether the file at `path` is still the length it was when it was measured,
 /// and a description of the discrepancy if not.
 ///
@@ -167,8 +221,8 @@ fn csv_seconds(value: Option<f64>) -> String {
 /// decision is being replayed from a report written yesterday. In that window a
 /// download finishes, a re-encode lands over the top, a copy is truncated --
 /// and the file about to be removed is no longer the file that was judged
-/// redundant. Two syscalls immediately before an irreversible one is a cheap way
-/// to notice.
+/// redundant. A stat immediately before an irreversible syscall is a cheap way
+/// to notice, and `on_disk` has already taken it -- `current` is what it read.
 ///
 /// Size is the only property compared, because it is the only one the
 /// fingerprint records. It catches everything that changes a file's length,
@@ -177,12 +231,12 @@ fn csv_seconds(value: Option<f64>) -> String {
 /// Recording an mtime or an inode alongside the fingerprint would close that
 /// gap at the cost of a field on every cache entry; nothing has needed it yet.
 ///
-/// A metadata error is deliberately NOT reported as a change. It proves nothing
-/// about the file's contents, and the removal that follows will fail with the
+/// A length that could not be read is deliberately NOT reported as a change. It
+/// proves nothing about the file's contents, and the removal that follows will fail with the
 /// real reason -- so a file that vanished mid-scan reads as a deletion that
 /// could not happen rather than as a file quietly left alone.
-fn changed_since(path: &str, measured_size: u64) -> Option<String> {
-    let size = std::fs::metadata(path).ok()?.len();
+fn changed_since(path: &str, measured_size: u64, current: Option<u64>) -> Option<String> {
+    let size = current?;
 
     (size != measured_size).then(|| {
         format!(
@@ -196,7 +250,13 @@ fn changed_since(path: &str, measured_size: u64) -> Option<String> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Fate {
     /// Gone from the path it was at -- trashed, unlinked or relocated.
-    Done,
+    ///
+    /// `aliased` says whether the DATA went with it. A hard link with siblings
+    /// or a symlink loses a name and keeps every byte, so a run that counted
+    /// those bytes as freed reported space that is still occupied -- and the
+    /// caller cannot work that out for itself, because the only moment the
+    /// question can be asked is the stat immediately before the removal.
+    Done { aliased: bool },
     /// It no longer matches the size it was measured at, so it was left alone.
     Changed,
     /// The disposal itself failed. The file is still there.
@@ -220,10 +280,12 @@ pub fn dispose_one(
     disposal: &Disposal,
     stats: &RunStats,
 ) -> Fate {
-    // The last thing before the irreversible step, and the only check here that
-    // consults the disk rather than the measurement. See `changed_since`: the
+    // The last thing before the irreversible step, and the only look here at
+    // the disk rather than at the measurement. See `changed_since`: the
     // decision being acted on may be hours or days old.
-    if let Some(detail) = changed_since(path, measured_size) {
+    let disk = on_disk(path);
+
+    if let Some(detail) = changed_since(path, measured_size, disk.size) {
         log::error!(
             target: crate::stats::COUNTED,
             "Not removing {}: it changed on disk after it was scanned",
@@ -234,7 +296,7 @@ pub fn dispose_one(
     }
 
     match dispose_of(path, disposal) {
-        Ok(()) => Fate::Done,
+        Ok(()) => Fate::Done { aliased: disk.aliased },
         Err(e) => {
             log::error!(target: crate::stats::COUNTED, "{:#}", e);
             stats.delete_failed.record(path.to_string());
@@ -609,6 +671,8 @@ pub fn output_results(
     let mut removed_count = 0usize;
     let mut failed_count = 0usize;
     let mut changed_count = 0usize;
+    let mut aliased_count = 0usize;
+    let mut aliased_bytes = 0u64;
     let mut removed_bytes = 0u64;
     let delete_candidate_count = delete_indices.len();
 
@@ -618,6 +682,12 @@ pub fn output_results(
     // the deletion pass re-checks against disk before touching anything, and
     // the set is index-based -- so a file reached through a hard link
     // contributes its bytes once.
+    //
+    // It is still an upper bound, and deliberately: a file whose data has
+    // another name OUTSIDE the run reclaims nothing when it goes, and the only
+    // way to know that is to stat every candidate. The real run does exactly
+    // that at the moment it acts (`on_disk`) and reports the difference; a dry
+    // run stats nothing and promises nothing it has measured.
     let reclaimable_bytes: u64 = delete_indices
         .iter()
         .map(|&idx| fingerprints[idx].file_size)
@@ -646,11 +716,17 @@ pub fn output_results(
             let fp = &fingerprints[idx];
 
             match dispose_one(&fp.path, fp.file_size, disposal, stats) {
-                Fate::Done => {
+                Fate::Done { aliased } => {
                     removed_count += 1;
-                    removed_bytes += fp.file_size;
+                    // Only bytes that actually went away. See `OnDisk`.
+                    if aliased {
+                        aliased_count += 1;
+                        aliased_bytes += fp.file_size;
+                    } else {
+                        removed_bytes += fp.file_size;
+                    }
                     deleted_paths.push(fp.path.clone());
-                    delete_outcome.insert(idx, disposal.done_label());
+                    delete_outcome.insert(idx, disposal.done_label(aliased));
                 }
                 Fate::Changed => {
                     changed_count += 1;
@@ -1107,6 +1183,7 @@ pub fn output_results(
     }
 
     if acting {
+        summary.push_str(&aliased_line(aliased_count, aliased_bytes));
         summary.push_str(&trouble_lines(failed_count, changed_count));
     }
 
@@ -1161,6 +1238,12 @@ pub fn output_results(
                             },
                             "files_removed": removed_count,
                             "bytes_removed": removed_bytes,
+                            // Of those removed, the ones that were a second
+                            // name for data still on disk. `bytes_removed`
+                            // excludes them, so this is what a reader needs to
+                            // reconcile it against the rows.
+                            "files_unlinked": aliased_count,
+                            "bytes_unlinked": aliased_bytes,
                             "files_failed": failed_count,
                             "files_changed": changed_count,
                         },
@@ -1244,6 +1327,32 @@ pub fn disposed_line(disposal: &Disposal, count: usize, bytes: u64) -> String {
             dir.display()
         ),
     }
+}
+
+/// What the byte figure above it leaves out, when there is anything to leave
+/// out.
+///
+/// Removing one of several names for a file is a perfectly good outcome -- the
+/// user asked for that path to go, and it went -- so this is not a problem, not
+/// a skip, and does not touch the exit code. It exists because the figure
+/// beside it would otherwise be unaccountable: rows totalling 40GB above a line
+/// reading "12GB freed", with nothing to say which rows were which. The rows
+/// are labelled UNLINKED; this says how many, how much, and why. It carries the
+/// bytes because a `--move-to` run of nothing else reads "Moved 1 file(s) (0B
+/// total)", which looks like a malfunction rather than a caveat.
+///
+/// Shared with `--from-report` for the same reason `disposed_line` is: it
+/// performs the same removals and can reach the same files.
+pub fn aliased_line(count: usize, bytes: u64) -> String {
+    if count == 0 {
+        return String::new();
+    }
+    format!(
+        "\n{} file(s) were another name for data that is still on disk (a hard link or a \
+         symlink), so their {} is not counted above; they are marked UNLINKED.",
+        count,
+        format_size(bytes)
+    )
 }
 
 /// The lines that follow it when the pass did not get everything, each omitted
@@ -2008,6 +2117,133 @@ matched_from_seconds;matched_to_seconds";
         assert_eq!(report["summary"]["mode"], "move");
         assert_eq!(report["summary"]["files_removed"], 1);
         assert_eq!(report["summary"]["bytes_removed"], 1_310_720u64);
+
+        let _ = fs::remove_file(path_str);
+    }
+
+    #[test]
+    fn test_removing_one_of_several_names_frees_nothing_and_says_so() {
+        // "N MB freed" is a claim about the filesystem, and unlinking a hard
+        // link with a sibling makes it false: the name goes, every byte stays.
+        // `sources::collect` deduplicates on (device, inode), so this is only
+        // reachable when the other name is OUTSIDE the scan -- which is the
+        // ordinary shape of it, a library that hard-links into a store folder
+        // nobody scans.
+        //
+        // Two DELETE targets rather than one, because the figure has to come
+        // out as a partial sum: zeroing it whenever anything was aliased would
+        // be a different bug in the same line.
+        let dir = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+
+        let keep_path = at(&dir, "keep.mkv");
+        let linked_path = at(&dir, "linked.mkv");
+        let plain_path = at(&dir, "plain.mkv");
+
+        let fps = vec![
+            mock_fp_at(&keep_path, 60.0),
+            mock_fp_at(&linked_path, 10.0),
+            mock_fp_at(&plain_path, 11.0),
+        ];
+        materialize(&fps[0]);
+        materialize(&fps[2]);
+
+        // The name that is not in the library, and the one that is.
+        let elsewhere = store.path().join("original.mkv");
+        fs::File::create(&elsewhere).unwrap().set_len(fps[1].file_size).unwrap();
+        fs::hard_link(&elsewhere, &linked_path).unwrap();
+
+        let groups = vec![vec![0, 1, 2]];
+        let stats = RunStats::default();
+        let path_str = report_to("json");
+
+        let mut gone = output_results(
+            &groups, &fps, &all_compared(fps.len()), Some(&to_file(&path_str)), 0, Priority::Length,
+            Some(&Disposal::Permanent), true, &stats,
+        ).unwrap();
+        gone.sort();
+
+        assert!(!Path::new(&linked_path).exists(), "the name it was asked to remove is gone");
+        assert!(elsewhere.exists(), "and the data is not");
+        assert_eq!(
+            fs::metadata(&elsewhere).unwrap().len(),
+            fps[1].file_size,
+            "untouched, not truncated"
+        );
+        assert!(!stats.had_problems(), "removing a redundant name is not a failure");
+
+        let mut expected = vec![linked_path, plain_path];
+        expected.sort();
+        assert_eq!(gone, expected, "both paths are empty, so both fingerprints are stale");
+
+        let report = read_json(&path_str);
+        assert_eq!(report["results"][0]["files"][1]["action"], "UNLINKED");
+        assert_eq!(report["results"][0]["files"][2]["action"], "DELETED");
+        assert_eq!(report["summary"]["files_removed"], 2);
+        assert_eq!(report["summary"]["files_unlinked"], 1);
+        assert_eq!(
+            report["summary"]["bytes_removed"], 1_441_792u64,
+            "the plain file's bytes, and only those"
+        );
+        assert_eq!(
+            report["summary"]["bytes_unlinked"], 1_310_720u64,
+            "and the ones that stayed are still accounted for"
+        );
+
+        let _ = fs::remove_file(path_str);
+    }
+
+    #[test]
+    fn test_a_symlink_is_checked_against_its_target_and_frees_none_of_it() {
+        // The other half, and the one that also has to keep working the other
+        // way round: the scan stats THROUGH a symlink, so the link enters the
+        // library carrying the target's size. The staleness check has to follow
+        // it too, or a fix that reads only `symlink_metadata` reports every
+        // symlinked file as CHANGED and quietly stops deleting any of them.
+        //
+        // What `remove_file` then takes is the link. The video survives at a
+        // path this run never mentioned, so counting its bytes as freed is the
+        // same false claim with a worse aftertaste: a re-run finds a clean
+        // library, because the path that led to the duplicate is gone.
+        let dir = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+
+        let keep_path = at(&dir, "keep.mkv");
+        let link_path = at(&dir, "link.mkv");
+
+        let fps = vec![
+            mock_fp_at(&keep_path, 60.0),
+            mock_fp_at(&link_path, 10.0),
+        ];
+        materialize(&fps[0]);
+
+        let target = store.path().join("original.mkv");
+        fs::File::create(&target).unwrap().set_len(fps[1].file_size).unwrap();
+        std::os::unix::fs::symlink(&target, &link_path).unwrap();
+
+        let groups = vec![vec![0, 1]];
+        let stats = RunStats::default();
+        let path_str = report_to("json");
+
+        let gone = output_results(
+            &groups, &fps, &all_compared(fps.len()), Some(&to_file(&path_str)), 0, Priority::Length,
+            Some(&Disposal::Permanent), true, &stats,
+        ).unwrap();
+
+        assert!(
+            fs::symlink_metadata(&link_path).is_err(),
+            "the link was removed, so it was not read as CHANGED"
+        );
+        assert!(target.exists(), "and its target was not");
+        assert_eq!(gone, vec![link_path], "the path is empty, so its fingerprint is stale");
+        assert_eq!(stats.delete_stale.count(), 0);
+
+        let report = read_json(&path_str);
+        assert_eq!(report["results"][0]["files"][1]["action"], "UNLINKED");
+        assert_eq!(report["summary"]["files_removed"], 1);
+        assert_eq!(report["summary"]["files_unlinked"], 1);
+        assert_eq!(report["summary"]["bytes_unlinked"], 1_310_720u64);
+        assert_eq!(report["summary"]["bytes_removed"], 0u64);
 
         let _ = fs::remove_file(path_str);
     }
