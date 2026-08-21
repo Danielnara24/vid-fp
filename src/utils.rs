@@ -284,13 +284,45 @@ impl GroupMaxima {
     /// sharing `fp`'s codec.
     pub fn tier(&self, fp: &VideoFingerprint, metric: Priority) -> u8 {
         match metric {
-            Priority::Length => u8::from(fp.duration >= self.duration - DURATION_TOLERANCE_SECS),
+            Priority::Length => {
+                // The same reading as the frame rate below, and it matters more
+                // here: a runtime nothing could measure is missing information,
+                // not a short file. `duration >= max - 1s` is false for 0
+                // whatever the group holds, so an unguarded zero does not merely
+                // fail to rank a file -- it condemns it, on the metric that
+                // normally keeps a long file safe from the clip cut out of it.
+                // A 20 second raw H.264 stream that CONTAINS a 10 second MP4 of
+                // the same footage was the file marked DELETE.
+                //
+                // Reached by anything libavformat cannot get a runtime out of
+                // whose packets carry no clock to measure one from either: a
+                // raw elementary stream above all, where FFmpeg's own tools
+                // report N/A as well. `fingerprint_video` does measure a
+                // runtime off the samples where the header is wrong, but that
+                // needs a clock to read, and these files have none: their
+                // samples fall back to one nominal millisecond each.
+                //
+                // Ties here, rather than winning: unknown is not evidence of a
+                // LONGER file either. What stops the metrics that are left from
+                // condemning it anyway -- size favours a dense clip over the
+                // sparse capture it came from perfectly happily -- is that
+                // `export.rs` holds a file of unmeasurable length for REVIEW.
+                if fp.duration <= 0.0 {
+                    return 1;
+                }
+                u8::from(fp.duration >= self.duration - DURATION_TOLERANCE_SECS)
+            }
             Priority::Resolution => within(resolution(fp), self.resolution, RESOLUTION_TOLERANCE),
             Priority::Quality => {
                 // An unreported frame rate is missing information, not evidence
                 // of a worse copy, so it costs the file nothing here and the
-                // decision moves on to a metric that is actually known.
-                if fp.frame_rate <= 0.0 {
+                // decision moves on to a metric that is actually known. An
+                // unreported runtime says the same thing by a second route:
+                // `bitrate` divides by it, so quality reads 0 for an unknown
+                // duration exactly as it does for an unknown frame rate, and a
+                // file already spared the length tier would have lost this one
+                // for the very same missing number.
+                if fp.frame_rate <= 0.0 || fp.duration <= 0.0 {
                     return 1;
                 }
                 within(fp.quality(), self.codec_maxima(fp).quality, QUALITY_TOLERANCE)
@@ -330,6 +362,16 @@ impl GroupMaxima {
     /// silently fell through to alphabetical order, and `export.rs` saw no
     /// standoff to flag because the foreign file was not a contender.
     fn compare(&self, a: &VideoFingerprint, b: &VideoFingerprint, metric: Priority) -> Ordering {
+        // A metric one of the two could not be measured on ties here exactly as
+        // it ties on tiers, so the decision falls through to a metric that is
+        // known instead of reading an unmeasured file as a zero. Without this
+        // the tier guards above would be undone one pass later: the tiers say
+        // "no claim either way", and then the raw values say 0 against ten
+        // thousand milliseconds and condemn the file anyway.
+        if !measurable(a, metric) || !measurable(b, metric) {
+            return Ordering::Equal;
+        }
+
         let (val_a, val_b) = (self.value(a, metric), self.value(b, metric));
 
         if !is_codec_relative(metric) {
@@ -343,6 +385,22 @@ impl GroupMaxima {
         // product of two u64 metrics does not fit in one.
         let (max_a, max_b) = (self.codec_max(a, metric), self.codec_max(b, metric));
         (val_a as u128 * max_b as u128).cmp(&(val_b as u128 * max_a as u128))
+    }
+}
+
+/// Whether `metric` was measured for `fp` at all.
+///
+/// Resolution and size come off the frame and the filesystem and are always
+/// known. The other two rest on a runtime the container may never have reported
+/// and the samples may have had no clock to measure -- length directly, quality
+/// through the bitrate that divides by it -- and a file that could not be
+/// measured must not be ranked as though it had scored zero. See the tiers in
+/// `GroupMaxima::tier`, which this keeps whole.
+pub fn measurable(fp: &VideoFingerprint, metric: Priority) -> bool {
+    match metric {
+        Priority::Length => fp.duration > 0.0,
+        Priority::Quality => fp.frame_rate > 0.0 && fp.duration > 0.0,
+        Priority::Resolution | Priority::Size => true,
     }
 }
 
@@ -453,6 +511,77 @@ mod tests {
         let group: Vec<usize> = (0..fps.len()).collect();
         let maxima = GroupMaxima::of(&group, fps);
         find_best(&group, fps, priority, &maxima)
+    }
+
+    /// A runtime nothing could measure is unknown, and the ranking must not
+    /// read unknown as "the shortest file here".
+    ///
+    /// The case that forced it: a 20 second raw H.264 elementary stream holding
+    /// a 10 second MP4 of the same footage. FFmpeg's own tools report N/A for
+    /// such a file -- there is no duration in the container and no clock on the
+    /// packets to measure one from -- so `duration` is 0, and `0 >= 10 - 1` is
+    /// false. The host therefore lost the length tier to the clip cut out of
+    /// it, lost the quality tier as well (bitrate divides by the same missing
+    /// number), and was the file marked DELETE: the exact inversion of the
+    /// property the whole ranking rests on.
+    #[test]
+    fn test_an_unmeasured_runtime_is_not_ranked_as_the_shortest_file() {
+        let host = fp("/host.h264", 0.0, 320, 240, 141_000);
+        let clip = fp("/clip.mp4", 10.0, 320, 240, 73_000);
+
+        let group = vec![0, 1];
+        let fps = vec![host, clip];
+        let maxima = GroupMaxima::of(&group, &fps);
+
+        assert_eq!(maxima.tier(&fps[0], Priority::Length), 1, "unknown is not short");
+        assert_eq!(
+            maxima.tier(&fps[0], Priority::Quality),
+            1,
+            "quality divides by the same missing runtime, so it is unknown too"
+        );
+        assert_eq!(
+            maxima.compare(&fps[0], &fps[1], Priority::Length),
+            Ordering::Equal,
+            "the value pass must not undo the tier one file later"
+        );
+        assert_eq!(
+            maxima.compare(&fps[0], &fps[1], Priority::Quality),
+            Ordering::Equal
+        );
+
+        // Which leaves size, the one metric both files were measured on, and
+        // the host is the bigger file.
+        assert_eq!(best(&fps, Priority::Length), 0, "the host must not lose to its own clip");
+    }
+
+    /// The same file against a group that really is longer: an unknown runtime
+    /// ties, it does not win. Nothing here says the file is long, only that
+    /// nobody measured it, so it must not take the tier off a file that WAS
+    /// measured and is plainly the longest thing in the group.
+    #[test]
+    fn test_an_unmeasured_runtime_does_not_win_the_length_ranking_either() {
+        let unknown = fp("/unknown.h264", 0.0, 320, 240, 10_000);
+        let long = fp("/long.mp4", 600.0, 320, 240, 10_000);
+        let short = fp("/short.mp4", 10.0, 320, 240, 10_000);
+
+        let group = vec![0, 1, 2];
+        let fps = vec![unknown, long, short];
+        let maxima = GroupMaxima::of(&group, &fps);
+
+        assert_eq!(maxima.tier(&fps[1], Priority::Length), 1, "600s is the group's longest");
+        assert_eq!(maxima.tier(&fps[2], Priority::Length), 0, "10s is not, and still is not");
+        assert_eq!(
+            maxima.tier(&fps[0], Priority::Length),
+            1,
+            "the unknown file joins the top tier rather than taking it"
+        );
+        // And it is a tie in both directions: the file that WAS measured is not
+        // ranked below one that was not.
+        assert_eq!(maxima.compare(&fps[0], &fps[1], Priority::Length), Ordering::Equal);
+        assert_eq!(maxima.compare(&fps[1], &fps[0], Priority::Length), Ordering::Equal);
+        // The measured pair still ranks against each other exactly as before,
+        // which is the half of the metric this must not touch.
+        assert_eq!(maxima.compare(&fps[1], &fps[2], Priority::Length), Ordering::Greater);
     }
 
     #[test]

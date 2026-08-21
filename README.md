@@ -485,9 +485,9 @@ them, resolved as REVIEW > DELETE > KEEP.
   Nothing happens to it without `--delete`; the summary totals these into the
   reclaimable figure.
 - **REVIEW**: worth a manual look before deleting, for example when the KEEP
-  pick is the longest video but a different file has higher resolution, or when
-  the group holds the best copy of several codecs. REVIEW files are never
-  deleted.
+  pick is the longest video but a different file has higher resolution, when the
+  group holds the best copy of several codecs, or when a file's runtime could
+  not be measured at all. REVIEW files are never deleted.
 
 Once armed, DELETE rows report what actually happened: **DELETED** (trashed or
 removed), **MOVED** (relocated by `--move-to`), **UNLINKED**, **FAILED**, or

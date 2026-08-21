@@ -6,7 +6,7 @@ use crate::fingerprint::VideoFingerprint;
 use crate::stats::RunStats;
 use crate::utils::{
     find_best, format_bitrate, format_codec, format_duration, format_frame_rate, format_quality,
-    format_shared, format_size, shutdown_requested, GroupMaxima, Priority,
+    format_shared, format_size, measurable, shutdown_requested, GroupMaxima, Priority,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs::{FileTimes, OpenOptions};
@@ -496,6 +496,54 @@ pub fn output_results(
         // raise more than one, so it is a set rather than an Option.
         let mut group_review: HashSet<usize> = HashSet::new();
 
+        // --- A runtime nobody could measure ---------------------------------
+        // Length is the first thing the ranking compares and the property that
+        // keeps a long file safe from the clip cut out of it. A file whose
+        // container never reported a runtime, and whose packets carried no
+        // clock to measure one from, has no length to compare with anything:
+        // it ties on that metric rather than losing it (`GroupMaxima::tier`),
+        // which stops it being condemned for a measurement nobody took, and it
+        // is held back here, which stops it being condemned on the metrics that
+        // are left. Size is the one that would decide, and size is no
+        // substitute -- a five-minute clip at a high bitrate is comfortably
+        // larger than the two-hour capture it was cut from, so the fall-through
+        // marks the host for deletion just as surely as the zero did.
+        //
+        // That is the same shape as the codec standoff below and it is answered
+        // the same way: an unmeasurable runtime makes a file INCOMPARABLE with
+        // the rest, not worse than it, so the group ends with one survivor per
+        // class rather than one survivor. Every unmeasured file lives, and the
+        // measured ones elect a champion of their own to live beside them --
+        // deferring to the group's pick when the pick is one of them, for the
+        // same reason the standoff defers to it. The also-rans of the measured
+        // side are deleted exactly as they always were, because they lost to a
+        // file they really were measured against.
+        let unmeasured: Vec<usize> = group
+            .iter()
+            .copied()
+            .filter(|&idx| !measurable(&fingerprints[idx], Priority::Length))
+            .collect();
+
+        if !unmeasured.is_empty() {
+            group_review.extend(unmeasured.iter().copied());
+
+            let measured: Vec<usize> = group
+                .iter()
+                .copied()
+                .filter(|&idx| measurable(&fingerprints[idx], Priority::Length))
+                .collect();
+
+            if !measured.is_empty() {
+                let champion = if measurable(keep_fp, Priority::Length) {
+                    keep_idx
+                } else {
+                    let measured_maxima = GroupMaxima::of(&measured, fingerprints);
+                    find_best(&measured, fingerprints, priority, &measured_maxima)
+                };
+                group_review.insert(champion);
+            }
+        }
+
         // If the KEEP pick isn't top-tier on some quality metric, surface the
         // file that IS as worth a manual look. Metrics are checked in default
         // precedence order, skipping the one the user prioritised (KEEP wins
@@ -908,11 +956,29 @@ pub fn output_results(
             // here, only lookups against figures phase 2 already took.
             let links = matches.links_of(idx, group, fingerprints);
             let best = links.first();
-            let matched = best.map(|l| l.matched_seconds);
+            // Every figure in this block is stated in the SUBJECT's own
+            // seconds, which is `coverage x duration` -- so a file whose
+            // runtime nobody could measure has no seconds to state, and "0s
+            // matched" would read as evidence that nothing matched when what is
+            // missing is the runtime to scale the coverage by. Blank, like the
+            // length it is derived from. The link itself is kept: which file it
+            // matched, and where in that file, are both known.
+            let seconds_known = fp.duration > 0.0;
+            let matched = best.map(|l| l.matched_seconds).filter(|_| seconds_known);
 
             let size_str = format_size(fp.file_size);
             let bitrate_str = format_bitrate(fp.bitrate());
-            let duration_str = format_duration(fp.duration);
+            // "-" rather than 00:00:00 when no runtime could be measured, the
+            // same sentinel the frame rate and the quality columns use for the
+            // same reason: a zero-length video and a video of unknown length
+            // are different findings, and the row that reads 00:00:00 beside 20
+            // samples looks like a malfunction. See `GroupMaxima::tier`, which
+            // is where the distinction decides something.
+            let duration_str = if fp.duration > 0.0 {
+                format_duration(fp.duration)
+            } else {
+                "-".to_string()
+            };
             let res_str = format!("{}x{}", fp.width, fp.height);
 
             // The codec is the reason two rows' bit figures may not be compared
@@ -937,7 +1003,11 @@ pub fn output_results(
             // is an empty field / a null rather than a zero: a container that
             // never reported a frame rate is not a container that reported no
             // frames, and a quality figure derived from one is unknowable
-            // rather than worst-in-group.
+            // rather than worst-in-group. The runtime joins them for the same
+            // reason and with more at stake -- it is the metric the ranking
+            // compares first, and a consumer sorting on this column must not
+            // see an unmeasured file as a zero-length one.
+            let length_num = (fp.duration > 0.0).then(|| (fp.duration * 100.0).round() / 100.0);
             let frame_rate_num = (fp.frame_rate > 0.0)
                 .then(|| (fp.frame_rate * 1000.0).round() / 1000.0);
             let quality_num = (fp.quality() > 0).then(|| fp.quality());
@@ -951,7 +1021,11 @@ pub fn output_results(
             // ranking uses can be sorted on. Resolution's raw form is the two
             // sides rather than their product: the product is one multiplication
             // away in any spreadsheet, and the sides are what was measured.
-            let length_seconds_raw = format!("{:.2}", fp.duration);
+            let length_seconds_raw = if fp.duration > 0.0 {
+                format!("{:.2}", fp.duration)
+            } else {
+                String::new()
+            };
             let width_raw = fp.width.to_string();
             let height_raw = fp.height.to_string();
 
@@ -1086,7 +1160,8 @@ pub fn output_results(
                 .map(|l| {
                     serde_json::json!({
                         "full_path": fingerprints[l.other].path,
-                        "matched_seconds": (l.matched_seconds * 100.0).round() / 100.0,
+                        "matched_seconds": seconds_known
+                            .then(|| (l.matched_seconds * 100.0).round() / 100.0),
                         "matched_from": l.span.map(|s| format_duration(s.start_seconds())),
                         "matched_to": l.span.map(|s| format_duration(s.end_seconds())),
                         "matched_from_seconds": l.span
@@ -1103,7 +1178,7 @@ pub fn output_results(
                 "action": action_str,
                 "full_path": fp.path,
                 "length": duration_str,
-                "length_seconds": (fp.duration * 100.0).round() / 100.0,
+                "length_seconds": length_num,
                 "resolution": res_str,
                 "width": fp.width,
                 "height": fp.height,
@@ -2848,6 +2923,145 @@ matched_from_seconds;matched_to_seconds";
         let files = &report["results"][0]["files"];
         assert_eq!(files[0]["action"], "REVIEW");
         assert_eq!(files[1]["action"], "REVIEW");
+
+        let _ = fs::remove_file(path_str);
+    }
+
+    #[test]
+    fn test_a_file_whose_length_nobody_measured_is_never_the_one_deleted() {
+        // The reported case: a 20 second raw H.264 elementary stream holding a
+        // 10 second MP4 of the same footage. No container runtime, no clock on
+        // the packets, so the ranking has no length for it at all -- and the
+        // metrics left over are no substitute, since size prefers whichever
+        // file spent more bits and says nothing about which contains which.
+        // Neither file may be deleted, exactly as in a codec standoff.
+        let dir = tempfile::tempdir().unwrap();
+        let p_raw = at(&dir, "long.h264");
+        let p_clip = at(&dir, "clip.mp4");
+
+        let mut fp_raw = mock_fp_at(&p_raw, 0.0);
+        fp_raw.file_size = 141_000; // twice the clip, being twice the footage
+        let mut fp_clip = mock_fp_at(&p_clip, 10.0);
+        fp_clip.file_size = 73_000;
+
+        let fps = vec![fp_raw, fp_clip];
+        materialize_all(&fps);
+
+        let groups = vec![vec![0, 1]];
+        let path_str = report_to("json");
+
+        let deleted = output_results(
+            &groups, &fps, &all_compared(fps.len()), Some(&to_file(&path_str)), 0, Priority::Length,
+            Some(&Disposal::Permanent), true, &RunStats::default(),
+        ).unwrap();
+
+        assert!(Path::new(&p_raw).exists(), "the file of unknown length must survive");
+        assert!(Path::new(&p_clip).exists(), "and so must the one it was not ranked against");
+        assert!(deleted.is_empty());
+
+        let report = read_json(&path_str);
+        let files = &report["results"][0]["files"];
+        assert_eq!(files[0]["action"], "REVIEW");
+        assert_eq!(files[1]["action"], "REVIEW");
+        // The row says unknown rather than 00:00:00, because a zero-length
+        // video and a video of unknown length are different findings.
+        let raw_row = if files[0]["full_path"] == serde_json::json!(p_raw) { &files[0] } else { &files[1] };
+        assert_eq!(raw_row["length"], "-");
+        assert!(raw_row["length_seconds"].is_null(), "and nothing to sort as a zero");
+        // Its matched footage is stated in its own seconds, so it is unknown
+        // for the same reason rather than zero. The link is still named.
+        assert!(raw_row["matched_seconds"].is_null(), "no runtime, no seconds to state");
+        assert_eq!(raw_row["matched_with"], serde_json::json!(p_clip));
+        assert!(raw_row["matches"][0]["matched_seconds"].is_null());
+
+        let _ = fs::remove_file(path_str);
+    }
+
+    #[test]
+    fn test_a_group_of_nothing_but_unmeasured_lengths_deletes_nothing() {
+        // A library of raw streams: no runtime anywhere, so there is no length
+        // comparison to be had between any two of them and the rule DELETE
+        // rests on cannot be applied at all. Every file lives, which is the
+        // honest answer rather than a conservative one -- and the empty
+        // measured side must not be asked to elect a champion.
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<String> =
+            ["a.h264", "b.h264", "c.h264"].iter().map(|n| at(&dir, n)).collect();
+
+        let fps: Vec<VideoFingerprint> = paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let mut fp = mock_fp_at(p, 0.0);
+                fp.file_size = 1_000_000 * (i as u64 + 1); // and size cannot stand in
+                fp
+            })
+            .collect();
+        materialize_all(&fps);
+
+        let deleted = output_results(
+            &vec![vec![0, 1, 2]], &fps, &all_compared(fps.len()), None, 0, Priority::Length,
+            Some(&Disposal::Permanent), true, &RunStats::default(),
+        ).unwrap();
+
+        assert!(deleted.is_empty());
+        for p in &paths {
+            assert!(Path::new(p).exists(), "{} must survive", p);
+        }
+    }
+
+    #[test]
+    fn test_an_unmeasured_length_does_not_protect_the_rest_of_the_group() {
+        // One file of unknown length beside two that were measured. The
+        // unknown one is incomparable, not the group's winner, so the two that
+        // ARE comparable still rank against each other: the 720p copy lost to
+        // the 1080p one on a metric both of them were measured on, and it goes.
+        // The 1080p copy is held beside the unknown file for the same reason a
+        // codec champion is -- nothing ranked the two of them against each
+        // other.
+        let dir = tempfile::tempdir().unwrap();
+        let p_raw = at(&dir, "capture.h264");
+        let p_full = at(&dir, "full.mkv");
+        let p_small = at(&dir, "small.mkv");
+
+        let mut fp_raw = mock_fp_at(&p_raw, 0.0);
+        fp_raw.file_size = 20_000_000; // the biggest file, and unrankable
+        let fp_full = mock_fp_at(&p_full, 60.0);
+        let mut fp_small = mock_fp_at(&p_small, 60.0);
+        fp_small.width = 1280;
+        fp_small.height = 720;
+
+        let fps = vec![fp_raw, fp_full, fp_small];
+        materialize_all(&fps);
+
+        let groups = vec![vec![0, 1, 2]];
+        let path_str = report_to("json");
+
+        output_results(
+            &groups, &fps, &all_compared(fps.len()), Some(&to_file(&path_str)), 0, Priority::Length,
+            Some(&Disposal::Permanent), true, &RunStats::default(),
+        ).unwrap();
+
+        assert!(Path::new(&p_raw).exists(), "unknown length is never a reason to delete");
+        assert!(Path::new(&p_full).exists(), "the measured side's champion lives beside it");
+        assert!(!Path::new(&p_small).exists(), "720p lost to 1080p, both of them measured");
+
+        let report = read_json(&path_str);
+        let files = &report["results"][0]["files"];
+        let action_of = |path: &str| -> String {
+            files
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|f| f["full_path"] == serde_json::json!(path))
+                .unwrap()["action"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(action_of(&p_raw), "REVIEW");
+        assert_eq!(action_of(&p_full), "REVIEW");
+        assert_eq!(action_of(&p_small), "DELETED", "armed, so the row is past tense");
 
         let _ = fs::remove_file(path_str);
     }
