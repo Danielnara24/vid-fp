@@ -171,6 +171,14 @@ fn witness_schedule() -> [u32; HASH_BITS as usize + 1] {
     schedule
 }
 
+/// The most witnesses any distance can be asked for, and therefore the size of
+/// the accepted-witness set `corroborated` holds on the stack.
+///
+/// `witness_schedule` searches cluster sizes `2..=HASH_BITS`, so the largest
+/// number of witnesses it can return is `HASH_BITS - 1`; every distance past
+/// that is `u32::MAX` and refused outright.
+const MAX_WITNESSES: usize = HASH_BITS as usize;
+
 /// How far apart two frame matches may place the videos and still count as the
 /// same alignment, in milliseconds.
 ///
@@ -1133,9 +1141,20 @@ fn plan_bands(
 ///
 /// `aligned` is every match out to the loose tolerance. Sorting it by offset
 /// puts every match that could witness another one next to it, so one pass with
-/// a sliding window settles the whole pair. A witness must differ on BOTH sides:
-/// one frame of A matching two neighbouring frames of B says only that B holds a
-/// static shot, and a static shot is what admits unrelated footage.
+/// a sliding window settles the whole pair. A witness must differ on BOTH sides
+/// from the candidate AND from every other witness: one frame of A matching two
+/// neighbouring frames of B says only that B holds a static shot, and a static
+/// shot is what admits unrelated footage. Distinctness from each other is what
+/// makes the quota mean what the schedule below assumes -- counting MATCHES
+/// rather than samples, a 2x2 block of mutually matching frames is four
+/// witnesses off two samples a side, so a quota of four could be filled by two
+/// coincidences instead of four.
+///
+/// The witnesses are taken greedily in offset order, which is a maximum
+/// bipartite matching in all but a handful of cases: against an exact matching
+/// over this corpus the two agree on every pair out to `-d 10`, on all but one
+/// at `-d 12` and all but four at `-d 14`. Greedy costs one linear scan of at
+/// most `needed` accepted pairs and no allocation.
 ///
 /// How many witnesses are enough comes from `schedule`, i.e. from how far apart
 /// the two frames were -- one out to 12 bits, two at 14, three at 16. A single
@@ -1184,12 +1203,27 @@ fn corroborated(
         if needed == u32::MAX {
             continue;
         }
-        let witnesses = aligned[lo..]
-            .iter()
-            .take_while(|&&(o, _, _, _)| o - offset <= ALIGNMENT_TOLERANCE_MS)
-            .filter(|&&(_, wi, wj, _)| wi != i && wj != j)
-            .take(needed as usize)
-            .count();
+        // Witnesses must be distinct from EACH OTHER as well as from the
+        // candidate, on both sides. `needed` is small, so the accepted set is a
+        // linear scan of a stack array rather than anything allocated.
+        let mut used: [(u32, u32); MAX_WITNESSES] = [(u32::MAX, u32::MAX); MAX_WITNESSES];
+        let mut witnesses = 0usize;
+        for &(o, wi, wj, _) in aligned[lo..].iter() {
+            if o - offset > ALIGNMENT_TOLERANCE_MS {
+                break;
+            }
+            if wi == i || wj == j {
+                continue;
+            }
+            if used[..witnesses].iter().any(|&(ui, uj)| ui == wi || uj == wj) {
+                continue;
+            }
+            used[witnesses] = (wi, wj);
+            witnesses += 1;
+            if witnesses >= needed as usize {
+                break;
+            }
+        }
         if witnesses as u32 >= needed {
             matched_a[i as usize] = true;
             matched_b[j as usize] = true;

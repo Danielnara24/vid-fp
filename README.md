@@ -307,7 +307,8 @@ thresholds: a match with nothing behind it must be within `-d`, while a match
 that another frame match agrees with (a different frame of each video, landing
 within half a second of the same offset) may reach `-d + 6`. Past 12 bits one
 agreeing match stops being rare enough to mean anything, so more are required:
-two at 14 bits, three at 16, four at 20.
+two at 14 bits, three at 16, four at 20. No two of them may share a frame on
+either side, or one static shot would supply them all.
 
 Both thresholds move with every rung of `-d`, so the flag stays a sensitivity
 control across its whole range. The default is deliberately conservative:
