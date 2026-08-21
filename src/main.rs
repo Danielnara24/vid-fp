@@ -1619,6 +1619,17 @@ fn cache_lookup(db: &Database, path: &str, stamp: &Stamp) -> Option<VideoFingerp
     let stored = table.get(path).ok()??;
 
     match bincode::deserialize::<CacheEntry>(stored.value()) {
+        // An entry with no hashes in it is one an older build wrote for a file
+        // whose every frame was featureless, back when that returned a
+        // fingerprint instead of failing. It matches nothing at any `-d`, so
+        // handing it back is what made those files silent -- and the `Stamp`
+        // cannot tell it from a good entry, since nothing about the file
+        // changed. Re-decoding is what a cache MISS means and it is what this
+        // is: the decode fails loudly, and `REFUSED_TABLE` remembers the
+        // sentence, so the cost is one decode per such file, once, rather than
+        // the whole-library re-decode a `CACHE_TABLE` rename would charge every
+        // user for a handful of blank videos. No fresh entry can be empty.
+        Ok((_, fp)) if fp.valid_hashes.is_empty() => None,
         Ok((cached, fp)) if cached.matches(stamp) => Some(fp),
         // The file was edited, or the sampling knobs moved. Either way the
         // fingerprint on record describes something that is no longer there.
@@ -3983,6 +3994,40 @@ mod tests {
         let hit = cache_lookup(&db, &fp.path, &written).expect("an untouched file must hit");
         assert_eq!(hit.valid_hashes, fp.valid_hashes);
         assert_eq!(hit.codec, fp.codec);
+    }
+
+    /// A fingerprint holding no hashes is not a fingerprint, however well its
+    /// stamp matches.
+    ///
+    /// Only an older build could have written one: a file whose every frame was
+    /// featureless used to return an empty hash list instead of failing, and
+    /// that entry then matched nothing at any `-d` for ever -- the file was
+    /// silently absent from every report, on a run that had never decoded it and
+    /// so had nothing to say about it either. Nothing about the file changed, so
+    /// the `Stamp` cannot see it; the emptiness is the only tell there is.
+    #[test]
+    fn test_a_cached_fingerprint_with_no_hashes_in_it_is_not_handed_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+        let s = stamp(1_700_000_000, 12_345);
+
+        let path = "/videos/ten_minutes_of_black.mp4";
+        let mut empty = mock_fp(path);
+        empty.valid_hashes.clear();
+        empty.valid_t_start.clear();
+        empty.valid_t_end.clear();
+        cache_store(&db, path, s, &empty).unwrap();
+
+        assert!(
+            cache_lookup(&db, path, &s).is_none(),
+            "an empty entry has to read as a miss, so the decode re-runs and says why"
+        );
+
+        // And the check is about the hashes rather than about the path: an
+        // ordinary entry under the same stamp still hits.
+        let good = mock_fp(path);
+        cache_store(&db, path, s, &good).unwrap();
+        assert!(cache_lookup(&db, path, &s).is_some());
     }
 
     #[test]

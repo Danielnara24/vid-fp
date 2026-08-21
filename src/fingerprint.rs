@@ -2041,6 +2041,28 @@ pub fn fingerprint_video(
         }
     }
 
+    // Every frame this file gave up was featureless -- black, a fade, a title
+    // card -- so `is_featureless` dropped all of them and there is nothing left
+    // to compare with. A failure rather than a fingerprint holding no hashes,
+    // for the same reason the unscalable frame above is one: an empty
+    // fingerprint is cached like any other and matches nothing at any `-d`, so
+    // two identical all-black recordings were reported as no duplicates at all
+    // -- exit 0, nothing in the problem list, and the empty entry read back as
+    // a legitimate fingerprint on every run after, which is the one state where
+    // no setting the user can reach makes the tool say what it found.
+    //
+    // Asked separately from the `frame_idx == 0` line above because "it decoded
+    // and there was nothing in the picture" is a different finding from "it
+    // decoded nothing", and one of them is answered by looking at the file
+    // while the other is answered by re-encoding it. The distinction is also
+    // what the user sees, since `Refusal::Said` remembers this sentence.
+    if final_hashes.is_empty() {
+        return Err(anyhow!(
+            "No usable frames: all {} sampled frame(s) were featureless",
+            n_unique
+        ));
+    }
+
     Ok(Some(VideoFingerprint {
         path: filepath.to_string(),
         valid_hashes: final_hashes,
@@ -2946,6 +2968,49 @@ mod tests {
         assert_eq!(fp.bitrate(), 0);
         assert_eq!(fp.quality(), 0);
         assert!(!fp.valid_hashes.is_empty(), "the stream still fingerprints");
+    }
+
+    /// A video with nothing in the picture fails rather than fingerprinting to
+    /// nothing.
+    ///
+    /// `is_featureless` drops a frame below `MIN_AC_ENERGY` so a fade or a title
+    /// card cannot link two unrelated files, and the only guard on the result
+    /// was `frame_idx == 0` -- which counts frames the DECODER produced, not
+    /// hashes that survived. A file whose every frame is blank therefore
+    /// returned a fingerprint with an empty hash list: it was cached, it matched
+    /// nothing at any tolerance, and two identical all-black recordings reported
+    /// zero groups at `-d 32 -p 0` with exit code 0 and an empty problem list.
+    ///
+    /// The failure has to be an error rather than a smaller answer, because the
+    /// empty entry is indistinguishable from a good one on every run after --
+    /// same `Stamp`, same file, no re-decode.
+    #[test]
+    fn test_a_video_with_no_features_in_it_fails_rather_than_fingerprinting_to_nothing() {
+        init_ffmpeg_for_tests();
+        let path = fixture_named("test_video_featureless.mp4");
+        let filepath = path.to_string_lossy().to_string();
+        let size = std::fs::metadata(&path).unwrap().len();
+
+        let err = match fingerprint_video(&filepath, 0.0, 4.0, 1, 0.0, size, &|_| {}) {
+            Err(e) => e,
+            Ok(_) => panic!("an all-black video has nothing to fingerprint"),
+        };
+
+        let said = format!("{:#}", err);
+        assert!(
+            said.contains("featureless"),
+            "the sentence has to say what was wrong with the file, said: {}",
+            said
+        );
+        // Distinct from the "decoded nothing" line: the frames arrived, they
+        // just held no picture, and the two want different things done about it.
+        assert!(
+            !said.contains("No valid frames found"),
+            "a file that decoded should not be reported as one that did not: {}",
+            said
+        );
+        // And it is a verdict about the file, so a re-run is spared the decode.
+        assert!(!is_transient(&err), "a blank video is blank again next run");
     }
 
     #[test]
