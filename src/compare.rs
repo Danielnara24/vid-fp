@@ -180,6 +180,51 @@ fn witness_schedule() -> [u32; HASH_BITS as usize + 1] {
 /// identically to this, and 1500 starts admitting scattered coincidences.
 const ALIGNMENT_TOLERANCE_MS: i64 = 500;
 
+/// The most frame matches the corroboration rule will hold for one pair at once.
+///
+/// The list of loose matches is the only allocation phase 2 makes that is not
+/// bounded by the number of SAMPLES, and it has no natural ceiling: it holds one
+/// 24-byte entry per matching frame PAIR, so it is `|A| x |B|` for two videos
+/// whose every sample matches every sample of the other. That is not a
+/// contrived input -- it is what a static camera produces. Two 2-hour
+/// recordings of one lecture, sampled at their keyframes, are 4,000 samples
+/// each and 16 million matches: **372 MB for one pair**, on a stage that runs
+/// one pair per rayon worker, so eight cores of it is 3 GB. The whole rest of
+/// this program is written to keep memory flat (see the frame buffer and the
+/// `mallopt` calls in `main`), and this was the one place a long, repetitive
+/// library could undo that.
+///
+/// A ceiling alone would have to throw matches away, which is a wrong answer
+/// rather than a refused one. Instead it is a WORKING SET: past this many, the
+/// pair is corroborated in bands of the time-offset axis, and only the entries
+/// in one band at a time are held. Corroboration is local in that axis -- a
+/// witness has to sit within `ALIGNMENT_TOLERANCE_MS` of the match it supports
+/// -- so a band that carries a skirt of that width on each side sees every
+/// witness the whole-pair list would have offered, and the result is identical.
+/// What it costs is one more sweep of the quadratic compare per band, on
+/// exactly the pairs that would otherwise have been the most expensive thing in
+/// the program.
+///
+/// A million entries is ~25 MB, and it is far above anything an ordinary
+/// library reaches: this list cost the whole local corpus +0.6 MB of peak RSS
+/// at the default `-d 4` and +2.4 MB at `-d 24` -- i.e. its widest pair holds
+/// perhaps a hundred thousand matches. Nothing measured here bands, and the
+/// corpus reports are byte-identical either side of the change at `-d 4` and
+/// `-d 18`. Measured on the one pair that does: 4,000 static samples a side is
+/// 16,000,000 entries held before and 1,051,365 after (the cap plus one band's
+/// skirt), for 2.5% more time in that pair's comparison and the same verdict on
+/// every sample.
+const MAX_ALIGNED_MATCHES: usize = 1 << 20;
+
+/// A frame match kept for the corroboration pass: the time offset it implies,
+/// the sample it pairs on each side, and how far apart the two hashes were.
+type Aligned = (i64, u32, u32, u32);
+
+/// The band of time offsets `corroborated` may mark matches in, when it is
+/// being handed one band of a pair at a time. Half-open, and this is the whole
+/// axis.
+const EVERY_OFFSET: (i64, i64) = (i64::MIN, i64::MAX);
+
 /// The two Hamming distances one `-d` implies.
 ///
 /// `strict` is what a frame match needs on its own; `loose` is what it needs
@@ -859,33 +904,21 @@ fn match_overlap(
     let mut matched_a = vec![false; fp_a.valid_hashes.len()];
     let mut matched_b = vec![false; fp_b.valid_hashes.len()];
 
-    // Every match out to `loose`, tagged with the offset it implies. Strict
-    // matches are in here too: they are the strongest witnesses there are, and
-    // leaving them out would make a loose match's fate depend on whether its
-    // corroborator happened to be close enough to stand alone.
-    //
-    // This is the only allocation the rule adds, it lives for one pair, and it
-    // holds one 24-byte entry per frame MATCH rather than per frame pair --
-    // unrelated frames sit ~32 bits apart and never enter it. Measured on the
-    // local corpus: +0.6 MB peak at the default `-d 4`, +2.4 MB at `-d 24`.
-    let mut aligned: Vec<(i64, u32, u32, u32)> = Vec::new();
-
-    for (i, &h_a) in fp_a.valid_hashes.iter().enumerate() {
-        for (j, &h_b) in fp_b.valid_hashes.iter().enumerate() {
-            let distance = (h_a ^ h_b).count_ones();
-            if distance <= tol.strict {
-                matched_a[i] = true;
-                matched_b[j] = true;
-            }
-            if distance <= tol.loose {
-                let offset = fp_a.valid_t_start[i] as i64 - fp_b.valid_t_start[j] as i64;
-                aligned.push((offset, i as u32, j as u32, distance));
-            }
-        }
-    }
-
     if tol.loose > tol.strict {
-        corroborated(&mut aligned, schedule, &mut matched_a, &mut matched_b);
+        corroborate_pair(
+            fp_a,
+            fp_b,
+            tol,
+            schedule,
+            &mut matched_a,
+            &mut matched_b,
+            MAX_ALIGNED_MATCHES,
+        );
+    } else {
+        // Nothing to corroborate, so nothing is worth remembering: the strict
+        // pass marks everything this pair is going to get. Only `-d` at the
+        // width of the hash and the tests reach this.
+        for_each_frame_match(fp_a, fp_b, tol, &mut matched_a, &mut matched_b, |_| {});
     }
 
     // Each stored hash stands in for the picture over [t_start, t_end), so the
@@ -919,6 +952,182 @@ fn match_overlap(
     )
 }
 
+/// Every frame pair of A against every frame pair of B, marking the strict
+/// matches and handing the loose ones to `keep`.
+///
+/// The whole quadratic comparison lives here, in one place, because the
+/// corroboration pass may have to walk a pair more than once -- see
+/// `MAX_ALIGNED_MATCHES` -- and a second copy of this loop is a second place for
+/// the two tolerances to be applied differently. Marking a strict match is
+/// idempotent, so a repeated sweep costs time and changes nothing.
+///
+/// `keep` is called for every match out to `loose`, strict ones included: they
+/// are the strongest witnesses there are, and leaving them out would make a
+/// loose match's fate depend on whether its corroborator happened to be close
+/// enough to stand alone.
+#[inline]
+fn for_each_frame_match<F: FnMut(Aligned)>(
+    fp_a: &VideoFingerprint,
+    fp_b: &VideoFingerprint,
+    tol: Tolerance,
+    matched_a: &mut [bool],
+    matched_b: &mut [bool],
+    mut keep: F,
+) {
+    for (i, &h_a) in fp_a.valid_hashes.iter().enumerate() {
+        for (j, &h_b) in fp_b.valid_hashes.iter().enumerate() {
+            let distance = (h_a ^ h_b).count_ones();
+            if distance <= tol.strict {
+                matched_a[i] = true;
+                matched_b[j] = true;
+            }
+            if distance <= tol.loose {
+                let offset = fp_a.valid_t_start[i] as i64 - fp_b.valid_t_start[j] as i64;
+                keep((offset, i as u32, j as u32, distance));
+            }
+        }
+    }
+}
+
+/// Run the corroboration rule over one pair, holding at most `cap` matches at a
+/// time.
+///
+/// The straightforward version of this collects every loose match and sorts it,
+/// which is what happens whenever a pair has `cap` matches or fewer -- i.e.
+/// always, on any library anyone has measured this against. See
+/// `MAX_ALIGNED_MATCHES` for the pairs that do not fit and why holding them all
+/// is not an option.
+///
+/// Those are walked in bands of the time-offset axis instead. Each band is
+/// collected with a skirt of `ALIGNMENT_TOLERANCE_MS` on either side, so every
+/// witness of every match inside the band is present, and `corroborated` is told
+/// to mark only the matches whose own offset is inside it -- the skirt entries
+/// are witnesses here and targets in their own band. The bands partition the
+/// offset axis, so every match is judged exactly once, against exactly the
+/// witnesses the whole-pair list would have offered it.
+///
+/// Returns the largest number of entries it held at once, which is what the
+/// tests measure the working set by.
+fn corroborate_pair(
+    fp_a: &VideoFingerprint,
+    fp_b: &VideoFingerprint,
+    tol: Tolerance,
+    schedule: &[u32; HASH_BITS as usize + 1],
+    matched_a: &mut [bool],
+    matched_b: &mut [bool],
+    cap: usize,
+) -> usize {
+    let mut aligned: Vec<Aligned> = Vec::new();
+    let mut total = 0usize;
+    for_each_frame_match(fp_a, fp_b, tol, matched_a, matched_b, |entry| {
+        total += 1;
+        if aligned.len() < cap {
+            aligned.push(entry);
+        }
+    });
+
+    if total <= cap {
+        let held = aligned.len();
+        corroborated(&mut aligned, schedule, matched_a, matched_b, EVERY_OFFSET);
+        return held;
+    }
+
+    // The whole pair does not fit. What was collected is a prefix of it and is
+    // no use for anything, since a band needs its own witnesses in full.
+    aligned = Vec::new();
+
+    let bands = plan_bands(fp_a, fp_b, tol, matched_a, matched_b, cap);
+    log::debug!(
+        "{} loose frame match(es) between {} and {}: corroborating in {} band(s)",
+        total,
+        fp_a.path,
+        fp_b.path,
+        bands.len()
+    );
+
+    let mut held = 0usize;
+    for &(lo, hi) in &bands {
+        aligned.clear();
+        for_each_frame_match(fp_a, fp_b, tol, matched_a, matched_b, |entry| {
+            // Saturating so the widest band there is (`EVERY_OFFSET`, which
+            // `plan_bands` falls back to for a pair with no samples at all)
+            // cannot overflow the skirt off either end.
+            if entry.0 >= lo.saturating_sub(ALIGNMENT_TOLERANCE_MS)
+                && entry.0 <= hi.saturating_add(ALIGNMENT_TOLERANCE_MS)
+            {
+                aligned.push(entry);
+            }
+        });
+        held = held.max(aligned.len());
+        corroborated(&mut aligned, schedule, matched_a, matched_b, (lo, hi));
+    }
+
+    held
+}
+
+/// Cut the time-offset axis into bands of at most `cap` matches each.
+///
+/// One more sweep of the pair, counting matches into fixed-width buckets, and
+/// then a greedy walk that closes a band whenever the next bucket would overrun
+/// the cap. Buckets are `ALIGNMENT_TOLERANCE_MS` wide so the skirt a band
+/// carries is one bucket on each side; a single bucket holding more than `cap`
+/// is left as its own band and simply exceeds it, because everything in it is
+/// within witnessing distance of everything else and splitting it would not
+/// reduce what has to be held.
+fn plan_bands(
+    fp_a: &VideoFingerprint,
+    fp_b: &VideoFingerprint,
+    tol: Tolerance,
+    matched_a: &mut [bool],
+    matched_b: &mut [bool],
+    cap: usize,
+) -> Vec<(i64, i64)> {
+    // Measured rather than assumed from the ends of the two lists: an offset
+    // that fell outside the histogram would index it out of bounds, and sample
+    // times being ascending is a property of the decoder rather than of this
+    // module.
+    let (Some(&a_lo), Some(&a_hi)) = (fp_a.valid_t_start.iter().min(), fp_a.valid_t_start.iter().max())
+    else {
+        return vec![EVERY_OFFSET];
+    };
+    let (Some(&b_lo), Some(&b_hi)) = (fp_b.valid_t_start.iter().min(), fp_b.valid_t_start.iter().max())
+    else {
+        return vec![EVERY_OFFSET];
+    };
+
+    let first = a_lo as i64 - b_hi as i64;
+    let last = a_hi as i64 - b_lo as i64;
+    let span = last - first + 1;
+
+    // Wider buckets than the alignment window only if the offsets span so much
+    // that a bucket each would be a bigger allocation than the matches were.
+    // A day of runtime either side of zero is 350k buckets at 500 ms, so this
+    // is a guard rather than a working part.
+    const MAX_BUCKETS: i64 = 1 << 20;
+    let width = ALIGNMENT_TOLERANCE_MS.max(span / MAX_BUCKETS + 1);
+    let buckets = (span / width + 1) as usize;
+
+    let mut counts = vec![0usize; buckets];
+    for_each_frame_match(fp_a, fp_b, tol, matched_a, matched_b, |(offset, _, _, _)| {
+        counts[((offset - first) / width) as usize] += 1;
+    });
+
+    let mut bands = Vec::new();
+    let mut start = 0usize;
+    let mut running = 0usize;
+    for (b, &count) in counts.iter().enumerate() {
+        if running > 0 && running + count > cap {
+            bands.push((first + start as i64 * width, first + b as i64 * width));
+            start = b;
+            running = 0;
+        }
+        running += count;
+    }
+    // The last band runs past the last bucket, so nothing can fall off the end.
+    bands.push((first + start as i64 * width, last + 1));
+    bands
+}
+
 /// Flag every frame match that enough *other* frame matches agree with about the
 /// time offset between the two videos.
 ///
@@ -937,10 +1146,11 @@ fn match_overlap(
 /// loop that produced them. `m` is small on anything unrelated -- an unrelated
 /// frame pair sits ~32 bits apart and never enters this list at all.
 fn corroborated(
-    aligned: &mut [(i64, u32, u32, u32)],
+    aligned: &mut [Aligned],
     schedule: &[u32; HASH_BITS as usize + 1],
     matched_a: &mut [bool],
     matched_b: &mut [bool],
+    targets: (i64, i64),
 ) {
     if aligned.len() < 2 {
         return;
@@ -959,6 +1169,16 @@ fn corroborated(
         let (offset, i, j, distance) = aligned[k];
         while offset - aligned[lo].0 > ALIGNMENT_TOLERANCE_MS {
             lo += 1;
+        }
+        // Outside the band this call is responsible for: present as a witness
+        // for the matches that are inside it, and judged in the band that holds
+        // it, where its own window is complete. Skipping it here is the one
+        // safe direction anyway -- a skirt entry can only ever see FEWER
+        // witnesses than it is owed, never more. `lo` is advanced first,
+        // because it walks the whole slice whatever this step is for.
+        // `EVERY_OFFSET` makes this false for every entry.
+        if offset < targets.0 || offset >= targets.1 {
+            continue;
         }
         let needed = schedule[distance.min(HASH_BITS) as usize];
         if needed == u32::MAX {
@@ -1485,6 +1705,127 @@ mod tests {
             schedule[HASH_BITS as usize],
             u32::MAX,
             "two hashes as far apart as they can be are not evidence at any cluster size"
+        );
+    }
+
+    /// A fingerprint whose samples sit at the given millisecond marks, each
+    /// standing for the picture until the next one.
+    fn mock_fp_at(hashes: Vec<u64>, times: Vec<u32>) -> VideoFingerprint {
+        assert_eq!(hashes.len(), times.len());
+        let last = *times.last().expect("a fingerprint needs at least one sample");
+        let ends: Vec<u32> = times.iter().skip(1).copied().chain(std::iter::once(last + 1000)).collect();
+        let total = *ends.last().unwrap();
+        let mut fp = mock_fp_with_hashes(hashes, total);
+        fp.valid_t_start = times;
+        fp.valid_t_end = ends;
+        fp.duration = total as f64 / 1000.0;
+        fp
+    }
+
+    /// What the corroboration pass makes of one pair, and how many matches it
+    /// had to hold at once to do it.
+    fn corroborate_with_cap(
+        fp_a: &VideoFingerprint,
+        fp_b: &VideoFingerprint,
+        tol: Tolerance,
+        cap: usize,
+    ) -> (Vec<bool>, Vec<bool>, usize) {
+        let mut matched_a = vec![false; fp_a.valid_hashes.len()];
+        let mut matched_b = vec![false; fp_b.valid_hashes.len()];
+        let held = corroborate_pair(
+            fp_a,
+            fp_b,
+            tol,
+            &witness_schedule(),
+            &mut matched_a,
+            &mut matched_b,
+            cap,
+        );
+        (matched_a, matched_b, held)
+    }
+
+    #[test]
+    fn test_cutting_the_offset_axis_into_bands_changes_no_verdict() {
+        // The property the whole banding argument rests on: a pair judged in
+        // one pass and the same pair judged a band at a time must reach the
+        // same verdict on every frame match, including the ones whose witnesses
+        // sit on the far side of a band edge. That is what the skirt is for --
+        // drop it and the matches near every cut lose their corroboration.
+        //
+        // 40 samples of A re-encoded into B at 10 bits, at 20 offsets 700 ms
+        // apart with two matches 120 ms apart at each -- so every match has
+        // exactly ONE witness, its partner, and nothing else is within the
+        // alignment window. A band edge that falls between a pair (and with a
+        // cap of one match per band, every bucket boundary is an edge) takes
+        // that witness away unless the band carries its skirt. Plus one match
+        // at an offset entirely of its own, which no cap may rescue.
+        let tol = Tolerance::for_distance(4);
+        assert!(tol.loose >= 10 && tol.strict < 10, "the matches below have to be loose ones");
+        let ten_bits = 0x3FFu64;
+
+        let a_hashes: Vec<u64> = (0..60).map(distinct_hash).collect();
+        let a_times: Vec<u32> = (0..60).map(|i| 50_000 + i * 2000).collect();
+
+        let mut b_hashes: Vec<u64> = (100..160).map(distinct_hash).collect();
+        let mut b_times: Vec<u32> = a_times.clone();
+        for i in 0..40u32 {
+            b_hashes[i as usize] = a_hashes[i as usize] ^ ten_bits;
+            let offset = (i / 2) * 700 + (i % 2) * 120;
+            b_times[i as usize] = a_times[i as usize] - offset + 30_000;
+        }
+        for i in 40..60 {
+            b_times[i] = a_times[i] + 60_000;
+        }
+        // The lone one: a real match at 10 bits, half a minute away from any
+        // offset the rest of them agree on.
+        b_hashes[59] = a_hashes[59] ^ ten_bits;
+
+        let a = mock_fp_at(a_hashes, a_times);
+        let b = mock_fp_at(b_hashes, b_times);
+
+        let (whole_a, whole_b, held) = corroborate_with_cap(&a, &b, tol, usize::MAX);
+        assert_eq!(held, 41, "40 corroborating matches and one lone one");
+        assert!(whole_a[..40].iter().all(|&m| m), "the drifting run is corroborated");
+        assert!(!whole_a[59], "and a match nothing agrees with is not");
+
+        // Small enough that a band is a handful of matches, so the cuts land
+        // inside witness windows rather than between them.
+        for cap in [1, 2, 3, 7, 20] {
+            let (banded_a, banded_b, held) = corroborate_with_cap(&a, &b, tol, cap);
+            assert_eq!(banded_a, whole_a, "banded at {cap}, A read differently");
+            assert_eq!(banded_b, whole_b, "banded at {cap}, B read differently");
+            assert!(held < 41, "banding at {cap} held the whole pair anyway");
+        }
+    }
+
+    #[test]
+    fn test_a_long_static_pair_is_not_held_in_memory_all_at_once() {
+        // Two recordings of a static scene: every sample of one is within the
+        // loose tolerance of every sample of the other, so the list of matches
+        // is |A| x |B| and nothing about the number of SAMPLES bounds it. At
+        // 4,000 samples a side -- two hours of keyframes, not a contrived
+        // input -- that list is 372 MB for the one pair, on a stage that runs a
+        // pair per rayon worker.
+        let tol = Tolerance::for_distance(4);
+        let n = 300usize;
+        let ten_bits = 0x3FFu64;
+        let times: Vec<u32> = (0..n as u32).map(|i| i * 2000).collect();
+        let a = mock_fp_at(vec![0xAAAA_AAAA_AAAA_AAAA; n], times.clone());
+        let b = mock_fp_at(vec![0xAAAA_AAAA_AAAA_AAAA ^ ten_bits; n], times);
+
+        let (whole_a, whole_b, held) = corroborate_with_cap(&a, &b, tol, usize::MAX);
+        assert_eq!(held, n * n, "every sample matches every sample");
+        assert!(whole_a.iter().all(|&m| m) && whole_b.iter().all(|&m| m));
+
+        let cap = 1000;
+        let (banded_a, banded_b, held) = corroborate_with_cap(&a, &b, tol, cap);
+        assert_eq!((banded_a, banded_b), (whole_a, whole_b), "banding changed the verdict");
+        // A band stops one bucket short of the cap and carries a skirt of one
+        // bucket on each side; a bucket here is one time offset, which this
+        // pair has at most `n` matches at.
+        assert!(
+            held <= cap + 2 * n,
+            "held {held} matches at once against a cap of {cap}"
         );
     }
 

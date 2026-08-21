@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use utils::{shutdown_requested, Priority};
 
@@ -1396,15 +1396,61 @@ impl ThreadBudget {
         }
     }
 
-    /// Reserve this video's share of the budget, waiting if nothing is free.
+    /// Take the next video off the queue *and* its share of the budget, under
+    /// one lock.
     ///
-    /// `None` means the run is shutting down and the caller should stop rather
-    /// than wait for threads it is not going to use.
-    fn claim(&self, weight: u64) -> Option<Grant<'_>> {
+    /// The two have to happen together. `share_for` gives a video most of the
+    /// machine only while the budget is still wide, and threads cannot be added
+    /// to a decode once it has started -- so the whole schedule rests on the
+    /// heaviest file, which is first in the weight-sorted queue, claiming
+    /// first. Drawing the index from an atomic cursor and *then* claiming left a
+    /// window between the two in which any number of lighter workers could
+    /// overtake, and the heavyweight was then priced against a budget and a
+    /// queue somebody else had already moved. It goes wrong in both directions,
+    /// because an early claim takes a thread AND shrinks `queued`: with eight
+    /// workers spawning at once on `[huge, small x 7]`, seven small files
+    /// claiming first leave the heavyweight one thread where four were due --
+    /// the straggler this whole schedule exists to prevent, and precisely the
+    /// 12% the ordering was measured to be worth -- while a couple of them
+    /// claiming first hands it MORE than the plan allowed for and starves the
+    /// queue behind it. Nothing was ever over-committed by the race (the ledger
+    /// is still one lock, and a `Grant` is still the only way to hold threads),
+    /// so it cost wall time rather than correctness, and only at worker
+    /// start-up, which is exactly when every worker is racing.
+    ///
+    /// The wait is given the queue as well: a worker that finds the budget fully
+    /// committed with nothing left to claim would otherwise block until some
+    /// decode finished, only to draw an index past the end of the queue and
+    /// leave. It checks under the lock, so a cursor that reaches the end while
+    /// this worker waits is seen on the next tick of the wait timeout.
+    fn claim_next<'a>(
+        &'a self,
+        cursor: &AtomicUsize,
+        queue: &'a [Job],
+    ) -> Option<(usize, &'a Job, Grant<'a>)> {
+        let mut state =
+            self.wait_for_a_free_thread(|| cursor.load(Ordering::SeqCst) < queue.len())?;
+
+        let idx = cursor.fetch_add(1, Ordering::SeqCst);
+        // Nothing is reserved on this path, so the guard simply drops.
+        let job = queue.get(idx)?;
+
+        let threads = Self::reserve(&mut state, job.weight);
+        Some((idx, job, Grant { budget: self, threads }))
+    }
+
+    /// Block until the budget has a thread in it, holding the ledger on return.
+    ///
+    /// `more_to_claim` is re-asked on every wake-up, so a caller can give up on
+    /// a queue that emptied while it waited.
+    fn wait_for_a_free_thread(
+        &self,
+        more_to_claim: impl Fn() -> bool,
+    ) -> Option<MutexGuard<'_, BudgetState>> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 
         while state.free == 0 {
-            if shutdown_requested() {
+            if shutdown_requested() || !more_to_claim() {
                 return None;
             }
             // A timeout rather than a bare wait purely so the shutdown check
@@ -1416,6 +1462,11 @@ impl ThreadBudget {
             state = next;
         }
 
+        Some(state)
+    }
+
+    /// Charge one video's share against the ledger and hand back the width.
+    fn reserve(state: &mut BudgetState, weight: u64) -> usize {
         // No longer queued: from here on this video is represented by the
         // threads it is about to take, not by its weight. Doing this BEFORE
         // computing the share is what keeps `queued` meaning "the work I am
@@ -1424,16 +1475,26 @@ impl ThreadBudget {
 
         let threads = share_for(weight, state.queued, state.free);
         state.free -= threads;
-
-        Some(Grant {
-            budget: self,
-            threads,
-        })
+        threads
     }
 }
 
 #[cfg(test)]
 impl ThreadBudget {
+    /// One reservation with no queue behind it.
+    ///
+    /// `run` claims through `claim_next`, which draws the video and reserves
+    /// its share together; this is that reservation on its own, so a test can
+    /// state a sequence of claims without also staging a queue for them.
+    fn claim(&self, weight: u64) -> Option<Grant<'_>> {
+        let mut state = self.wait_for_a_free_thread(|| true)?;
+        let threads = Self::reserve(&mut state, weight);
+        Some(Grant {
+            budget: self,
+            threads,
+        })
+    }
+
     fn free(&self) -> usize {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).free
     }
@@ -3019,8 +3080,19 @@ fn run(
 
                         let mut open = in_flight.lock().unwrap_or_else(|e| e.into_inner());
                         open.remove(&idx);
-                        if let Some((_, name)) = open.iter().next() {
-                            pb.set_message(name.clone());
+                        // Cleared when the map drains, not left as it was. The
+                        // message names the decode the run is WAITING on, so
+                        // with nothing open there is nothing to name -- and the
+                        // old `if let` simply kept the last one on screen. That
+                        // is a file this run has already finished with, and at
+                        // the one moment it is most likely to be read: a single
+                        // worker (`-t 1`, or a one-file library) empties the map
+                        // between every pair of decodes, and every ending that
+                        // leaves the bar up -- an interrupt, a decode that
+                        // outlives its neighbours -- ends with it stale.
+                        match open.iter().next() {
+                            Some((_, name)) => pb.set_message(name.clone()),
+                            None => pb.set_message(String::new()),
                         }
                     };
 
@@ -3034,14 +3106,18 @@ fn run(
                             break;
                         }
 
-                        let idx = cursor.fetch_add(1, Ordering::SeqCst);
-                        let Some(job) = todo.get(idx) else { break };
-
                         // Blocks if every thread is already promised to a decode
                         // that is running -- which is precisely when there is
                         // nothing useful for this worker to be doing. `None`
-                        // means the run is shutting down.
-                        let Some(grant) = budget.claim(job.weight) else { break };
+                        // means the run is shutting down, or that the queue ran
+                        // out while this worker waited.
+                        //
+                        // The index comes back with the grant because the two
+                        // are one decision: see `claim_next` for what pulling
+                        // them apart cost.
+                        let Some((idx, job, grant)) = budget.claim_next(cursor, todo) else {
+                            break;
+                        };
 
                         let file_name = Path::new(&job.path)
                             .file_name()
@@ -3555,6 +3631,75 @@ mod tests {
         let b = budget.claim(small).unwrap();
         assert_eq!((a.threads, b.threads), (1, 1));
         assert_eq!(budget.free(), 0, "and the machine is fully committed");
+    }
+
+    #[test]
+    fn test_the_heaviest_video_is_still_first_when_every_worker_starts_at_once() {
+        // The ordering the schedule rests on, asserted against the moment it is
+        // hardest to keep: every worker spawning together and racing for the
+        // head of the queue. `claim_next` draws the index and reserves the
+        // share under one lock, so whichever worker wins that race is
+        // necessarily the one holding job 0 -- and job 0 is therefore always
+        // priced against a full budget and an untouched queue, whatever the
+        // scheduler does with the other fifteen.
+        //
+        // Drawing the index from the cursor and claiming afterwards left a
+        // window between the two, and any of the other files could reserve
+        // inside it; the heavyweight was then priced against a budget and a
+        // queue somebody else had already moved -- in either direction, since a
+        // light file that claims early takes a thread AND shrinks `queued`.
+        // Against that version this fails on the first or second iteration
+        // (4 threads where 3 are due), and it takes the barrier to do it: thread
+        // spawning is sequential enough that worker one is usually finished
+        // before worker two exists.
+        let jobs: Vec<Job> = std::iter::once(16 * LOAD)
+            .chain(std::iter::repeat_n(LOAD, 31))
+            .map(|weight| Job {
+                path: String::new(),
+                stamp: stamp(0, 0),
+                weight,
+                size: 0,
+            })
+            .collect();
+
+        let queued: u128 = jobs.iter().map(|j| j.weight as u128).sum();
+        let expected = share_for(jobs[0].weight, queued - jobs[0].weight as u128, 8);
+        assert!(expected > 1, "the test only means something if the head is owed a wide share");
+
+        for _ in 0..50 {
+            let budget = ThreadBudget::new(8, queued);
+            let cursor = AtomicUsize::new(0);
+            let taken: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+            // Spawning is sequential, so without this the first worker has
+            // usually claimed before the second one exists and the race the
+            // test is about never happens.
+            let start = std::sync::Barrier::new(16);
+
+            std::thread::scope(|scope| {
+                for _ in 0..16 {
+                    scope.spawn(|| {
+                        start.wait();
+                        // Released at once, so the queue drains rather than
+                        // deadlocking sixteen workers against eight threads.
+                        while let Some((idx, _, grant)) = budget.claim_next(&cursor, &jobs) {
+                            taken.lock().unwrap().push((idx, grant.threads));
+                        }
+                    });
+                }
+            });
+
+            let mut taken = taken.into_inner().unwrap();
+            taken.sort_unstable();
+            assert_eq!(taken.len(), jobs.len(), "every video is claimed exactly once");
+            assert!(
+                taken.iter().map(|&(idx, _)| idx).eq(0..jobs.len()),
+                "and no index is drawn twice"
+            );
+            assert_eq!(
+                taken[0].1, expected,
+                "the heaviest video must be priced against a budget nothing else has touched"
+            );
+        }
     }
 
     #[test]
