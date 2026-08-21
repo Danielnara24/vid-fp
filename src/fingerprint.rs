@@ -463,8 +463,15 @@ fn frame_rate_of(stream: &ffmpeg_next::format::stream::Stream<'_>, duration_sec:
 /// can be regenerated from the cache instead of stored in it.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct NotMedia {
-    /// How much of the file was read before giving up: `FIRST_PROBE_BYTES`, or
-    /// `SECOND_PROBE_BYTES` when the name earned a second look.
+    /// How much of the file was actually LOOKED AT before giving up, which is
+    /// `FIRST_PROBE_BYTES` (or `SECOND_PROBE_BYTES` when the name earned a
+    /// second look) capped by what the file holds. The cap is the whole reason
+    /// this is not simply the constant: an empty file used to be refused with
+    /// "no demuxer recognised the first 16384 bytes of this file", which is a
+    /// sentence about 16 KB that do not exist, and it was reached by exactly the
+    /// files most likely to prompt the question -- a truncated download, an
+    /// interrupted copy, a 0-byte placeholder. Nothing about the VERDICT moves;
+    /// a file with nothing in it is not media either way.
     pub bytes: usize,
     /// What the best guess scored. At most `NO_EVIDENCE`, or this would not exist.
     pub score: i32,
@@ -472,6 +479,15 @@ pub struct NotMedia {
 
 impl std::fmt::Display for NotMedia {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // An empty file has no bytes to have recognised and no score worth
+        // quoting: "no demuxer recognised the first 0 bytes (the best guess
+        // scored 0 of 100)" is three clauses saying nothing about the one thing
+        // the user needs to know, which is that there is nothing in the file.
+        // It arrives here rather than anywhere earlier because emptiness is not
+        // a special case to the probe, only to the sentence.
+        if self.bytes == 0 {
+            return write!(f, "this file is empty");
+        }
         write!(
             f,
             "no demuxer recognised the first {} bytes of this file (the best guess scored {} of \
@@ -670,6 +686,12 @@ fn open_input(filepath: &str) -> Result<ffmpeg_next::format::context::Input> {
 fn unrecognised(filepath: &str) -> Option<(usize, i32)> {
     let mut buf = read_head(filepath, SECOND_PROBE_BYTES)?;
 
+    // What the file actually holds, which is what the two sizes below are capped
+    // against so the refusal reports bytes that exist -- see `NotMedia::bytes`.
+    // A short file comes back short and a missing tail is not evidence of
+    // anything, so the reading is unchanged; only the sentence is.
+    let held = buf.len().saturating_sub(AVPROBE_PADDING_SIZE);
+
     // The name is part of the question: `av_probe_input_format3` floors the score
     // of any demuxer whose extension list matches it at 1, whatever the bytes
     // say. That is the whole reason the second look exists -- and also why no
@@ -681,14 +703,14 @@ fn unrecognised(filepath: &str) -> Option<(usize, i32)> {
         return None;
     }
     if first == 0 {
-        return Some((FIRST_PROBE_BYTES, first));
+        return Some((FIRST_PROBE_BYTES.min(held), first));
     }
 
     let second = probe_head(&mut buf, SECOND_PROBE_BYTES, &cname);
     if second > NO_EVIDENCE {
         return None;
     }
-    Some((SECOND_PROBE_BYTES, second))
+    Some((SECOND_PROBE_BYTES.min(held), second))
 }
 
 /// The first `want` bytes of a file, in a buffer with libavformat's probe
@@ -2571,9 +2593,15 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("song.mp3");
-        std::fs::write(&path, "the quick brown fox\n".repeat(400)).unwrap();
+        // Comfortably past SECOND_PROBE_BYTES, so the size the refusal reports
+        // is the probe's own and not the file's -- see the test below, which
+        // pins the other side of that.
+        let text = "the quick brown fox\n".repeat(1_500);
+        std::fs::write(&path, &text).unwrap();
 
-        let Weighed::Undecodable(e) = weigh_decode(&path.to_string_lossy(), 0.0, 4.0, 0.0, 8000) else {
+        let Weighed::Undecodable(e) =
+            weigh_decode(&path.to_string_lossy(), 0.0, 4.0, 0.0, text.len() as u64)
+        else {
             panic!("this is text, whatever it is called");
         };
         let said = format!("{:#}", e);
@@ -2582,6 +2610,48 @@ mod tests {
             "a claimed extension has to reach the second probe: {}",
             said
         );
+    }
+
+    /// The refusal counts bytes that exist. A file shorter than the probe size
+    /// is read short, judged on what it holds, and must say so: quoting the
+    /// constant instead described 16 KB of a file that has none of them, and it
+    /// is exactly the truncated downloads and interrupted copies that land here.
+    #[test]
+    fn test_a_file_shorter_than_the_probe_is_refused_over_the_bytes_it_has() {
+        init_ffmpeg_for_tests();
+
+        let dir = tempfile::tempdir().unwrap();
+        // A claimed extension, so the second probe is reached and the constant
+        // that would be quoted is the larger of the two.
+        let path = dir.path().join("stub.mp3");
+        std::fs::write(&path, "the quick brown fox\n").unwrap();
+
+        let Weighed::Undecodable(e) = weigh_decode(&path.to_string_lossy(), 0.0, 4.0, 0.0, 20)
+        else {
+            panic!("twenty bytes of text is not a video");
+        };
+        let said = format!("{:#}", e);
+        assert!(said.contains("first 20 bytes"), "the bytes it really read: {}", said);
+        assert!(!said.contains("16384"), "and not the ones it did not: {}", said);
+    }
+
+    /// The end of that same line. An empty file has no bytes to have recognised
+    /// and no score worth quoting, so it gets a sentence about the one thing
+    /// that is wrong with it rather than three clauses about a probe.
+    #[test]
+    fn test_an_empty_file_is_refused_for_being_empty() {
+        init_ffmpeg_for_tests();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("interrupted.mp4");
+        std::fs::write(&path, b"").unwrap();
+
+        let Weighed::Undecodable(e) = weigh_decode(&path.to_string_lossy(), 0.0, 4.0, 0.0, 0) else {
+            panic!("an empty file is not a video");
+        };
+        let said = format!("{:#}", e);
+        assert!(said.contains("empty"), "say what is wrong with it: {}", said);
+        assert!(!said.contains("16384"), "not what a probe would have read: {}", said);
     }
 
     /// And the gate lets the real thing through untouched, which every other

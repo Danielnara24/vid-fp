@@ -463,30 +463,28 @@ pub struct Link {
 /// "how much of i does j contain" without the caller having to know which way
 /// round the pair was originally emitted.
 ///
-/// `neighbours` is the same information as an adjacency list, and it exists
-/// because the report asks a question the pair map answers badly: "everything
-/// this file matched". Answering that by probing the map for every other file in
-/// the library is quadratic, and a loose scan can leave one file with hundreds
-/// of neighbours -- while the number of edges stays proportional to the pairs
-/// actually measured, which is far smaller.
+/// The pair map is the whole index. It used to carry an adjacency list beside
+/// it, for the report's question -- "everything this file matched" -- on the
+/// grounds that answering it from the map alone means probing every other file
+/// in the library. That was never the question actually asked: every link the
+/// report prints is scoped to the group being printed, so the walk is over the
+/// group's handful of members and each one is a single lookup. The adjacency
+/// list only ever added a `deg(subject)`-sized scan in front of it, plus a
+/// `Vec` per file for a loose scan to grow.
 pub struct MatchIndex {
     links: HashMap<(usize, usize), Link>,
-    neighbours: HashMap<usize, Vec<usize>>,
 }
 
 impl MatchIndex {
     pub fn new(matches: Vec<Match>) -> Self {
         let mut links = HashMap::with_capacity(matches.len() * 2);
-        let mut neighbours: HashMap<usize, Vec<usize>> = HashMap::new();
 
         for m in matches {
             links.insert((m.a, m.b), Link { coverage: m.coverage_a, span: m.span_a });
             links.insert((m.b, m.a), Link { coverage: m.coverage_b, span: m.span_b });
-            neighbours.entry(m.a).or_default().push(m.b);
-            neighbours.entry(m.b).or_default().push(m.a);
         }
 
-        Self { links, neighbours }
+        Self { links }
     }
 
     /// How much of `subject` is contained in `other`, if the two were compared.
@@ -567,10 +565,19 @@ impl MatchIndex {
     /// neighbour list is filtered to the group being printed.
     ///
     /// Inside a clique that filter is the only thing doing any work -- every
-    /// other member is a neighbour by construction, so the result always has
-    /// `group.len() - 1` entries. It is written as a lookup rather than assumed,
-    /// because the assumption is exactly what a change to the clustering rule
-    /// would break silently.
+    /// other member was measured against the subject by construction, so the
+    /// result always has `group.len() - 1` entries. It is written as a lookup
+    /// rather than assumed, because the assumption is exactly what a change to
+    /// the clustering rule would break silently: a group whose members were not
+    /// all compared with each other simply reports fewer links.
+    ///
+    /// It walks the GROUP and probes the pair map, rather than walking the
+    /// subject's neighbours and testing each against the group. The two answer
+    /// identically -- a neighbour is exactly a pair the map holds -- but the
+    /// second is `deg(subject) x group.len()`, and `deg` is a property of the
+    /// whole library at the chosen `-d` rather than of the group being printed.
+    /// This way the reporting pass costs one hash lookup per pair it prints,
+    /// whatever a loose scan did to the graph around it.
     ///
     /// Ordered by matched duration descending, ties broken on path, so the
     /// report is reproducible run to run: the strongest link is `first()`, which
@@ -587,13 +594,9 @@ impl MatchIndex {
         group: &[usize],
         fps: &[VideoFingerprint],
     ) -> Vec<GroupLink> {
-        let Some(others) = self.neighbours.get(&subject) else {
-            return Vec::new();
-        };
-
-        let mut links: Vec<GroupLink> = others
+        let mut links: Vec<GroupLink> = group
             .iter()
-            .filter(|&&other| group.contains(&other))
+            .filter(|&&other| other != subject)
             .filter_map(|&other| {
                 Some(GroupLink {
                     other,

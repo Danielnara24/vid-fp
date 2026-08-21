@@ -52,13 +52,17 @@ const CACHE_TABLE: TableDefinition<&str, &[u8]> =
 /// A refusal is worth half a millisecond, so it can be discarded on the merest
 /// suspicion -- and it has to be, because it depends on things `Stamp`
 /// deliberately does not record: the vendored FFmpeg's demuxer set (`ff8`) and
-/// this tool's own gate (`probe1` = `FIRST_PROBE_BYTES`/`SECOND_PROBE_BYTES`/
-/// `NO_EVIDENCE`). Change any of those and the entries are wrong in the
-/// direction that matters -- a file that would now be read as video, remembered
-/// as junk -- so bump the suffix and push the old name into `SUPERSEDED_TABLES`.
-/// That costs one cheap re-probe of the library and nothing else.
+/// this tool's own gate (`probe3` = `FIRST_PROBE_BYTES`/`SECOND_PROBE_BYTES`/
+/// `NO_EVIDENCE`, and what a `NotMedia` counts). Change any of those and the
+/// entries are wrong in the direction that matters -- a file that would now be
+/// read as video, remembered as junk -- so bump the suffix and push the old name
+/// into `SUPERSEDED_REFUSAL_TABLES`, which is a separate list precisely because
+/// what this costs (one cheap re-probe of the library) is not what retiring a
+/// fingerprint table costs, and the run says so in different words. Putting it
+/// in `SUPERSEDED_TABLES` would tell a user with a large library to expect a
+/// re-decode that is not coming.
 const REFUSED_TABLE: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("refused_ff8_probe2");
+    TableDefinition::new("refused_ff8_probe3");
 
 /// Tables earlier builds wrote, all dead. They are dropped whole on the first
 /// run of this one.
@@ -157,8 +161,16 @@ const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 8] = [
 /// the WORDING is part of what is in there. Trimming the duplicated path out of
 /// those messages would otherwise have left a cache printing two formats in one
 /// run, half of them naming the file twice.
-const SUPERSEDED_REFUSAL_TABLES: [TableDefinition<&str, &[u8]>; 1] =
-    [TableDefinition::new("refused_ff8_probe1")];
+///
+/// `refused_ff8_probe2` went for the same kind of reason one rung down.
+/// `NotMedia` stores numbers rather than a sentence, but `bytes` changed
+/// meaning: it was the probe size the gate had reached and it is now that size
+/// capped by what the file actually holds, so an entry written by the old build
+/// regenerates "the first 16384 bytes" for a file with nothing in it. Same
+/// field, same units, different value -- which is exactly the case a layout
+/// check cannot see, and which costs a re-probe measured in seconds.
+const SUPERSEDED_REFUSAL_TABLES: [TableDefinition<&str, &[u8]>; 2] =
+    [TableDefinition::new("refused_ff8_probe1"), TableDefinition::new("refused_ff8_probe2")];
 
 /// Hard ceiling on the cache's page cache.
 ///
@@ -1746,12 +1758,19 @@ fn cache_forget(db: &Database, paths: &[String]) -> Result<usize> {
         let mut refused =
             txn.open_table(REFUSED_TABLE).context("Failed to open the refusals table")?;
         for path in paths {
-            let existed = table
+            let had_fingerprint = table
                 .remove(path.as_str())
                 .context("Failed to remove a cache entry")?
                 .is_some();
-            refused.remove(path.as_str()).context("Failed to remove a refusal")?;
-            if existed {
+            let had_refusal =
+                refused.remove(path.as_str()).context("Failed to remove a refusal")?.is_some();
+            // Either table counts. A path is remembered by exactly one of them
+            // -- a file is fingerprinted or it is refused -- so this is a count
+            // of paths the cache had something to say about, not a total that
+            // can exceed `paths.len()`. Counting only the fingerprints made the
+            // one case worth logging (an entry that was not there) look
+            // identical to the one case that is routine.
+            if had_fingerprint || had_refusal {
                 forgotten += 1;
             }
         }
@@ -2758,16 +2777,22 @@ fn run(
         let weighed: Vec<fingerprint::Weighed> = todo
             .par_iter()
             .map(|job| {
-                if shutdown_requested() {
-                    return fingerprint::Weighed::Work(job.size);
-                }
-                let weighed = fingerprint::weigh_decode(
-                    &job.path,
-                    kf_interval,
-                    min_kf_samples,
-                    min_duration,
-                    job.size,
-                );
+                // The bar is advanced on BOTH paths: after a Ctrl-C the
+                // remaining files are answered instantly, and a bar that stops
+                // counting them freezes part-way while the pass visibly keeps
+                // running. Weighing a file this run will not decode costs
+                // nothing to say so.
+                let weighed = if shutdown_requested() {
+                    fingerprint::Weighed::Work(job.size)
+                } else {
+                    fingerprint::weigh_decode(
+                        &job.path,
+                        kf_interval,
+                        min_kf_samples,
+                        min_duration,
+                        job.size,
+                    )
+                };
                 wb.inc(1);
                 weighed
             })
@@ -3858,6 +3883,38 @@ mod tests {
         assert_eq!(forgotten, 1);
         assert!(cache_lookup(&db, gone, &s).is_none(), "a removed file keeps no fingerprint");
         assert!(cache_lookup(&db, kept, &s).is_some(), "and its neighbours are untouched");
+    }
+
+    /// The other table counts too. A path is remembered by exactly one of the
+    /// two, so a count that reads only `CACHE_TABLE` reports a refusal that was
+    /// really there as an entry that was not -- which is the one thing the
+    /// figure exists to distinguish.
+    #[test]
+    fn test_a_forgotten_path_is_counted_whichever_table_remembered_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+        let refused_path = "/videos/not_really_a_video.mkv";
+        let s = stamp(1_700_000_000, 12_345);
+
+        refusals_store(
+            &db,
+            &[(refused_path.to_string(), s, Refusal::Said("nope".to_string()))],
+        )
+        .unwrap();
+
+        let forgotten = cache_forget(&db, &[refused_path.to_string()]).unwrap();
+
+        assert_eq!(forgotten, 1, "the cache had something to say about this path");
+        assert!(
+            refusal_lookup(&db, refused_path, &s).is_none(),
+            "and it no longer says it"
+        );
+
+        assert_eq!(
+            cache_forget(&db, &["/videos/never_seen.mkv".to_string()]).unwrap(),
+            0,
+            "a path neither table held is still not an entry"
+        );
     }
 
     /// A report and a real file to go with it, sized to agree with `mock_fp`.
