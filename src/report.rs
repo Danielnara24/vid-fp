@@ -38,6 +38,7 @@
 use anyhow::{anyhow, Context, Result};
 use log::info;
 use std::collections::HashSet;
+use std::path::{Component, Path};
 
 use crate::confirm::{self, Target};
 use crate::export::{self, Disposal, Fate};
@@ -176,6 +177,38 @@ impl Rows {
             return;
         }
 
+        // Every path this tool writes is canonical: rooted, and with no `..`
+        // left in it. A path that is not is a path this run cannot answer for,
+        // for two separate reasons, and it is refused for the same reason a
+        // word the action column does not recognise is -- the file is left
+        // alone and the run says so, rather than guessing.
+        //
+        // A relative path means something different from every directory the
+        // command could be run in, so the same report replayed from elsewhere
+        // acts on different files. And `..` walks out of `--move-to`: that mode
+        // mirrors the source path under the destination root, so a row naming
+        // `../../outside/clip.mp4` lands at `<dest>/../../outside/clip.mp4`,
+        // creating directories outside the destination and leaving nothing for
+        // the documented single copy back from it to restore. `--permanent`
+        // reaches the same file by the same arithmetic, with nothing to undo.
+        if let Some(fault) = not_canonical(row.file) {
+            log::error!(
+                target: crate::stats::COUNTED,
+                "{}: {} is marked DELETE but its full_path \"{}\" {}. It was left alone: \
+                 --from-report acts only on the absolute paths vid-fp writes, because a path \
+                 that is not one names a different file from every directory this command \
+                 could be run in.",
+                report,
+                row.at,
+                row.file,
+                fault
+            );
+            stats
+                .report_unusable
+                .record(format!("{} {}: full_path {}", report, row.at, fault));
+            return;
+        }
+
         // No fallback if this will not parse. The recorded size is the entire
         // basis of the check that runs before the file is touched, and a
         // deletion carried out without it is a deletion with nothing behind it
@@ -216,6 +249,27 @@ impl Rows {
             rows: self.rows,
         }
     }
+}
+
+/// Why `path` is not one of the canonical paths this tool writes, or `None`.
+///
+/// The two faults are worth separating in the message because they are
+/// different mistakes: a relative path is usually a report moved or edited by
+/// hand, while `..` inside an absolute one is either a hand-built row or an
+/// attempt to make a report reach somewhere the run that wrote it never
+/// scanned. `Component::CurDir` is deliberately not a fault -- `/a/./b` names
+/// the same file from anywhere and mirrors to the same slot -- so this refuses
+/// only what actually changes which bytes are touched.
+fn not_canonical(path: &str) -> Option<&'static str> {
+    let path = Path::new(path);
+
+    if !path.is_absolute() {
+        return Some("is not an absolute path");
+    }
+
+    path.components()
+        .any(|c| c == Component::ParentDir)
+        .then_some("contains a \"..\" component")
 }
 
 /// The index of the column called `name`.
@@ -1266,6 +1320,98 @@ shared_to_seconds";
             .path()
             .join(PathBuf::from(&doomed).strip_prefix("/").unwrap());
         assert!(landed.exists(), "expected it under {}", landed.display());
+    }
+
+    #[test]
+    fn test_a_path_that_is_not_the_canonical_one_vid_fp_writes_is_refused() {
+        // Both faults reach a file the report has no business naming, and by
+        // different routes. A relative path is resolved against whatever
+        // directory the command was run in, so one report acts on different
+        // files depending on where it is replayed from. `..` in an absolute one
+        // walks back out of the `--move-to` mirror. Neither can appear in a
+        // report this tool wrote, because every scanned path is canonical.
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            HEADER,
+            row("../../outside/pwned.mkv", 10, "DELETE"),
+            row("outside/pwned.mkv", 20, "DELETE"),
+            row("/../../outside/pwned.mkv", 30, "DELETE"),
+            row("/videos/./ok.mkv", 40, "DELETE"),
+        );
+        let path = write_report(&dir, &body);
+
+        let stats = RunStats::default();
+        let report = read(&path, &stats).unwrap();
+
+        assert_eq!(report.rows, 4);
+        assert_eq!(stats.report_unusable.count(), 3);
+        // A `.` component names the same file from anywhere and mirrors to the
+        // same slot, so it is not one of the faults.
+        assert_eq!(report.marked.len(), 1);
+        assert_eq!(report.marked[0].path, "/videos/./ok.mkv");
+    }
+
+    #[test]
+    fn test_a_json_path_that_is_not_canonical_is_refused_by_the_same_rule() {
+        // The judgement lives in `consider`, so it has to reach every format --
+        // that is the arrangement the module doc describes, and a second reader
+        // that could be talked into a relative path would defeat it.
+        let dir = tempfile::tempdir().unwrap();
+        let tree = serde_json::json!({
+            "results": [{
+                "group": 1,
+                "files": [{ "action": "DELETE", "full_path": "../pwned.mkv", "size_bytes": 10 }]
+            }]
+        });
+        let path = write_json(&dir, "report.json", &tree.to_string());
+
+        let stats = RunStats::default();
+        let report = read(&path, &stats).unwrap();
+
+        assert!(report.marked.is_empty());
+        assert_eq!(stats.report_unusable.count(), 1);
+    }
+
+    #[test]
+    fn test_a_path_cannot_walk_out_of_the_move_to_destination() {
+        // The end-to-end shape of it. `--move-to` mirrors the source path under
+        // the destination root by stripping the leading `/` and joining, so a
+        // `..` survives that arithmetic and comes out the other side: the row
+        // below names a file that opens perfectly well, and lands it OUTSIDE
+        // the destination along with the directories created to hold it. That
+        // breaks the one promise the mode makes -- that the whole run can be
+        // undone by a single copy back from the destination -- and
+        // `--permanent` reaches the same file with nothing to undo at all.
+        let root = tempfile::tempdir().unwrap();
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let victim = outside.join("victim.mkv");
+        std::fs::write(&victim, vec![b'x'; 200]).unwrap();
+
+        let dest = root.path().join("dest");
+        std::fs::create_dir(&dest).unwrap();
+
+        // `/..` is `/`, so this opens the file above -- and mirrored under the
+        // destination it is `<dest>/../<root>/outside/victim.mkv`, a sibling of
+        // the destination rather than anything inside it.
+        let escaping = format!("/..{}", victim.display());
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!("{}\n{}\n", HEADER, row(&escaping, 200, "DELETE"));
+        let path = write_report(&dir, &body);
+
+        let stats = RunStats::default();
+        let disposal = Disposal::MoveTo(dest.clone());
+        let gone = apply(&path, &disposal, true, &stats).unwrap();
+
+        assert!(gone.is_empty(), "nothing should have been disposed of");
+        assert!(victim.exists(), "the file outside the destination is untouched");
+        assert_eq!(
+            std::fs::read_dir(&dest).unwrap().count(),
+            0,
+            "the destination is still empty"
+        );
+        assert!(stats.had_problems(), "a row this run declined to act on is a problem");
     }
 
     #[test]

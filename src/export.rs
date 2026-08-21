@@ -2999,8 +2999,9 @@ matched_from_seconds;matched_to_seconds";
             .collect();
         materialize_all(&fps);
 
+        let groups = vec![vec![0, 1, 2]];
         let deleted = output_results(
-            &vec![vec![0, 1, 2]], &fps, &all_compared(fps.len()), None, 0, Priority::Length,
+            &groups, &fps, &all_compared(fps.len()), None, 0, Priority::Length,
             Some(&Disposal::Permanent), true, &RunStats::default(),
         ).unwrap();
 
