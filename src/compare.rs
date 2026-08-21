@@ -171,12 +171,14 @@ fn witness_schedule() -> [u32; HASH_BITS as usize + 1] {
     schedule
 }
 
-/// The most witnesses any distance can be asked for, and therefore the size of
-/// the accepted-witness set `corroborated` holds on the stack.
+/// The most witnesses any distance can be asked for.
 ///
 /// `witness_schedule` searches cluster sizes `2..=HASH_BITS`, so the largest
 /// number of witnesses it can return is `HASH_BITS - 1`; every distance past
-/// that is `u32::MAX` and refused outright.
+/// that is `u32::MAX` and refused outright. In practice the schedule runs out
+/// of attainable cluster sizes long before that -- 51 witnesses at 32 bits is
+/// the largest finite entry -- and this is only ever read to size the search
+/// `Witnesses::enough` is allowed to do.
 const MAX_WITNESSES: usize = HASH_BITS as usize;
 
 /// How far apart two frame matches may place the videos and still count as the
@@ -238,7 +240,8 @@ const EVERY_OFFSET: (i64, i64) = (i64::MIN, i64::MAX);
 /// `strict` is what a frame match needs on its own; `loose` is what it needs
 /// when another match agrees with it about the time offset between the two
 /// videos. `strict <= loose` always, and both move monotonically with `-d`, so
-/// raising the tolerance can only ever admit more.
+/// raising the tolerance can only ever admit more -- a property the rule that
+/// reads them has to preserve as well, which is what `Witnesses` is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Tolerance {
     strict: u32,
@@ -267,6 +270,19 @@ impl Tolerance {
     fn widest(&self) -> u32 {
         self.loose
     }
+}
+
+/// What one pair is judged by: the two tolerances `-d` implies and how many
+/// witnesses each distance has to carry.
+///
+/// One argument rather than two because they are one calibration -- both are
+/// derived from the hash width in sigma, and a frame match is read against both
+/// of them in the same breath. Copied freely; the schedule is a borrow of the
+/// single table `find_all_matches` builds for the whole run.
+#[derive(Clone, Copy)]
+struct Rule<'a> {
+    tol: Tolerance,
+    schedule: &'a [u32; HASH_BITS as usize + 1],
 }
 
 /// The `k`th 16-bit block of a hash, most significant first.
@@ -906,9 +922,10 @@ fn candidate_pairs(
 fn match_overlap(
     fp_a: &VideoFingerprint,
     fp_b: &VideoFingerprint,
-    tol: Tolerance,
-    schedule: &[u32; HASH_BITS as usize + 1],
+    rule: Rule,
+    witnesses: &mut Witnesses,
 ) -> (f32, f32, Option<Span>, Option<Span>) {
+    let tol = rule.tol;
     let mut matched_a = vec![false; fp_a.valid_hashes.len()];
     let mut matched_b = vec![false; fp_b.valid_hashes.len()];
 
@@ -916,11 +933,11 @@ fn match_overlap(
         corroborate_pair(
             fp_a,
             fp_b,
-            tol,
-            schedule,
+            rule,
             &mut matched_a,
             &mut matched_b,
             MAX_ALIGNED_MATCHES,
+            witnesses,
         );
     } else {
         // Nothing to corroborate, so nothing is worth remembering: the strict
@@ -1019,12 +1036,13 @@ fn for_each_frame_match<F: FnMut(Aligned)>(
 fn corroborate_pair(
     fp_a: &VideoFingerprint,
     fp_b: &VideoFingerprint,
-    tol: Tolerance,
-    schedule: &[u32; HASH_BITS as usize + 1],
+    rule: Rule,
     matched_a: &mut [bool],
     matched_b: &mut [bool],
     cap: usize,
+    witnesses: &mut Witnesses,
 ) -> usize {
+    let tol = rule.tol;
     let mut aligned: Vec<Aligned> = Vec::new();
     let mut total = 0usize;
     for_each_frame_match(fp_a, fp_b, tol, matched_a, matched_b, |entry| {
@@ -1036,7 +1054,7 @@ fn corroborate_pair(
 
     if total <= cap {
         let held = aligned.len();
-        corroborated(&mut aligned, schedule, matched_a, matched_b, EVERY_OFFSET);
+        corroborated(&mut aligned, rule.schedule, matched_a, matched_b, EVERY_OFFSET, witnesses);
         return held;
     }
 
@@ -1067,7 +1085,7 @@ fn corroborate_pair(
             }
         });
         held = held.max(aligned.len());
-        corroborated(&mut aligned, schedule, matched_a, matched_b, (lo, hi));
+        corroborated(&mut aligned, rule.schedule, matched_a, matched_b, (lo, hi), witnesses);
     }
 
     held
@@ -1136,6 +1154,357 @@ fn plan_bands(
     bands
 }
 
+/// No vertex: an unused slot in `Witnesses`, and an unmatched vertex in the
+/// matching it builds.
+const NO_VERTEX: u32 = u32::MAX;
+
+/// The frame matches in one alignment window that could witness a candidate:
+/// the ones that are a different sample from it on both sides.
+///
+/// `window` is the window already -- `corroborated` tracks both of its edges as
+/// it goes -- so all this drops is the candidate's own row and the matches that
+/// share a sample with it. One definition for both passes of
+/// `Witnesses::enough`, so the cheap pass and the exact one cannot disagree
+/// about which matches were on offer.
+#[inline]
+fn eligible(window: &[Aligned], i: u32, j: u32) -> impl Iterator<Item = (u32, u32)> + '_ {
+    window
+        .iter()
+        .filter(move |&&(_, wi, wj, _)| wi != i && wj != j)
+        .map(|&(_, wi, wj, _)| (wi, wj))
+}
+
+/// Whether a frame match has enough *distinct* other frame matches agreeing
+/// with it about the time offset, where "distinct" is a pairing rather than a
+/// count.
+///
+/// One alignment window is a bipartite graph: the samples of A it touches on
+/// one side, the samples of B on the other, and one edge per frame match. A
+/// witness must be a different sample from the candidate on both sides and from
+/// every other witness on both sides -- which is exactly to say the witnesses
+/// are a MATCHING in that graph, and the quota is met when the largest matching
+/// reaches `needed`.
+///
+/// This used to be answered greedily, in offset order, and greedy is not the
+/// same question. It is a lower bound on the matching, and one that a wider
+/// `-d` can make WORSE: an entry admitted by a looser tolerance sorts earlier,
+/// is taken first, and consumes both sides of two matches that would otherwise
+/// have paid the quota between them. Constructed at 14 bits with a quota of two
+/// and one 16-bit blocker a bucket earlier, `-d 8` marks the candidate and
+/// `-d 10` does not -- the flag documented to only ever admit more, taking a
+/// match away. The exact matching cannot do that: adding an edge to a bipartite
+/// graph can only raise the largest matching, so every rung of `-d` sees at
+/// least what the rung below it saw, by construction rather than by luck.
+///
+/// Measured on the local corpus, that is also nearly all it changes. Reports are
+/// byte-identical at `-d 4`, `6`, `8` and `10` -- the quota is one witness out
+/// to 12 bits and a matching of one is a witness of one -- and it adds 1, 7 and
+/// 18 links at `-d 12`, `14` and `16` against 631, 981 and 3,282, taking none
+/// away at any rung. Those are rungs where precision is 84% and falling, and the
+/// one of them the labels reach is a false positive, so this is not bought for
+/// accuracy: it is bought so that the sentence above about `-d` is true.
+///
+/// # Four questions before the search, in ascending order of cost
+///
+/// Deciding the matching outright for every candidate costs 13% of phase 2 at
+/// `-d 24`, where a loose tolerance throws up 58.7 million candidates. Nothing
+/// is gained by that: the answer is settled without building anything almost
+/// every time, and each of these is exact.
+///
+/// **Is the window even big enough?** A witness is a row of the window, so a
+/// window shorter than the quota cannot pay it. `corroborated` tracks both edges
+/// of the window as it walks -- they both only move forward -- so this costs a
+/// comparison and no walk at all. At a loose `-d` it is where most candidates
+/// end: two unrelated videos throw up a handful of far-apart frame matches and
+/// are asked for eight witnesses.
+///
+/// **Did greedy reach the quota?** A greedy pairing IS a matching, so reaching
+/// the quota settles it. This is the whole of the rule for every distance out to
+/// 12 bits, where the quota is one.
+///
+/// **Did greedy fall below half of it?** What greedy leaves is a MAXIMAL
+/// matching -- it considered every eligible match in the window and took the
+/// ones whose two samples were both still free -- so every edge of the largest
+/// matching touches one of its endpoints and the largest is at most twice it.
+///
+/// **Does the window hold `needed` distinct samples on each side?** A matching
+/// pairs one sample with one sample, so it cannot outrun the smaller side. One
+/// light walk, and 5.54 million of the 5.65 million candidates that got this far
+/// at `-d 24` ended here; 107 thousand went on to build anything.
+///
+/// # What bounds the search itself
+///
+/// A window that keeps `needed * (needed - 1) + 1` edges is over the quota
+/// whatever they look like: Koenig's theorem puts a vertex cover the size of the
+/// largest matching on the graph, and no vertex is allowed more than `needed`
+/// edges here, so a graph short of the quota cannot hold that many. Both the
+/// collecting walk and the matching stop there, which is why a static camera
+/// cannot make this walk a window of a million matches looking for a witness it
+/// already has.
+///
+/// Dropping an edge at a vertex already carrying `needed` of them is safe for
+/// the same counting reason: a matching of at most `needed` edges covers at
+/// most `needed - 1` other vertices, so a rejected edge always has a kept
+/// neighbour free to stand in for it. It is what stops one static shot's worth
+/// of matches filling the graph.
+///
+/// # What it costs
+///
+/// Less than the greedy rule it replaced, because the window-size question is
+/// one the greedy rule never asked. The local corpus, warm, whole run, three
+/// runs of each: 0.10-0.11 s against 0.11-0.12 s at `-d 4`, 0.19 s either way at
+/// `-d 12`, 0.88-0.92 s against 0.89-0.92 s at `-d 18`, and **5.11-5.28 s
+/// against 5.41-5.49 s** at `-d 24`. Peak RSS is unmoved at the first three and
+/// within the run-to-run spread at the last.
+///
+/// Take any one of the four questions out and that turns into a loss. The
+/// version that searched every candidate ran phase 2 at `-d 24` in 5.40-5.56 s
+/// against 4.73-4.86 s for greedy; the window-size question alone is worth more
+/// than the whole of the difference.
+struct Witnesses {
+    /// How many samples each side has, so the search can size its slots the
+    /// first time one is actually run. Most pairs never reach it.
+    samples_a: usize,
+    samples_b: usize,
+    /// The greedy pass: the witnesses accepted so far, at most `needed` of them.
+    taken: Vec<(u32, u32)>,
+    /// Sample index on each side to the vertex it became in this window, or
+    /// `NO_VERTEX`. Cleared through `side_a`/`side_b`, so a window costs only
+    /// the vertices it touched.
+    slot_a: Vec<u32>,
+    slot_b: Vec<u32>,
+    side_a: Vec<Vertex>,
+    side_b: Vec<Vertex>,
+    edges: Vec<(u32, u32)>,
+    seen: Vec<bool>,
+}
+
+/// One sample of one video, as the matching sees it: which sample it is, how
+/// many edges it has been given, and what it is currently paired with.
+///
+/// One array rather than three, because every step of the search reads all
+/// three of a vertex's fields together.
+#[derive(Clone, Copy)]
+struct Vertex {
+    sample: u32,
+    degree: u32,
+    mate: u32,
+}
+
+impl Witnesses {
+    /// One of these per phase-2 worker, reused for every pair it is handed:
+    /// the buffers below are cleared per candidate and grown at most once per
+    /// worker, so the ordinary path allocates nothing at all.
+    fn new() -> Self {
+        Witnesses {
+            samples_a: 0,
+            samples_b: 0,
+            taken: Vec::new(),
+            slot_a: Vec::new(),
+            slot_b: Vec::new(),
+            side_a: Vec::new(),
+            side_b: Vec::new(),
+            edges: Vec::new(),
+            seen: Vec::new(),
+        }
+    }
+
+    /// Take up a new pair. Only the slot arrays care, and they are grown lazily
+    /// by `reset`, since a pair whose every candidate is settled by the greedy
+    /// pass never indexes them.
+    fn begin(&mut self, samples_a: usize, samples_b: usize) {
+        self.samples_a = samples_a;
+        self.samples_b = samples_b;
+    }
+
+    fn enough(&mut self, window: &[Aligned], i: u32, j: u32, needed: usize) -> bool {
+        if needed == 0 {
+            return true;
+        }
+        debug_assert!(needed <= MAX_WITNESSES);
+        // A witness is a row of this window, so a window holding fewer rows than
+        // the quota cannot pay it whatever they are. Free -- `corroborated`
+        // already knows where the window ends -- and at a loose `-d` it is the
+        // first thing most candidates die on, before anything is walked at all.
+        if window.len() < needed {
+            return false;
+        }
+
+        // Greedy, in offset order, exactly as the rule was before it was exact.
+        // `taken` never grows past `needed`, so the scan of it is the same
+        // handful of comparisons the stack array it replaced held.
+        self.taken.clear();
+        for (wi, wj) in eligible(window, i, j) {
+            if self.taken.iter().any(|&(ui, uj)| ui == wi || uj == wj) {
+                continue;
+            }
+            self.taken.push((wi, wj));
+            if self.taken.len() >= needed {
+                return true;
+            }
+        }
+        // Maximal, so the largest matching is at most twice it -- see the type
+        // doc. This is where nearly every candidate at a loose `-d` ends.
+        if self.taken.len() * 2 < needed {
+            return false;
+        }
+        self.exact(window, i, j, needed)
+    }
+
+    /// The largest matching in the window, decided rather than approximated.
+    ///
+    /// Only reached from a greedy pairing that landed between half the quota and
+    /// the quota, which is the one range where the two can disagree.
+    fn exact(&mut self, window: &[Aligned], i: u32, j: u32, needed: usize) -> bool {
+        if !self.side_is_wide_enough(window, i, j, needed) {
+            return false;
+        }
+        self.reset();
+        let conclusive = needed * (needed - 1) + 1;
+        let mut paired = 0usize;
+        for (wi, wj) in eligible(window, i, j) {
+            let a = self.vertex_a(wi) as usize;
+            let b = self.vertex_b(wj) as usize;
+            if self.side_a[a].degree as usize >= needed || self.side_b[b].degree as usize >= needed {
+                continue;
+            }
+            self.side_a[a].degree += 1;
+            self.side_b[b].degree += 1;
+            self.edges.push((a as u32, b as u32));
+            if self.side_a[a].mate == NO_VERTEX && self.side_b[b].mate == NO_VERTEX {
+                self.side_a[a].mate = b as u32;
+                self.side_b[b].mate = a as u32;
+                paired += 1;
+                if paired >= needed {
+                    return true;
+                }
+            }
+            if self.edges.len() >= conclusive {
+                return true;
+            }
+        }
+
+        debug_assert!(self.side_a.len() >= needed && self.side_b.len() >= needed);
+
+        self.seen.clear();
+        self.seen.resize(self.side_b.len(), false);
+        // Only an unmatched A-side vertex can start an augmenting path, and each
+        // path raises the pairing by exactly one, so what is left to try is what
+        // is left to gain. Two failures in a row usually settle it.
+        let mut untried = self.side_a.len() - paired;
+        for a in 0..self.side_a.len() {
+            if paired + untried < needed {
+                return false;
+            }
+            if self.side_a[a].mate != NO_VERTEX {
+                continue;
+            }
+            untried -= 1;
+            self.seen.iter_mut().for_each(|s| *s = false);
+            if augment(a as u32, &self.edges, &mut self.side_a, &mut self.side_b, &mut self.seen) {
+                paired += 1;
+                if paired >= needed {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether the window has `needed` distinct samples on each side, which a
+    /// matching cannot outrun -- it pairs one sample with one sample.
+    ///
+    /// This is the test 98% of the candidates that reach the search die on: a
+    /// window of a dozen frame matches asked for a dozen witnesses. Answering it
+    /// first, out of one light walk, is what keeps the exact rule as cheap as
+    /// the greedy one -- it was measured at 5.65 million searches over the local
+    /// corpus at `-d 24`, of which 5.54 million ended here and 107 thousand went
+    /// on to build anything.
+    ///
+    /// A bit per sample, so it is exact only while the samples fit in the word,
+    /// and a `true` for anything longer -- 96.7% of the files in the local
+    /// corpus are under 64 samples, and a file with more is a long video whose
+    /// pairs are the expensive ones anyway. Erring toward the search is the safe
+    /// direction: it is the exact answer either way, this only decides how much
+    /// is built before reaching it.
+    fn side_is_wide_enough(&self, window: &[Aligned], i: u32, j: u32, needed: usize) -> bool {
+        if self.samples_a > u64::BITS as usize || self.samples_b > u64::BITS as usize {
+            return true;
+        }
+        let (mut seen_a, mut seen_b) = (0u64, 0u64);
+        for (wi, wj) in eligible(window, i, j) {
+            seen_a |= 1 << wi;
+            seen_b |= 1 << wj;
+        }
+        seen_a.count_ones() as usize >= needed && seen_b.count_ones() as usize >= needed
+    }
+
+    fn reset(&mut self) {
+        // Sized on first use, and grown rather than rebuilt: `reset` restores
+        // every slot it touched, so what is already there is already clear.
+        if self.slot_a.len() < self.samples_a {
+            self.slot_a.resize(self.samples_a, NO_VERTEX);
+        }
+        if self.slot_b.len() < self.samples_b {
+            self.slot_b.resize(self.samples_b, NO_VERTEX);
+        }
+        for v in &self.side_a {
+            self.slot_a[v.sample as usize] = NO_VERTEX;
+        }
+        for v in &self.side_b {
+            self.slot_b[v.sample as usize] = NO_VERTEX;
+        }
+        self.side_a.clear();
+        self.side_b.clear();
+        self.edges.clear();
+    }
+
+    fn vertex_a(&mut self, sample: u32) -> u32 {
+        let slot = &mut self.slot_a[sample as usize];
+        if *slot == NO_VERTEX {
+            *slot = self.side_a.len() as u32;
+            self.side_a.push(Vertex { sample, degree: 0, mate: NO_VERTEX });
+        }
+        *slot
+    }
+
+    fn vertex_b(&mut self, sample: u32) -> u32 {
+        let slot = &mut self.slot_b[sample as usize];
+        if *slot == NO_VERTEX {
+            *slot = self.side_b.len() as u32;
+            self.side_b.push(Vertex { sample, degree: 0, mate: NO_VERTEX });
+        }
+        *slot
+    }
+}
+
+/// One augmenting step of the matching: find an alternating path from an
+/// unmatched A-side vertex to an unmatched B-side one, and flip it.
+///
+/// Recursion depth is bounded by the number of edges, which `Witnesses::exact`
+/// caps at `needed * (needed - 1) + 1` before it ever gets here.
+fn augment(
+    a: u32,
+    edges: &[(u32, u32)],
+    side_a: &mut [Vertex],
+    side_b: &mut [Vertex],
+    seen: &mut [bool],
+) -> bool {
+    for &(from, to) in edges {
+        if from != a || seen[to as usize] {
+            continue;
+        }
+        seen[to as usize] = true;
+        let held = side_b[to as usize].mate;
+        if held == NO_VERTEX || augment(held, edges, side_a, side_b, seen) {
+            side_b[to as usize].mate = a;
+            side_a[a as usize].mate = to;
+            return true;
+        }
+    }
+    false
+}
+
 /// Flag every frame match that enough *other* frame matches agree with about the
 /// time offset between the two videos.
 ///
@@ -1150,11 +1519,10 @@ fn plan_bands(
 /// witnesses off two samples a side, so a quota of four could be filled by two
 /// coincidences instead of four.
 ///
-/// The witnesses are taken greedily in offset order, which is a maximum
-/// bipartite matching in all but a handful of cases: against an exact matching
-/// over this corpus the two agree on every pair out to `-d 10`, on all but one
-/// at `-d 12` and all but four at `-d 14`. Greedy costs one linear scan of at
-/// most `needed` accepted pairs and no allocation.
+/// Which witnesses those are is a maximum bipartite matching over the window --
+/// samples of A on one side, samples of B on the other, one edge per frame
+/// match -- and the quota is met when that matching reaches `needed`. See
+/// `Witnesses::enough`, which decides it without usually having to search.
 ///
 /// How many witnesses are enough comes from `schedule`, i.e. from how far apart
 /// the two frames were -- one out to 12 bits, two at 14, three at 16. A single
@@ -1170,6 +1538,7 @@ fn corroborated(
     matched_a: &mut [bool],
     matched_b: &mut [bool],
     targets: (i64, i64),
+    witnesses: &mut Witnesses,
 ) {
     if aligned.len() < 2 {
         return;
@@ -1179,22 +1548,32 @@ fn corroborated(
     // long videos it is the largest thing this pass holds.
     aligned.sort_unstable();
 
-    // `lo` is the first entry still inside the window of `k`, and it only ever
-    // moves forward, so finding the left edge is linear over the whole scan. The
-    // right edge is walked per entry, and the walk stops as soon as the quota is
-    // met -- which on a genuine pair is within the next entry or two.
+    // The scratch space is the worker's, not this pass's: it is indexed by
+    // sample number, so it only has to be told how far the two fingerprints
+    // reach, and the buffers it grew for the last pair are already clear.
+    witnesses.begin(matched_a.len(), matched_b.len());
+
+    // `lo` is the first entry still inside the window of `k` and `hi` the first
+    // one past it. Both only ever move forward, because `offset` does, so the
+    // two of them together are one pass over the slice rather than a walk out
+    // from every candidate -- and knowing where the window ENDS is what lets
+    // `Witnesses::enough` refuse a candidate on the window's size alone.
     let mut lo = 0usize;
+    let mut hi = 0usize;
     for k in 0..aligned.len() {
         let (offset, i, j, distance) = aligned[k];
         while offset - aligned[lo].0 > ALIGNMENT_TOLERANCE_MS {
             lo += 1;
         }
+        while hi < aligned.len() && aligned[hi].0 - offset <= ALIGNMENT_TOLERANCE_MS {
+            hi += 1;
+        }
         // Outside the band this call is responsible for: present as a witness
         // for the matches that are inside it, and judged in the band that holds
         // it, where its own window is complete. Skipping it here is the one
         // safe direction anyway -- a skirt entry can only ever see FEWER
-        // witnesses than it is owed, never more. `lo` is advanced first,
-        // because it walks the whole slice whatever this step is for.
+        // witnesses than it is owed, never more. Both edges are advanced
+        // first, because they walk the whole slice whatever this step is for.
         // `EVERY_OFFSET` makes this false for every entry.
         if offset < targets.0 || offset >= targets.1 {
             continue;
@@ -1204,27 +1583,9 @@ fn corroborated(
             continue;
         }
         // Witnesses must be distinct from EACH OTHER as well as from the
-        // candidate, on both sides. `needed` is small, so the accepted set is a
-        // linear scan of a stack array rather than anything allocated.
-        let mut used: [(u32, u32); MAX_WITNESSES] = [(u32::MAX, u32::MAX); MAX_WITNESSES];
-        let mut witnesses = 0usize;
-        for &(o, wi, wj, _) in aligned[lo..].iter() {
-            if o - offset > ALIGNMENT_TOLERANCE_MS {
-                break;
-            }
-            if wi == i || wj == j {
-                continue;
-            }
-            if used[..witnesses].iter().any(|&(ui, uj)| ui == wi || uj == wj) {
-                continue;
-            }
-            used[witnesses] = (wi, wj);
-            witnesses += 1;
-            if witnesses >= needed as usize {
-                break;
-            }
-        }
-        if witnesses as u32 >= needed {
+        // candidate, on both sides, which is what makes the question a matching
+        // rather than a count.
+        if witnesses.enough(&aligned[lo..hi], i, j, needed as usize) {
             matched_a[i as usize] = true;
             matched_b[j as usize] = true;
         }
@@ -1257,6 +1618,7 @@ pub fn find_all_matches(
     // One table for the whole run: it depends on the hash width alone, and
     // every pair reads the same answers out of it.
     let schedule = witness_schedule();
+    let rule = Rule { tol, schedule: &schedule };
 
     // The two arms differ only in where the pairs come from, and they agree on
     // every pair: the index is exhaustive, and the direct route is what
@@ -1286,10 +1648,17 @@ pub fn find_all_matches(
             .into_par_iter()
             .flat_map(|v_a| ((v_a + 1)..n).into_par_iter().map(move |v_b| (v_a, v_b)))
             .map_init(
-                || Ticker::new(&pb),
-                |ticker, pair| {
+                || (Ticker::new(&pb), Witnesses::new()),
+                |(ticker, witnesses), pair| {
                     ticker.tick();
-                    measure_pair(fingerprints, pair, tol, &schedule, min_match_percent, min_duration)
+                    measure_pair(
+                        fingerprints,
+                        pair,
+                        rule,
+                        min_match_percent,
+                        min_duration,
+                        witnesses,
+                    )
                 },
             )
             .flatten()
@@ -1308,10 +1677,10 @@ pub fn find_all_matches(
     let matches = pairs
         .into_par_iter()
         .map_init(
-            || Ticker::new(&pb),
-            |ticker, pair| {
+            || (Ticker::new(&pb), Witnesses::new()),
+            |(ticker, witnesses), pair| {
                 ticker.tick();
-                measure_pair(fingerprints, pair, tol, &schedule, min_match_percent, min_duration)
+                measure_pair(fingerprints, pair, rule, min_match_percent, min_duration, witnesses)
             },
         )
         .flatten()
@@ -1402,10 +1771,10 @@ impl Drop for Ticker<'_> {
 fn measure_pair(
     fingerprints: &[VideoFingerprint],
     (v_a, v_b): (usize, usize),
-    tol: Tolerance,
-    schedule: &[u32; HASH_BITS as usize + 1],
+    rule: Rule,
     min_match_percent: f32,
     min_duration: f64,
+    witnesses: &mut Witnesses,
 ) -> Option<Match> {
     if shutdown_requested() {
         return None;
@@ -1413,7 +1782,7 @@ fn measure_pair(
     let fp_a = &fingerprints[v_a];
     let fp_b = &fingerprints[v_b];
 
-    let (pct_a, pct_b, span_a, span_b) = match_overlap(fp_a, fp_b, tol, schedule);
+    let (pct_a, pct_b, span_a, span_b) = match_overlap(fp_a, fp_b, rule, witnesses);
 
     // A pair that shares NOTHING is not a match at any setting, and that has to
     // be said separately from the gate: `-p 0` makes `< min_match_percent` false
@@ -1532,6 +1901,12 @@ mod tests {
     /// mapping from the flag.
     fn exactly(bits: u32) -> Tolerance {
         Tolerance { strict: bits, loose: bits }
+    }
+
+    /// The same thing as a whole `Rule`, for the tests that call the pair-level
+    /// entry points rather than the corroboration pass directly.
+    fn exact_rule<'a>(bits: u32, schedule: &'a [u32; HASH_BITS as usize + 1]) -> Rule<'a> {
+        Rule { tol: exactly(bits), schedule }
     }
 
     #[test]
@@ -1769,11 +2144,11 @@ mod tests {
         let held = corroborate_pair(
             fp_a,
             fp_b,
-            tol,
-            &witness_schedule(),
+            Rule { tol, schedule: &witness_schedule() },
             &mut matched_a,
             &mut matched_b,
             cap,
+            &mut Witnesses::new(),
         );
         (matched_a, matched_b, held)
     }
@@ -1885,6 +2260,151 @@ mod tests {
         assert!(find_all_matches(&pair_of(needed as u64 + 4), 8, 1.0, 0.0).is_empty());
         // A looser one takes each match on its own distance, quota irrelevant.
         assert!(!find_all_matches(&pair_of(2), 16, 1.0, 0.0).is_empty());
+    }
+
+    #[test]
+    fn test_a_wider_tolerance_never_takes_a_frame_match_away() {
+        // The whole promise of `-d`: both tolerances move up with it, so every
+        // frame match admitted at one rung is admitted at the next. Greedy
+        // witness selection broke it, and only ever this way round -- a match
+        // the LOOSER setting admits sorts earlier in the offset order, is taken
+        // first, and consumes both sides of two witnesses that would otherwise
+        // have paid the quota between them.
+        //
+        // Three samples a side. The candidate is a0/b0 at 14 bits, so it needs
+        // two witnesses; a1/b1 and a2/b2 are the two, at 14 bits each and at
+        // the same offset. The blocker is a1/b2 at 16 bits -- out of reach at
+        // `-d 8` (loose 14), in reach at `-d 10` (loose 16) -- placed 100 ms
+        // earlier so it is the first thing the greedy walk sees. It touches a1
+        // and b2, which is one side of each real witness.
+        let a = vec![0xFFFF_FFFF_0000_0000u64, 0x0u64, 0x3Fu64];
+        let b = vec![0xFFFF_FFFF_000F_FFC0u64, 0x000F_FFC0u64, 0x0003_FFFCu64];
+        let distance = |x: u64, y: u64| (x ^ y).count_ones();
+        assert_eq!(
+            [distance(a[0], b[0]), distance(a[1], b[1]), distance(a[2], b[2])],
+            [14, 14, 14]
+        );
+        assert_eq!(distance(a[1], b[2]), 16, "the blocker");
+        assert_eq!(witness_schedule()[14], 2, "the candidate has to need both witnesses");
+        for (i, &x) in a.iter().enumerate() {
+            for (j, &y) in b.iter().enumerate() {
+                assert!(i == j || (i, j) == (1, 2) || distance(x, y) > 16, "stray match {i}/{j}");
+            }
+        }
+
+        let fp_a = mock_fp_at(a, vec![15_000, 25_000, 25_100]);
+        let fp_b = mock_fp_at(b, vec![10_000, 20_000, 20_100]);
+        for d in [8u32, 10] {
+            let (marked_a, marked_b, _) =
+                corroborate_with_cap(&fp_a, &fp_b, Tolerance::for_distance(d), usize::MAX);
+            assert_eq!(marked_a, [true; 3], "-d {d} lost a sample of A");
+            assert_eq!(marked_b, [true; 3], "-d {d} lost a sample of B");
+        }
+    }
+
+    #[test]
+    fn test_no_rung_of_the_tolerance_reports_less_than_the_one_below_it() {
+        // The same promise, asked of the whole ladder over pseudo-random pairs
+        // rather than of one constructed case. Coverage is what `-p` gates on,
+        // so it is coverage that has to be monotone; a rung that reports less
+        // than the one below it is the bug this is here to catch.
+        let mut seed = 0x243F_6A88_85A3_08D3u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..200 {
+            // Hashes clustered around a common ancestor, so the pair holds
+            // matches at a spread of distances rather than none at all.
+            let base = next();
+            let noisy = |bits: u32, r: &mut dyn FnMut() -> u64| {
+                let mut h = base;
+                for _ in 0..bits {
+                    h ^= 1u64 << (r() % 64);
+                }
+                h
+            };
+            let n = 3 + (next() % 6) as usize;
+            let a: Vec<u64> = (0..n).map(|_| noisy(6 + (next() % 12) as u32, &mut next)).collect();
+            let b: Vec<u64> = (0..n).map(|_| noisy(6 + (next() % 12) as u32, &mut next)).collect();
+            // Times close enough together that everything is in one alignment
+            // window, which is where the witness rule actually has to decide.
+            let times = |r: &mut dyn FnMut() -> u64| -> Vec<u32> {
+                let mut t = 10_000u32;
+                (0..n)
+                    .map(|_| {
+                        t += 60 + (r() % 200) as u32;
+                        t
+                    })
+                    .collect()
+            };
+            let fp_a = mock_fp_at(a, times(&mut next));
+            let fp_b = mock_fp_at(b, times(&mut next));
+
+            let mut previous: Option<(f32, f32)> = None;
+            for d in (0..=20).step_by(2) {
+                let (cov_a, cov_b, _, _) =
+                    match_overlap(
+                        &fp_a,
+                        &fp_b,
+                        Rule { tol: Tolerance::for_distance(d), schedule: &witness_schedule() },
+                        &mut Witnesses::new(),
+                    );
+                if let Some((was_a, was_b)) = previous {
+                    assert!(
+                        cov_a >= was_a && cov_b >= was_b,
+                        "case {case}: -d {d} covers ({cov_a}, {cov_b}) where -d {} covered ({was_a}, {was_b})",
+                        d - 2
+                    );
+                }
+                previous = Some((cov_a, cov_b));
+            }
+        }
+    }
+
+    #[test]
+    fn test_witnesses_are_paired_off_rather_than_counted_up() {
+        // Two witnesses are available and a greedy walk cannot see both: the
+        // first entry it meets touches one side of each of them. Nothing about
+        // the quota changes -- three distinct samples a side are involved, and
+        // two of them can be paired with two of the other -- so the candidate
+        // is corroborated.
+        let mut scratch = Witnesses::new();
+        scratch.begin(4, 9);
+        let window: Vec<Aligned> = vec![
+            (0, 1, 2, 16), // the blocker: takes a1 and b2 between them
+            (0, 1, 1, 14),
+            (0, 2, 2, 14),
+            (0, 0, 0, 14), // the candidate itself, which is never its own witness
+        ];
+        assert!(scratch.enough(&window, 0, 0, 2));
+        // Three is genuinely out of reach: only a1/a2 and b1/b2 are free of the
+        // candidate, so no matching there can exceed two.
+        assert!(!scratch.enough(&window, 0, 0, 3));
+        // And one side repeating itself is not two witnesses however many
+        // matches it produces.
+        let static_shot: Vec<Aligned> = (1..9).map(|j| (0, 1, j, 14)).collect();
+        assert!(scratch.enough(&static_shot, 0, 0, 1));
+        assert!(!scratch.enough(&static_shot, 0, 0, 2));
+
+        // The case that needs the augmenting search rather than the edge count:
+        // three witnesses are there (a1/b3, a2/b2, a3/b1) and the pairing has to
+        // be rearranged to find them, on too few edges for the Koenig bound to
+        // settle it. The greedy walk takes a1/b1 and a2/b2 and then has nothing
+        // left for a3.
+        let mut scratch = Witnesses::new();
+        scratch.begin(5, 5);
+        let rearrange: Vec<Aligned> = vec![
+            (0, 1, 1, 14),
+            (0, 2, 2, 14),
+            (0, 1, 3, 14),
+            (0, 3, 1, 14),
+        ];
+        assert!(rearrange.len() < 3 * (3 - 1) + 1, "the edge count must not settle it");
+        assert!(scratch.enough(&rearrange, 0, 0, 3));
+        assert!(!scratch.enough(&rearrange, 0, 0, 4));
     }
 
     #[test]
@@ -2278,7 +2798,8 @@ mod tests {
         let host = mock_fp_sampled((0..10).map(distinct_hash).collect(), 1000);
         let clip = mock_fp_sampled((4..7).map(distinct_hash).collect(), 1000);
 
-        let (_, _, span_clip, span_host) = match_overlap(&clip, &host, exactly(0), &witness_schedule());
+        let (_, _, span_clip, span_host) =
+            match_overlap(&clip, &host, exact_rule(0, &witness_schedule()), &mut Witnesses::new());
 
         assert_eq!(span_clip, Some(Span { start_ms: 0, end_ms: 3000 }));
         assert_eq!(
@@ -2298,7 +2819,8 @@ mod tests {
         let a = mock_fp_sampled((0..10).map(distinct_hash).collect(), 1000);
         let b = mock_fp_sampled(vec![distinct_hash(0), distinct_hash(9)], 1000);
 
-        let (coverage_a, _, span_a, _) = match_overlap(&a, &b, exactly(0), &witness_schedule());
+        let (coverage_a, _, span_a, _) =
+            match_overlap(&a, &b, exact_rule(0, &witness_schedule()), &mut Witnesses::new());
 
         assert_eq!(span_a, Some(Span { start_ms: 0, end_ms: 10_000 }));
         // Two samples of ten, i.e. two seconds of the ten the envelope spans.
@@ -2396,7 +2918,8 @@ mod tests {
         let a = mock_fp_sampled(vec![distinct_hash(1)], 1000);
         let b = mock_fp_sampled(vec![distinct_hash(2)], 1000);
 
-        let (_, _, span_a, span_b) = match_overlap(&a, &b, exactly(0), &witness_schedule());
+        let (_, _, span_a, span_b) =
+            match_overlap(&a, &b, exact_rule(0, &witness_schedule()), &mut Witnesses::new());
 
         assert_eq!(span_a, None);
         assert_eq!(span_b, None);
