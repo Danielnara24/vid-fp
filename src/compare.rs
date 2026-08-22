@@ -1420,11 +1420,17 @@ impl Witnesses {
         }
 
         // Every vertex here carries at least one edge, so this is the same
-        // question `side_is_wide_enough` asks, over what the window really
-        // offered. It is not redundant with it: that test gives up and says yes
-        // for a file with more samples than fit in its bitmask, and this is the
-        // exact answer for every pair. A matching pairs one sample with one
-        // sample, so it cannot outrun the smaller side.
+        // question `side_is_wide_enough` asks, over what the collecting loop
+        // really kept. It is not redundant with it: the degree cap can drop
+        // every edge a sample had, so a sample that side_is_wide_enough counted
+        // need not have a vertex here. A matching pairs one sample with one
+        // sample, so it cannot outrun the smaller side either way.
+        //
+        // It was a `debug_assert` until the cap started dropping edges before
+        // creating vertices, and it was wrong: `side_is_wide_enough` used to
+        // give up and say yes past 64 samples, so the property it asserted was
+        // simply never established for a long video and every debug build
+        // aborted on the first such pair. It is exact on both counts now.
         if self.side_a.len() < needed || self.side_b.len() < needed {
             return false;
         }
@@ -1464,15 +1470,35 @@ impl Witnesses {
     /// corpus at `-d 24`, of which 5.54 million ended here and 107 thousand went
     /// on to build anything.
     ///
-    /// A bit per sample, so it is exact only while the samples fit in the word,
-    /// and a `true` for anything longer -- 96.7% of the files in the local
-    /// corpus are under 64 samples, and a file with more is a long video whose
-    /// pairs are the expensive ones anyway. Erring toward the search is the safe
-    /// direction: it is the exact answer either way, this only decides how much
-    /// is built before reaching it.
+    /// A bit per sample answers it in two instructions a row, and is what the
+    /// measurement above was taken over -- but only while the samples fit in
+    /// the word. The version this replaced had nothing else, so past
+    /// `u64::BITS` samples it gave up and returned `true`, excused on the
+    /// grounds that a file with more is a long video whose pairs are the
+    /// expensive ones anyway. That is the argument FOR the cheap rejection
+    /// rather than against it: it left the 3.3% of files in the local corpus
+    /// carrying more than 64 samples building a graph for every candidate that
+    /// reached here, and it meant the property this function's name states was
+    /// never established for them at all -- which is what the `debug_assert` it
+    /// used to stand behind found out the hard way (see `exact`).
+    ///
+    /// So a wider file gets `wide_sides_are_wide_enough` instead, which is the
+    /// same question decided by collecting distinct samples rather than by
+    /// marking them. Two routes to one predicate is the thing this file
+    /// otherwise avoids, and it is bought here because the narrow one is the
+    /// hot one: making every pair take the wide route costs ~1.5% of wall time
+    /// at `-d 24` (5.37 s against 5.29 s, interleaved, means of five) for a
+    /// verdict that is identical by construction. The differential test walks
+    /// every one of its 4,000 windows past BOTH, so the collecting route cannot
+    /// refuse a window the bitmask would have allowed. What no verdict test can
+    /// catch is the opposite -- a route that gives up and says `true` reaches
+    /// the same answer through the graph, which is how the old one survived
+    /// every test there was -- so the refusal itself is pinned directly, in
+    /// `test_a_file_too_wide_for_the_bitmask_still_needs_witnesses_on_both_sides`.
     fn side_is_wide_enough(&self, window: &[Aligned], i: u32, j: u32, needed: usize) -> bool {
+        debug_assert!(needed <= MAX_WITNESSES);
         if self.samples_a > u64::BITS as usize || self.samples_b > u64::BITS as usize {
-            return true;
+            return Self::wide_sides_are_wide_enough(window, i, j, needed);
         }
         let (mut seen_a, mut seen_b) = (0u64, 0u64);
         for (wi, wj) in eligible(window, i, j) {
@@ -1480,6 +1506,34 @@ impl Witnesses {
             seen_b |= 1 << wj;
         }
         seen_a.count_ones() as usize >= needed && seen_b.count_ones() as usize >= needed
+    }
+
+    /// `side_is_wide_enough` for a file with more samples than a word holds.
+    ///
+    /// Nothing here grows with the sample count, which is the whole reason it
+    /// can be asked of a long video: `needed` is at most `MAX_WITNESSES`,
+    /// neither array is filled past it -- a side that has already reached the
+    /// quota cannot get wider in any way that matters -- and the walk stops the
+    /// moment both sides have. So a row costs at most `2 * needed` comparisons
+    /// against arrays that fit in a few cache lines, against a graph build and
+    /// an augmenting search if it is skipped.
+    fn wide_sides_are_wide_enough(window: &[Aligned], i: u32, j: u32, needed: usize) -> bool {
+        let (mut seen_a, mut seen_b) = ([0u32; MAX_WITNESSES], [0u32; MAX_WITNESSES]);
+        let (mut wide_a, mut wide_b) = (0usize, 0usize);
+        for (wi, wj) in eligible(window, i, j) {
+            if wide_a < needed && !seen_a[..wide_a].contains(&wi) {
+                seen_a[wide_a] = wi;
+                wide_a += 1;
+            }
+            if wide_b < needed && !seen_b[..wide_b].contains(&wj) {
+                seen_b[wide_b] = wj;
+                wide_b += 1;
+            }
+            if wide_a >= needed && wide_b >= needed {
+                return true;
+            }
+        }
+        false
     }
 
     /// Whether an already-created vertex has taken all the edges it is allowed.
@@ -2536,16 +2590,25 @@ mod tests {
                     window.push((0, wi, wj, 14));
                 }
             }
-            scratch.begin(samples as usize, samples as usize);
             let largest = largest_matching(&window, 0, 0);
-            for needed in 1..=5usize {
-                assert_eq!(
-                    scratch.enough(&window, 0, 0, needed),
-                    largest >= needed,
-                    "needed {needed}, largest {largest}, window {window:?}"
-                );
-                if largest >= needed && needed >= 3 {
-                    reached_the_search += 1;
+            // Every window is asked twice: once with the files declared at
+            // their real width, which takes the bitmask route through
+            // `side_is_wide_enough`, and once with both declared past
+            // `u64::BITS` samples, which takes the collecting one. The verdict
+            // is a property of the window, so the two routes have to agree --
+            // and the wide one is the route that returned `true` unconditionally
+            // until the exits below were made to stand on their own.
+            for declared in [samples as usize, samples as usize + 64] {
+                scratch.begin(declared, declared);
+                for needed in 1..=5usize {
+                    assert_eq!(
+                        scratch.enough(&window, 0, 0, needed),
+                        largest >= needed,
+                        "needed {needed}, largest {largest}, declared {declared}, window {window:?}"
+                    );
+                    if largest >= needed && needed >= 3 {
+                        reached_the_search += 1;
+                    }
                 }
             }
         }
@@ -2554,20 +2617,18 @@ mod tests {
 
     #[test]
     fn test_a_file_too_wide_for_the_bitmask_still_needs_witnesses_on_both_sides() {
-        // Past `u64::BITS` samples `side_is_wide_enough` gives up and says yes,
-        // so the count of distinct samples per side has to be settled by the
-        // graph itself. Every edge here is the same sample of A, so no matching
-        // can exceed one however many edges there are, and one side of the
-        // graph ends up narrower than the quota.
-        //
-        // That is what the `debug_assert` this replaced asserted could not
-        // happen, and it fired: `cargo test` on a pair like this panicked,
-        // where the release build reached the right answer by the `untried`
-        // exit instead. The isolated vertex is `b3` here -- the last edge is
-        // dropped for A's degree, and the old order had already made B's vertex
-        // for it. On side A the same thing inflates `side_a.len()`, which
-        // `untried` is derived from; that route is covered by the differential
-        // test above.
+        // Every edge here is the same sample of A, so no matching can exceed
+        // one however many edges there are, and side A is narrower than any
+        // quota above that. Both files are declared past `u64::BITS` samples,
+        // which used to be the width at which `side_is_wide_enough` gave up and
+        // said yes -- so this question fell through to the graph, and the
+        // `debug_assert` standing there said a state the give-up made reachable
+        // was impossible. It fired: `cargo test` on a pair like this panicked at
+        // any `-d` whose quota reaches 3 (16 bits, so `-d 10` and up), where the
+        // release build reached the right answer by the `untried` exit instead.
+        // The predicate is exact at every width now and settles it before a
+        // graph is built; the exit it used to be an assert about is still there
+        // for the samples the degree cap leaves without a vertex at all.
         let mut scratch = Witnesses::new();
         scratch.begin(70, 70);
         let window: Vec<Aligned> = vec![
@@ -2579,6 +2640,14 @@ mod tests {
         assert!(scratch.enough(&window, 0, 0, 1));
         assert!(!scratch.enough(&window, 0, 0, 2));
         assert_eq!(largest_matching(&window, 0, 0), 1);
+
+        // And asked of the predicate directly, because the verdict alone cannot
+        // tell the two apart: a route that gave up and said `true` would still
+        // reach this answer through the graph, which is exactly why the old one
+        // survived every test there was. Only the cheap refusal itself is
+        // evidence that a long file is settled before a graph is built.
+        assert!(!Witnesses::wide_sides_are_wide_enough(&window, 0, 0, 2));
+        assert!(Witnesses::wide_sides_are_wide_enough(&window, 0, 0, 1));
     }
 
     #[test]
