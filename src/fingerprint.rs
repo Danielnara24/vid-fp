@@ -488,11 +488,17 @@ impl std::fmt::Display for NotMedia {
         if self.bytes == 0 {
             return write!(f, "this file is empty");
         }
+        // Reached by a file holding exactly one byte, which is the same class of
+        // near-empty file the zero case above is about -- a truncated download,
+        // an interrupted copy -- so it is the one length that is actually likely
+        // rather than a pedantic possibility.
+        let unit = if self.bytes == 1 { "byte" } else { "bytes" };
         write!(
             f,
-            "no demuxer recognised the first {} bytes of this file (the best guess scored {} of \
+            "no demuxer recognised the first {} {} of this file (the best guess scored {} of \
              {}, which libavformat treats as no evidence)",
             self.bytes,
+            unit,
             self.score,
             ffmpeg_next::ffi::AVPROBE_SCORE_MAX
         )
@@ -2674,6 +2680,33 @@ mod tests {
         let said = format!("{:#}", e);
         assert!(said.contains("empty"), "say what is wrong with it: {}", said);
         assert!(!said.contains("16384"), "not what a probe would have read: {}", said);
+    }
+
+    /// The rung between them. A one-byte file is the same class of near-empty
+    /// thing the case above is about -- a truncated download, an interrupted
+    /// copy -- and it is the one length at which the sentence has to say "byte".
+    #[test]
+    fn test_a_file_of_one_byte_is_refused_in_the_singular() {
+        init_ffmpeg_for_tests();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncated.mp4");
+        std::fs::write(&path, b"\0").unwrap();
+
+        let Weighed::Undecodable(e) = weigh_decode(&path.to_string_lossy(), 0.0, 4.0, 0.0, 1) else {
+            panic!("one byte is not a video");
+        };
+        let said = format!("{:#}", e);
+        assert!(said.contains("first 1 byte of"), "one byte, not one bytes: {}", said);
+        assert!(!said.contains("1 bytes"), "the plural has no business here: {}", said);
+    }
+
+    /// And the plural is still the plural everywhere else, which is the half a
+    /// naive fix breaks.
+    #[test]
+    fn test_more_than_one_byte_keeps_the_plural() {
+        let said = format!("{}", NotMedia { bytes: 2, score: 0 });
+        assert!(said.contains("first 2 bytes of"), "{}", said);
     }
 
     /// And the gate lets the real thing through untouched, which every other

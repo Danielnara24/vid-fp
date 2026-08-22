@@ -131,15 +131,30 @@ pub enum Disposal {
     MoveTo(PathBuf),
 }
 
+/// Width of the leading action column in both listings, comma included.
+///
+/// It has to hold the longest word either listing can print, and that word is
+/// UNLINKED -- nine characters with the comma. It was 8 for as long as DELETED,
+/// CHANGED and SKIPPED were the longest, so adding UNLINKED shifted every field
+/// of exactly those rows one place right: the rows a reader is most likely to
+/// be squinting at, since they are the ones whose byte total does not add up.
+/// A named constant rather than a literal in two format strings, because the
+/// two listings are the same table and drifted apart silently the last time a
+/// word was added.
+pub const ACTION_COLUMN: usize = 9;
+
 impl Disposal {
     /// Label for the results table once the file has been dealt with.
     ///
-    /// A file that was only a name for data reachable elsewhere gets its own
-    /// word rather than the mode's, because that row is the whole explanation
-    /// for a byte total smaller than the sum of the rows above it. UNLINKED is
-    /// literally what happened in all three modes: `remove_file`, the trash's
-    /// rename, and `--move-to`'s rename all take the name off this path, and in
-    /// this one case that is all they take.
+    /// A file whose bytes did not go where the mode says gets its own word
+    /// rather than the mode's, because that row is the whole explanation for a
+    /// byte total smaller than the sum of the rows above it. UNLINKED is
+    /// literally what happened to it: `remove_file`, the trash's rename and
+    /// `--move-to`'s rename all take the name off this path, and for these rows
+    /// that is all they take. `frees_nothing` decides which rows those are, and
+    /// it is not simply "every alias" -- a hard link relocated by a rename
+    /// arrives at the destination with the whole video in it and is MOVED like
+    /// any other row.
     pub fn done_label(&self, aliased: bool) -> &'static str {
         if aliased {
             return "UNLINKED";
@@ -179,10 +194,32 @@ struct OnDisk {
     /// The file's current length, or `None` when it could not be read. See
     /// `changed_since` for why that is not treated as a change.
     size: Option<u64>,
-    /// True when this path is one of several names for the same data -- a
-    /// symlink, or a hard link with siblings -- so unlinking it takes the name
-    /// and leaves the bytes.
-    aliased: bool,
+    /// Whether this path is one of several names for the same data, and which
+    /// kind -- which is not the same question in every disposal mode. See
+    /// `Alias`.
+    alias: Alias,
+}
+
+/// What a path is a name for, as far as the removal about to happen is
+/// concerned.
+///
+/// Two kinds rather than one boolean, because they behave in OPPOSITE
+/// directions once the mode is not `Permanent`. A rename carries an inode with
+/// it, so a hard link moved to trash or under `--move-to` arrives with every
+/// byte of the video in it -- the destination holds the file, the sibling name
+/// still holds the file, and nothing anywhere was unlinked. A symlink renamed
+/// the same way arrives as a pointer: the footage never moved, it is still at a
+/// path this run did not print, and calling that row MOVED claims a copy exists
+/// at the destination that does not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Alias {
+    /// The only name for these bytes, as far as this filesystem knows.
+    None,
+    /// A hard link with at least one sibling. Unlinking it frees nothing;
+    /// renaming it moves the data with it.
+    HardLink,
+    /// A symbolic link. Nothing that happens to it happens to the video.
+    Symlink,
 }
 
 /// Read both of them.
@@ -201,15 +238,43 @@ struct OnDisk {
 /// exactly the case where removing this one frees nothing.
 fn on_disk(path: &str) -> OnDisk {
     let Ok(md) = std::fs::symlink_metadata(path) else {
-        return OnDisk { size: None, aliased: false };
+        return OnDisk { size: None, alias: Alias::None };
     };
 
     if md.file_type().is_symlink() {
         // A broken link has no size to check and is still an alias: what goes
         // when it goes is a pointer.
-        OnDisk { size: std::fs::metadata(path).ok().map(|m| m.len()), aliased: true }
+        OnDisk {
+            size: std::fs::metadata(path).ok().map(|m| m.len()),
+            alias: Alias::Symlink,
+        }
     } else {
-        OnDisk { size: Some(md.len()), aliased: md.nlink() > 1 }
+        let alias = if md.nlink() > 1 { Alias::HardLink } else { Alias::None };
+        OnDisk { size: Some(md.len()), alias }
+    }
+}
+
+/// Whether this disposal took the name and left the data behind.
+///
+/// This is the question `Fate::Done { aliased }` answers, and it is a question
+/// about the MODE as much as about the file. `--permanent` promises the bytes
+/// are gone, so either kind of alias falsifies it. Trash and `--move-to`
+/// promise the file is somewhere else instead, and a rename keeps that promise
+/// for a hard link -- the destination holds the same inode, every byte of it,
+/// restorable or undoable exactly like any other row. It is only the symlink
+/// that arrives at the destination without its video.
+///
+/// Getting this wrong the old way (any alias, any mode) cost `--move-to` twice
+/// over: the row read UNLINKED, a word that says the data stayed put, and its
+/// bytes were struck out of the "(N total)" figure -- so a run that relocated
+/// nothing but hard links reported "Moved 3 file(s) (0B total) under /dupes"
+/// over a destination holding three complete videos.
+fn frees_nothing(alias: Alias, disposal: &Disposal) -> bool {
+    match alias {
+        Alias::None => false,
+        Alias::Symlink => true,
+        // The one that depends on the mode.
+        Alias::HardLink => matches!(disposal, Disposal::Permanent),
     }
 }
 
@@ -251,11 +316,13 @@ fn changed_since(path: &str, measured_size: u64, current: Option<u64>) -> Option
 pub enum Fate {
     /// Gone from the path it was at -- trashed, unlinked or relocated.
     ///
-    /// `aliased` says whether the DATA went with it. A hard link with siblings
-    /// or a symlink loses a name and keeps every byte, so a run that counted
-    /// those bytes as freed reported space that is still occupied -- and the
-    /// caller cannot work that out for itself, because the only moment the
-    /// question can be asked is the stat immediately before the removal.
+    /// `aliased` says whether the bytes stayed where they were: the name went
+    /// and the data did not follow it anywhere. A run that counted those bytes
+    /// against its own total reported space that is still occupied, or a
+    /// destination holding footage it does not hold -- and the caller cannot
+    /// work it out for itself, because the only moment the question can be
+    /// asked is the stat immediately before the removal. Which files it is true
+    /// of depends on the mode as well as on the file; see `frees_nothing`.
     Done { aliased: bool },
     /// It no longer matches the size it was measured at, so it was left alone.
     Changed,
@@ -296,7 +363,7 @@ pub fn dispose_one(
     }
 
     match dispose_of(path, disposal) {
-        Ok(()) => Fate::Done { aliased: disk.aliased },
+        Ok(()) => Fate::Done { aliased: frees_nothing(disk.alias, disposal) },
         Err(e) => {
             log::error!(target: crate::stats::COUNTED, "{:#}", e);
             stats.delete_failed.record(path.to_string());
@@ -1094,7 +1161,7 @@ pub fn output_results(
             // piece of the text body that is neither shown nor saved.
             if show_listing || wants_txt {
                 let line = format!(
-                    "\t{:<8} {}, {}, {}, {}, {}, {}, {}, {} samples, {} matched, {}",
+                    "\t{:<width$} {}, {}, {}, {}, {}, {}, {}, {} samples, {} matched, {}",
                     format!("{},", action_str),
                     duration_str,
                     res_str,
@@ -1105,7 +1172,8 @@ pub fn output_results(
                     quality_str,
                     samples_raw,
                     matched_str,
-                    fp.path
+                    fp.path,
+                    width = ACTION_COLUMN
                 );
                 if show_listing {
                     info!("{}", line);
@@ -2364,6 +2432,105 @@ matched_from_seconds;matched_to_seconds";
         let mut expected = vec![a, b];
         expected.sort();
         assert_eq!(moved, expected);
+    }
+
+    #[test]
+    fn test_a_rename_carries_a_hard_link_with_it_and_leaves_a_symlink_behind() {
+        // The alias rule is not the same question in every mode, and this is the
+        // pair that shows it. `--move-to` renames, and rename(2) moves an INODE:
+        // a hard link arrives at the destination holding every byte of the
+        // video, so that row is MOVED like any other and its bytes belong in the
+        // "(N total)" figure. A symlink renamed the same way arrives as a
+        // pointer -- the footage never left the store -- so that row is the one
+        // the total must leave out.
+        //
+        // Both were called UNLINKED and both were struck out of the total, which
+        // made a run that relocated nothing but hard links report "Moved 1
+        // file(s) (0B total)" over a destination holding a complete video.
+        let dir = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+
+        let keep_path = at(&dir, "keep.mkv");
+        let linked_path = at(&dir, "linked.mkv");
+        let symlinked_path = at(&dir, "symlinked.mkv");
+
+        let fps = vec![
+            mock_fp_at(&keep_path, 60.0),
+            mock_fp_at(&linked_path, 10.0),
+            mock_fp_at(&symlinked_path, 11.0),
+        ];
+        materialize(&fps[0]);
+
+        // Both duplicates have a second name outside the scan, which is the only
+        // way either case is reachable: `sources::collect` deduplicates on
+        // (device, inode), so no two names for one file ever both reach a
+        // DELETE decision.
+        let hard_target = store.path().join("hard.mkv");
+        fs::File::create(&hard_target).unwrap().set_len(fps[1].file_size).unwrap();
+        fs::hard_link(&hard_target, &linked_path).unwrap();
+
+        let sym_target = store.path().join("sym.mkv");
+        fs::File::create(&sym_target).unwrap().set_len(fps[2].file_size).unwrap();
+        std::os::unix::fs::symlink(&sym_target, &symlinked_path).unwrap();
+
+        let groups = vec![vec![0, 1, 2]];
+        let stats = RunStats::default();
+        let path_str = report_to("json");
+
+        output_results(
+            &groups, &fps, &all_compared(fps.len()), Some(&to_file(&path_str)), 0,
+            Priority::Length, Some(&Disposal::MoveTo(dest.path().to_path_buf())), true, &stats,
+        ).unwrap();
+
+        // What is really where, before asking what the report called it.
+        let landed_hard = landing_spot(dest.path(), &linked_path);
+        assert_eq!(
+            fs::metadata(&landed_hard).unwrap().len(),
+            fps[1].file_size,
+            "the whole video is at the destination"
+        );
+        assert!(hard_target.exists(), "and its sibling name still reaches it too");
+
+        let landed_sym = landing_spot(dest.path(), &symlinked_path);
+        assert!(
+            fs::symlink_metadata(&landed_sym).unwrap().file_type().is_symlink(),
+            "what arrived is the pointer, not the video"
+        );
+        assert_eq!(
+            fs::metadata(&sym_target).unwrap().len(),
+            fps[2].file_size,
+            "the footage never moved"
+        );
+
+        let report = read_json(&path_str);
+        let action_for = |path: &str| -> String {
+            report["results"][0]["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|f| f["full_path"] == path)
+                .unwrap()["action"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(action_for(&linked_path), "MOVED", "a rename took the data with it");
+        assert_eq!(action_for(&symlinked_path), "UNLINKED", "and this one did not");
+
+        assert_eq!(report["summary"]["files_removed"], 2);
+        assert_eq!(report["summary"]["files_unlinked"], 1);
+        assert_eq!(
+            report["summary"]["bytes_removed"], fps[1].file_size,
+            "the hard link's bytes are at the destination, so they count"
+        );
+        assert_eq!(
+            report["summary"]["bytes_unlinked"], fps[2].file_size,
+            "and the symlink's are still in the store, so they do not"
+        );
+        assert!(!stats.had_problems());
+
+        let _ = fs::remove_file(path_str);
     }
 
     #[test]

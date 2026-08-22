@@ -2151,6 +2151,19 @@ Interrupted with Ctrl-C.
             // The file gets everything, uncapped and unconditionally -- that is
             // what it is for, and it is the only place the unabridged list of
             // failures exists.
+            //
+            // Deliberately unbuffered: one write(2) per line. A `BufWriter`
+            // would be free to add and there is nowhere honest to flush it --
+            // the logger is a `'static` global that is never dropped, so the
+            // tail of the file would survive only a return through `main`, and
+            // not a SIGKILL, a panic or the process being killed while it
+            // hangs. That last case is the one this flag is for: the 80-minute
+            // spin `MAX_CONSECUTIVE_DEMUX_ERRORS` now prevents was diagnosed
+            // from the last line written before the kill, which a buffer would
+            // have swallowed. The cost is a debugging flag's alone and it is
+            // small: measured at ~3 us a line (4,000 refusals add 0.01-0.02 s
+            // to a 0.04 s warm run), so the widest case there is -- a `-x '*'`
+            // scan of a 248k-file home directory -- pays well under a second.
             if let Some(file) = &log_file {
                 let mut file = file.lock().unwrap_or_else(|e| e.into_inner());
                 let _ = writeln!(file, "{}", line);

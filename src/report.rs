@@ -601,7 +601,13 @@ pub fn apply(
 
         // Laid out like the grouped run's results table: outcome first as a
         // column, path last because it is the one field of unbounded width.
-        info!("\t{:<8} {}, {}", format!("{},", label), format_size(m.size), m.path);
+        info!(
+            "\t{:<width$} {}, {}",
+            format!("{},", label),
+            format_size(m.size),
+            m.path,
+            width = export::ACTION_COLUMN
+        );
     }
 
     let mut summary = export::disposed_line(disposal, removed_count, removed_bytes);
@@ -616,6 +622,45 @@ pub fn apply(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// Every word either listing can print has to fit the column both of them
+    /// pad to, and `KNOWN_ACTIONS` is the complete set of them -- it exists
+    /// because a replay must recognise every word this tool writes, so a word
+    /// that is not in it is a word no listing prints.
+    ///
+    /// UNLINKED was added without the width moving, so exactly those rows had
+    /// every field after the action shifted one place right: the rows a reader
+    /// is most likely to be studying, since they are the ones whose byte total
+    /// does not add up. Equality rather than `<=` so the column cannot silently
+    /// drift wider than it needs to be either.
+    #[test]
+    fn test_the_action_column_is_exactly_wide_enough_for_the_longest_action() {
+        let widest = KNOWN_ACTIONS
+            .iter()
+            .map(|word| word.len() + 1) // the comma the listings append
+            .max()
+            .unwrap();
+        assert_eq!(
+            export::ACTION_COLUMN, widest,
+            "the widest action is {:?}",
+            KNOWN_ACTIONS.iter().max_by_key(|w| w.len()).unwrap()
+        );
+
+        // And the effect of it: one column, whatever the row says.
+        let column_ends: HashSet<usize> = KNOWN_ACTIONS
+            .iter()
+            .map(|word| {
+                format!(
+                    "{:<width$} rest",
+                    format!("{},", word.to_uppercase()),
+                    width = export::ACTION_COLUMN
+                )
+                .find("rest")
+                .unwrap()
+            })
+            .collect();
+        assert_eq!(column_ends.len(), 1, "every action leaves the next field in one place");
+    }
 
     const HEADER: &str = "group;action;full_path;length;length_seconds;resolution;width;height;\
 framerate_fps;codec;size;size_bytes;bitrate;bitrate_bps;quality;quality_bits_per_frame;\
