@@ -3801,6 +3801,58 @@ matched_from_seconds;matched_to_seconds";
         }
     }
 
+    /// Which copy a group loses must not depend on the order its files arrive
+    /// in, and it did whenever one of them could not be measured on a metric.
+    /// `find_best` hands `max_by` a relation that was not transitive then, so
+    /// the fold landed wherever the input order took it -- see
+    /// `utils::tests::test_a_metric_nobody_could_measure_does_not_make_the_ranking_cyclic`
+    /// for the relation itself. This is what it cost with `--delete` armed.
+    ///
+    /// Three copies of one 10 second clip. `a` beats `b` on quality, which is
+    /// where their comparison stopped. `c` reported no frame rate, so quality
+    /// said nothing about it either way and both of ITS comparisons fell
+    /// through to size, where it is the biggest file of its own codec and beat
+    /// them both: a > b > c > a. Four of the six orderings then deleted `b` and
+    /// two deleted `a` -- a different video destroyed, on nothing the user
+    /// could see, since renaming a file is enough to reorder a group.
+    #[test]
+    fn test_which_copy_is_deleted_does_not_depend_on_the_order_the_group_arrives_in() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Same footage, same length, same frame: only the encode differs.
+        let clip = |name: &str, size: u64, codec: &str, frame_rate: f64| {
+            let mut fp = mock_fp_at(&at(&dir, name), 10.0);
+            fp.width = 640;
+            fp.height = 480;
+            fp.file_size = size;
+            fp.codec = codec.to_string();
+            fp.frame_rate = frame_rate;
+            fp
+        };
+
+        let fps = vec![
+            clip("a.mkv", 42_807, "av1", 33.0),
+            clip("b.mkv", 43_451, "av1", 34.0),
+            clip("c.mkv", 87_955, "hevc", 0.0), // the container never said
+        ];
+
+        for order in [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
+            materialize_all(&fps);
+
+            let deleted = output_results(
+                &[order.to_vec()], &fps, &all_compared(fps.len()), None, 0, Priority::Length,
+                Some(&Disposal::Permanent), true, &RunStats::default(),
+            ).unwrap();
+
+            assert_eq!(
+                deleted,
+                vec![fps[1].path.clone()],
+                "group order {:?} lost a different copy",
+                order
+            );
+        }
+    }
+
     #[test]
     fn test_an_unmeasured_length_does_not_protect_the_rest_of_the_group() {
         // One file of unknown length beside two that were measured. The

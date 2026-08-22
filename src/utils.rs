@@ -68,17 +68,6 @@ pub const RESOLUTION_TOLERANCE: f64 = 0.05;
 pub const QUALITY_TOLERANCE: f64 = 0.05;
 pub const SIZE_TOLERANCE: f64 = 0.05;
 
-/// Whether a metric's value is only meaningful alongside the codec that
-/// produced it.
-///
-/// Quality is bits per frame and size is bits per file; both are the encoder's
-/// output, and a good encoder's job is to produce fewer of them. Neither can be
-/// read across codecs. Length and resolution are properties of the footage
-/// rather than of the encode, so they compare freely.
-fn is_codec_relative(metric: Priority) -> bool {
-    matches!(metric, Priority::Quality | Priority::Size)
-}
-
 pub fn format_size(bytes: u64) -> String {
     let b = bytes as f64;
     if b >= 1_073_741_824.0 {
@@ -268,13 +257,23 @@ impl GroupMaxima {
         self.per_codec.get(&fp.codec).copied().unwrap_or_default()
     }
 
-    /// The best `metric` reached among the group's files sharing `fp`'s codec,
-    /// which is 0 for the metrics that are not measured per codec.
-    fn codec_max(&self, fp: &VideoFingerprint, metric: Priority) -> u64 {
+    /// The best value `metric` can be measured against for `fp`, in the units
+    /// `value` returns. Exactly the frame of reference `tier` uses, which is
+    /// what lets the value pass refine the tiers rather than contradict them.
+    ///
+    /// The two arms are the whole of "some metrics mean the same thing however
+    /// a file was encoded, and some do not". Quality is bits per frame and size
+    /// is bits per file; both are the encoder's output, and a good encoder's
+    /// job is to produce fewer of them, so neither can be read across codecs
+    /// and each is measured against the best its own codec managed. Length and
+    /// resolution are properties of the footage rather than of the encode, so
+    /// they are measured against the whole group's best.
+    fn metric_max(&self, fp: &VideoFingerprint, metric: Priority) -> u64 {
         match metric {
+            Priority::Length => (self.duration * 1000.0) as u64,
+            Priority::Resolution => self.resolution,
             Priority::Quality => self.codec_maxima(fp).quality,
             Priority::Size => self.codec_maxima(fp).file_size,
-            _ => 0,
         }
     }
 
@@ -342,49 +341,87 @@ impl GroupMaxima {
         }
     }
 
+    /// One file's standing on one metric, as the fraction `num / den` of the
+    /// best value that metric can be measured against for it. Never divided --
+    /// `compare` cross-multiplies, so the ordering is exact and nothing new
+    /// ties through rounding.
+    ///
+    /// A fraction rather than a raw value because the bit-based metrics have to
+    /// be read against their OWN codec's best: a bit count is never held
+    /// against a bit count some other codec produced, and two files that are
+    /// each the best of their own kind tie at 1 exactly as they tie on tiers.
+    /// Two files sharing a codec share a denominator, which reduces their
+    /// comparison to their raw values -- that is what stops a third file of
+    /// some foreign codec blinding them to each other. For length and
+    /// resolution every file in the group shares the denominator, so the
+    /// fraction is the raw comparison written the same way.
+    ///
+    /// **A metric nobody could measure for this file scores 1 -- level with the
+    /// best, the same "no claim either way" the tier pass makes one step
+    /// earlier.** That is the load-bearing line, and it is what makes the whole
+    /// ranking a total order. The unknown has to land SOMEWHERE definite,
+    /// because a score is a property of one file and a comparison of scores is
+    /// transitive by construction; what it must not do is land at the bottom,
+    /// which is where reading the unmeasured value as a zero puts it, and which
+    /// is the inversion `tier` documents at length. See
+    /// `test_a_metric_nobody_could_measure_does_not_make_the_ranking_cyclic`
+    /// for what answering "equal to whatever it is being compared with"
+    /// instead -- a tie that says nothing about either file and so does not
+    /// compose -- cost: a > b > c > a over three copies of one video, and a
+    /// KEEP pick that moved with the order the group arrived in.
+    ///
+    /// A maximum of 0 is the same statement about the whole comparison set
+    /// (quality when not one file of a codec reported a frame rate), and
+    /// everyone in it scores 1 for the same reason -- exactly how `within`
+    /// treats it one pass earlier.
+    fn score(&self, fp: &VideoFingerprint, metric: Priority) -> (u128, u128) {
+        let max = self.metric_max(fp, metric);
+
+        if max == 0 || !measurable(fp, metric) {
+            return (1, 1);
+        }
+
+        (self.value(fp, metric) as u128, max as u128)
+    }
+
     /// Order two of the group's files on one metric, greater meaning better.
     ///
-    /// Codec-independent metrics compare their raw values. Codec-relative ones
-    /// compare each file's value as a FRACTION of the best its own codec
-    /// managed -- the same frame of reference `tier` uses, so this pass refines
-    /// the tiers instead of contradicting them, and a bit count is never held
-    /// against a bit count some other codec produced. Two files that are each
-    /// the best of their own kind tie here exactly as they tie on tiers, and
-    /// the decision falls through to path order for `export.rs` to flag.
-    ///
-    /// The fractions are cross-multiplied rather than divided, so the ordering
-    /// is exact and nothing new ties through rounding. Two files sharing a
-    /// codec share a denominator, which reduces their comparison to their raw
-    /// values: that is what stops a third file of some foreign codec blinding
-    /// them to each other. Zeroing the metric outright (what this replaced) hid
-    /// that case, because tiers cannot separate two copies inside the same 5%
-    /// band and the raw pass was the only thing left that could -- so the group
-    /// silently fell through to alphabetical order, and `export.rs` saw no
-    /// standoff to flag because the foreign file was not a contender.
+    /// Both scores are fractions of a maximum (see `score`), so this is the
+    /// comparison of two rationals with non-zero denominators -- a total order,
+    /// which `find_best` requires and `max_by` silently gives an arbitrary
+    /// answer without. u128 because the product of two u64 metrics does not fit
+    /// in one.
     fn compare(&self, a: &VideoFingerprint, b: &VideoFingerprint, metric: Priority) -> Ordering {
-        // A metric one of the two could not be measured on ties here exactly as
-        // it ties on tiers, so the decision falls through to a metric that is
-        // known instead of reading an unmeasured file as a zero. Without this
-        // the tier guards above would be undone one pass later: the tiers say
-        // "no claim either way", and then the raw values say 0 against ten
-        // thousand milliseconds and condemn the file anyway.
-        if !measurable(a, metric) || !measurable(b, metric) {
-            return Ordering::Equal;
+        let ((num_a, den_a), (num_b, den_b)) = (self.score(a, metric), self.score(b, metric));
+
+        (num_a * den_b).cmp(&(num_b * den_a))
+    }
+
+    /// Order two of the group's files outright: every tier, then every value,
+    /// then the path. `Greater` means the better copy, which is the one
+    /// `find_best` keeps.
+    ///
+    /// This is the relation `max_by` is handed, so it has to be a total order
+    /// -- see `test_the_ranking_is_a_total_order`. Paths are unique within a
+    /// library, so nothing below the last line can ever tie.
+    pub fn rank(
+        &self,
+        a: &VideoFingerprint,
+        b: &VideoFingerprint,
+        order: [Priority; 4],
+    ) -> Ordering {
+        let mut ord = Ordering::Equal;
+
+        for m in order {
+            ord = ord.then(self.tier(a, m).cmp(&self.tier(b, m)));
+        }
+        for m in order {
+            ord = ord.then(self.compare(a, b, m));
         }
 
-        let (val_a, val_b) = (self.value(a, metric), self.value(b, metric));
-
-        if !is_codec_relative(metric) {
-            return val_a.cmp(&val_b);
-        }
-
-        // A codec whose maximum is 0 could not measure the metric at all (no
-        // frame rate, say), and then every one of its files is 0 too, so both
-        // products collapse to 0 and it ties rather than losing -- exactly how
-        // `within` treats the same case one pass earlier. u128 because the
-        // product of two u64 metrics does not fit in one.
-        let (max_a, max_b) = (self.codec_max(a, metric), self.codec_max(b, metric));
-        (val_a as u128 * max_b as u128).cmp(&(val_b as u128 * max_a as u128))
+        // Reversed so the alphabetically FIRST path wins, since max_by keeps
+        // the greater element.
+        ord.then_with(|| b.path.cmp(&a.path))
     }
 }
 
@@ -451,23 +488,7 @@ pub fn find_best(
 
     *group
         .iter()
-        .max_by(|&&a, &&b| {
-            let fp_a = &fps[a];
-            let fp_b = &fps[b];
-
-            let mut ord = Ordering::Equal;
-
-            for m in order {
-                ord = ord.then(maxima.tier(fp_a, m).cmp(&maxima.tier(fp_b, m)));
-            }
-            for m in order {
-                ord = ord.then(maxima.compare(fp_a, fp_b, m));
-            }
-
-            // Reversed so the alphabetically FIRST path wins, since max_by
-            // keeps the greater element.
-            ord.then_with(|| fp_b.path.cmp(&fp_a.path))
-        })
+        .max_by(|&&a, &&b| maxima.rank(&fps[a], &fps[b], order))
         .unwrap()
 }
 
@@ -582,6 +603,169 @@ mod tests {
         // The measured pair still ranks against each other exactly as before,
         // which is the half of the metric this must not touch.
         assert_eq!(maxima.compare(&fps[1], &fps[2], Priority::Length), Ordering::Greater);
+    }
+
+    /// The ranking `find_best` hands to `max_by` has to be a TOTAL order, and
+    /// treating "nobody measured this metric for one of these two files" as a
+    /// pairwise tie is what stopped it being one.
+    ///
+    /// `Equal` from unmeasurability is not an equivalence relation: it says
+    /// nothing about the two files, so it does not compose. A metric skipped
+    /// for one pair is still decided for the next, and the lexicographic walk
+    /// then reaches a LATER metric for some pairs and not for others -- which
+    /// is all a cycle needs.
+    ///
+    /// Three copies of the same 10 second 640x480 footage do it. `a` beats `b`
+    /// on quality, which is where their comparison stops. `c` has no frame
+    /// rate, so quality says nothing about it either way and both of its
+    /// comparisons fall through to size, where it is the biggest file of its
+    /// own codec and beats them both. a > b > c > a.
+    ///
+    /// `max_by` folds left over whatever order the group arrives in, so a cycle
+    /// makes the survivor of a duplicate group a function of the input order --
+    /// the KEEP pick can be a file that lost a direct comparison to a file the
+    /// same run marks DELETE, which is the one property `export.rs`'s delete
+    /// rule rests on.
+    #[test]
+    fn test_a_metric_nobody_could_measure_does_not_make_the_ranking_cyclic() {
+        let fps = vec![
+            fp_full("/a.mkv", 10.0, 640, 480, 42_807, "av1", 33.0),
+            fp_full("/b.mkv", 10.0, 640, 480, 43_451, "av1", 34.0),
+            fp_full("/c.mkv", 10.0, 640, 480, 87_955, "hevc", 0.0),
+        ];
+        let group: Vec<usize> = (0..3).collect();
+        let maxima = GroupMaxima::of(&group, &fps);
+        let order = ordered_metrics(Priority::Length);
+
+        // Not a claim about WHICH file wins -- only that the three answers can
+        // be laid on one line. The old comparator answered a > b, b > c, c > a.
+        let mut ranked = group.clone();
+        ranked.sort_by(|&x, &y| maxima.rank(&fps[x], &fps[y], order));
+        for pair in ranked.windows(2) {
+            assert_ne!(
+                maxima.rank(&fps[pair[0]], &fps[pair[1]], order),
+                Ordering::Greater,
+                "{} outranks {}, yet sorts below it",
+                fps[pair[0]].path,
+                fps[pair[1]].path
+            );
+        }
+
+        // And the winner is the winner however the group is handed over.
+        assert_permutation_invariant(&fps, Priority::Length);
+    }
+
+    /// `find_best` must not depend on the order the group arrives in. Every
+    /// permutation of the group is the same set of files, so it is the same
+    /// answer or the ranking is not a ranking.
+    fn assert_permutation_invariant(fps: &[VideoFingerprint], priority: Priority) {
+        let group: Vec<usize> = (0..fps.len()).collect();
+        let maxima = GroupMaxima::of(&group, fps);
+        let expected = find_best(&group, fps, priority, &maxima);
+
+        let mut perm = group.clone();
+        // Heap's algorithm, iterative: every ordering of the group, in place.
+        let mut c = vec![0usize; perm.len()];
+        let mut i = 0;
+        while i < perm.len() {
+            if c[i] < i {
+                perm.swap(if i % 2 == 0 { 0 } else { c[i] }, i);
+                assert_eq!(
+                    find_best(&perm, fps, priority, &maxima),
+                    expected,
+                    "the winner moved when the group was reordered: {:?}",
+                    perm.iter().map(|&j| &fps[j].path).collect::<Vec<_>>()
+                );
+                c[i] += 1;
+                i = 0;
+            } else {
+                c[i] = 0;
+                i += 1;
+            }
+        }
+    }
+
+    /// The property the case above is one instance of, asserted directly over
+    /// pseudo-random groups: the ranking is a total order, so `Greater` and
+    /// `Equal` are both transitive and the relation is antisymmetric.
+    ///
+    /// The generator makes unmeasurable files on purpose -- a runtime no
+    /// container reported and a frame rate none did -- because those are the
+    /// only inputs that can break it, and it keeps the groups small and their
+    /// values coarse so files really do tie and the later metrics are reached.
+    #[test]
+    fn test_the_ranking_is_a_total_order() {
+        let mut state = 0x9E3779B97F4A7C15u64;
+        let mut next = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state >> 33
+        };
+
+        let codecs = ["h264", "hevc", "av1"];
+
+        for round in 0..3_000 {
+            let n = 3 + (next() % 4) as usize;
+            let fps: Vec<VideoFingerprint> = (0..n)
+                .map(|i| {
+                    // Zero means the container never said, for both of them.
+                    let dur = [0.0, 10.0, 10.4, 11.0, 600.0][(next() % 5) as usize];
+                    let rate = [0.0, 25.0, 30.0][(next() % 3) as usize];
+                    let side = [320u32, 640, 1920][(next() % 3) as usize];
+                    fp_full(
+                        &format!("/r{}/f{}.mkv", round, i),
+                        dur,
+                        side,
+                        side * 3 / 4,
+                        1 + next() % 100_000,
+                        codecs[(next() % 3) as usize],
+                        rate,
+                    )
+                })
+                .collect();
+
+            let group: Vec<usize> = (0..n).collect();
+            let maxima = GroupMaxima::of(&group, &fps);
+            let order = ordered_metrics(Priority::Length);
+            let rank = |x: usize, y: usize| maxima.rank(&fps[x], &fps[y], order);
+
+            for &x in &group {
+                for &y in &group {
+                    assert_eq!(
+                        rank(x, y),
+                        rank(y, x).reverse(),
+                        "not antisymmetric: {} against {}",
+                        fps[x].path,
+                        fps[y].path
+                    );
+                    for &z in &group {
+                        if rank(x, y) == Ordering::Greater && rank(y, z) == Ordering::Greater {
+                            assert_eq!(
+                                rank(x, z),
+                                Ordering::Greater,
+                                "{} > {} > {}, yet not {} > {}",
+                                fps[x].path,
+                                fps[y].path,
+                                fps[z].path,
+                                fps[x].path,
+                                fps[z].path
+                            );
+                        }
+                        if rank(x, y) == Ordering::Equal && rank(y, z) == Ordering::Equal {
+                            assert_eq!(
+                                rank(x, z),
+                                Ordering::Equal,
+                                "{} == {} == {}, yet not {} == {}",
+                                fps[x].path,
+                                fps[y].path,
+                                fps[z].path,
+                                fps[x].path,
+                                fps[z].path
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
