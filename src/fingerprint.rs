@@ -604,9 +604,10 @@ const FIRST_PROBE_BYTES: usize = 2048;
 /// signal.
 ///
 /// A score of exactly 1 is not a weak opinion, it is libavformat's way of
-/// spelling "no opinion": `av_probe_input_format3` floors the score of any
-/// demuxer whose extension list matches the NAME at 1 whatever the bytes said,
-/// and `mp3_probe` returns 1 for a single frame sync anywhere in the buffer.
+/// spelling "no opinion": `av_probe_input_format3` floors at 1 the score of a
+/// demuxer that HAS a `read_probe` and whose extension list matches the NAME,
+/// whatever the bytes said, and `mp3_probe` returns 1 for a single frame sync
+/// anywhere in the buffer.
 /// Both are usually noise -- 16,652 files in that home directory score exactly 1
 /// at 2 KB, nearly all of them `.o` files with one accidental sync, and a bigger
 /// buffer takes the score back to 0 (mp3 wants `max_frames >= buf_size/10000`,
@@ -628,10 +629,16 @@ const SECOND_PROBE_BYTES: usize = 16384;
 /// A file has to beat this, at one size or the other, to be worth opening.
 ///
 /// The safety property that makes this hard to get wrong: a match on the file's
-/// EXTENSION alone scores 1, so any file named like media -- `.mp4`, `.mkv`,
-/// `.mp3`, anything at all that some demuxer claims -- is guaranteed to reach
-/// the second look rather than being turned away at 2 KB. Only a file whose name
-/// tells nothing AND whose first bytes match nothing is refused outright, which
+/// EXTENSION alone scores at LEAST 1, so any file named like media -- `.mp4`,
+/// `.mkv`, `.mp3`, anything at all that some demuxer claims -- is guaranteed to
+/// reach the second look rather than being turned away at 2 KB. It is only ever
+/// exactly 1 for a demuxer that brought a `read_probe` of its own and got
+/// nothing out of the bytes; one with an extension list and no `read_probe`
+/// scores `AVPROBE_SCORE_EXTENSION` (50) on the name alone and is opened
+/// outright, and an extension match over an ID3 tag too long for the buffer
+/// floors at 24 or 50 rather than 1. Every one of those clears this line, which
+/// is why the rule can be stated as the floor. Only a file whose name tells
+/// nothing AND whose first bytes match nothing is refused outright, which
 /// on that corpus is 205,014 of 229,144 files. Of the 3,404 that a full-budget
 /// probe went on to identify with a real score, 40 fall below this line: 39 are
 /// object files and build caches, and the fortieth is that MP3, which the second
@@ -678,6 +685,20 @@ fn open_input(filepath: &str) -> Result<ffmpeg_next::format::context::Input> {
     }
 }
 
+thread_local! {
+    /// One probe buffer per decode worker, grown once and reused for every file
+    /// that worker looks at.
+    ///
+    /// A `-x '*'` scan asks this question a quarter of a million times, and the
+    /// allocation it replaces was `SECOND_PROBE_BYTES + AVPROBE_PADDING_SIZE`
+    /// of freshly zeroed heap per file -- for a buffer that is read, probed and
+    /// dropped before the next file is opened. Thread-local rather than
+    /// threaded through the call chain because `open_input`'s two callers are
+    /// the whole of the decode path and neither has anything else to hand down.
+    static PROBE_BUF: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// How much of a file was read before concluding it is not media, and what the
 /// best guess scored -- or `None` if it IS worth opening.
 ///
@@ -685,66 +706,94 @@ fn open_input(filepath: &str) -> Result<ffmpeg_next::format::context::Input> {
 /// home directory and wrong about a real MP3. See `FIRST_PROBE_BYTES` and
 /// `SECOND_PROBE_BYTES`.
 ///
+/// The second size is read only when the first one comes back with a whisper,
+/// which is the ~10% of files that score exactly `NO_EVIDENCE`. The bytes are
+/// read from the handle the first stage left open, so a file that needs the
+/// second look pays one more `read` rather than a second `open`.
+///
 /// A file that cannot be read here is never a verdict: it is handed to
 /// `avformat_open_input` anyway, so the user gets the real error ("No such file
 /// or directory", "Permission denied") rather than this function's opinion of a
 /// file it never saw.
 fn unrecognised(filepath: &str) -> Option<(usize, i32)> {
-    let mut buf = read_head(filepath, SECOND_PROBE_BYTES)?;
-
-    // What the file actually holds, which is what the two sizes below are capped
-    // against so the refusal reports bytes that exist -- see `NotMedia::bytes`.
-    // A short file comes back short and a missing tail is not evidence of
-    // anything, so the reading is unchanged; only the sentence is.
-    let held = buf.len().saturating_sub(AVPROBE_PADDING_SIZE);
-
-    // The name is part of the question: `av_probe_input_format3` floors the score
-    // of any demuxer whose extension list matches it at 1, whatever the bytes
-    // say. That is the whole reason the second look exists -- and also why no
-    // file named like media can ever be turned away by the first one.
+    // The name is part of the question: `av_probe_input_format3` scores a
+    // demuxer whose extension list matches it on the name alone -- see
+    // `NO_EVIDENCE` for what that is worth and why it is a safety property.
     let cname = std::ffi::CString::new(filepath).ok()?;
+    let mut file = std::fs::File::open(filepath).ok()?;
 
-    let first = probe_head(&mut buf, FIRST_PROBE_BYTES, &cname);
-    if first > NO_EVIDENCE {
-        return None;
-    }
-    if first == 0 {
-        return Some((FIRST_PROBE_BYTES.min(held), first));
-    }
+    PROBE_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
 
-    let second = probe_head(&mut buf, SECOND_PROBE_BYTES, &cname);
-    if second > NO_EVIDENCE {
-        return None;
-    }
-    Some((SECOND_PROBE_BYTES.min(held), second))
+        // `held` is what the file really gave up, which is what the refusal
+        // reports so it names bytes that exist -- see `NotMedia::bytes`. A
+        // short file comes back short and a missing tail is not evidence of
+        // anything, so the reading is unchanged; only the sentence is.
+        let held = fill_to(&mut file, &mut buf, 0, FIRST_PROBE_BYTES)?;
+        let first = probe_head(&mut buf, held, &cname);
+        if first > NO_EVIDENCE {
+            return None;
+        }
+        if first == 0 {
+            return Some((held, first));
+        }
+
+        let held = fill_to(&mut file, &mut buf, held, SECOND_PROBE_BYTES)?;
+        let second = probe_head(&mut buf, held, &cname);
+        if second > NO_EVIDENCE {
+            return None;
+        }
+        Some((held, second))
+    })
 }
 
-/// The first `want` bytes of a file, in a buffer with libavformat's probe
-/// padding on the end -- the zeroed tail every `read_probe` is allowed to read
-/// into. Short files come back short; the padding is still there.
-fn read_head(filepath: &str, want: usize) -> Option<Vec<u8>> {
+/// Read `buf` up to `want` real bytes, resuming from the `filled` it already
+/// holds, and return how many it holds now. Short files come back short.
+///
+/// The buffer is left with libavformat's probe padding zeroed on the end -- the
+/// tail every `read_probe` is allowed to read into, which
+/// `av_probe_input_buffer2` memsets before every one of its own probes. It has
+/// to be re-zeroed here rather than once, because the padding of the first
+/// reading sits where the second reading's real bytes land. Getting this wrong
+/// is what the old single-read version did: it probed 2 KB out of a buffer
+/// holding 16 KB, so the 32 bytes past the probe window were the file's own
+/// data instead of zeros, and a demuxer that reads its padding was answering a
+/// question libavformat never asks.
+///
+/// The buffer itself is never shrunk: it belongs to the worker, not to the file.
+fn fill_to(
+    file: &mut std::fs::File,
+    buf: &mut Vec<u8>,
+    filled: usize,
+    want: usize,
+) -> Option<usize> {
     use std::io::Read;
 
-    let mut file = std::fs::File::open(filepath).ok()?;
-    let mut buf = vec![0u8; want + AVPROBE_PADDING_SIZE];
-    let mut filled = 0usize;
-    while filled < want {
-        match file.read(&mut buf[filled..want]) {
-            Ok(0) => break,
-            Ok(n) => filled += n,
-            Err(_) => return None,
+    let mut filled = filled;
+    if filled < want {
+        if buf.len() < want + AVPROBE_PADDING_SIZE {
+            buf.resize(want + AVPROBE_PADDING_SIZE, 0);
+        }
+        while filled < want {
+            match file.read(&mut buf[filled..want]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(_) => return None,
+            }
         }
     }
-    buf.truncate(filled + AVPROBE_PADDING_SIZE);
-    Some(buf)
+    buf[filled..filled + AVPROBE_PADDING_SIZE].fill(0);
+    Some(filled)
 }
 
 /// What libavformat makes of the first `len` bytes of `buf`.
 ///
 /// `is_opened = 1` is the value `av_probe_input_buffer2` passes, so this
-/// considers exactly the demuxers the real open will consider.
+/// considers exactly the demuxers the real open will consider. `len` is the
+/// real byte count `fill_to` reported, and the padding it zeroed sits directly
+/// after it -- which is the whole of what makes this the same question.
 fn probe_head(buf: &mut [u8], len: usize, filename: &std::ffi::CStr) -> i32 {
-    let len = len.min(buf.len().saturating_sub(AVPROBE_PADDING_SIZE));
+    debug_assert!(buf.len() >= len + AVPROBE_PADDING_SIZE, "the padding must be there");
     let mut score: i32 = 0;
     let probe = ffmpeg_next::ffi::AVProbeData {
         filename: filename.as_ptr(),
@@ -3071,5 +3120,113 @@ mod tests {
         init_ffmpeg_for_tests();
         let ictx = open_input(&fixture_path().to_string_lossy()).unwrap();
         assert!(header_is_complete(&ictx), "an ordinary MP4 must not need probing");
+    }
+
+    /// The probe buffer belongs to the worker and is reused, so every reading it
+    /// hands libavformat has to look exactly like a freshly allocated one: the
+    /// real bytes, then `AVPROBE_PADDING_SIZE` of zeros, and nothing of the file
+    /// before it. `av_probe_input_buffer2` memsets that tail before every one of
+    /// its own probes and demuxers are allowed to read into it, so a stale byte
+    /// there is this tool asking a question libavformat never asks.
+    ///
+    /// Both ways of getting it wrong are checked, because they fail on opposite
+    /// files: the tail of the FIRST reading is where the second reading's real
+    /// bytes land, and the tail of the SECOND is where the previous file's bytes
+    /// are still sitting.
+    #[test]
+    fn test_every_probe_reading_is_padded_with_zeros_and_not_with_leftovers() {
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        let long = dir.path().join("long.bin");
+        std::fs::write(&long, vec![0xABu8; SECOND_PROBE_BYTES * 2]).expect("write");
+        let mut file = std::fs::File::open(&long).expect("open");
+        let mut buf = Vec::new();
+
+        let first = fill_to(&mut file, &mut buf, 0, FIRST_PROBE_BYTES).expect("first read");
+        assert_eq!(first, FIRST_PROBE_BYTES);
+        assert!(
+            buf[first..first + AVPROBE_PADDING_SIZE].iter().all(|&b| b == 0),
+            "the first reading's padding is where the second reading's bytes land"
+        );
+
+        let second = fill_to(&mut file, &mut buf, first, SECOND_PROBE_BYTES).expect("second read");
+        assert_eq!(second, SECOND_PROBE_BYTES);
+        assert!(
+            buf[..second].iter().all(|&b| b == 0xAB),
+            "the second reading must not have lost the first reading's bytes"
+        );
+        assert!(
+            buf[second..second + AVPROBE_PADDING_SIZE].iter().all(|&b| b == 0),
+            "the second reading is padded too"
+        );
+
+        // Now a SHORT file through the same worker's buffer, which is still
+        // holding 16 KB of 0xAB. Its padding must be zeros, not those.
+        let short = dir.path().join("short.bin");
+        std::fs::write(&short, [1u8, 2, 3, 4]).expect("write");
+        let mut file = std::fs::File::open(&short).expect("open");
+        let held = fill_to(&mut file, &mut buf, 0, FIRST_PROBE_BYTES).expect("short read");
+        assert_eq!(held, 4, "a short file comes back short");
+        assert!(
+            buf[held..held + AVPROBE_PADDING_SIZE].iter().all(|&b| b == 0),
+            "the previous file's bytes must not survive into this one's padding"
+        );
+    }
+
+    /// The second reading is paid for only by the files that earned it. A file
+    /// whose first 2 KB say nothing at all is settled there and the 14 KB behind
+    /// it is never read, which is the whole saving; a file that showed a whisper
+    /// goes on to the second size, which is the whole safety net. Both are
+    /// visible in the byte count the refusal reports, which is the only place
+    /// the difference surfaces.
+    #[test]
+    fn test_only_a_file_that_showed_a_whisper_is_read_past_the_first_probe() {
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        let plain = dir.path().join("nothing.bin");
+        std::fs::write(&plain, "hello world\n".repeat(3000)).expect("write");
+        let (bytes, score) = unrecognised(&plain.to_string_lossy()).expect("text is not media");
+        assert_eq!(score, 0, "nothing in it scored at all");
+        assert_eq!(
+            bytes, FIRST_PROBE_BYTES,
+            "settled on the first reading, so that is all it may claim to have read"
+        );
+
+        // Pseudo-random bytes carry an accidental frame sync, which is exactly
+        // the whisper `SECOND_PROBE_BYTES` exists to look past -- 16,652 files
+        // of one home directory do this. It has to reach the second size.
+        let mut byte = 0x5Au8;
+        let junk: Vec<u8> = (0..SECOND_PROBE_BYTES * 2)
+            .map(|_| {
+                byte = byte.wrapping_mul(37).wrapping_add(11);
+                byte
+            })
+            .collect();
+        let noisy = dir.path().join("whisper.bin");
+        std::fs::write(&noisy, &junk).expect("write");
+        let (bytes, _) = unrecognised(&noisy.to_string_lossy()).expect("noise is not media");
+        assert_eq!(
+            bytes, SECOND_PROBE_BYTES,
+            "a whisper at 2 KB must be disproved at 16 KB, not taken as a refusal"
+        );
+    }
+
+    /// The bytes a refusal reports are the bytes the file really held, at both
+    /// sizes -- the property `NotMedia::bytes` rests on, and the one the lazy
+    /// second read could most easily have broken.
+    #[test]
+    fn test_a_refusal_never_claims_more_bytes_than_the_file_holds() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        for size in [0usize, 1, 100, FIRST_PROBE_BYTES - 1, FIRST_PROBE_BYTES] {
+            let path = dir.path().join(format!("junk_{size}.bin"));
+            std::fs::write(&path, vec![0u8; size]).expect("write");
+            let name = path.to_string_lossy().to_string();
+            if let Some((bytes, _)) = unrecognised(&name) {
+                assert!(
+                    bytes <= size,
+                    "a {size}-byte file was refused on {bytes} bytes it does not have"
+                );
+            }
+        }
     }
 }

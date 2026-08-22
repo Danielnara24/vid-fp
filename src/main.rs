@@ -52,7 +52,7 @@ const CACHE_TABLE: TableDefinition<&str, &[u8]> =
 /// A refusal is worth half a millisecond, so it can be discarded on the merest
 /// suspicion -- and it has to be, because it depends on things `Stamp`
 /// deliberately does not record: the vendored FFmpeg's demuxer set (`ff8`) and
-/// this tool's own gate (`probe3` = `FIRST_PROBE_BYTES`/`SECOND_PROBE_BYTES`/
+/// this tool's own gate (`probe4` = `FIRST_PROBE_BYTES`/`SECOND_PROBE_BYTES`/
 /// `NO_EVIDENCE`, and what a `NotMedia` counts). Change any of those and the
 /// entries are wrong in the direction that matters -- a file that would now be
 /// read as video, remembered as junk -- so bump the suffix and push the old name
@@ -62,7 +62,7 @@ const CACHE_TABLE: TableDefinition<&str, &[u8]> =
 /// in `SUPERSEDED_TABLES` would tell a user with a large library to expect a
 /// re-decode that is not coming.
 const REFUSED_TABLE: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("refused_ff8_probe3");
+    TableDefinition::new("refused_ff8_probe4");
 
 /// Tables earlier builds wrote, all dead. They are dropped whole on the first
 /// run of this one.
@@ -169,8 +169,22 @@ const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 8] = [
 /// regenerates "the first 16384 bytes" for a file with nothing in it. Same
 /// field, same units, different value -- which is exactly the case a layout
 /// check cannot see, and which costs a re-probe measured in seconds.
-const SUPERSEDED_REFUSAL_TABLES: [TableDefinition<&str, &[u8]>; 2] =
-    [TableDefinition::new("refused_ff8_probe1"), TableDefinition::new("refused_ff8_probe2")];
+///
+/// `refused_ff8_probe3` went on suspicion rather than on a measured difference,
+/// which is the whole reason this list is cheap enough to have. The first
+/// reading used to be probed out of a buffer already holding all 16 KB, so the
+/// 32 bytes of padding past the 2 KB window were the file's own data where
+/// `av_probe_input_buffer2` memsets zeros -- a demuxer that reads its padding
+/// was answering a question libavformat never asks. It now reads 2 KB and pads
+/// them properly. No file changed its score: 98,209 files across the build tree
+/// and both video corpora were probed both ways and every one agreed. But a
+/// score CAN move in principle, and the direction that matters is a file read
+/// as junk by the old gate and as video by this one, so the entries go.
+const SUPERSEDED_REFUSAL_TABLES: [TableDefinition<&str, &[u8]>; 3] = [
+    TableDefinition::new("refused_ff8_probe1"),
+    TableDefinition::new("refused_ff8_probe2"),
+    TableDefinition::new("refused_ff8_probe3"),
+];
 
 /// Hard ceiling on the cache's page cache.
 ///
