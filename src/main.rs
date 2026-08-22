@@ -531,7 +531,8 @@ struct Args {
 
     /// Base keyframe sampling interval in seconds (0 = decode every keyframe).
     /// Long videos sample at this interval; short videos use a finer interval
-    /// automatically so they keep at least --min-keyframes frames.
+    /// automatically so they keep at least --min-keyframes frames. Negative and
+    /// unparseable values are rejected before the scan starts.
     #[arg(long = "keyframe-interval", default_value_t = 0.0)]
     kf_interval: f64,
 
@@ -545,7 +546,8 @@ struct Args {
     /// match nothing dilute a pair's coverage and can push it under
     /// --match-percent. 4, 12, 20 and 28 all measure well; 8 and 16 lose pairs
     /// that way. Only used when --keyframe-interval is > 0.0; 0 here removes the
-    /// floor and leaves that interval to stand on its own.
+    /// floor and leaves that interval to stand on its own. Negative and
+    /// unparseable values are rejected before the scan starts.
     #[arg(long = "min-keyframes", default_value_t = 12.0)]
     min_kf_samples: f64,
 
@@ -1691,9 +1693,18 @@ enum Refusal {
     /// reached for it and the exit code does not move. It shares this table
     /// because it is the same kind of entry -- one per file this build looked at
     /// and will not fingerprint, guarded by the same `Stamp`, worth half a
-    /// millisecond to rebuild -- and a file that has one of these can have no
-    /// fingerprint beside it, since a fingerprinted file never reaches the
-    /// weighing pass at all.
+    /// millisecond to rebuild.
+    ///
+    /// It is also the one entry in this table a fingerprint can supersede, and
+    /// `cache_store` is what takes it away. Falling through -- which is the
+    /// whole point of storing a number rather than a verdict -- puts the file
+    /// back in `todo`, so a lowered `--min-duration` decodes it and files a
+    /// fingerprint under the same path this entry is under. The argument that
+    /// used to sit here, that a fingerprinted file never reaches the weighing
+    /// pass, is exactly the case that is wrong: it reaches it on the run that
+    /// decodes it. Left behind, the entry does not go stale -- the `Stamp` still
+    /// matches -- and `Lookup::Short` reads it before `cache_lookup` is ever
+    /// asked, so a header runtime would outrank a decoded one for ever.
     ///
     /// Appended last on purpose: bincode tags a variant by its position, so the
     /// two above keep their numbers and caches written before this existed are
@@ -1778,6 +1789,27 @@ fn refusals_store(db: &Database, refused: &[(String, Stamp, Refusal)]) -> Result
 /// only ever holding a b-tree insert -- and the caller hands its decoder
 /// threads back BEFORE calling this, so nothing waits on an fsync while
 /// holding a share of the budget.
+///
+/// "Whatever was filed under this path before" includes a REFUSAL, which is
+/// what makes this two tables rather than one. `Refusal::TooShort` is the route
+/// there: it is a measurement rather than a verdict, so the cache pass lets a
+/// file whose runtime clears THIS run's `--min-duration` fall through to be
+/// decoded like any other miss -- and nothing then took the refusal away, so
+/// one `--min-duration 60` run followed by a `--min-duration 0` one left the
+/// path in both tables at once. That falsifies the reasoning written into
+/// `Refusal::TooShort` and `cache_forget` ("a path is remembered by exactly one
+/// of them"), and it is the direction that can be WRONG rather than merely
+/// untidy: `Lookup::Short` answers before `cache_lookup` is reached, so the
+/// header runtime the weighing pass measured outranks the one the decode went
+/// on to measure, for ever. The two differ for a file that restarts its clock
+/// (`fingerprint_video` takes the runtime from the samples there, and it is
+/// LONGER), which today cannot also be `header_is_complete` and so cannot also
+/// have a `TooShort` -- a latent contradiction rather than a visible one, and
+/// one nothing in the `Stamp` could ever catch, since neither entry is stale.
+///
+/// Removing it here rather than where the fall-through happens is what makes
+/// the invariant true by construction: a path with a fingerprint has no refusal
+/// beside it because writing the fingerprint is what takes the refusal away.
 fn cache_store(db: &Database, path: &str, stamp: Stamp, fp: &VideoFingerprint) -> Result<()> {
     // `&(stamp, fp)` rather than an owned pair: serde follows the reference, so
     // this writes the exact bytes `CacheEntry` reads back without copying the
@@ -1790,6 +1822,15 @@ fn cache_store(db: &Database, path: &str, stamp: Stamp, fp: &VideoFingerprint) -
         table
             .insert(path, encoded.as_slice())
             .context("Failed to insert the fingerprint")?;
+
+        // Unconditional, and cheap because it is a b-tree descent that normally
+        // finds nothing: the common case is a first decode with no refusal to
+        // take away. In the same transaction as the insert, so the two tables
+        // can never disagree about a path even if the process dies between
+        // them.
+        let mut refused =
+            txn.open_table(REFUSED_TABLE).context("Failed to open the refusals table")?;
+        refused.remove(path).context("Failed to drop a superseded refusal")?;
     }
     txn.commit().context("Failed to commit the fingerprint")?;
 
@@ -1836,12 +1877,14 @@ fn cache_forget(db: &Database, paths: &[String]) -> Result<usize> {
                 .is_some();
             let had_refusal =
                 refused.remove(path.as_str()).context("Failed to remove a refusal")?.is_some();
-            // Either table counts. A path is remembered by exactly one of them
-            // -- a file is fingerprinted or it is refused -- so this is a count
-            // of paths the cache had something to say about, not a total that
-            // can exceed `paths.len()`. Counting only the fingerprints made the
-            // one case worth logging (an entry that was not there) look
-            // identical to the one case that is routine.
+            // Either table counts, and a path is remembered by at most one of
+            // them -- a fingerprint supersedes a refusal in `cache_store`, which
+            // is what keeps that true across a lowered `--min-duration` -- so
+            // this is a count of paths the cache had something to say about,
+            // not a total that can exceed `paths.len()`. The `||` does not rest
+            // on that invariant, only the arithmetic does. Counting only the
+            // fingerprints made the one case worth logging (an entry that was
+            // not there) look identical to the one case that is routine.
             if had_fingerprint || had_refusal {
                 forgotten += 1;
             }
@@ -2408,6 +2451,35 @@ fn run(
             widest_useful,
             HASH_BITS,
             widest_useful
+        );
+    }
+
+    // The sampling knobs, refused on the same terms and for a reason the three
+    // above do not have. `-d`, `-p` and `--min-duration` are read by
+    // comparisons, so an out-of-range value shows up as a report nobody can
+    // explain; these two are read by `effective_interval`, which asks
+    // `kf_interval > 0.0` and `min_kf_samples > 0.0` -- so a negative, an
+    // infinity or a NaN is not out of range at all, it is silently the DEFAULT.
+    // `--keyframe-interval=-5` decodes every keyframe of the library and says
+    // "Using keyframe interval" nowhere, because the line that would have said
+    // it is gated on the same test; the run then costs what a full-rate scan
+    // costs and reports what a full-rate scan reports, with nothing anywhere to
+    // connect either to the flag. 0 stays legal in both and is documented: it
+    // turns the interval off, and it removes the floor.
+    //
+    // `Stamp::same_sampling` and `same_floor` still treat every one of those
+    // values as "off", and must keep doing so: caches written by builds that
+    // accepted them are still out there, and an entry written with a negative
+    // interval holds exactly the fingerprint a default run wants.
+    if !args.kf_interval.is_finite() || args.kf_interval < 0.0 {
+        anyhow::bail!(
+            "--keyframe-interval must be zero or more seconds (0 decodes every keyframe)."
+        );
+    }
+    if !args.min_kf_samples.is_finite() || args.min_kf_samples < 0.0 {
+        anyhow::bail!(
+            "--min-keyframes must be zero or more frames (0 removes the floor and leaves \
+             --keyframe-interval to stand on its own)."
         );
     }
 
@@ -4234,6 +4306,16 @@ mod tests {
             .collect()
     }
 
+    fn refused_paths(db: &Database) -> Vec<String> {
+        let read = db.begin_read().unwrap();
+        let table = read.open_table(REFUSED_TABLE).unwrap();
+        table
+            .iter()
+            .unwrap()
+            .map(|e| e.unwrap().0.value().to_string())
+            .collect()
+    }
+
     /// A file that is not video is reported by whichever pass discovers it, and
     /// the run's account of itself does not depend on which one that was.
     ///
@@ -4321,6 +4403,84 @@ mod tests {
         assert!(
             refusal_lookup(&db, path, &stamp(1_700_000_001, 12_345)).is_none(),
             "and an edit re-opens the question, exactly as for a refusal"
+        );
+    }
+
+    /// One path, one table. A `TooShort` entry is the only one a fingerprint can
+    /// ever land on top of -- the other two verdicts never fall through to a
+    /// decode -- and the run that lowers `--min-duration` is exactly the run
+    /// that does it: the file is decoded and filed under the same path the
+    /// refusal is under.
+    ///
+    /// Both halves are asserted because the failure is silent from either side
+    /// on its own. A leftover refusal is not stale (its `Stamp` still matches
+    /// the file, so nothing collects it), and `Lookup::Short` reads that table
+    /// BEFORE `cache_lookup`, so the header runtime it holds would outrank the
+    /// runtime the decode went on to measure for as long as the entry lived.
+    #[test]
+    fn test_a_fingerprint_supersedes_the_refusal_it_fell_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+        let path = "/videos/clip.mp4";
+        let written = stamp(1_700_000_000, 12_345);
+
+        // Run one, `--min-duration 60`: the weighing pass measures 8.84s and
+        // files the number rather than the verdict.
+        refusals_store(&db, &[(path.to_string(), written, Refusal::TooShort(8.84))]).unwrap();
+        assert!(refusal_lookup(&db, path, &written).is_some(), "which run two will read");
+
+        // Run two, `--min-duration 0`: the number clears this run's floor, so
+        // the file falls through, decodes, and is stored.
+        let mut fp = mock_fp(path);
+        fp.duration = 8.84;
+        cache_store(&db, path, written, &fp).unwrap();
+
+        assert!(
+            cache_lookup(&db, path, &written).is_some(),
+            "the fingerprint is what this path means now"
+        );
+        assert!(
+            refusal_lookup(&db, path, &written).is_none(),
+            "and the measurement it superseded went with it"
+        );
+    }
+
+    /// The same property through `run`, because the argument for it is about a
+    /// route rather than about two cache calls: the file has to really reach the
+    /// weighing pass on the run that decodes it, which is the step the reasoning
+    /// this fixes denied could happen at all.
+    #[test]
+    fn test_lowering_the_duration_floor_leaves_one_entry_rather_than_two() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+
+        let library = dir.path().join("library");
+        std::fs::create_dir(&library).unwrap();
+        let mut fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        fixture.push("tests/fixtures/test_video.mp4");
+        let scanned = library.join("clip.mp4");
+        std::fs::copy(&fixture, &scanned).expect("the fixture video is part of the tree");
+        let scanned = scanned.to_string_lossy().to_string();
+        let root = library.to_string_lossy().to_string();
+
+        let run_with = |floor: &str| {
+            let args = Args::parse_from(["vid-fp", &root, "--min-duration", floor]);
+            let stats = RunStats::default();
+            run(&args, Some(&db), Instant::now(), 1, &stats).expect("the scan itself is fine");
+        };
+
+        // Far longer than the fixture, so the weighing pass measures it and
+        // remembers the runtime.
+        run_with("100");
+        assert!(cached_paths(&db).is_empty(), "nothing was decoded");
+        assert_eq!(refused_paths(&db), vec![scanned.clone()], "the runtime is on record");
+
+        // Off, so the same runtime now clears the floor and the file decodes.
+        run_with("0");
+        assert_eq!(cached_paths(&db), vec![scanned.clone()], "and is fingerprinted");
+        assert!(
+            refused_paths(&db).is_empty(),
+            "with the refusal it superseded taken away rather than left beside it"
         );
     }
 
@@ -4741,6 +4901,40 @@ mod tests {
         for bad in ["--min-duration=-5", "--min-duration=nan"] {
             let err = run_error(&dir, &db, &[bad]);
             assert!(err.contains("--min-duration"), "{}: {}", bad, err);
+        }
+    }
+
+    #[test]
+    fn test_a_negative_or_unparseable_sampling_knob_is_refused() {
+        // The two flags where "out of range" and "the default" are the same
+        // thing. `effective_interval` asks `kf_interval > 0.0` and
+        // `min_kf_samples > 0.0`, so a negative or a NaN does not misbehave --
+        // it turns the flag off, silently, and a mistyped --keyframe-interval
+        // then decodes every keyframe in the library while the line that would
+        // have announced the interval is gated on the same test and says
+        // nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+
+        for bad in ["--keyframe-interval=-5", "--keyframe-interval=nan", "--keyframe-interval=inf"]
+        {
+            let err = run_error(&dir, &db, &[bad]);
+            assert!(err.contains("--keyframe-interval"), "{}: {}", bad, err);
+        }
+        for bad in ["--min-keyframes=-1", "--min-keyframes=nan", "--min-keyframes=inf"] {
+            let err = run_error(&dir, &db, &[bad]);
+            assert!(err.contains("--min-keyframes"), "{}: {}", bad, err);
+        }
+
+        // 0 is a documented setting in both and has to stay one: it turns the
+        // interval off, and it removes the floor so the interval stands alone.
+        for ok in ["--keyframe-interval=0", "--min-keyframes=0", "--keyframe-interval=5"] {
+            let stats = RunStats::default();
+            assert!(
+                run(&args_over(&dir, &[ok]), Some(&db), Instant::now(), 1, &stats).is_ok(),
+                "{} is a setting, not a typo",
+                ok
+            );
         }
     }
 
