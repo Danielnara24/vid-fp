@@ -1317,6 +1317,15 @@ impl Witnesses {
         self.samples_b = samples_b;
     }
 
+    /// Whether the largest matching in `window`, excluding the candidate's own
+    /// sample on each side, reaches `needed`.
+    ///
+    /// `window` must CONTAIN the candidate's row -- `corroborated` hands over
+    /// `aligned[lo..hi]` with `lo <= k < hi`, so it always does -- because the
+    /// window-size exit below counts on `eligible` dropping exactly that one.
+    /// It must also hold at most one row per sample pair, which
+    /// `for_each_frame_match` guarantees by visiting each pair exactly once;
+    /// the degree cap in `exact` is where that becomes load-bearing.
     fn enough(&mut self, window: &[Aligned], i: u32, j: u32, needed: usize) -> bool {
         if needed == 0 {
             return true;
@@ -1326,7 +1335,17 @@ impl Witnesses {
         // the quota cannot pay it whatever they are. Free -- `corroborated`
         // already knows where the window ends -- and at a loose `-d` it is the
         // first thing most candidates die on, before anything is walked at all.
-        if window.len() < needed {
+        //
+        // `<=`, not `<`: the candidate's own row is always one of these (the
+        // window is `aligned[lo..hi]` and `lo <= k < hi`), and `eligible` drops
+        // it, so a window can only ever offer `len() - 1` witnesses. `<` was
+        // conservative rather than wrong -- it let a window of exactly `needed`
+        // rows walk the greedy pass to find the one row it was always short of.
+        if window.len() <= needed {
+            debug_assert!(
+                window.iter().any(|&(_, wi, wj, _)| wi == i && wj == j),
+                "the candidate's own row has to be in its window for this bound to hold"
+            );
             return false;
         }
 
@@ -1363,11 +1382,27 @@ impl Witnesses {
         let conclusive = needed * (needed - 1) + 1;
         let mut paired = 0usize;
         for (wi, wj) in eligible(window, i, j) {
-            let a = self.vertex_a(wi) as usize;
-            let b = self.vertex_b(wj) as usize;
-            if self.side_a[a].degree as usize >= needed || self.side_b[b].degree as usize >= needed {
+            // The degree cap is asked of the slots rather than of fresh
+            // vertices, so an edge it drops leaves nothing behind. Creating the
+            // vertices first put ISOLATED ones in `side_a`: a sample whose only
+            // eligible rows all died on the other side's degree still got a
+            // vertex, and `untried` below is `side_a.len() - paired`, so every
+            // one of them made the "what is left to gain" exit fire later than
+            // it had to. Never a wrong answer -- an isolated vertex simply
+            // fails to augment -- just work the bound existed to avoid.
+            //
+            // Capping the degree at `needed` keeps a matching of that size if
+            // one existed, but only because each edge is a DISTINCT pair of
+            // samples: two copies of one edge would spend a vertex's budget on
+            // a single neighbour and could then turn away the edge that paid
+            // the quota. See the precondition on `enough`.
+            if self.at_degree_cap(self.slot_a[wi as usize], &self.side_a, needed)
+                || self.at_degree_cap(self.slot_b[wj as usize], &self.side_b, needed)
+            {
                 continue;
             }
+            let a = self.vertex_a(wi) as usize;
+            let b = self.vertex_b(wj) as usize;
             self.side_a[a].degree += 1;
             self.side_b[b].degree += 1;
             self.edges.push((a as u32, b as u32));
@@ -1384,7 +1419,15 @@ impl Witnesses {
             }
         }
 
-        debug_assert!(self.side_a.len() >= needed && self.side_b.len() >= needed);
+        // Every vertex here carries at least one edge, so this is the same
+        // question `side_is_wide_enough` asks, over what the window really
+        // offered. It is not redundant with it: that test gives up and says yes
+        // for a file with more samples than fit in its bitmask, and this is the
+        // exact answer for every pair. A matching pairs one sample with one
+        // sample, so it cannot outrun the smaller side.
+        if self.side_a.len() < needed || self.side_b.len() < needed {
+            return false;
+        }
 
         self.seen.clear();
         self.seen.resize(self.side_b.len(), false);
@@ -1437,6 +1480,13 @@ impl Witnesses {
             seen_b |= 1 << wj;
         }
         seen_a.count_ones() as usize >= needed && seen_b.count_ones() as usize >= needed
+    }
+
+    /// Whether an already-created vertex has taken all the edges it is allowed.
+    /// `NO_VERTEX` is a sample this window has not reached yet, which has no
+    /// edges at all and so is never at the cap.
+    fn at_degree_cap(&self, slot: u32, side: &[Vertex], needed: usize) -> bool {
+        slot != NO_VERTEX && side[slot as usize].degree as usize >= needed
     }
 
     fn reset(&mut self) {
@@ -2385,7 +2435,10 @@ mod tests {
         assert!(!scratch.enough(&window, 0, 0, 3));
         // And one side repeating itself is not two witnesses however many
         // matches it produces.
-        let static_shot: Vec<Aligned> = (1..9).map(|j| (0, 1, j, 14)).collect();
+        // The candidate's own row is in every window `corroborated` builds, so
+        // it is in every window here too -- see the precondition on `enough`.
+        let static_shot: Vec<Aligned> =
+            std::iter::once((0, 0, 0, 14)).chain((1..9).map(|j| (0, 1, j, 14))).collect();
         assert!(scratch.enough(&static_shot, 0, 0, 1));
         assert!(!scratch.enough(&static_shot, 0, 0, 2));
 
@@ -2397,14 +2450,135 @@ mod tests {
         let mut scratch = Witnesses::new();
         scratch.begin(5, 5);
         let rearrange: Vec<Aligned> = vec![
+            (0, 0, 0, 14), // the candidate
             (0, 1, 1, 14),
             (0, 2, 2, 14),
             (0, 1, 3, 14),
             (0, 3, 1, 14),
         ];
-        assert!(rearrange.len() < 3 * (3 - 1) + 1, "the edge count must not settle it");
+        assert!(rearrange.len() - 1 < 3 * (3 - 1) + 1, "the edge count must not settle it");
         assert!(scratch.enough(&rearrange, 0, 0, 3));
         assert!(!scratch.enough(&rearrange, 0, 0, 4));
+    }
+
+    /// The largest matching in a window, written the slow obvious way: every
+    /// eligible edge in an adjacency list, then one augmenting search per
+    /// A-side sample. Nothing it does is shared with `Witnesses`, which is the
+    /// point -- it is the definition the four cheap exits stand in for.
+    fn largest_matching(window: &[Aligned], i: u32, j: u32) -> usize {
+        let mut edges: std::collections::BTreeMap<u32, Vec<u32>> = std::collections::BTreeMap::new();
+        for &(_, wi, wj, _) in window {
+            if wi != i && wj != j {
+                let to = edges.entry(wi).or_default();
+                if !to.contains(&wj) {
+                    to.push(wj);
+                }
+            }
+        }
+
+        fn walk(
+            a: u32,
+            edges: &std::collections::BTreeMap<u32, Vec<u32>>,
+            mate: &mut std::collections::BTreeMap<u32, u32>,
+            seen: &mut std::collections::BTreeSet<u32>,
+        ) -> bool {
+            for &b in edges.get(&a).map(|v| v.as_slice()).unwrap_or(&[]) {
+                if !seen.insert(b) {
+                    continue;
+                }
+                let held = mate.get(&b).copied();
+                if held.is_none() || walk(held.unwrap(), edges, mate, seen) {
+                    mate.insert(b, a);
+                    return true;
+                }
+            }
+            false
+        }
+
+        let mut mate = std::collections::BTreeMap::new();
+        let mut size = 0;
+        for &a in edges.keys() {
+            let mut seen = std::collections::BTreeSet::new();
+            if walk(a, &edges, &mut mate, &mut seen) {
+                size += 1;
+            }
+        }
+        size
+    }
+
+    #[test]
+    fn test_the_cheap_exits_agree_with_the_matching_they_stand_in_for() {
+        // `enough` is four refusals and a search, and every one of the refusals
+        // is an arithmetic claim about a matching nobody has built yet: the
+        // window is too small to hold the quota, greedy already paid it, greedy
+        // is over half of it, each side is wide enough. This walks random
+        // windows past all four and asks the definition instead.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut rng = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        let mut scratch = Witnesses::new();
+        let mut reached_the_search = 0;
+        for _ in 0..4000 {
+            let samples = 2 + rng() % 7;
+            let count = (rng() % 10) as usize;
+            // The candidate's own row is always present, which is the
+            // precondition the window-size exit rests on.
+            let mut window: Vec<Aligned> = vec![(0, 0, 0, 14)];
+            for _ in 0..count {
+                let (wi, wj) = ((rng() % samples) as u32, (rng() % samples) as u32);
+                // One row per sample pair, as `for_each_frame_match` produces.
+                if !window.iter().any(|&(_, ei, ej, _)| (ei, ej) == (wi, wj)) {
+                    window.push((0, wi, wj, 14));
+                }
+            }
+            scratch.begin(samples as usize, samples as usize);
+            let largest = largest_matching(&window, 0, 0);
+            for needed in 1..=5usize {
+                assert_eq!(
+                    scratch.enough(&window, 0, 0, needed),
+                    largest >= needed,
+                    "needed {needed}, largest {largest}, window {window:?}"
+                );
+                if largest >= needed && needed >= 3 {
+                    reached_the_search += 1;
+                }
+            }
+        }
+        assert!(reached_the_search > 0, "the corpus never exercised the augmenting search");
+    }
+
+    #[test]
+    fn test_a_file_too_wide_for_the_bitmask_still_needs_witnesses_on_both_sides() {
+        // Past `u64::BITS` samples `side_is_wide_enough` gives up and says yes,
+        // so the count of distinct samples per side has to be settled by the
+        // graph itself. Every edge here is the same sample of A, so no matching
+        // can exceed one however many edges there are, and one side of the
+        // graph ends up narrower than the quota.
+        //
+        // That is what the `debug_assert` this replaced asserted could not
+        // happen, and it fired: `cargo test` on a pair like this panicked,
+        // where the release build reached the right answer by the `untried`
+        // exit instead. The isolated vertex is `b3` here -- the last edge is
+        // dropped for A's degree, and the old order had already made B's vertex
+        // for it. On side A the same thing inflates `side_a.len()`, which
+        // `untried` is derived from; that route is covered by the differential
+        // test above.
+        let mut scratch = Witnesses::new();
+        scratch.begin(70, 70);
+        let window: Vec<Aligned> = vec![
+            (0, 0, 0, 14), // the candidate
+            (0, 5, 1, 14),
+            (0, 5, 2, 14),
+            (0, 5, 3, 14),
+        ];
+        assert!(scratch.enough(&window, 0, 0, 1));
+        assert!(!scratch.enough(&window, 0, 0, 2));
+        assert_eq!(largest_matching(&window, 0, 0), 1);
     }
 
     #[test]

@@ -57,9 +57,147 @@ pub struct ReportTarget {
     pub format: Format,
 }
 
+/// A report being written next to the one it is about to replace.
+///
+/// Removed on the way out unless `keep` has been called, so a run that fails
+/// or unwinds between the create and the rename leaves the old report standing
+/// and no litter beside it. A run KILLED outright runs no destructor and does
+/// leave the scratch copy behind -- but the report it was replacing is still
+/// whole, which is the half that matters, and the name it is under is not one
+/// anything reads.
+struct Scratch {
+    path: Option<PathBuf>,
+}
+
+impl Scratch {
+    /// The rename succeeded: there is nothing at this name any more.
+    fn keep(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if let Some(path) = &self.path {
+            // Best effort, like `Conjured`: a run already on its way out with an
+            // error to report has nothing to add about a file it could not tidy.
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Where the scratch copy goes: beside the report, so the rename is within one
+/// filesystem, and named so it cannot collide with a report anybody asked for.
+///
+/// The pid is in it because nothing stops two runs writing the same `--output`
+/// (the cache lock is per cache, and `--from-report` takes no cache at all),
+/// and two runs sharing one scratch file would hand one of them the other's
+/// bytes.
+fn scratch_beside(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?;
+    let mut scratch = std::ffi::OsString::from(".");
+    scratch.push(name);
+    scratch.push(format!(".vid-fp-{}.tmp", std::process::id()));
+    Some(path.with_file_name(scratch))
+}
+
+/// Whether this destination can be replaced by a rename at all.
+///
+/// Only a regular file, or a name with nothing at it yet. Everything else is
+/// written through in place, because for those the NAME is not what the user
+/// asked to be filled:
+///
+/// * A FIFO is a reader waiting at the other end -- `mkfifo p; vid-fp lib -o p
+///   & cat p` is a documented shape, and `ensure_writable` deliberately accepts
+///   it unexamined. A rename would replace the pipe with a regular file and
+///   leave that reader waiting for ever.
+/// * A symlink is a report kept somewhere else under a local name. `fs::write`
+///   follows it; a rename would break it and put the report where the link is
+///   instead of where it points.
+/// * A device (`-o /dev/stdout` by another spelling) is not this run's to
+///   replace either.
+///
+/// `symlink_metadata`, so the link itself is what is examined rather than
+/// whatever it leads to.
+fn replaceable_by_rename(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta.file_type().is_file(),
+        // Nothing there: the ordinary case, and the one the rename is for.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        // Anything else (a folder in the way, a permission problem on the
+        // parent) is the real write's to report, in its own words.
+        Err(_) => false,
+    }
+}
+
+/// Write the report so that the file at `path` is either the old report or the
+/// new one, never half of either.
+///
+/// `fs::write` truncates in place, and the report is the LAST thing
+/// `output_results` does -- after the disposal pass. So a run killed mid-write
+/// destroyed the previous report and left a truncated one in its place, and
+/// that is exactly the file the documented `--from-report` workflow hands back:
+/// a plan for a library that has already been acted on, minus however many rows
+/// did not make it to disk. It degrades safely rather than dangerously (a
+/// half-written row loses `size_bytes` and the replay refuses it), but "the
+/// last rows are missing" is a plan that silently keeps files it condemned.
+///
+/// Two things are given up to close it, and both are given up only where they
+/// are actually needed. A rename cannot create a file in a folder that refuses
+/// one, and `ensure_writable` deliberately allows a read-only FOLDER holding a
+/// writable report -- so a scratch file that cannot be created falls back to
+/// the write it replaced, which is no worse than what was there before. And a
+/// destination that is not a regular file is written through rather than
+/// replaced (see `replaceable_by_rename`).
+///
+/// A failure AFTER the scratch file exists is returned rather than fallen back
+/// on: whatever stopped the copy (a full disk, most likely) would stop the
+/// in-place write too, having truncated the old report first.
+fn write_file_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let scratch_path = match scratch_beside(path) {
+        Some(scratch) if replaceable_by_rename(path) => scratch,
+        _ => return std::fs::write(path, bytes),
+    };
+
+    let mut file = match OpenOptions::new().write(true).create_new(true).open(&scratch_path) {
+        Ok(file) => file,
+        // The folder will not take a new file. The old report is still the one
+        // thing this can be written over.
+        Err(_) => return std::fs::write(path, bytes),
+    };
+    let mut scratch = Scratch { path: Some(scratch_path.clone()) };
+
+    file.write_all(bytes)?;
+    // Before the rename, not after: a rename that beats its own data to disk is
+    // how a crash leaves an empty file where a whole report used to be.
+    file.sync_all()?;
+    drop(file);
+
+    // A rename carries the scratch file's permissions, so a report the user had
+    // narrowed would quietly widen back to the default. Best effort -- the
+    // report is worth more than its mode.
+    if let Ok(meta) = std::fs::metadata(path) {
+        let _ = std::fs::set_permissions(&scratch_path, meta.permissions());
+    }
+
+    std::fs::rename(&scratch_path, path)?;
+    scratch.keep();
+
+    // The rename is atomic to any reader either way; this is only about it
+    // surviving a power cut, and there is nothing useful to say if it fails.
+    if let Some(parent) = path.parent() {
+        let parent = if parent.as_os_str().is_empty() { Path::new(".") } else { parent };
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+
+    Ok(())
+}
+
 /// Hand the finished report to its destination.
 ///
-/// The one thing here that is not `fs::write` is what happens when the reader
+/// The one thing here that is not a plain write is what happens when the reader
 /// of a pipe goes away first: `vid-fp DIR -o - | head` closes stdout under us,
 /// and that is a normal end to a pipeline rather than a run that did less than
 /// it was asked. Every other write failure is still a problem the caller
@@ -67,7 +205,7 @@ pub struct ReportTarget {
 /// than killing the process.)
 fn write_report(target: &ReportTarget, bytes: &[u8]) -> Result<()> {
     match &target.sink {
-        Sink::File(path) => std::fs::write(path, bytes)
+        Sink::File(path) => write_file_atomically(path, bytes)
             .with_context(|| format!("Failed to write the report to {}", path.display())),
         Sink::Stdout => {
             let mut out = std::io::stdout().lock();
@@ -1536,6 +1674,7 @@ const REVIEW_METRICS: [Priority; 2] = [Priority::Length, Priority::Resolution];
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use crate::compare::Match;
     use crate::utils::Priority;
     use tempfile::NamedTempFile;
@@ -2968,6 +3107,95 @@ matched_from_seconds;matched_to_seconds";
         assert_eq!(json["summary"]["total_groups"], 1);
         assert_eq!(json["results"][0]["files"].as_array().unwrap().len(), 2);
         assert_eq!(json["results"][0]["files"][0]["full_path"], "/fake/keep.mkv");
+    }
+
+    #[test]
+    fn test_a_report_replaces_the_last_one_in_one_step_and_leaves_nothing_beside_it() {
+        // The report is the last thing `output_results` does, after the
+        // disposal pass, and `--from-report` hands exactly this file back. A
+        // truncated one is a deletion plan missing its last rows, so the file
+        // at this name has to be one whole report or the other.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dupes.csv");
+
+        write_file_atomically(&path, b"the first run\n").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"the first run\n");
+
+        write_file_atomically(&path, b"the second run, longer\n").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"the second run, longer\n");
+
+        // No scratch copy survives a write that worked.
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(left, vec!["dupes.csv".to_string()]);
+
+        // And a write that does NOT reach its rename takes the scratch copy
+        // with it and leaves the report it was replacing exactly as it was.
+        let scratch_path = scratch_beside(&path).unwrap();
+        std::fs::write(&scratch_path, b"half a report").unwrap();
+        drop(Scratch { path: Some(scratch_path.clone()) });
+        assert!(!scratch_path.exists());
+        assert_eq!(std::fs::read(&path).unwrap(), b"the second run, longer\n");
+
+        // A rename carries the scratch file's mode, so the report a user had
+        // narrowed would quietly widen back to the default without this.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        write_file_atomically(&path, b"the third run\n").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the report's own permissions have to survive the replace");
+    }
+
+    #[test]
+    fn test_a_destination_that_is_not_a_plain_file_is_written_through_rather_than_replaced() {
+        // `ensure_writable` accepts a FIFO unexamined (`mkfifo p; vid-fp lib -o
+        // p & cat p` is a shape people use), and a symlinked report is one kept
+        // somewhere else under a local name. Replacing either by rename would
+        // destroy the thing that was asked for -- the reader waits for ever,
+        // the link is gone -- so both are written in place.
+        let dir = tempfile::tempdir().unwrap();
+
+        let fifo = dir.path().join("pipe");
+        let c_path = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        assert!(!replaceable_by_rename(&fifo));
+
+        let elsewhere = dir.path().join("elsewhere.csv");
+        std::fs::write(&elsewhere, b"").unwrap();
+        let link = dir.path().join("report.csv");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+        assert!(!replaceable_by_rename(&link));
+
+        write_file_atomically(&link, b"through the link\n").unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(&elsewhere).unwrap(), b"through the link\n");
+
+        // The ordinary two: a plain file, and a name with nothing at it.
+        assert!(replaceable_by_rename(&elsewhere));
+        assert!(replaceable_by_rename(&dir.path().join("not there yet.csv")));
+    }
+
+    #[test]
+    fn test_a_read_only_folder_still_takes_a_report_over_the_one_already_in_it() {
+        // `ensure_writable` allows this on purpose -- writing over an existing
+        // file needs no permission on the directory holding it -- and a rename
+        // cannot create the scratch copy there. Falling back to the write this
+        // replaced is no worse than what was there before.
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("locked");
+        std::fs::create_dir(&folder).unwrap();
+        let path = folder.join("dupes.csv");
+        std::fs::write(&path, b"an earlier run\n").unwrap();
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let wrote = write_file_atomically(&path, b"this run\n");
+
+        // Restore before any assertion, so a failure does not leave the temp
+        // directory undeletable.
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).unwrap();
+        wrote.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"this run\n");
     }
 
     #[test]
