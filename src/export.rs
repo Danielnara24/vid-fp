@@ -10,7 +10,7 @@ use crate::utils::{
 };
 use std::collections::{HashMap, HashSet};
 use std::fs::{FileTimes, OpenOptions};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -70,9 +70,66 @@ struct Scratch {
 }
 
 impl Scratch {
+    /// Open a scratch copy beside `dest`, ready to be written and renamed over
+    /// it.
+    ///
+    /// `None` is the cue to write `dest` in place instead, and there are two
+    /// ways to get one. A destination that is not a regular file must not be
+    /// replaced by a rename at all (see `replaceable_by_rename`), and a folder
+    /// that will not take a new file cannot hold a scratch copy -- which is a
+    /// case rather than an error, because `ensure_writable` deliberately allows
+    /// a read-only FOLDER holding a writable report. Writing in place is no
+    /// worse than what was there before either fix.
+    fn beside(dest: &Path) -> Option<(std::fs::File, Self)> {
+        let scratch_path = match scratch_beside(dest) {
+            Some(scratch) if replaceable_by_rename(dest) => scratch,
+            _ => return None,
+        };
+
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&scratch_path)
+            .ok()?;
+
+        Some((file, Scratch { path: Some(scratch_path) }))
+    }
+
     /// The rename succeeded: there is nothing at this name any more.
     fn keep(&mut self) {
         self.path = None;
+    }
+
+    /// Put the finished copy in the report's place.
+    ///
+    /// The caller flushes and fsyncs before calling this, and it has to be that
+    /// way round: a rename that beats its own data to disk is how a crash
+    /// leaves an empty file where a whole report used to be.
+    fn commit(mut self, dest: &Path) -> std::io::Result<()> {
+        let Some(scratch_path) = self.path.clone() else {
+            return Ok(());
+        };
+
+        // A rename carries the scratch file's permissions, so a report the user
+        // had narrowed would quietly widen back to the default. Best effort --
+        // the report is worth more than its mode.
+        if let Ok(meta) = std::fs::metadata(dest) {
+            let _ = std::fs::set_permissions(&scratch_path, meta.permissions());
+        }
+
+        std::fs::rename(&scratch_path, dest)?;
+        self.keep();
+
+        // The rename is atomic to any reader either way; this is only about it
+        // surviving a power cut, and there is nothing useful to say if it fails.
+        if let Some(parent) = dest.parent() {
+            let parent = if parent.as_os_str().is_empty() { Path::new(".") } else { parent };
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -154,45 +211,18 @@ fn replaceable_by_rename(path: &Path) -> bool {
 /// on: whatever stopped the copy (a full disk, most likely) would stop the
 /// in-place write too, having truncated the old report first.
 fn write_file_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let scratch_path = match scratch_beside(path) {
-        Some(scratch) if replaceable_by_rename(path) => scratch,
-        _ => return std::fs::write(path, bytes),
+    let Some((mut file, scratch)) = Scratch::beside(path) else {
+        // Nothing can be written beside the report. The old report is still the
+        // one thing this can be written over.
+        return std::fs::write(path, bytes);
     };
-
-    let mut file = match OpenOptions::new().write(true).create_new(true).open(&scratch_path) {
-        Ok(file) => file,
-        // The folder will not take a new file. The old report is still the one
-        // thing this can be written over.
-        Err(_) => return std::fs::write(path, bytes),
-    };
-    let mut scratch = Scratch { path: Some(scratch_path.clone()) };
 
     file.write_all(bytes)?;
-    // Before the rename, not after: a rename that beats its own data to disk is
-    // how a crash leaves an empty file where a whole report used to be.
+    // Before the rename, not after. See `Scratch::commit`.
     file.sync_all()?;
     drop(file);
 
-    // A rename carries the scratch file's permissions, so a report the user had
-    // narrowed would quietly widen back to the default. Best effort -- the
-    // report is worth more than its mode.
-    if let Ok(meta) = std::fs::metadata(path) {
-        let _ = std::fs::set_permissions(&scratch_path, meta.permissions());
-    }
-
-    std::fs::rename(&scratch_path, path)?;
-    scratch.keep();
-
-    // The rename is atomic to any reader either way; this is only about it
-    // surviving a power cut, and there is nothing useful to say if it fails.
-    if let Some(parent) = path.parent() {
-        let parent = if parent.as_os_str().is_empty() { Path::new(".") } else { parent };
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
-    }
-
-    Ok(())
+    scratch.commit(path)
 }
 
 /// Hand the finished report to its destination.
@@ -216,6 +246,232 @@ fn write_report(target: &ReportTarget, bytes: &[u8]) -> Result<()> {
         }
     }
 }
+
+/// The indent `serde_json::to_string_pretty` uses, and therefore the one a
+/// document assembled a piece at a time has to match.
+/// The indent `serde_json::to_string_pretty` uses, and therefore the one a
+/// document assembled a piece at a time has to match.
+const JSON_INDENT: &str = "  ";
+
+/// Render one value at the depth it sits at in the finished document.
+///
+/// `to_string_pretty` always starts a value at column zero, so a piece written
+/// into the middle of a document has to be pushed out by the nesting it is
+/// being written into: `depth` is the value's OWN depth, and `indent_first`
+/// says whether it begins on a fresh line (a group inside the results array) or
+/// after a key that has already been written (the summary).
+///
+/// Splitting on '\n' is safe for exactly this input: pretty JSON never emits a
+/// blank line, and a string value carries its own newlines escaped.
+fn write_nested(
+    out: &mut dyn Write,
+    value: &serde_json::Value,
+    depth: usize,
+    indent_first: bool,
+) -> std::io::Result<()> {
+    let pad = JSON_INDENT.repeat(depth);
+    // Infallible, and was where the whole document was rendered before this.
+    // A `Value` cannot hold either of the two things that fail: `json!` takes
+    // string keys only, and `Value::from(f64)` has already turned an infinity
+    // or a NaN into `Null` rather than storing one.
+    let rendered = serde_json::to_string_pretty(value).expect("a report value serializes");
+
+    for (n, line) in rendered.split('\n').enumerate() {
+        if n > 0 {
+            out.write_all(b"\n")?;
+        }
+        if n > 0 || indent_first {
+            out.write_all(pad.as_bytes())?;
+        }
+        out.write_all(line.as_bytes())?;
+    }
+    Ok(())
+}
+
+/// Where a report is being written as it is produced.
+enum ReportOut {
+    /// Into a scratch copy beside the report, renamed over it at the end. The
+    /// same replacement `write_file_atomically` performs, held open across the
+    /// reporting pass rather than handed a finished document.
+    Replacing { file: BufWriter<std::fs::File>, scratch: Scratch, dest: PathBuf },
+    /// Straight down the pipe. Nothing else in a run writes to stdout, and
+    /// `console_for` has already decided what stderr still says beside it.
+    Stdout(BufWriter<std::io::Stdout>),
+    /// Held whole and handed to `write_report` at the end -- the write this
+    /// replaced, kept for the destinations that must not be renamed over (a
+    /// FIFO, a symlink, a device) and for a folder that will not take a scratch
+    /// file. Those keep the property streaming gives up: the report is one
+    /// `fs::write` after the run is over, so a run killed during the reporting
+    /// pass leaves the previous report standing.
+    Buffered(Vec<u8>),
+}
+
+/// The report, written as the reporting pass produces it rather than assembled
+/// in memory and handed over in one piece.
+///
+/// All three formats go through this, and the JSON is the one it was written
+/// for. A `serde_json::Value` is an `IndexMap` per file and another per link,
+/// and a group of `g` members contributes `g * (g - 1)` links, so the tree ran
+/// roughly seven times the document it rendered to and the rendered `String`
+/// was then a second whole copy of that document beside it. The other two are
+/// each one copy of their own document, which is smaller but is still the
+/// entire report held in memory for no reason -- and the text body was two,
+/// since the summary was appended by building a second `String` from the first.
+///
+/// What every format gives up for it is stated on `ReportOut::Buffered`.
+struct ReportStream {
+    out: ReportOut,
+    /// The first write failure. Everything after it is skipped rather than
+    /// retried, because nothing that stops one group finishes the next: this is
+    /// a full disk or a reader that went away. `finish` is where it is
+    /// reported, in the same words a whole-document write would have used.
+    failed: Option<std::io::Error>,
+}
+
+impl ReportStream {
+    fn open(target: &ReportTarget) -> Self {
+        let out = match &target.sink {
+            Sink::Stdout => ReportOut::Stdout(BufWriter::new(std::io::stdout())),
+            Sink::File(path) => match Scratch::beside(path) {
+                Some((file, scratch)) => ReportOut::Replacing {
+                    file: BufWriter::new(file),
+                    scratch,
+                    dest: path.clone(),
+                },
+                None => ReportOut::Buffered(Vec::new()),
+            },
+        };
+
+        ReportStream { out, failed: None }
+    }
+
+    /// Close the document and put it where it was asked for.
+    fn finish(mut self, target: &ReportTarget) -> Result<()> {
+        // A reader closing early is how a pipeline ends rather than a run that
+        // did less than it was asked, exactly as in `write_report`. Anything
+        // else is the caller's to record. The sink drops on the way out of
+        // here, which is what takes the half-written scratch copy with it and
+        // leaves the previous report standing.
+        if let Some(e) = self.failed.take() {
+            return match &target.sink {
+                Sink::Stdout if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                Sink::Stdout => Err(e).context("Failed to write the report to stdout"),
+                Sink::File(path) => Err(e)
+                    .with_context(|| format!("Failed to write the report to {}", path.display())),
+            };
+        }
+
+        match self.out {
+            ReportOut::Replacing { mut file, scratch, dest } => {
+                // The buffer has to reach the file before the file is synced,
+                // and the file has to be synced before the rename. `BufWriter`
+                // flushes on drop too, but silently -- a report lost to a full
+                // disk at the last block would have been renamed into place as
+                // a truncated one.
+                let flushed = file.flush().and_then(|()| file.get_ref().sync_all());
+                drop(file);
+
+                flushed
+                    .and_then(|()| scratch.commit(&dest))
+                    .with_context(|| format!("Failed to write the report to {}", dest.display()))
+            }
+            ReportOut::Stdout(mut out) => match out.flush() {
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                other => other.context("Failed to write the report to stdout"),
+            },
+            ReportOut::Buffered(bytes) => write_report(target, &bytes),
+        }
+    }
+}
+
+/// Records the first failure and tells the caller every write succeeded.
+///
+/// That is deliberate rather than sloppy, and it is what lets the three bodies
+/// be written where they are produced. A report that could not be saved is a
+/// problem this run REPORTS -- logged, tallied, exit 2 -- and never one it
+/// returns: by the time a body is being written the disposal pass has already
+/// run, and propagating an error out of `output_results` throws away
+/// `deleted_paths` on the way, leaving the cache claiming fingerprints for
+/// files this run has just removed. The `?` on a `csv::Writer` record and the
+/// `write!` on a text line are both inside that pass, so neither may carry a
+/// failure out of it. `finish` is where the first one is answered for.
+impl Write for ReportStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.failed.is_none() {
+            let wrote = match &mut self.out {
+                ReportOut::Replacing { file, .. } => file.write_all(buf),
+                ReportOut::Stdout(out) => out.write_all(buf),
+                ReportOut::Buffered(bytes) => bytes.write_all(buf),
+            };
+            if let Err(e) = wrote {
+                self.failed = Some(e);
+            }
+        }
+        Ok(buf.len())
+    }
+
+    /// Not the end of the report: `finish` is, and it is the only thing that
+    /// flushes for real. Whatever asked for this (a `csv::Writer` finishing a
+    /// record) is told it happened.
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The JSON report, written one group at a time.
+///
+/// It is opened before the reporting loop rather than after it, which is only
+/// possible because the summary leads the document and every figure in the
+/// summary was settled by the disposal pass above -- see `output_results`.
+struct JsonBody {
+    stream: ReportStream,
+    /// How many groups have gone into `results`: the first needs no leading
+    /// comma.
+    groups_written: usize,
+    /// Whether `results` was opened as an array with something in it. An empty
+    /// one is written closed, which is the one shape writing groups cannot
+    /// reach.
+    results_open: bool,
+}
+
+impl JsonBody {
+    /// Open the document and write the summary.
+    ///
+    /// Summary first, then the groups. It is the part a human opens the file to
+    /// read, and burying it under an array with a row per duplicate makes it
+    /// something you have to go looking for.
+    fn open(target: &ReportTarget, summary: &serde_json::Value, any_groups: bool) -> Self {
+        let mut stream = ReportStream::open(target);
+
+        // Infallible: `ReportStream` records a failure rather than returning
+        // one, which is the whole of why these three writes need no handling.
+        let _ = stream.write_all(b"{\n  \"summary\": ");
+        let _ = write_nested(&mut stream, summary, 1, false);
+        let _ = stream.write_all(if any_groups {
+            b",\n  \"results\": [\n".as_slice()
+        } else {
+            b",\n  \"results\": []".as_slice()
+        });
+
+        JsonBody { stream, groups_written: 0, results_open: any_groups }
+    }
+
+    /// One group, in the place the whole-document renderer would have put it.
+    fn group(&mut self, group: &serde_json::Value) {
+        if self.groups_written > 0 {
+            let _ = self.stream.write_all(b",\n");
+        }
+        self.groups_written += 1;
+        let _ = write_nested(&mut self.stream, group, 2, true);
+    }
+
+    fn finish(mut self, target: &ReportTarget) -> Result<()> {
+        let closing: &[u8] = if self.results_open { b"\n  ]\n}" } else { b"\n}" };
+        let _ = self.stream.write_all(closing);
+        self.stream.finish(target)
+    }
+}
+
 
 /// Which parts of the run stderr still says out loud once the report has a
 /// destination.
@@ -1039,13 +1295,18 @@ pub fn output_results(
     let wants_csv = format == Some(Format::Csv);
     let wants_json = format == Some(Format::Json);
 
-    let mut txt_out = String::new();
-    let mut json_out_groups = Vec::new();
+    // Where the report is destined, for the at-most-one body below that is
+    // going to be written into it.
+    let sink = || report_target.expect("a report format means there is a report target");
+
+    let mut txt_out = wants_txt.then(|| ReportStream::open(sink()));
 
     // Use csv crate for robust and RFC-compliant CSV generation
-    let mut csv_wtr = csv::WriterBuilder::new()
-        .delimiter(b';')
-        .from_writer(Vec::new());
+    let mut csv_wtr = wants_csv.then(|| {
+        csv::WriterBuilder::new()
+            .delimiter(b';')
+            .from_writer(ReportStream::open(sink()))
+    });
 
     // The CSV carries exactly what the JSON carries, field for field, in the
     // same order. Anything shown in a formatted column is immediately followed
@@ -1091,7 +1352,7 @@ pub fn output_results(
     // `framerate` is the one figure with no formatted twin, by request: the
     // formatted form is still on the console line, where a human reads it, and
     // the reports keep only `framerate_fps` to sort on.
-    if wants_csv {
+    if let Some(csv_wtr) = &mut csv_wtr {
         csv_wtr
             .write_record([
                 "group",
@@ -1121,14 +1382,54 @@ pub fn output_results(
             .context("Failed to write CSV header")?;
     }
 
+    // The JSON is written as the loop below produces it rather than collected
+    // into a `serde_json::Value` and rendered at the end -- see `JsonSink` for
+    // what that cost.
+    //
+    // Opening it here is what makes that possible, and it is possible because
+    // the summary leads the document: every figure in it was decided by the
+    // disposal pass above, so the part that has to be written first is already
+    // known before a single group has been formatted. Its own three blocks run
+    // what was found -> what was decided -> what was done, so a dry run's keys
+    // stop after the second one has said everything it can.
+    let mut json = wants_json.then(|| {
+        let summary = serde_json::json!({
+            "total_groups": final_groups.len(),
+            "total_files_matched": matched_file_count,
+            "time_elapsed_seconds": total_elapsed_secs,
+            // What the run would reclaim, present whether or not it did
+            // anything: a dry run's whole output is a plan, and a plan with no
+            // cost attached is not one.
+            "files_marked_delete": delete_candidate_count,
+            "reclaimable_bytes": reclaimable_bytes,
+            "deletion_enabled": acting,
+            "mode": disposal.map(|d| d.mode()).unwrap_or("report"),
+            "move_to": match disposal {
+                Some(Disposal::MoveTo(dir)) => Some(dir.to_string_lossy().to_string()),
+                _ => None,
+            },
+            "files_removed": removed_count,
+            "bytes_removed": removed_bytes,
+            // Of those removed, the ones that were a second name for data still
+            // on disk. `bytes_removed` excludes them, so this is what a reader
+            // needs to reconcile it against the rows.
+            "files_unlinked": aliased_count,
+            "bytes_unlinked": aliased_bytes,
+            "files_failed": failed_count,
+            "files_changed": changed_count,
+        });
+
+        JsonBody::open(sink(), &summary, !final_groups.is_empty())
+    });
+
     for (i, group) in final_groups.iter().enumerate() {
         let group_name = format!("group_{}", i + 1);
 
         if show_listing {
             info!("{}:", group_name);
         }
-        if wants_txt {
-            txt_out.push_str(&format!("{}:\n", group_name));
+        if let Some(txt_out) = &mut txt_out {
+            let _ = writeln!(txt_out, "{}:", group_name);
         }
 
         let mut json_files = Vec::new();
@@ -1316,14 +1617,13 @@ pub fn output_results(
                 if show_listing {
                     info!("{}", line);
                 }
-                if wants_txt {
-                    txt_out.push_str(&line);
-                    txt_out.push('\n');
+                if let Some(txt_out) = &mut txt_out {
+                    let _ = writeln!(txt_out, "{}", line);
                 }
             }
 
             // 2. CSV Output
-            if wants_csv {
+            if let Some(csv_wtr) = &mut csv_wtr {
                 csv_wtr.write_record([
                     &group_name,
                     action_str,
@@ -1416,12 +1716,12 @@ pub fn output_results(
         if show_listing {
             info!(""); // Empty line for spacing
         }
-        if wants_txt {
-            txt_out.push('\n');
+        if let Some(txt_out) = &mut txt_out {
+            let _ = txt_out.write_all(b"\n");
         }
 
-        if wants_json {
-            json_out_groups.push(serde_json::json!({
+        if let Some(sink) = &mut json {
+            sink.group(&serde_json::json!({
                 "group": group_name,
                 "files": json_files
             }));
@@ -1486,63 +1786,27 @@ pub fn output_results(
     // this destination writable before any work started, so what reaches here
     // is a full disk, or permissions that changed while the run was going.
     if let Some(target) = report_target {
+        // Every body has already been written where it was produced. All that
+        // is left is to close it and put it where it was asked for -- and for
+        // the text report, to add the summary, which is the one part of it that
+        // could not be known until the loop above had finished.
         let written = (move || -> Result<()> {
-            let bytes = match target.format {
-                Format::Csv => {
-                    csv_wtr.into_inner().context("Failed to finalize CSV buffer")?
-                }
-                Format::Json => {
-                    // Summary first, then the groups. It is the part a human opens
-                    // the file to read, and burying it under an array with a row per
-                    // duplicate makes it something you have to go looking for.
-                    //
-                    // Its own three blocks run what was found -> what was decided ->
-                    // what was done, so a dry run's keys stop after the second one
-                    // has said everything it can.
-                    let json_final = serde_json::json!({
-                        "summary": {
-                            "total_groups": final_groups.len(),
-                            "total_files_matched": matched_file_count,
-                            "time_elapsed_seconds": total_elapsed_secs,
-                            // What the run would reclaim, present whether or not it
-                            // did anything: a dry run's whole output is a plan, and
-                            // a plan with no cost attached is not one.
-                            "files_marked_delete": delete_candidate_count,
-                            "reclaimable_bytes": reclaimable_bytes,
-                            "deletion_enabled": acting,
-                            "mode": disposal.map(|d| d.mode()).unwrap_or("report"),
-                            "move_to": match disposal {
-                                Some(Disposal::MoveTo(dir)) => {
-                                    Some(dir.to_string_lossy().to_string())
-                                }
-                                _ => None,
-                            },
-                            "files_removed": removed_count,
-                            "bytes_removed": removed_bytes,
-                            // Of those removed, the ones that were a second
-                            // name for data still on disk. `bytes_removed`
-                            // excludes them, so this is what a reader needs to
-                            // reconcile it against the rows.
-                            "files_unlinked": aliased_count,
-                            "bytes_unlinked": aliased_bytes,
-                            "files_failed": failed_count,
-                            "files_changed": changed_count,
-                        },
-                        "results": json_out_groups
-                    });
-                    serde_json::to_string_pretty(&json_final).unwrap().into_bytes()
-                }
+            match target.format {
+                Format::Csv => csv_wtr
+                    .expect("a CSV run opens a CSV writer")
+                    .into_inner()
+                    .map_err(|e| e.into_error())
+                    .context("Failed to finalize the CSV report")?
+                    .finish(target),
+                Format::Json => json
+                    .expect("a JSON run opens a JSON body")
+                    .finish(target),
                 Format::Txt => {
-                    let mut full_txt = String::new();
-                    full_txt.push_str(&txt_out);
-                    full_txt.push_str(&summary);
-                    full_txt.push('\n');
-
-                    full_txt.into_bytes()
+                    let mut txt_out = txt_out.expect("a text run opens a text body");
+                    let _ = writeln!(txt_out, "{}", summary);
+                    txt_out.finish(target)
                 }
-            };
-
-            write_report(target, &bytes)
+            }
         })();
 
         match written {
@@ -3145,6 +3409,137 @@ matched_from_seconds;matched_to_seconds";
         write_file_atomically(&path, b"the third run\n").unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "the report's own permissions have to survive the replace");
+    }
+
+    #[test]
+    fn test_the_streamed_json_is_laid_out_exactly_as_one_rendered_whole() {
+        // The document is written a group at a time, so nothing anywhere holds
+        // it whole and nothing can diff the streamed layout against a rendered
+        // one. What CAN be compared is the file against itself: parse it back
+        // -- `preserve_order` hands the keys back in the order they went in --
+        // and render that the way `to_string_pretty` would have. Every place
+        // the streaming has to reproduce by hand is in that comparison: the two
+        // spaces per level, the depth each piece is written at, the comma
+        // between groups, and the brackets around them.
+        //
+        // Three groups, because one exercises no separator and two exercise
+        // only the first; and a three-member group, because that is where a
+        // file carries more than one entry in its `matches` array.
+        let fps = vec![
+            mock_fp_at("/fake/a.mp4", 100.0),
+            mock_fp_at("/fake/b.mp4", 90.0),
+            mock_fp_at("/fake/c.mp4", 80.0),
+            mock_fp_at("/fake/d.mp4", 70.0),
+            mock_fp_at("/fake/e.mp4", 60.0),
+        ];
+        let groups = vec![vec![0, 1, 2], vec![1, 3], vec![3, 4]];
+        let path_str = report_to("json");
+
+        output_results(
+            &groups, &fps, &all_compared(fps.len()), Some(&to_file(&path_str)), 0, Priority::Length, None,
+            true, &RunStats::default(),
+        ).unwrap();
+
+        let text = fs::read_to_string(&path_str).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            text,
+            serde_json::to_string_pretty(&parsed).unwrap(),
+            "the streamed document has to be laid out exactly as a rendered one"
+        );
+        assert_eq!(parsed["results"].as_array().unwrap().len(), 3);
+        assert_eq!(parsed["results"][0]["files"][0]["matches"].as_array().unwrap().len(), 2);
+
+        // And the empty document, which is the one shape the streaming cannot
+        // reach by writing groups: `results` is written closed rather than
+        // opened and closed. It is what `conclude_without_comparing` produces,
+        // so it is a report a real run writes rather than a degenerate case.
+        let empty_str = report_to("json");
+        output_results(
+            &[], &fps, &all_compared(fps.len()), Some(&to_file(&empty_str)), 0, Priority::Length, None,
+            true, &RunStats::default(),
+        ).unwrap();
+
+        let empty = fs::read_to_string(&empty_str).unwrap();
+        let parsed_empty: serde_json::Value = serde_json::from_str(&empty).unwrap();
+        assert_eq!(empty, serde_json::to_string_pretty(&parsed_empty).unwrap());
+        assert!(empty.contains("\"results\": []"), "{}", empty);
+
+        let _ = fs::remove_file(path_str);
+        let _ = fs::remove_file(empty_str);
+    }
+
+    #[test]
+    fn test_a_streamed_report_replaces_the_last_one_and_leaves_no_litter() {
+        // No format reaches `write_file_atomically` any more -- each holds a
+        // scratch copy open across the whole reporting pass instead of handing
+        // over a finished document -- so every promise that function makes has
+        // to be made again by the sink that replaced it. The report is replaced
+        // in one step, its permissions survive, nothing is left beside it, and
+        // the destinations a rename must not replace still get the write they
+        // had. Asked of all three, because one sink now serves all three.
+        let fps = vec![
+            mock_fp_at("/fake/a.mp4", 100.0),
+            mock_fp_at("/fake/b.mp4", 10.0),
+        ];
+        let groups = vec![vec![0, 1]];
+
+        for extension in ["csv", "txt", "json"] {
+            let dir = tempfile::tempdir().unwrap();
+            let run_into = |path: &str| {
+                output_results(
+                    &groups, &fps, &all_compared(fps.len()), Some(&to_file(path)), 0,
+                    Priority::Length, None, true, &RunStats::default(),
+                ).unwrap();
+            };
+
+            let name = format!("dupes.{}", extension);
+            let path = at(&dir, &name);
+            fs::write(&path, "an earlier, longer report that must not survive in part").unwrap();
+            run_into(&path);
+
+            let text = fs::read_to_string(&path).unwrap();
+            assert!(text.contains("/fake/a.mp4"), "{}: {}", extension, text);
+            assert!(!text.contains("earlier"), "{}: replaced, not appended to", extension);
+
+            let left: Vec<String> = fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+                .collect();
+            assert_eq!(left, vec![name.clone()], "{}: no scratch copy left behind", extension);
+
+            // A report the user had narrowed keeps its mode across the replace.
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            run_into(&path);
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "{}: the report's own permissions have to survive the replace",
+                extension
+            );
+
+            // A symlinked report is one kept somewhere else under a local name:
+            // written through, so the link survives and the bytes land at its
+            // target. `Scratch::beside` refuses it and the sink falls back to
+            // holding the document, which is the one case that still does.
+            let elsewhere = dir.path().join(format!("elsewhere.{}", extension));
+            fs::write(&elsewhere, "").unwrap();
+            let link = at(&dir, &format!("linked.{}", extension));
+            std::os::unix::fs::symlink(&elsewhere, Path::new(&link)).unwrap();
+
+            run_into(&link);
+            assert!(
+                fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+                "{}: the link itself must survive",
+                extension
+            );
+            assert_eq!(
+                fs::read_to_string(&elsewhere).unwrap(),
+                text,
+                "{}: and the report has to land at what it points at",
+                extension
+            );
+        }
     }
 
     #[test]
