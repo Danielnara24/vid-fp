@@ -249,8 +249,6 @@ fn write_report(target: &ReportTarget, bytes: &[u8]) -> Result<()> {
 
 /// The indent `serde_json::to_string_pretty` uses, and therefore the one a
 /// document assembled a piece at a time has to match.
-/// The indent `serde_json::to_string_pretty` uses, and therefore the one a
-/// document assembled a piece at a time has to match.
 const JSON_INDENT: &str = "  ";
 
 /// Render one value at the depth it sits at in the finished document.

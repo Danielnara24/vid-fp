@@ -468,8 +468,17 @@ fn walk_folder(
         // (`remove_file`, `rename`) resolves the link and acts on the real
         // file. Left as it was, `-e keep` did not protect `keep/precious.mp4`
         // from a run that reached it as `scan/linkdir/precious.mp4`.
+        //
+        // Not counted, unlike the same test in `collect`: a file the walk found
+        // was not asked for by name, and `stats.skipped_excluded` says "named
+        // path(s)". Counting it here also made the number a mixture of two
+        // routes rather than an answer to either -- an excluded subtree is
+        // PRUNED by `filter_entry` above and contributes nothing however many
+        // files are behind it, so a run that spared a thousand videos through a
+        // prefix match and one through a link reported "1 named path(s)
+        // skipped". Which of the two a given exclusion takes is an
+        // implementation detail the user has no way to see.
         if is_excluded_target(path, excludes, follow || entry.path_is_symlink()) {
-            stats.skipped_excluded.bump();
             log::debug!(
                 "Skipping {}: leads to a file under an --exclude path",
                 path.display()
@@ -1259,7 +1268,11 @@ mod tests {
         let stats = RunStats::default();
 
         assert_eq!(collected(&request, &stats), vec![ordinary]);
-        assert_eq!(stats.skipped_excluded.count(), 1);
+        assert_eq!(
+            stats.skipped_excluded.count(),
+            0,
+            "the walk found it; nobody named it"
+        );
     }
 
     /// The per-file half of the check, which the pruning above never reaches:
@@ -1291,7 +1304,50 @@ mod tests {
         ];
         expected.sort();
         assert_eq!(collected(&request, &stats), expected, "{} was found", spare);
-        assert_eq!(stats.skipped_excluded.count(), 1);
+        assert_eq!(
+            stats.skipped_excluded.count(),
+            0,
+            "the walk found it; nobody named it"
+        );
+        assert!(!stats.had_problems());
+    }
+
+    /// The count under `--exclude` answers for exactly one route, and the
+    /// summary line says which: "named path(s) skipped because --exclude covers
+    /// them". A file the WALK dropped is not one -- it was never asked for, and
+    /// "you excluded it" is the whole story. The walk used to bump it from the
+    /// per-file check, which made the number an answer to neither question: an
+    /// excluded subtree is pruned whole and contributes nothing however many
+    /// files sit behind it, so the same exclusion counted 0 or 1 depending on
+    /// whether it was reached by a prefix match or through a link.
+    ///
+    /// Driven as one run so the two routes are counted against each other.
+    #[test]
+    fn test_only_a_path_the_user_named_is_counted_as_excluded() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let scan = root.join("scan");
+        let keep = scan.join("keep");
+        let protected = touch(&keep, "precious.mkv");
+        let behind_the_link = touch(&keep, "also_precious.mkv");
+        let ordinary = touch(&scan, "copy.mkv");
+        // Three ways into the excluded folder: named outright, pruned as a
+        // subtree by `filter_entry`, and reached file-by-file through a link.
+        std::os::unix::fs::symlink(&behind_the_link, scan.join("link.mkv")).unwrap();
+
+        let include = vec![protected, scan.to_string_lossy().to_string()];
+        let exclude = vec![keep.to_string_lossy().to_string()];
+        let extensions = extensions_of(&["mkv"]);
+        let mut request = sources(&include, &exclude, &extensions);
+        request.recursive = true;
+        let stats = RunStats::default();
+
+        assert_eq!(collected(&request, &stats), vec![ordinary]);
+        assert_eq!(
+            stats.skipped_excluded.count(),
+            1,
+            "one path was named and skipped; the other two were never asked for"
+        );
         assert!(!stats.had_problems());
     }
 

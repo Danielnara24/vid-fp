@@ -227,6 +227,13 @@ impl RunStats {
             // descended into, and "you excluded it" is the whole story. A path
             // asked for BY NAME and then silently dropped is a different
             // matter, and the count is what keeps it from being silent.
+            //
+            // Both of the walk's own routes therefore count nothing, and they
+            // have to agree: an excluded subtree is pruned whole, so counting
+            // the per-file check that catches an excluded file reached through
+            // a symlink made the same exclusion worth 0 or 1 depending on which
+            // route reached it. `sources::walk_folder` says so at the site, and
+            // `test_only_a_path_the_user_named_is_counted_as_excluded` pins it.
             (
                 &self.skipped_excluded,
                 "named path(s) skipped because --exclude covers them",
