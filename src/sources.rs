@@ -22,6 +22,21 @@
 //! absence of one. It means "hand every regular file to the decoder and let the
 //! decoder say", which is the same contract a named path already gets.
 //!
+//! `-x '!flac'` is that escape hatch with the one thing the user already knows
+//! about taken back out, and it is the same flag because it is the same
+//! sentence: the list is what a walk picks up, and an entry marked `!` is a
+//! subtraction from it rather than a second kind of request. So `-x mp4` is
+//! "only these", `-x '*'` is "all of them", `-x '!flac'` is "all of them but
+//! these", and `-x 'mp4,mkv,!mkv'` is the first with one taken back -- one rule,
+//! read left to right, with no flag ordering to get wrong. It is not
+//! `--exclude`, which is about which BYTES a run may touch and applies to a
+//! path the user named outright; this only ever narrows a folder walk's guess.
+//! What earns it a place is that the guess and the thing it gets wrong are
+//! often the same shape: FFmpeg fingerprints a `.flac` with cover art in it as
+//! a one-frame video, so a music library under `-x '*'` groups albums by their
+//! artwork, and the fix is not a narrower list (the folder's videos have no
+//! extension either) but that one exception.
+//!
 //! `--exclude` is the opposite: it applies to everything, including a path named
 //! explicitly. It is the one flag whose entire purpose is "do not touch this",
 //! and `find ... | vid-fp - -e ~/keep --delete` has to mean what it obviously
@@ -137,12 +152,13 @@ fn record_undecodable(path: &Path, stats: &RunStats) {
 pub struct Library {
     pub files: Vec<ScannedFile>,
     /// What the walk was willing to pick up, which is the only thing that makes
-    /// the count sayable. Every other setting of `--extensions` means a walk
-    /// turned away everything not named like a video, so what came back are
-    /// video files; under `-x '*'` there was no filter at all and they are
-    /// simply files. Saying "video files" there is how a scan of a home
-    /// directory announced "Found 229112 video files" and then spent the run
-    /// failing to decode 229 thousand of them.
+    /// the count sayable. A positive `--extensions` list means the walk turned
+    /// away everything not named like a video, so what came back are video
+    /// files; under `-x '*'` there was no filter at all and they are simply
+    /// files, and under `-x '!flac'` there was one that removes a hole rather
+    /// than naming videos, so they are simply files too. Saying "video files"
+    /// there is how a scan of a home directory announced "Found 229112 video
+    /// files" and then spent the run failing to decode 229 thousand of them.
     ///
     /// A named path is never filtered (see the module doc), so this describes
     /// the walk and not every route in. That is the one it is asked about: a
@@ -259,15 +275,14 @@ pub fn collect(sources: &Sources, stats: &RunStats) -> Result<Scan> {
     }
 
     match &extensions {
-        // Worth saying out loud: it is the one setting under which a folder of
+        // Worth saying out loud: these are the settings under which a folder of
         // text files becomes a folder of failed fingerprints.
         Wanted::Anything => info!("Searching every file, whatever its extension (-x '*')."),
-        Wanted::OneOf(set) => {
-            // HashSet iteration order is unspecified; sort for a stable log.
-            let mut ext_display: Vec<&str> = set.iter().map(|s| s.as_str()).collect();
-            ext_display.sort_unstable();
-            info!("Searching extensions: {:?}", ext_display);
-        }
+        Wanted::AnythingBut(set) => info!(
+            "Searching every file except these extensions: {:?}",
+            sorted(set)
+        ),
+        Wanted::OneOf(set) => info!("Searching extensions: {:?}", sorted(set)),
     }
 
     let excludes = resolve_excludes(sources.exclude, stats);
@@ -365,7 +380,7 @@ pub fn collect(sources: &Sources, stats: &RunStats) -> Result<Scan> {
 
     Ok(Scan::Complete(Library {
         files: into.found,
-        any_extension: matches!(extensions, Wanted::Anything),
+        any_extension: !extensions.is_a_guess_at_video(),
         walked: into.walked,
         excluded: excludes,
     }))
@@ -629,34 +644,75 @@ fn split_path_list(raw: &[u8], null_separated: bool) -> Vec<&[u8]> {
 
 /// The guess a folder walk makes about which of its files are videos.
 ///
-/// Two shapes rather than one set, because "every file" is not expressible as a
+/// Shapes rather than one set, because "every file" is not expressible as a
 /// list of suffixes: a file with no extension at all has nothing for
 /// `Path::extension` to return, so no entry could ever name it. That is not a
 /// corner case -- it is a whole camera dump, a DVD rip, or anything named by a
 /// content hash -- and before `-x '*'` those folders were unreachable from a
 /// walk, with the only workaround being to pipe the paths in from another tool.
+///
+/// The third is that same absence with a hole in it, and it is here for the
+/// same reason: the folders `-x '*'` exists for are full of files no list can
+/// name, and one extension in them is often known to be worth skipping. A set
+/// of what to refuse and a set of what to accept are not the same question, so
+/// they are not the same variant -- `normalize_extensions` decides which of the
+/// two a given `-x` list is asking, once, and the walk never asks again.
 enum Wanted {
     /// `-x '*'`. Every regular file the walk finds, extension or not.
     Anything,
+    /// `-x '!flac'`. Every file except the ones named, which is the same
+    /// contract as `Anything` minus a hole -- a file with no extension is not
+    /// named by anything, so it is still taken.
+    AnythingBut(HashSet<String>),
     /// Files whose extension is in this set, lowercased and dot-free.
     OneOf(HashSet<String>),
 }
 
 impl Wanted {
     fn accepts(&self, path: &Path) -> bool {
+        let extension = || {
+            path.extension()
+                .and_then(|s| s.to_str())
+                .map(|ext| ext.to_lowercase())
+        };
         match self {
             Wanted::Anything => true,
-            Wanted::OneOf(extensions) => path
-                .extension()
-                .and_then(|s| s.to_str())
-                .is_some_and(|ext| extensions.contains(ext.to_lowercase().as_str())),
+            Wanted::AnythingBut(refused) => {
+                extension().is_none_or(|ext| !refused.contains(ext.as_str()))
+            }
+            Wanted::OneOf(extensions) => {
+                extension().is_some_and(|ext| extensions.contains(ext.as_str()))
+            }
         }
+    }
+
+    /// Whether the walk turned away anything for being named wrong.
+    ///
+    /// False for both wildcard shapes: what came back is then simply files, and
+    /// a run that calls them video files is the one that announced "Found
+    /// 229112 video files" over a home directory. Excepting `flac` narrows
+    /// nothing towards video -- everything not named `.flac` is still handed to
+    /// the decoder -- so it belongs on that side of the line, not this one.
+    fn is_a_guess_at_video(&self) -> bool {
+        matches!(self, Wanted::OneOf(_))
     }
 }
 
 /// The wildcard, spelled the way a shell user expects. Quoting is on them --
 /// unquoted it is a glob, and one that expands to the directory's contents.
 const WILDCARD: &str = "*";
+
+/// What turns an entry into an exception: `-x '!flac'` is every file but those.
+/// Quoting is on the user here too -- an interactive bash expands `!` as
+/// history unless it is in single quotes.
+const NOT: char = '!';
+
+/// HashSet iteration order is unspecified; sort for a stable log line.
+fn sorted(set: &HashSet<String>) -> Vec<&str> {
+    let mut shown: Vec<&str> = set.iter().map(|s| s.as_str()).collect();
+    shown.sort_unstable();
+    shown
+}
 
 fn normalize_extensions(requested: &[String]) -> Result<Wanted> {
     // Strip an optional leading dot and lowercase, so `-x .MP4`, `-x MP4`, and
@@ -665,28 +721,62 @@ fn normalize_extensions(requested: &[String]) -> Result<Wanted> {
     // `-x '*.mkv'` is how a shell user spells the same thing, and the entry it
     // produces would otherwise be a suffix no file on earth has -- matching
     // nothing, silently, which is the failure this flag is being widened to fix.
-    let extensions: HashSet<String> = requested
-        .iter()
-        .map(|e| {
-            let e = e.trim();
-            let e = e.strip_prefix("*.").unwrap_or(e);
-            e.trim_start_matches('.').to_lowercase()
-        })
-        .filter(|e| !e.is_empty())
-        .collect();
+    // A leading `!` is what makes an entry an exception rather than a request;
+    // it is read before the rest, so `-x '!*.FLAC'` spells one too.
+    let mut wanted: HashSet<String> = HashSet::new();
+    let mut refused: HashSet<String> = HashSet::new();
 
-    // The wildcard wins over anything beside it. `-x '*',mkv` is not a
-    // contradiction to refuse -- it is a wider request with a narrower one
-    // still written down, and the wider one is what was asked for.
-    if extensions.contains(WILDCARD) {
-        return Ok(Wanted::Anything);
+    for entry in requested {
+        let entry = entry.trim();
+        let (into, entry) = match entry.strip_prefix(NOT) {
+            Some(rest) => (&mut refused, rest.trim()),
+            None => (&mut wanted, entry),
+        };
+
+        let entry = entry.strip_prefix("*.").unwrap_or(entry);
+        let entry = entry.trim_start_matches('.').to_lowercase();
+
+        if !entry.is_empty() {
+            into.insert(entry);
+        }
     }
 
-    if extensions.is_empty() {
-        anyhow::bail!("No valid video extensions to search for (--extensions was empty).");
+    // "Everything except everything" is the empty walk, and no user means it.
+    if refused.contains(WILDCARD) {
+        anyhow::bail!("--extensions excludes every file (-x '!*' matches nothing).");
     }
 
-    Ok(Wanted::OneOf(extensions))
+    // What the exceptions are subtracted from. `*` asks for it outright, and so
+    // does a list that only says what it does NOT want: "every file but flac" is
+    // the whole of what `-x '!flac'` can mean, and requiring the `*` beside it
+    // would be a spelling rule rather than a distinction.
+    let everything = wanted.contains(WILDCARD) || (wanted.is_empty() && !refused.is_empty());
+
+    if everything {
+        // The wildcard wins over anything beside it. `-x '*',mkv` is not a
+        // contradiction to refuse -- it is a wider request with a narrower one
+        // still written down, and the wider one is what was asked for. An
+        // exception is not a narrower request: it is the only part of the list
+        // that can still take a file away.
+        return Ok(if refused.is_empty() {
+            Wanted::Anything
+        } else {
+            Wanted::AnythingBut(refused)
+        });
+    }
+
+    // Otherwise the positive entries are the whole of the walk's guess, and an
+    // exception written beside them can only take one back out again.
+    wanted.retain(|ext| !refused.contains(ext));
+
+    if wanted.is_empty() {
+        anyhow::bail!(
+            "No valid video extensions to search for (--extensions was empty, \
+             or every extension in it was excluded)."
+        );
+    }
+
+    Ok(Wanted::OneOf(wanted))
 }
 
 /// Canonicalize the exclude list so prefix matching is safe and reliable.
@@ -1025,6 +1115,100 @@ mod tests {
             collected(&sources(&include, &[], &extensions_of(&["mkv", "*"])), &stats),
             expected
         );
+    }
+
+    #[test]
+    fn test_an_exception_takes_one_extension_out_of_every_file() {
+        // The case it was written for: a music folder under `-x '*'` groups its
+        // albums by their cover art, because a .flac with artwork in it is a
+        // one-frame mjpeg video carrying the track's whole length. The fix
+        // cannot be a positive list, since what is worth scanning beside it may
+        // have no extension at all.
+        let dir = tempfile::tempdir().unwrap();
+        let video = touch(dir.path(), "episode.mkv");
+        let bare = touch(dir.path(), "VTS_01_1");
+        touch(dir.path(), "01 Storm.flac");
+        touch(dir.path(), "02 Static.FLAC");
+
+        let include = vec![dir.path().to_string_lossy().to_string()];
+        let stats = RunStats::default();
+
+        let mut expected = vec![bare, video];
+        expected.sort();
+
+        // Every spelling of the same request: the exception on its own, the
+        // exception written under the wildcard it implies, and both the shell
+        // glob and the dotted form of the extension itself.
+        for list in [
+            vec!["!flac"],
+            vec!["*", "!flac"],
+            vec!["!*.FLAC"],
+            vec!["!.flac"],
+        ] {
+            assert_eq!(
+                collected(&sources(&include, &[], &extensions_of(&list)), &stats),
+                expected,
+                "-x {:?}",
+                list
+            );
+        }
+    }
+
+    #[test]
+    fn test_an_exception_beside_a_list_takes_one_back_out_of_it() {
+        // The list is read left to right as one sentence rather than as two
+        // kinds of request, so an exception narrows whatever the positives
+        // asked for instead of widening it to everything.
+        let dir = tempfile::tempdir().unwrap();
+        let video = touch(dir.path(), "episode.mkv");
+        touch(dir.path(), "episode.srt");
+        touch(dir.path(), "VTS_01_1");
+
+        let include = vec![dir.path().to_string_lossy().to_string()];
+        let stats = RunStats::default();
+
+        assert_eq!(
+            collected(
+                &sources(&include, &[], &extensions_of(&["mkv", "srt", "!srt"])),
+                &stats
+            ),
+            vec![video]
+        );
+    }
+
+    #[test]
+    fn test_a_request_that_can_match_nothing_is_refused_rather_than_walked() {
+        // Both ways of writing the empty walk. Refusing is the point: a scan
+        // that cannot match a file is a typo, and reporting "No videos found"
+        // for it is how a user concludes the tool is broken.
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "episode.mkv");
+        let include = vec![dir.path().to_string_lossy().to_string()];
+        let stats = RunStats::default();
+
+        for list in [vec!["!*"], vec!["mkv", "!mkv"], vec![""]] {
+            assert!(
+                collect(&sources(&include, &[], &extensions_of(&list)), &stats).is_err(),
+                "-x {:?} matches nothing and has to say so",
+                list
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_walk_that_only_removed_a_hole_did_not_look_for_videos() {
+        // `any_extension` is what entitles the run to call what it found video
+        // files. Excepting flac turns nothing away for being named wrong, so it
+        // belongs with the wildcard and not with a list.
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "clip.mkv");
+        touch(dir.path(), "notes.txt");
+        let include = vec![dir.path().to_string_lossy().to_string()];
+        let stats = RunStats::default();
+
+        let library = library(&sources(&include, &[], &extensions_of(&["!flac"])), &stats);
+        assert!(library.any_extension);
+        assert_eq!(library.files.len(), 2, "the text file is still a candidate");
     }
 
     #[test]

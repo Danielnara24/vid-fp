@@ -499,6 +499,9 @@ struct Args {
     /// containers. Use `-x '*'` — quoted — to fingerprint every file whatever
     /// it is called, which is the only way to reach files with no extension at
     /// all; expect failures for the non-videos it then hands to the decoder.
+    /// Prefix an entry with `!` to make it an exception: `-x '!flac'` is every
+    /// file except those, and `-x 'mp4,mkv,!mkv'` is the list with one taken
+    /// back out. Quote it — an interactive shell eats a bare `!`.
     /// A file named on the command line is scanned whatever its extension, so
     /// this never has to be widened just to reach one file.
     #[arg(

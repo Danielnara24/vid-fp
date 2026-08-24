@@ -262,7 +262,7 @@ reports refused.
 | `-r`, `--recursive` | Include subfolders | off |
 | `--follow-symlinks` | Descend into symlinked folders. Deletions act on the file the link leads to | off |
 | `-e`, `--exclude <PATH>` | Exclude a folder or a single file; repeat for several. Matched by whole path components, so a file must be named exactly, and resolved through symlinks | |
-| `-x`, `--extensions <EXT>` | Extensions a **folder walk** treats as videos, comma-separated or repeated. `-x '*'` (quoted) takes every file, including ones with no extension | `mp4,m4v,mkv,webm,avi,mov,flv,wmv,asf,mpg,mpeg,m2ts,mts,ts,vob,ogv,3gp,divx` |
+| `-x`, `--extensions <EXT>` | Extensions a **folder walk** treats as videos, comma-separated or repeated. `-x '*'` (quoted) takes every file, including ones with no extension; an entry prefixed with `!` is an exception, so `-x '!flac'` takes every file but those | `mp4,m4v,mkv,webm,avi,mov,flv,wmv,asf,mpg,mpeg,m2ts,mts,ts,vob,ogv,3gp,divx` |
 | `-d`, `--hamming-distance <N>` | Frame-match tolerance, in bits out of 64; higher = less strict matching. Raise to find more duplicates, at the cost of false positives. See [Tuning](#tuning). Values above `32` are refused | `4` |
 | `-p`, `--match-percent <F>` | Min % of overlap to count as a duplicate, from `0` to `100`. Lower includes shorter matches, at the cost of false positives. `0` turns the gate off and reports every pair sharing any footage at all; a pair sharing none is never reported | `20.0` |
 | `--min-duration <SECS>` | Min shared clip length in seconds for a match. Videos shorter than this are skipped entirely. `0` = off | `0.0` |
@@ -526,17 +526,19 @@ while an interval is in force, `--min-keyframes`. The comparison flags (`-d`,
 `-p`, `--min-duration`) are applied to cached fingerprints and never invalidate
 them, so re-running a scan at a different tolerance is instant.
 
-### Images and text files
+### Files that are not video
 
-FFmpeg opens more than video, so under `-x '*'` images are fingerprinted as a
-one-frame video and `.txt` as an ANSI terminal rendering at 640x400. The
-resolution, fps and duration on those rows are FFmpeg's defaults for the
-format, not properties of the file.
+`-x '*'`, any `-x '!...'` list, and a path you name outright all hand the file
+to FFmpeg, which opens far more than video. Whatever it can render is
+fingerprinted and can group with anything else: an image as a single frame, a
+track's cover art as a frame carrying the track's length, a text file as an ANSI
+terminal picture. Resolution, fps and duration on those rows are FFmpeg's
+defaults for the format, not properties of the file.
 
-On images this is an ordinary perceptual image hash and works. On text it
-compares a picture of the text at 16x16, a layout signature rather than the
-words, so those groups are mostly noise. A one-frame file also reads as 0% or
-100% covered, so `-p` cannot gate it. `--min-duration 1` drops these matches.
+Neither gate reliably helps. A one-frame file reads as 0% or 100% covered, so
+`-p` cannot touch it, and only some of these carry a runtime `--min-duration`
+can catch. Drop the kind instead, with `-x '!flac'` or `-x '!flac,!jpg'`, which
+still reaches files with no extension.
 
 ## Exit codes
 
