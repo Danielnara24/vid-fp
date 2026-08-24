@@ -1739,7 +1739,6 @@ pub fn find_all_matches(
         // parallel range below yields it instead, and the inner range is
         // parallel too because the outer one is lopsided -- video 0 pairs with
         // everything and the last video with nothing.
-        info!("Tolerance is too loose for the index; comparing all pairs directly...");
 
         // The count is the whole triangle even though the list of it is never
         // built -- `n * (n - 1) / 2` is what the ranges below yield, and the bar

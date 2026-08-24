@@ -499,7 +499,7 @@ the bytes are not, and no space was reclaimed.
 ### Errors
 
 Failures are reported once at the end in the summary: a count per kind and up
-to 20 examples of each. `--log-file <PATH>` records every one in full for
+to 10 examples of each. `--log-file <PATH>` records every one in full for
 grepping.
 
 ### Cache

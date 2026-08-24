@@ -17,13 +17,19 @@ use std::sync::Mutex;
 
 /// Worked examples kept per category.
 ///
-/// Twenty rather than the three it was, because the summary is now the ONLY
-/// place a counted problem is reported: the per-file lines that used to scroll
-/// past during the run are not printed at all any more (see `COUNTED`), so
-/// these examples are what the user actually reads. Twenty is about a screen,
-/// which is the most that can be read without scrolling and far more than the
-/// three that made sense when the full list was above.
-const MAX_SAMPLES: usize = 20;
+/// Ten rather than the three it was, because the summary is now the ONLY place
+/// a counted problem is reported: the per-file lines that used to scroll past
+/// during the run are not printed at all any more (see `COUNTED`), so these
+/// examples are what the user actually reads.
+///
+/// It is a budget per CATEGORY and not for the summary, which is what pulled it
+/// back from the twenty it was briefly set to: a `-x '*'` scan fails files in
+/// several kinds at once, so twenty each is a wall the user has to scroll past
+/// to find out the run succeeded. Ten keeps the whole summary — every category,
+/// the totals and the "Results saved to" line — inside a screen, which is the
+/// thing worth fitting. `--log-file` still holds every line for anyone who
+/// wants the full list.
+const MAX_SAMPLES: usize = 10;
 
 /// Log target for a failure this module is going to account for.
 ///
