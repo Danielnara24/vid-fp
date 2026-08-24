@@ -434,17 +434,17 @@ const DEFAULT_EXTENSIONS: [&str; 18] = [
     author, version,
     about = "Fast video duplicate and clip finder",
     long_about = "Fingerprints videos from their keyframes and groups files with the \
-                  same content, even at different resolutions or containers, and even \
-                  when one video is only a trimmed clip inside another.\n\n\
-                  Report-only by default: it tells you what is redundant and what that \
-                  is costing you. Files are touched only when --delete or --move-to is \
-                  given."
+                  same content, whatever their resolution or container, including one \
+                  video that is only a trimmed clip inside another.\n\n\
+                  Report-only by default. Files are touched only with --delete or \
+                  --move-to."
 )]
 struct Args {
-    /// Folders and video files to scan (one or more). A folder is searched for
-    /// videos; a file you name is scanned whatever its extension, since
-    /// --extensions is only a guess about what a FOLDER contains. Use `-` to
-    /// read a list of paths from stdin, e.g. `fd -e mkv | vid-fp -`.
+    /// Folders and video files to scan. `-` reads a list of paths from stdin
+    ///
+    /// A folder is searched for videos; a file you name is scanned whatever its
+    /// extension, since --extensions is only a guess about what a FOLDER
+    /// contains. Example: `fd -e mkv | vid-fp -`.
     #[arg(
         required_unless_present_any = ["completions", "man", "from_file", "from_report"],
         num_args = 1..,
@@ -453,57 +453,51 @@ struct Args {
     )]
     include: Vec<String>,
 
-    /// Path to exclude from the scan: a folder, or a single file. Repeat the
-    /// flag to exclude several (e.g. -e ~/a -e ~/b). Matched one whole path
-    /// component at a time, so -e ~/keep covers everything under it, while
-    /// -e ~/clips/take does NOT cover ~/clips/take.mkv -- a file has to be
-    /// named exactly. Applies to piped and explicitly named paths too, and
-    /// protects a file whichever route the scan reached it by, so excluding
-    /// either a symlink or what it points at covers both.
+    /// Exclude a folder or a single file; repeat for several
+    ///
+    /// Matched one whole path component at a time, so -e ~/keep covers
+    /// everything under it while -e ~/clips/take does NOT cover
+    /// ~/clips/take.mkv. Applies to piped and named paths too, and resolves
+    /// through symlinks, so excluding either a link or its target covers both.
     #[arg(short = 'e', long = "exclude", value_name = "PATH",
           value_hint = clap::ValueHint::AnyPath)]
     exclude: Vec<String>,
 
-    /// Read the paths to scan from a file, one per line. `-` means stdin.
-    /// Entries may be folders or files, exactly as if given as arguments, and
-    /// combine with any paths already passed on the command line.
+    /// Read the paths to scan from a file, one per line (`-` = stdin)
+    ///
+    /// Entries may be folders or files, and combine with any paths given on the
+    /// command line.
     #[arg(long = "from-file", value_name = "FILE",
           value_hint = clap::ValueHint::FilePath)]
     from_file: Option<String>,
 
-    /// Paths in the list are separated by NUL bytes rather than newlines, for
-    /// `find -print0` or `fd -0`. The only way to pass a filename containing a
-    /// newline.
+    /// Paths in the list are NUL-separated, for `find -print0` or `fd -0`
+    ///
+    /// The only way to pass a filename containing a newline.
     #[arg(short = '0', long = "null")]
     null: bool,
 
-    /// Scan folders recursively. Off by default (only the given folders and
-    /// their immediate files are scanned).
+    /// Scan folders recursively (off by default)
     #[arg(short = 'r', long = "recursive")]
     recursive: bool,
 
-    /// Follow symbolic links while scanning. Off by default, which means a
-    /// symlinked directory is not descended into. The same bytes are never
-    /// fingerprinted twice however many links reach them, because files are
-    /// deduplicated by (device, inode). Worth knowing before arming a
-    /// destructive run: deleting or moving a file found through a link acts on
-    /// the file the link leads to, not on the link, so a folder you want left
-    /// alone is worth naming with --exclude (which follows links too, and
-    /// protects such a file whichever path the walk reached it by).
+    /// Follow symbolic links while scanning
+    ///
+    /// Files are deduplicated by (device, inode), so the same bytes are never
+    /// fingerprinted twice however many links reach them. Deleting or moving a
+    /// file found through a link acts on the file the link leads to, not on the
+    /// link; protect a folder with --exclude, which follows links too.
     #[arg(long = "follow-symlinks")]
     follow_symlinks: bool,
 
-    /// Video file extensions to search for in a FOLDER (case-insensitive; a
-    /// leading dot or `*.` is optional). Repeat the flag or comma-separate,
-    /// e.g. `-x mp4,mkv` or `-x mp4 -x mkv`. Defaults to the common video
-    /// containers. Use `-x '*'` — quoted — to fingerprint every file whatever
-    /// it is called, which is the only way to reach files with no extension at
-    /// all; expect failures for the non-videos it then hands to the decoder.
-    /// Prefix an entry with `!` to make it an exception: `-x '!flac'` is every
-    /// file except those, and `-x 'mp4,mkv,!mkv'` is the list with one taken
-    /// back out. Quote it — an interactive shell eats a bare `!`.
-    /// A file named on the command line is scanned whatever its extension, so
-    /// this never has to be widened just to reach one file.
+    /// Extensions a FOLDER walk treats as video, comma-separated or repeated
+    ///
+    /// Case-insensitive; a leading dot or `*.` is optional. `-x '*'` takes every
+    /// file whatever it is called, the only way to reach files with no
+    /// extension; expect failures for the non-videos it hands to the decoder.
+    /// An entry prefixed with `!` is an exception: `-x '!flac'` is every file
+    /// but those, `-x 'mp4,mkv,!mkv'` is the list with one removed. Quote both
+    /// forms, since a shell eats a bare `*` or `!`.
     #[arg(
         short = 'x',
         long = "extensions",
@@ -513,113 +507,105 @@ struct Args {
     )]
     extensions: Vec<String>,
 
-    /// Maximum Hamming distance between two frame hashes, out of 64 bits.
-    /// Higher = looser matching, lower = stricter matching. Default is 4.
+    /// Frame-match tolerance, in bits out of 64; higher is looser
+    ///
     /// Two unrelated frames sit about 32 bits apart, so the useful range is
-    /// roughly 2 (only near-identical frames) to 12 (visibly the same shot);
-    /// past that unrelated footage starts linking whole groups together.
-    /// A frame match standing on its own must be within this; one that another
-    /// frame match agrees with about the time offset between the two videos may
-    /// reach 6 bits further. Past 12 bits one agreeing match stops being enough
-    /// and the number required grows with the distance -- two at 14, three at
-    /// 16, four at 20 -- so raising this trades precision for recall smoothly
-    /// rather than falling off a cliff.
-    /// Values above 32 are rejected before the scan starts: that is how far
-    /// apart two unrelated frames sit on average, so a higher tolerance matches
-    /// everything against everything and has nothing left to control.
-    #[arg(short = 'd', long = "hamming-distance", default_value_t = 4)]
+    /// roughly 2 to 12. Only even values do anything, since every hash has 32
+    /// of its 64 bits set. A lone frame match must be within this; one that
+    /// another match agrees with about the time offset may reach 6 bits
+    /// further, and past 12 bits more agreeing matches are needed: two at 14,
+    /// three at 16, four at 20. Values above 32 are refused.
+    #[arg(short = 'd', long = "hamming-distance", value_name = "N", default_value_t = 4)]
     hamming_distance: u32,
 
-    /// Minimum match percentage required to be considered a duplicate, from 0
-    /// to 100. Default is 20.0 (20%). Values outside that range are rejected
-    /// before the scan starts: coverage is capped at 100%, so a higher floor is
-    /// one no pair could ever clear. 0 turns the gate off and reports every
-    /// pair that shares any footage at all; pairs sharing nothing are never
-    /// reported at any setting.
-    #[arg(short = 'p', long = "match-percent", default_value_t = 20.0)]
+    /// Minimum percentage of a video that must match, from 0 to 100
+    ///
+    /// 0 turns the gate off and reports every pair sharing any footage at all;
+    /// a pair sharing none is never reported. Values outside the range are
+    /// refused.
+    #[arg(short = 'p', long = "match-percent", value_name = "F", default_value_t = 20.0)]
     match_percent: f32,
 
-    /// Minimum shared clip length, in seconds, for two videos to count as a
-    /// match. Also skips fingerprinting any video shorter than this. 0 = off,
-    /// and negative values are rejected before the scan starts. Independent of
-    /// --match-percent; both must be satisfied.
-    #[arg(long = "min-duration", default_value_t = 0.0)]
+    /// Minimum shared clip length in seconds; also skips shorter videos
+    ///
+    /// 0 = off. Independent of --match-percent; both must be satisfied.
+    /// Negative values are refused.
+    #[arg(long = "min-duration", value_name = "SECS", default_value_t = 0.0)]
     min_duration: f64,
 
-    /// Base keyframe sampling interval in seconds (0 = decode every keyframe).
-    /// Long videos sample at this interval; short videos use a finer interval
-    /// automatically so they keep at least --min-keyframes frames. Negative and
-    /// unparseable values are rejected before the scan starts.
-    #[arg(long = "keyframe-interval", default_value_t = 0.0)]
+    /// Seconds between sampled keyframes (0 = decode every keyframe)
+    ///
+    /// Long videos sample at this interval; short ones use a finer spacing so
+    /// they keep at least --min-keyframes samples. Higher is faster, but makes
+    /// short matches harder to find. Negative values are refused.
+    #[arg(long = "keyframe-interval", value_name = "F", default_value_t = 0.0)]
     kf_interval: f64,
 
-    /// Minimum keyframes to keep for short videos. When duration divided by
-    /// this count is finer than --keyframe-interval, that finer spacing is used
-    /// instead, so every video keeps at least this many samples. The two rules
-    /// meet at a runtime of --keyframe-interval times this count: above it the
-    /// interval alone already yields enough samples and this never applies,
-    /// below it this takes over. Raising it is NOT monotonic, because a denser
-    /// sample makes each hash stand for a shorter span, so extra frames that
-    /// match nothing dilute a pair's coverage and can push it under
-    /// --match-percent. 4, 12, 20 and 28 all measure well; 8 and 16 lose pairs
-    /// that way. Only used when --keyframe-interval is > 0.0; 0 here removes the
-    /// floor and leaves that interval to stand on its own. Negative and
-    /// unparseable values are rejected before the scan starts.
-    #[arg(long = "min-keyframes", default_value_t = 12.0)]
+    /// Minimum keyframes to keep for short videos
+    ///
+    /// Only used when --keyframe-interval is above 0; 0 removes the floor.
+    /// Raising it is NOT monotonic: denser sampling makes each hash stand for a
+    /// shorter span, so frames that match nothing dilute a pair's coverage and
+    /// can push it under --match-percent. 4, 12, 20 and 28 measure well; 8 and
+    /// 16 lose pairs. Negative values are refused.
+    #[arg(long = "min-keyframes", value_name = "F", default_value_t = 12.0)]
     min_kf_samples: f64,
 
-    /// Priority for determining the best file to KEEP
-    #[arg(short = 'k', long = "priority", default_value = "length")]
+    /// Property that decides which file to KEEP
+    #[arg(short = 'k', long = "priority", value_name = "P", default_value = "length")]
     priority: Priority,
 
-    /// Output file for the results. The format follows the extension (.txt,
-    /// .csv, .json; anything else is written as text) unless --format overrides
-    /// it. Use - to write the report to stdout, where it replaces the terminal
-    /// listing rather than repeating it; progress, warnings and prompts stay on
-    /// stderr, so `vid-fp DIR -o - --format csv | grep DELETE` pipes the report
-    /// alone. A file actually named - is reachable as ./-
-    #[arg(short = 'o', long = "output", value_hint = clap::ValueHint::FilePath)]
+    /// Write the report here; `-` writes it to stdout
+    ///
+    /// The format follows the extension (.txt, .csv, .json; anything else is
+    /// written as text) unless --format overrides it. On stdout the report
+    /// replaces the terminal listing rather than repeating it, and progress,
+    /// warnings and prompts stay on stderr. A file actually named - is
+    /// reachable as ./-
+    #[arg(short = 'o', long = "output", value_name = "FILE",
+          value_hint = clap::ValueHint::FilePath)]
     output: Option<String>,
 
-    /// Write the report in this format regardless of what --output is called.
+    /// Write the report in this format whatever --output is called
+    ///
     /// Needed for stdout, which has no extension to read, and for a report kept
-    /// under a name that carries no format (dupes.bak). Without it the
-    /// extension decides.
+    /// under a name that carries no format. Without it the extension decides.
     #[arg(long = "format", value_enum, value_name = "FORMAT")]
     format: Option<Format>,
 
-    /// Delete the files marked DELETE. By default they are moved to the system
-    /// trash (recoverable); add --permanent to remove them for good. Files
-    /// marked KEEP or REVIEW are never touched.
+    /// Move the files marked DELETE to the system trash
+    ///
+    /// Add --permanent to remove them for good. Files marked KEEP or REVIEW are
+    /// never touched.
     #[arg(long = "delete")]
     delete: bool,
 
-    /// With --delete, remove files permanently instead of moving them to the
-    /// trash. Irreversible — use with care. Has no effect on its own.
+    /// With --delete, remove the files permanently instead of trashing them
+    ///
+    /// Irreversible. No effect on its own.
     #[arg(long = "permanent")]
     permanent: bool,
 
-    /// Move the files marked DELETE under this folder, recreating each file's
-    /// absolute path inside it (/mnt/media/ep.mkv -> DIR/mnt/media/ep.mkv).
-    /// Nothing is overwritten and nothing is renamed, so the whole run can be
-    /// undone with a single copy back from DIR. Use this wherever the system
-    /// trash isn't available — external disks, NFS mounts, headless servers.
-    /// Acts on its own: it is not a deletion, so it needs no --delete, and it
-    /// supersedes --delete and --permanent if they are given.
+    /// Move the files marked DELETE under this folder
+    ///
+    /// Each file's absolute path is recreated inside it (/mnt/media/ep.mkv ->
+    /// DIR/mnt/media/ep.mkv), so the whole run can be undone with one copy back
+    /// from DIR. For where the system trash is not available: external disks,
+    /// NFS mounts, headless servers. Arms the run on its own and supersedes
+    /// --delete and --permanent.
     #[arg(long = "move-to", value_name = "DIR",
           value_hint = clap::ValueHint::DirPath)]
     move_to: Option<String>,
 
     /// Act on a CSV or JSON report from an earlier run instead of scanning
-    /// anything (the format is read from the file itself, so its name does not
-    /// matter). Every row whose
-    /// action reads DELETE is disposed of, and nothing else is touched — so
-    /// editing that field is how you act on the rows the tool would not decide
-    /// for you (REVIEW), or spare one it would. Nothing is re-fingerprinted and
-    /// no groups are recomputed: the report is the decision. Each file is still
-    /// re-checked against the size the report recorded and left alone if it
-    /// changed since. A .txt report cannot be replayed: it records no size to
-    /// check against. Requires --delete or --move-to, and cannot be combined
+    ///
+    /// Every row whose action reads DELETE is disposed of and nothing else is
+    /// touched, so editing that field is how you act on REVIEW rows or spare a
+    /// file. Nothing is re-fingerprinted and no groups are recomputed: the
+    /// report is the decision. Each file is re-checked against the size the
+    /// report recorded and left alone if it changed. The format is read from
+    /// the file, not its name; a .txt report cannot be replayed because it
+    /// records no size. Requires --delete or --move-to, and cannot be combined
     /// with scanning or matching options.
     #[arg(
         long = "from-report",
@@ -634,20 +620,19 @@ struct Args {
     )]
     from_report: Option<String>,
 
-    /// Answer yes to the confirmation shown before any file is touched. That
-    /// confirmation only appears on an interactive terminal -- a run whose
-    /// input or output is piped or redirected is never prompted and never
-    /// blocks -- so this flag is for saying so out loud, and for the
-    /// interactive runs that would rather not be asked.
+    /// Answer yes to the confirmation shown before any file is touched
+    ///
+    /// The confirmation only appears on an interactive terminal, so a piped or
+    /// redirected run is never prompted and never blocks.
     #[arg(short = 'y', long = "yes")]
     yes: bool,
 
-    /// Use this cache file instead of the default one under
-    /// $XDG_CACHE_HOME/vid-fp (or ~/.cache/vid-fp). A run locks its cache for
-    /// the whole scan, so two runs at once need two caches — this is what
-    /// makes scanning separate libraries in parallel possible. A path that is
-    /// an existing directory, or is written with a trailing slash, gets the
-    /// default filename inside it; missing parent directories are created.
+    /// Use this cache file instead of the default one
+    ///
+    /// The default is under $XDG_CACHE_HOME/vid-fp (or ~/.cache/vid-fp). A run
+    /// locks its cache for the whole scan, so scanning libraries in parallel
+    /// needs a cache each. An existing directory, or a path with a trailing
+    /// slash, gets the default filename inside it; missing parents are created.
     /// --clear-cache and --prune-cache act on whichever cache this names.
     #[arg(long = "cache", value_name = "PATH",
           value_hint = clap::ValueHint::FilePath)]
@@ -657,24 +642,22 @@ struct Args {
     #[arg(long = "clear-cache")]
     clear_cache: bool,
 
-    /// Write every log line to this file, including the failures the terminal
-    /// never shows. A failure that the end-of-run summary is going to account
-    /// for is not printed while the run works — under -x '*' every file that is
-    /// not a video is one, and a scan of a home directory produces hundreds of
-    /// thousands — so the summary's count and its examples are what you see.
-    /// This is where the unabridged list goes when you want to grep it. The
-    /// file is truncated at the start of each run.
+    /// Write every log line to this file, including the ones the terminal hides
+    ///
+    /// A failure the end-of-run summary accounts for is not also printed while
+    /// the run works, so this is where the unabridged list goes when you want
+    /// to grep it. Truncated at the start of each run.
     #[arg(long = "log-file", value_name = "PATH",
           value_hint = clap::ValueHint::FilePath)]
     log_file: Option<String>,
 
-    /// Drop the cached fingerprint of every file this scan did not find, so a
-    /// cache stops growing with libraries that have moved on. It is skipped,
-    /// loudly, when the scan was not complete enough to measure against: a scan
-    /// path that would not resolve, a folder that could not be read, or a scan
-    /// that found no videos at all. Pruning against a partial scan would throw
-    /// away fingerprints that are still good -- a mistyped folder empties the
-    /// cache -- so the run says so, keeps the entries, and exits 2.
+    /// Drop the cached fingerprint of every file this scan did not find
+    ///
+    /// Keeps a cache from growing with libraries that have moved on. Skipped,
+    /// loudly, when the scan was not complete enough to measure against: a path
+    /// that would not resolve, a folder that could not be read, or a scan that
+    /// found no videos. Pruning against a partial scan would throw away good
+    /// fingerprints, so the run keeps them and exits 2.
     #[arg(long = "prune-cache")]
     prune_cache: bool,
 
@@ -682,23 +665,22 @@ struct Args {
     #[arg(short = 'q', long = "quiet")]
     quiet: bool,
 
-    /// Maximum number of threads to use. 0 uses all available CPU cores
-    /// (default), which is the fastest setting for videos on a local disk:
-    /// raising it further does not measurably speed a scan up, and every
-    /// concurrent decode holds a full-resolution frame buffer, so peak memory
-    /// grows roughly in step with this number. More workers than cores is still
-    /// worth trying when the videos are on a network mount or a slow disk,
-    /// where workers spend their time waiting on I/O rather than on the CPU.
-    /// Anything above four per core (or 16, whichever is larger) is capped at
-    /// that, with a note saying so.
-    #[arg(short = 't', long = "threads", default_value_t = 0)]
+    /// Maximum number of threads to use (0 = all CPU cores)
+    ///
+    /// All cores is fastest for videos on a local disk: raising it further does
+    /// not measurably speed a scan up, and every concurrent decode holds a
+    /// full-resolution frame buffer, so peak memory grows in step with this
+    /// number. More workers than cores is worth trying when the videos are on a
+    /// network mount or a slow disk. Anything above four per core, or 16 if
+    /// that is larger, is capped at that with a note saying so.
+    #[arg(short = 't', long = "threads", value_name = "N", default_value_t = 0)]
     threads: usize,
 
-    /// Print a shell completion script to stdout and exit.
+    /// Print a shell completion script to stdout and exit
     #[arg(long = "completions", value_name = "SHELL", exclusive = true)]
     completions: Option<Shell>,
 
-    /// Print the roff man page to stdout and exit.
+    /// Print the roff man page to stdout and exit
     #[arg(long = "man", exclusive = true)]
     man: bool,
 }
@@ -2467,7 +2449,7 @@ fn run(
     // nearly COMPLETE graph, which has few enough groups to slip under that
     // ceiling while costing minutes of quadratic pivot work to prove it. Chance
     // is the honest edge of the range, and it is comfortably past the edge of the
-    // useful one (`--help` says 2 to 14).
+    // useful one (`--help` says 2 to 12).
     //
     // MAX_HAMMING_DISTANCE itself stays legal, the mirror of `-p 0`: it is a
     // sensitivity control, and refusing its last rung would be arbitrary where

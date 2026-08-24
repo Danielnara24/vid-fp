@@ -40,10 +40,10 @@ pub fn shutdown_requested() -> bool {
 pub enum Priority {
     Length,
     Resolution,
-    /// Bits spent on an average frame: bitrate divided by frame rate. Replaces
-    /// the old raw-bitrate metric, which double-counted frame rate (a 60 fps
-    /// copy needs roughly twice the bitrate to look the same as a 30 fps one)
-    /// and so preferred whichever copy simply had more frames.
+    // Not raw bitrate, which double-counts frame rate (a 60 fps copy needs
+    // roughly twice the bitrate to look the same as a 30 fps one) and so
+    // preferred whichever copy simply had more frames.
+    /// Bits spent on an average frame: bitrate divided by frame rate
     Quality,
     Size,
 }
