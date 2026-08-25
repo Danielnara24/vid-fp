@@ -419,38 +419,76 @@ fn read_csv(path: &str, stats: &RunStats) -> Result<Report> {
 /// for its columns: a JSON file with no `results` array is not a report, and
 /// walking it would find nothing to do and report that as a clean run over an
 /// empty list.
+///
+/// **What it does NOT hold is the report.** This used to read the whole file
+/// into a `String` and parse it into a `serde_json::Value`, on the reasoning
+/// that a report is written in one `fs::write` and may as well be read back the
+/// same way. That reasoning outlived the writer: `output_results` streams every
+/// format now, and reading back what it streams cost far more than writing it.
+/// The tree is dominated by the one thing this reader never looks at -- a group
+/// of `g` members carries `g * (g - 1)` link objects -- so the 288 MB report the
+/// local corpus writes at `-d 18 -p 20` (65,441 rows) was **1,376 MB of peak RSS
+/// and 3.0-3.1 s** to replay, against 9.5 MB and 0.07-0.08 s for the same
+/// decisions in the CSV. A `Deserializer` over a `BufReader`, into a shape that
+/// keeps three cells per row and walks past every other key, is **25 MB and
+/// 1.26-1.30 s**: a fifty-fifth of the memory, and what time is left is the
+/// parse of 288 MB of text that the CSV states in 23 MB. The replay is
+/// byte-identical -- the same 725 rows marked in the same order, with the same
+/// complaints, as the old reader and as the CSV beside it.
+///
+/// Only one thing in the file is refused outright, and it is the same thing the
+/// CSV refuses: a report with no rows in it anywhere. A root that is not an
+/// object and a missing `results` are both "this is not a report", because
+/// walking one would find nothing to do and report that as a clean run over an
+/// empty list. Everything inside `results` is reported where it sits instead --
+/// a group whose `files` is not a list, a `files` entry that is not an object
+/// -- because one mangled group is no reason to refuse the decisions in the
+/// ninety-nine good ones. That is why `JsonFiles` and `JsonRow` are written out
+/// by hand: a derived struct turns each of those into a parse error, and a
+/// parse error here is the whole replay lost to one stray value.
 fn read_json(path: &str, stats: &RunStats) -> Result<Report> {
-    let text = std::fs::read_to_string(path)
+    let file = std::fs::File::open(path)
         .with_context(|| format!("Failed to open the report {}", path))?;
 
-    // The whole tree at once. A report is written in one `fs::write` and read
-    // back the same way; streaming it would buy nothing but a second shape to
-    // get wrong.
-    let root: serde_json::Value = serde_json::from_str(&text)
-        .with_context(|| format!("{} is not valid JSON", path))?;
-
-    let groups = root.get("results").and_then(|r| r.as_array()).ok_or_else(|| {
-        anyhow!(
-            "The report {} has no 'results' array. --from-report reads the .csv or .json that \
-             -o writes; a .txt report cannot be replayed, because it records no size to check \
-             each file against before removing it.",
-            path
-        )
-    })?;
+    // Straight off the disk in `BufReader`-sized pieces. Nothing below keeps a
+    // borrow into it, so no part of the file is held for longer than it takes
+    // to decide what it was.
+    let tree: JsonReport = match serde_json::from_reader(std::io::BufReader::new(file)) {
+        Ok(tree) => tree,
+        // Well-formed JSON that is not this shape. Serde's own sentence names
+        // the key or the type it wanted and the line and column it wanted it
+        // at, which is the actionable half; what it cannot know is what the
+        // file was supposed to be, so that is said here.
+        Err(e) if e.classify() == serde_json::error::Category::Data => {
+            return Err(anyhow!(
+                "The report {} is not one --from-report can read: {}. It reads the .csv or the \
+                 .json that -o writes, and that JSON is an object with a 'results' array of \
+                 groups, each holding a 'files' array. A .txt report cannot be replayed at all, \
+                 because it records no size to check each file against before removing it.",
+                path,
+                e
+            ));
+        }
+        Err(e) => {
+            return Err(
+                anyhow::Error::new(e).context(format!("{} is not valid JSON", path))
+            )
+        }
+    };
 
     let mut rows = Rows::default();
 
-    for (g, group) in groups.iter().enumerate() {
+    for (g, group) in tree.results.into_iter().enumerate() {
         // A group is located by its own `group` key when it has one, because
         // that is the name the report prints and the user reads. Falling back to
         // the index keeps a hand-assembled tree navigable.
         let group_name = group
-            .get("group")
-            .and_then(|v| v.as_str())
+            .group
+            .as_str()
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("results[{}]", g));
 
-        let Some(files) = group.get("files").and_then(|f| f.as_array()) else {
+        let Some(files) = group.files.0 else {
             log::error!(target: crate::stats::COUNTED, "{}: {} has no 'files' array; nothing in it was acted on.", path, group_name);
             stats
                 .report_unusable
@@ -459,24 +497,12 @@ fn read_json(path: &str, stats: &RunStats) -> Result<Report> {
         };
 
         for (f, file) in files.iter().enumerate() {
-            let at = format!("{} file {}", group_name, f + 1);
-
-            // Every cell is read as the text it would have been in the CSV, so
-            // the shared rules apply unchanged: a number becomes its own
-            // digits, a string is taken as written, and anything absent is the
-            // empty cell it amounts to. `size_bytes` written as 4096.0 or as
-            // null therefore lands in the same "that is not a byte count"
-            // refusal a spreadsheet's 1.23E+09 does.
-            let action = cell(file.get("action"));
-            let filename = cell(file.get("full_path"));
-            let size = cell(file.get("size_bytes"));
-
             rows.consider(
                 Row {
-                    at,
-                    action: &action,
-                    file: &filename,
-                    size: &size,
+                    at: format!("{} file {}", group_name, f + 1),
+                    action: &file.action,
+                    file: &file.full_path,
+                    size: &file.size_bytes,
                 },
                 path,
                 stats,
@@ -487,18 +513,196 @@ fn read_json(path: &str, stats: &RunStats) -> Result<Report> {
     Ok(rows.finish())
 }
 
+/// A report, as much of it as a decision is taken from.
+///
+/// `results` is not optional and not a `Value`: a file without it is not a
+/// report, and that is the one thing this reader is entitled to abort over.
+#[derive(serde::Deserialize)]
+struct JsonReport {
+    results: Vec<JsonGroup>,
+}
+
+/// One group: a name to quote back, and the rows it holds.
+///
+/// Neither field can fail the report. The name is a `Value` rather than a
+/// `String` because it is only ever printed -- a hand-assembled tree that wrote
+/// `"group": 5` is navigable by the index fallback, and refusing the whole
+/// report over a label would be refusing it over nothing. `JsonFiles` says the
+/// same of the rows: a group that holds no list of them is a group with nothing
+/// to act on, which is a complaint about that group and not about the file.
+#[derive(serde::Deserialize)]
+struct JsonGroup {
+    #[serde(default)]
+    group: serde_json::Value,
+    #[serde(default)]
+    files: JsonFiles,
+}
+
+/// The `files` array of one group, or nothing when the key held some other
+/// shape entirely.
+///
+/// `None` covers all three ways a group can fail to offer rows -- the key
+/// absent, `null`, or a value that is not a list -- and they are one finding,
+/// reported in one sentence at the group that has it.
+#[derive(Default)]
+struct JsonFiles(Option<Vec<JsonRow>>);
+
+impl<'de> serde::Deserialize<'de> for JsonFiles {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(JsonFilesVisitor)
+    }
+}
+
+struct JsonFilesVisitor;
+
+impl<'de> serde::de::Visitor<'de> for JsonFilesVisitor {
+    type Value = JsonFiles;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a list of file objects")
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<JsonFiles, A::Error> {
+        let mut files = Vec::new();
+        while let Some(row) = seq.next_element()? {
+            files.push(row);
+        }
+        Ok(JsonFiles(Some(files)))
+    }
+
+    // Anything else is a group with no rows in it. Each is drained rather than
+    // abandoned where there is something to drain, because whatever follows it
+    // is still in front of the parser and the other groups are on the far side.
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<JsonFiles, A::Error> {
+        while map
+            .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+            .is_some()
+        {}
+        Ok(JsonFiles::default())
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> Result<JsonFiles, E> {
+        Ok(JsonFiles::default())
+    }
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<JsonFiles, E> {
+        Ok(JsonFiles::default())
+    }
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<JsonFiles, E> {
+        Ok(JsonFiles::default())
+    }
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<JsonFiles, E> {
+        Ok(JsonFiles::default())
+    }
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<JsonFiles, E> {
+        Ok(JsonFiles::default())
+    }
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<JsonFiles, E> {
+        Ok(JsonFiles::default())
+    }
+}
+
+/// One `results[].files[]` object, cut down to the three cells a decision needs.
+///
+/// Hand-written rather than derived, for the two things a derived struct would
+/// get wrong here.
+///
+/// It skips what it does not want instead of building it. Every unknown key is
+/// consumed as `IgnoredAny`, which walks the value without allocating it --
+/// including `matches`, the one key that makes these reports large. That is the
+/// whole of the memory fix; a derived struct would do the same, but only for as
+/// long as nobody typed a `Value` field to be safe.
+///
+/// And an entry that is not an object at all comes back naming no file, rather
+/// than failing the deserializer and with it the entire replay. A `files` array
+/// with a stray number in it is one mangled row among however many good ones,
+/// and this module's whole disposition towards those is to count them, name
+/// them and act on the rest -- see `Rows::consider`, which is where such a row
+/// is turned into a complaint.
+#[derive(Default)]
+struct JsonRow {
+    action: String,
+    full_path: String,
+    size_bytes: String,
+}
+
+impl<'de> serde::Deserialize<'de> for JsonRow {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(JsonRowVisitor)
+    }
+}
+
+struct JsonRowVisitor;
+
+impl<'de> serde::de::Visitor<'de> for JsonRowVisitor {
+    type Value = JsonRow;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a file object")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<JsonRow, A::Error> {
+        let mut row = JsonRow::default();
+
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "action" => row.action = cell(map.next_value()?),
+                "full_path" => row.full_path = cell(map.next_value()?),
+                "size_bytes" => row.size_bytes = cell(map.next_value()?),
+                // `matches` above all, and it is the reason this is not a
+                // `Value`: one object per measured link, never read, and on a
+                // large report the great majority of the file.
+                _ => {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+        }
+
+        Ok(row)
+    }
+
+    // Every other shape a JSON value can take. None of them is a row, and each
+    // comes back as the empty one it amounts to -- which `Rows::consider`
+    // counts and leaves alone, exactly as it does a row whose action cell was
+    // emptied. The alternative is a deserializer error, and a deserializer
+    // error here is the whole report refused over one entry.
+    fn visit_unit<E: serde::de::Error>(self) -> Result<JsonRow, E> {
+        Ok(JsonRow::default())
+    }
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<JsonRow, E> {
+        Ok(JsonRow::default())
+    }
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<JsonRow, E> {
+        Ok(JsonRow::default())
+    }
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<JsonRow, E> {
+        Ok(JsonRow::default())
+    }
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<JsonRow, E> {
+        Ok(JsonRow::default())
+    }
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<JsonRow, E> {
+        Ok(JsonRow::default())
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<JsonRow, A::Error> {
+        // Drained rather than abandoned: what is left of it is still in front
+        // of the parser, and the rows after it are on the other side.
+        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+        Ok(JsonRow::default())
+    }
+}
+
 /// One JSON value as the cell it stands for.
 ///
-/// A string keeps every byte of itself -- a path's leading space is part of its
-/// name and `Rows::consider` is relying on still having it. Anything else is
+/// A string keeps every byte of itself, and is moved rather than copied -- a
+/// path's leading space is part of its name and `Rows::consider` is relying on
+/// still having it. Anything else is
 /// rendered the way JSON writes it, which is what makes a number usable as a
 /// size and makes a nonsense value (an array, `true`) show up as the nonsense it
 /// is in the message that reports it, rather than as a blank.
-fn cell(value: Option<&serde_json::Value>) -> String {
+fn cell(value: serde_json::Value) -> String {
     match value {
-        Some(serde_json::Value::String(s)) => s.clone(),
-        Some(serde_json::Value::Null) | None => String::new(),
-        Some(other) => other.to_string(),
+        serde_json::Value::String(s) => s,
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
     }
 }
 
@@ -1073,6 +1277,127 @@ shared_to_seconds";
         assert_eq!(report.rows, 1, "one file object is one row");
         assert_eq!(report.marked.len(), 1);
         assert_eq!(report.marked[0].path, "/b.mkv");
+    }
+
+    #[test]
+    fn test_a_link_that_names_itself_a_decision_is_still_not_one() {
+        // `test_the_nested_match_list_is_not_a_row` says the link objects are
+        // not rows; this says it of a link built to look exactly like one. The
+        // reader walks past every key it does not want without building it,
+        // which is the whole of why a 288 MB report no longer costs 1.4 GB to
+        // replay -- and a walk-past that started reading would take the file
+        // that WON the comparison.
+        let dir = tempfile::tempdir().unwrap();
+        let tree = serde_json::json!({
+            "results": [ { "group": "group_1", "files": [ {
+                "action": "KEEP",
+                "full_path": "/a.mkv",
+                "size_bytes": 10,
+                "matches": [
+                    { "action": "DELETE", "full_path": "/b.mkv", "size_bytes": 20 }
+                ],
+            } ] } ]
+        });
+        let path = write_json(&dir, "links.json", &tree.to_string());
+
+        let stats = RunStats::default();
+        let report = read(&path, &stats).unwrap();
+
+        assert_eq!(report.rows, 1, "the link is not a row");
+        assert!(report.marked.is_empty(), "and its DELETE is not a decision");
+        assert_eq!(stats.report_unusable.count(), 0);
+    }
+
+    #[test]
+    fn test_a_junk_entry_among_the_files_is_one_row_and_not_a_dead_report() {
+        // The line this reader draws: the structure of a report is refused
+        // outright, its contents are reported row by row. A stray value in a
+        // `files` array is contents -- one mangled row, counted and left alone,
+        // with the good rows either side of it still acted on. Deserializing
+        // straight into a struct would have made it a parse error, and a parse
+        // error here is sixty-five thousand decisions refused over one.
+        let dir = tempfile::tempdir().unwrap();
+        let tree = serde_json::json!({
+            "results": [ { "group": "group_1", "files": [
+                json_file("/a.mkv", serde_json::json!(10), "DELETE"),
+                serde_json::json!(42),
+                serde_json::json!("not a file object"),
+                serde_json::json!([1, 2, 3]),
+                serde_json::json!(null),
+                json_file("/b.mkv", serde_json::json!(20), "DELETE"),
+            ] } ]
+        });
+        let path = write_json(&dir, "junk.json", &tree.to_string());
+
+        let stats = RunStats::default();
+        let report = read(&path, &stats).unwrap();
+
+        assert_eq!(report.rows, 6, "every entry is a row, junk included");
+        let marked: Vec<&str> = report.marked.iter().map(|m| m.path.as_str()).collect();
+        assert_eq!(marked, ["/a.mkv", "/b.mkv"], "the good rows either side still go through");
+        // A junk entry names no file and asks for nothing, which is the same
+        // silence an emptied action cell gets and for the same reason.
+        assert_eq!(stats.report_unusable.count(), 0);
+    }
+
+    #[test]
+    fn test_a_group_that_holds_no_list_of_rows_is_one_complaint_and_not_a_dead_report() {
+        // A group can fail to offer rows in three ways -- the key absent, null,
+        // or something that is not a list at all -- and all three are the same
+        // finding about that group: there is nothing in it to act on. None of
+        // them is a finding about the file, so the groups either side are still
+        // read, which is what a derived struct would have taken away by turning
+        // the third one into a parse error.
+        let dir = tempfile::tempdir().unwrap();
+        let tree = serde_json::json!({
+            "results": [
+                { "group": "group_1", "files": [
+                    json_file("/a.mkv", serde_json::json!(10), "DELETE")
+                ] },
+                { "group": "group_2", "files": 3 },
+                { "group": "group_3", "files": serde_json::Value::Null },
+                { "group": "group_4", "files": { "full_path": "/x.mkv" } },
+                { "group": "group_5" },
+                { "group": "group_6", "files": [
+                    json_file("/b.mkv", serde_json::json!(20), "DELETE")
+                ] },
+            ]
+        });
+        let path = write_json(&dir, "shape.json", &tree.to_string());
+
+        let stats = RunStats::default();
+        let report = read(&path, &stats).unwrap();
+
+        let marked: Vec<&str> = report.marked.iter().map(|m| m.path.as_str()).collect();
+        assert_eq!(marked, ["/a.mkv", "/b.mkv"], "the groups either side are still read");
+        assert_eq!(report.rows, 2, "a group with no rows contributes none");
+        assert_eq!(stats.report_unusable.count(), 4, "and each says so once");
+        assert!(stats.had_problems());
+        // The one nested path in the file is in the group that had no list, and
+        // it must not have been read as a row of anything.
+        assert!(!marked.contains(&"/x.mkv"));
+    }
+
+    #[test]
+    fn test_a_group_labelled_with_something_other_than_a_name_is_still_navigable() {
+        // The name is only ever quoted back, so a hand-assembled tree that put
+        // a number there falls back to the index and the complaint still tells
+        // the user where to look. Refusing the whole report over a label would
+        // be refusing it over nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let tree = serde_json::json!({
+            "results": [ { "group": 5, "files": [
+                json_file("/a.mkv", serde_json::json!(10), "DELET")
+            ] } ]
+        });
+        let path = write_json(&dir, "label.json", &tree.to_string());
+
+        let stats = RunStats::default();
+        read(&path, &stats).unwrap();
+
+        let complaints = stats.report_unusable.samples();
+        assert_eq!(complaints.len(), 1);
+        assert!(complaints[0].contains("results[0] file 1"), "{}", complaints[0]);
     }
 
     #[test]

@@ -1248,7 +1248,18 @@ pub fn output_results(
     }
 
     // --- Reporting -----------------------------------------------------------
-    let Console { listing: show_listing, summary: show_summary } = console_for(report_target);
+    let Console { listing, summary: summarise } = console_for(report_target);
+
+    // Both halves are also a question about the log level, and it is asked here
+    // rather than inside `console_for` so that function stays a statement about
+    // `--output` alone. Everything the listing and the summary amount to leaves
+    // through `info!`, and `-q` sets the whole filter -- console and
+    // `--log-file` alike -- so under it there is nobody at the other end. The
+    // macro was already dropping those lines; what it cannot drop is the
+    // `format!` that built each one, and on the local corpus at `-d 18` that is
+    // 65,441 lines assembled and thrown away.
+    let show_listing = listing && log::log_enabled!(log::Level::Info);
+    let show_summary = summarise && log::log_enabled!(log::Level::Info);
 
     if show_listing {
         info!("\n========================================");
@@ -1420,7 +1431,27 @@ pub fn output_results(
         JsonBody::open(sink(), &summary, !final_groups.is_empty())
     });
 
-    for (i, group) in final_groups.iter().enumerate() {
+    // Nothing in the loop below reaches anywhere except the console listing and
+    // the one report body this run is writing, so a run with neither has no
+    // reason to walk it at all. That combination is not a corner case: it is
+    // `-q` with no `--output`, the shape a script uses when all it wants is the
+    // exit code and the disposal. Both figures the summary quotes -- the group
+    // count and `matched_file_count` -- were settled above, and the disposal
+    // pass ran before either of them.
+    //
+    // Written as the slice to walk rather than as a guard around the loop so
+    // that the reason sits with the decision, and so that anything ever added
+    // below cannot quietly become a side effect that a `-q` run skips.
+    //
+    // Worth 0.67-0.69 s -> 0.41 s on the local corpus at `-d 18 -p 20`, which
+    // is 9,003 groups and 65,441 rows formatted for nobody.
+    let rows_to_report: &[Vec<usize>] = if show_listing || wants_txt || wants_csv || wants_json {
+        final_groups
+    } else {
+        &[]
+    };
+
+    for (i, group) in rows_to_report.iter().enumerate() {
         let group_name = format!("group_{}", i + 1);
 
         if show_listing {
@@ -1495,13 +1526,6 @@ pub fn output_results(
             // Bitrate stays alongside it because it is the number people know
             // and the one their other tools print, but it never ranks anything.
             let quality_str = format_quality(fp.quality());
-            // The console and text report show only the formatted figure,
-            // because a human is reading it at a glance.
-            let matched_str = format_shared(matched);
-            // Hashes held, not keyframes decoded: featureless frames are dropped
-            // below MIN_AC_ENERGY, so this is what the comparison actually had
-            // to work with, which is the number that explains the row.
-            let samples_raw = fp.valid_hashes.len().to_string();
 
             // The same values as numbers, for the CSV and JSON. An unknown one
             // is an empty field / a null rather than a zero: a container that
@@ -1516,42 +1540,11 @@ pub fn output_results(
                 .then(|| (fp.frame_rate * 1000.0).round() / 1000.0);
             let quality_num = (fp.quality() > 0).then(|| fp.quality());
 
-            let frame_rate_raw = frame_rate_num.map(|f| f.to_string()).unwrap_or_default();
-            let quality_raw = quality_num.map(|q| q.to_string()).unwrap_or_default();
-            let size_bytes_raw = fp.file_size.to_string();
-            let bitrate_bps_raw = fp.bitrate().to_string();
-            let matched_seconds_raw = csv_seconds(matched);
-            // Runtime and frame geometry as plain numbers, so every figure the
-            // ranking uses can be sorted on. Resolution's raw form is the two
-            // sides rather than their product: the product is one multiplication
-            // away in any spreadsheet, and the sides are what was measured.
-            let length_seconds_raw = if fp.duration > 0.0 {
-                format!("{:.2}", fp.duration)
-            } else {
-                String::new()
-            };
-            let width_raw = fp.width.to_string();
-            let height_raw = fp.height.to_string();
-
-            // The file the figures above describe. Empty rather than "-" when
-            // there is none, for the same reason every other unknown is empty:
-            // a CSV consumer should see a blank cell, not a sentinel it has to
-            // know about.
-            let matched_with_raw = best
-                .map(|l| fingerprints[l.other].path.clone())
-                .unwrap_or_default();
-
             // The envelope, in this file's own timeline -- the same timeline
             // `matched_seconds` is stated in, so the two can be read against
-            // each other. Both the clock form and the raw seconds, like every
-            // other figure here.
+            // each other. The JSON states it as well, so it is measured here;
+            // the two ways of writing it down are not.
             let best_span = best.and_then(|l| l.span);
-            let matched_from_str =
-                best_span.map(|s| format_duration(s.start_seconds())).unwrap_or_default();
-            let matched_to_str =
-                best_span.map(|s| format_duration(s.end_seconds())).unwrap_or_default();
-            let matched_from_raw = csv_seconds(best_span.map(|s| s.start_seconds()));
-            let matched_to_raw = csv_seconds(best_span.map(|s| s.end_seconds()));
 
             // Label by the file's GLOBAL fate (precedence REVIEW > DELETE > KEEP).
             // A file that is redundant in an overlapping group is shown DELETE/
@@ -1597,6 +1590,11 @@ pub fn output_results(
             // it, and not otherwise: on a CSV or JSON run this line is the one
             // piece of the text body that is neither shown nor saved.
             if show_listing || wants_txt {
+                // The formatted figure only, because a human is reading this at
+                // a glance. The CSV states the same match in seconds and the
+                // JSON as a number, so neither of them wants this string.
+                let matched_str = format_shared(matched);
+
                 let line = format!(
                     "\t{:<width$} {}, {}, {}, {}, {}, {}, {}, {} samples, {} matched, {}",
                     format!("{},", action_str),
@@ -1607,7 +1605,11 @@ pub fn output_results(
                     size_str,
                     bitrate_str,
                     quality_str,
-                    samples_raw,
+                    // Hashes held, not keyframes decoded: featureless frames
+                    // are dropped below MIN_AC_ENERGY, so this is what the
+                    // comparison actually had to work with, which is the number
+                    // that explains the row.
+                    fp.valid_hashes.len(),
                     matched_str,
                     fp.path,
                     width = ACTION_COLUMN
@@ -1621,7 +1623,55 @@ pub fn output_results(
             }
 
             // 2. CSV Output
+            //
+            // Every string below is built here rather than above because this
+            // is the only place any of them is read. They are the raw halves of
+            // the columns -- the figure a spreadsheet sorts on, beside the
+            // formatted one a person reads -- and the JSON states the same
+            // figures as JSON numbers, so on any other run these were thirteen
+            // allocations a row, one of them a full copy of a path, built and
+            // dropped without being looked at. Measured on the local corpus at
+            // `-d 18 -p 20`, three runs each: `-o x.txt -q` 0.72-0.74 s ->
+            // 0.63-0.65 s, `-o x.json -q` 4.67-5.54 s -> 4.49-4.70 s. The CSV
+            // run gains a little too (0.79 s -> 0.72-0.77 s), because the copy
+            // of the path became a borrow of it. All three reports are
+            // byte-identical, and so is every line of the console listing.
             if let Some(csv_wtr) = &mut csv_wtr {
+                let frame_rate_raw = frame_rate_num.map(|f| f.to_string()).unwrap_or_default();
+                let quality_raw = quality_num.map(|q| q.to_string()).unwrap_or_default();
+                let size_bytes_raw = fp.file_size.to_string();
+                let bitrate_bps_raw = fp.bitrate().to_string();
+                let matched_seconds_raw = csv_seconds(matched);
+                let samples_raw = fp.valid_hashes.len().to_string();
+                // Runtime and frame geometry as plain numbers, so every figure
+                // the ranking uses can be sorted on. Resolution's raw form is
+                // the two sides rather than their product: the product is one
+                // multiplication away in any spreadsheet, and the sides are what
+                // was measured.
+                let length_seconds_raw = if fp.duration > 0.0 {
+                    format!("{:.2}", fp.duration)
+                } else {
+                    String::new()
+                };
+                let width_raw = fp.width.to_string();
+                let height_raw = fp.height.to_string();
+
+                // The file the figures above describe. Empty rather than "-"
+                // when there is none, for the same reason every other unknown is
+                // empty: a CSV consumer should see a blank cell, not a sentinel
+                // it has to know about.
+                let matched_with_raw = best
+                    .map(|l| fingerprints[l.other].path.as_str())
+                    .unwrap_or_default();
+
+                // The envelope both ways, like every other figure here.
+                let matched_from_str =
+                    best_span.map(|s| format_duration(s.start_seconds())).unwrap_or_default();
+                let matched_to_str =
+                    best_span.map(|s| format_duration(s.end_seconds())).unwrap_or_default();
+                let matched_from_raw = csv_seconds(best_span.map(|s| s.start_seconds()));
+                let matched_to_raw = csv_seconds(best_span.map(|s| s.end_seconds()));
+
                 csv_wtr.write_record([
                     &group_name,
                     action_str,
@@ -1639,7 +1689,7 @@ pub fn output_results(
                     &bitrate_bps_raw,
                     &quality_str,
                     &quality_raw,
-                    &matched_with_raw,
+                    matched_with_raw,
                     &samples_raw,
                     &matched_seconds_raw,
                     &matched_from_str,
@@ -2612,6 +2662,43 @@ matched_from_seconds;matched_to_seconds";
             vec![del_path],
             "the caller is told exactly which fingerprints to forget"
         );
+    }
+
+    #[test]
+    fn test_a_run_with_nowhere_to_say_anything_still_does_everything_else() {
+        // `-q` with no `--output` is a run whose per-file rows have no reader:
+        // no listing, no report body. The reporting loop is skipped outright
+        // for it, so what this pins is that nothing else went with it -- the
+        // disposal pass runs before that loop and its answer is what the caller
+        // needs to drop the cache entries of files that are no longer there.
+        //
+        // The condition it turns on is the log level, which a unit test has no
+        // way to set without leaking into every test running beside it -- so it
+        // is read the other way around: no logger is installed here, `info!` is
+        // going nowhere, and this run is already the one being described.
+        assert!(
+            !log::log_enabled!(log::Level::Info),
+            "a test binary installs no logger, which is what makes this run the quiet one"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let keep_path = at(&dir, "keep.mkv");
+        let del_path = at(&dir, "duplicate.mkv");
+
+        let fps = vec![mock_fp_at(&keep_path, 60.0), mock_fp_at(&del_path, 10.0)];
+        materialize_all(&fps);
+
+        let stats = RunStats::default();
+
+        let deleted = output_results(
+            &[vec![0, 1]], &fps, &all_compared(fps.len()), None, 0, Priority::Length,
+            Some(&Disposal::Permanent), true, &stats,
+        ).unwrap();
+
+        assert!(Path::new(&keep_path).exists(), "the KEEP pick is untouched");
+        assert!(!Path::new(&del_path).exists(), "the duplicate is still disposed of");
+        assert_eq!(deleted, vec![del_path], "and the caller is still told which one");
+        assert!(!stats.had_problems());
     }
 
     #[test]
