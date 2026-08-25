@@ -1099,6 +1099,10 @@ pub enum Weighed {
 /// or three keyframes of an hour-long stream and read it as the total, which is
 /// an underestimate no rung of the ladder below would catch: it is not zero, so
 /// nothing falls back.
+///
+/// The seek one rung down had exactly that hole and the same shape of
+/// underestimate: it left MPEG-TS holding the one entry it landed on, which is
+/// not zero either. See the note at that seek.
 fn weigh_from_container(
     filepath: &str,
     kf_interval: f64,
@@ -1168,6 +1172,29 @@ fn weigh_from_container(
             );
         }
         keyframes = index_keyframes(&ictx, stream_index);
+
+        // One entry is the seek's own residue rather than an index. A container
+        // that answers a seek by publishing its index publishes all of it --
+        // Matroska hands over the whole Cue table -- while one with no index to
+        // publish is seeked by libavformat's generic fallback, which reads
+        // packets forward until it has landed and adds the single entry it
+        // landed on. MPEG-TS is that case and it is in `DEFAULT_EXTENSIONS` for
+        // the DVB captures and camcorder splits the splice invariant is about:
+        // a 90-keyframe 1080p capture came back weighed at one keyframe's
+        // pixels, 1% of its decode, so it sorted LAST, was handed one decoder
+        // thread at the one moment threads can still be handed out, and left
+        // ~99% of its work off the progress bar's denominator.
+        //
+        // This is asked only of a count the seek produced, so a file whose
+        // header really did carry an index of one keyframe is untouched: that
+        // one is non-zero before the seek and never reaches here. What it costs
+        // is a container with no index and a genuine single keyframe, which
+        // then takes the duration rung below and is charged as though it were
+        // keyframed on the usual clock -- an overcharge in the safe direction,
+        // since a decode of one enormous GOP still demuxes the whole file.
+        if keyframes <= 1 {
+            keyframes = 0;
+        }
     }
 
     let mut facts = weighable_facts(&ictx, stream_index);
@@ -2812,6 +2839,55 @@ mod tests {
             fp.width,
             fp.height,
             fp.codec
+        );
+    }
+
+    /// The seek that makes Matroska publish its Cues leaves MPEG-TS holding a
+    /// single entry -- the one it landed on -- and one is not zero, so the
+    /// ladder below never ran and every `.ts` in a library was weighed at one
+    /// keyframe's pixels whatever its length. That is a constant, so the error
+    /// grows with the file: this 30 s fixture was charged 3% of its decode, and
+    /// the 1080p DVB captures the extension list is there for are charged 1%.
+    ///
+    /// All three of the things the weighing pass exists to get right go with
+    /// it. The capture sorts LAST instead of first; `share_for` hands it one
+    /// decoder thread at the only moment threads can still be handed out, since
+    /// FFmpeg fixes them when the decoder opens; and the progress bar's
+    /// denominator omits work that then has to be finished after the bar reads
+    /// 100%.
+    ///
+    /// Checked against the decode rather than against a literal, and with room
+    /// either side, because what it lands on now is the duration rung -- an
+    /// estimate, and only ever meant to be the right scale. What must not come
+    /// back is the constant.
+    #[test]
+    fn test_the_one_entry_a_seek_leaves_behind_is_not_a_keyframe_count() {
+        init_ffmpeg_for_tests();
+
+        let path = fixture_named("test_video_capture.ts");
+        let filepath = path.to_string_lossy().to_string();
+        let size = std::fs::metadata(&path).unwrap().len();
+
+        let fp = fingerprint_path(&path);
+        let pixels = (fp.width * fp.height) as f64 * codec_cost(&fp.codec);
+        let truth = fp.valid_hashes.len() as f64 * pixels;
+
+        let weight = work_of(weigh_decode(&filepath, 0.0, 12.0, 0.0, size)) as f64;
+
+        assert!(
+            weight > pixels,
+            "weighed {} keyframe-pixels, which is the one index entry the seek left behind, \
+             for a decode of {} keyframes",
+            weight,
+            fp.valid_hashes.len()
+        );
+        assert!(
+            weight >= truth / 4.0 && weight <= truth * 4.0,
+            "a {:.0}s capture weighed {} against a decode of {} -- the weight has to be the \
+             file's scale, not one keyframe's",
+            fp.duration,
+            weight,
+            truth
         );
     }
 
