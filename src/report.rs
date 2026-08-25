@@ -371,9 +371,25 @@ fn read_csv(path: &str, stats: &RunStats) -> Result<Report> {
 
     let mut rows = Rows::default();
 
-    for (i, record) in rdr.records().enumerate() {
-        // Line number as the user's editor counts them: the header is line 1.
-        let line = i + 2;
+    // The header is line 1, and the parser is what knows where every row after
+    // it begins. A record COUNT is not that number: a newline is a legal byte in
+    // a Linux filename, `--null` exists so one can be piped in, and the writer
+    // quotes such a path rather than mangling it -- so a row can span two
+    // physical lines and every complaint after it names a line the user's editor
+    // does not have. The number is here so they can go and fix the row, which
+    // means it has to point at the row.
+    let mut counted = 1u64;
+
+    for record in rdr.records() {
+        counted += 1;
+        // Only for a record the parser could not place at all, which nothing
+        // this reader is handed should be: `records()` positions every record it
+        // yields, and an error carries the position it stopped at.
+        let line = match &record {
+            Ok(r) => r.position().map(|at| at.line()),
+            Err(e) => e.position().map(|at| at.line()),
+        }
+        .unwrap_or(counted);
 
         let record = match record {
             Ok(r) => r,
@@ -1232,6 +1248,40 @@ shared_to_seconds";
 
         assert_eq!(report.rows, 1);
         assert_eq!(stats.report_unusable.count(), 0);
+    }
+
+    #[test]
+    fn test_a_row_is_named_by_the_line_it_is_really_on() {
+        // A newline is a legal byte in a Linux filename, `--null` exists so one
+        // can be piped in, and both writers quote such a path rather than
+        // mangling it -- so a report can carry a row spanning two physical
+        // lines. Counting records and calling the count a line number then
+        // names a row the user's editor does not have: the complaint exists so
+        // they can go and fix the row, and it has to point at it.
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "{}\n{}\n{}\n{}\n",
+            HEADER,                                        // line 1
+            row("/a.mkv", 10, "DELETE"),                   // line 2
+            row("\"/we\nird.mkv\"", 20, "DELETE"),         // lines 3-4
+            row("/c.mkv", 30, "DELETEE"),                  // line 5
+        );
+        let path = write_report(&dir, &body);
+
+        let stats = RunStats::default();
+        let report = read(&path, &stats).unwrap();
+
+        // The quoted path round-trips, newline and all.
+        assert_eq!(report.marked.len(), 2);
+        assert_eq!(report.marked[1].path, "/we\nird.mkv");
+
+        assert_eq!(stats.report_unusable.count(), 1);
+        let sample = &stats.report_unusable.samples()[0];
+        assert!(
+            sample.contains("line 5"),
+            "the misspelt action is on physical line 5: {}",
+            sample
+        );
     }
 
     // --- the JSON report ------------------------------------------------------

@@ -714,6 +714,21 @@ fn sorted(set: &HashSet<String>) -> Vec<&str> {
     shown
 }
 
+/// The exceptions in a positive `-x` list that have nothing to subtract from,
+/// spelt the way they were written.
+///
+/// Empty for both wildcard shapes, which are never asked: there an exception is
+/// the only part of the list that can take a file away, so it always means
+/// something.
+fn inert_exceptions(wanted: &HashSet<String>, refused: &HashSet<String>) -> Vec<String> {
+    let mut inert: Vec<String> = refused
+        .difference(wanted)
+        .map(|ext| format!("{}{}", NOT, ext))
+        .collect();
+    inert.sort_unstable();
+    inert
+}
+
 fn normalize_extensions(requested: &[String]) -> Result<Wanted> {
     // Strip an optional leading dot and lowercase, so `-x .MP4`, `-x MP4`, and
     // `-x mp4` all behave identically. A HashSet gives O(1) lookups during the
@@ -767,6 +782,31 @@ fn normalize_extensions(requested: &[String]) -> Result<Wanted> {
 
     // Otherwise the positive entries are the whole of the walk's guess, and an
     // exception written beside them can only take one back out again.
+    //
+    // One that takes nothing out is worth a word. `-x` REPLACES the default
+    // list, so someone meaning "the defaults minus flac" writes
+    // `-x 'mp4,!flac'`, gets a one-extension walk, and is told only that the
+    // walk is searching `["mp4"]` -- a line that reads like confirmation
+    // because the extension they typed is in it. The exception is the half of
+    // the request that was silently dropped, so it is the half that has to be
+    // said out loud. Not an error: the walk is a perfectly good one and
+    // refusing it would also refuse `-x 'mp4,mkv,!flac'`, which is harmless
+    // belt-and-braces rather than a typo.
+    let inert = inert_exceptions(&wanted, &refused);
+    if !inert.is_empty() {
+        log::warn!(
+            "--extensions: {:?} matched nothing in {:?} and took nothing away. -x \
+             REPLACES the default extension list rather than narrowing it, so this \
+             walk is exactly {:?}; an exception can only take back an extension \
+             written beside it, and '{}' on its own means EVERY file except that one \
+             rather than the defaults except it.",
+            inert,
+            sorted(&wanted),
+            sorted(&wanted),
+            inert[0]
+        );
+    }
+
     wanted.retain(|ext| !refused.contains(ext));
 
     if wanted.is_empty() {
@@ -1170,6 +1210,47 @@ mod tests {
         assert_eq!(
             collected(
                 &sources(&include, &[], &extensions_of(&["mkv", "srt", "!srt"])),
+                &stats
+            ),
+            vec![video]
+        );
+    }
+
+    #[test]
+    fn test_an_exception_that_takes_nothing_back_out_is_said_out_loud() {
+        // `-x` REPLACES the default list, so someone meaning "the defaults
+        // except flac" writes `-x 'mp4,!flac'`, gets a one-extension walk, and
+        // is told only that the walk is searching ["mp4"] -- which reads like
+        // confirmation, because the extension they typed is in it. The dropped
+        // half of the request is the half that has to be reported.
+        let one = |list: &[&str]| {
+            let requested = extensions_of(list);
+            let mut wanted: HashSet<String> = HashSet::new();
+            let mut refused: HashSet<String> = HashSet::new();
+            for entry in &requested {
+                match entry.strip_prefix(NOT) {
+                    Some(rest) => refused.insert(rest.to_string()),
+                    None => wanted.insert(entry.to_string()),
+                };
+            }
+            inert_exceptions(&wanted, &refused)
+        };
+
+        assert_eq!(one(&["mp4", "!flac"]), vec!["!flac".to_string()]);
+        assert_eq!(one(&["mp4", "!flac", "!wav"]), vec!["!flac", "!wav"]);
+        // An exception the list really can act on is not inert, and neither is
+        // one in a list that is refused outright a moment later.
+        assert!(one(&["mp4", "mkv", "!mkv"]).is_empty());
+        assert!(one(&["mkv", "!mkv"]).is_empty());
+        // And the walk it describes is still the walk that happens.
+        let dir = tempfile::tempdir().unwrap();
+        let video = touch(dir.path(), "clip.mp4");
+        touch(dir.path(), "track.flac");
+        let include = vec![dir.path().to_string_lossy().to_string()];
+        let stats = RunStats::default();
+        assert_eq!(
+            collected(
+                &sources(&include, &[], &extensions_of(&["mp4", "!flac"])),
                 &stats
             ),
             vec![video]
