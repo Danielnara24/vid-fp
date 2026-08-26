@@ -1607,8 +1607,11 @@ struct Retired {
 /// exactly the same thing to the caller -- fingerprint the file again -- so
 /// they collapse into one answer here rather than making every call site handle
 /// four failure shapes that need identical treatment. A stale entry is left
-/// where it is on the way past, because the re-fingerprint is about to
-/// overwrite it: one path, one entry, always.
+/// where it is on the way past, because whichever pass takes the file next is
+/// about to write over it: `cache_store` if it decodes, `refusals_store` if it
+/// is refused. Both of those remove the path from the OTHER table in the same
+/// transaction, which is what keeps "one path, one entry" true -- leaving a
+/// stale entry here is only safe because neither of them leaves one behind.
 ///
 /// The read transaction is per-call on purpose. It is a snapshot handle rather
 /// than a lock, readers never block each other or the writer, and taking it
@@ -1695,7 +1698,9 @@ enum Refusal {
     /// millisecond to rebuild.
     ///
     /// It is also the one entry in this table a fingerprint can supersede, and
-    /// `cache_store` is what takes it away. Falling through -- which is the
+    /// `cache_store` is what takes it away. The reverse -- this entry landing on
+    /// a path a fingerprint is already under, which an edited file reaches -- is
+    /// `refusals_store`'s to undo. Falling through -- which is the
     /// whole point of storing a number rather than a verdict -- puts the file
     /// back in `todo`, so a lowered `--min-duration` decodes it and files a
     /// fingerprint under the same path this entry is under. The argument that
@@ -1743,7 +1748,8 @@ fn worth_remembering(error: &anyhow::Error) -> Option<Refusal> {
     Some(Refusal::Said(format!("{:#}", error)))
 }
 
-/// Write a whole pass worth of refusals in ONE transaction.
+/// Write a whole pass worth of refusals in ONE transaction, replacing whatever
+/// was filed under each path before.
 ///
 /// Deliberately not shaped like `cache_store`, which commits per video because a
 /// decode costs seconds and an interrupt must not throw one away. A refusal
@@ -1751,6 +1757,28 @@ fn worth_remembering(error: &anyhow::Error) -> Option<Refusal> {
 /// a single `-x '*'` run: one fsync each would cost far more than re-probing
 /// every file next time. Losing the lot to an interrupt is fine -- the next run
 /// simply pays the same half-millisecond again.
+///
+/// "Whatever was filed under each path before" includes a FINGERPRINT, and this
+/// is the mirror of the removal `cache_store` makes. `cache_lookup` leaves a
+/// stale entry where it lies on the grounds that the re-fingerprint is about to
+/// overwrite it -- which is true of every file that goes on to decode, and is
+/// precisely what a refusal denies: the refused file is the one that never gets
+/// decoded, so nothing ever writes over it. An edited video whose new runtime
+/// falls under `--min-duration` reaches it in three steps (fingerprint; edit;
+/// run with a floor above the new runtime), and so does one edited into
+/// something that is not video at all. The path then sits in BOTH tables, which
+/// falsifies the reasoning written into `Refusal::TooShort` and `cache_forget`,
+/// and `--prune-cache` reports one file as "1 stale entries and 1 stale
+/// refusal(s)".
+///
+/// Every path that reaches here is one `cache_lookup` has already answered
+/// `None` for -- both callers refuse only jobs drawn from `todo`, and `todo` is
+/// built from `Lookup::Miss` -- so any fingerprint still under it is one of the
+/// four things that answer is made of (absent, stale, undeserializable, or
+/// empty), and none of them is worth keeping. Removing it in the same
+/// transaction as the insert is what makes "one path, one table" true by
+/// construction from this side, exactly as `cache_store` makes it true from the
+/// other.
 fn refusals_store(db: &Database, refused: &[(String, Stamp, Refusal)]) -> Result<()> {
     if refused.is_empty() {
         return Ok(());
@@ -1760,12 +1788,21 @@ fn refusals_store(db: &Database, refused: &[(String, Stamp, Refusal)]) -> Result
     {
         let mut table =
             txn.open_table(REFUSED_TABLE).context("Failed to open the refusals table")?;
+        // Opened once for the whole pass rather than per entry, and normally
+        // finding nothing: the common case is a file that was never
+        // fingerprinted, so this is a b-tree descent against a table a
+        // `-x '*'` run barely uses.
+        let mut cached =
+            txn.open_table(CACHE_TABLE).context("Failed to open the cache table")?;
         for (path, stamp, verdict) in refused {
             let encoded = bincode::serialize(&(stamp, verdict))
                 .context("Failed to serialize a refusal")?;
             table
                 .insert(path.as_str(), encoded.as_slice())
                 .context("Failed to record a refusal")?;
+            cached
+                .remove(path.as_str())
+                .context("Failed to drop a superseded fingerprint")?;
         }
     }
     txn.commit().context("Failed to commit the refusals")?;
@@ -1877,13 +1914,16 @@ fn cache_forget(db: &Database, paths: &[String]) -> Result<usize> {
             let had_refusal =
                 refused.remove(path.as_str()).context("Failed to remove a refusal")?.is_some();
             // Either table counts, and a path is remembered by at most one of
-            // them -- a fingerprint supersedes a refusal in `cache_store`, which
-            // is what keeps that true across a lowered `--min-duration` -- so
-            // this is a count of paths the cache had something to say about,
-            // not a total that can exceed `paths.len()`. The `||` does not rest
-            // on that invariant, only the arithmetic does. Counting only the
-            // fingerprints made the one case worth logging (an entry that was
-            // not there) look identical to the one case that is routine.
+            // them -- each of the two writers removes the path from the other
+            // table in the same transaction (`cache_store` and
+            // `refusals_store`), which is what keeps that true across a lowered
+            // `--min-duration` in one direction and an edited file in the other
+            // -- so this is a count of paths the cache had something to say
+            // about, not a total that can exceed `paths.len()`. The `||` does
+            // not rest on that invariant, only the arithmetic does. Counting
+            // only the fingerprints made the one case worth logging (an entry
+            // that was not there) look identical to the one case that is
+            // routine.
             if had_fingerprint || had_refusal {
                 forgotten += 1;
             }
@@ -4493,6 +4533,85 @@ mod tests {
         assert!(
             refused_paths(&db).is_empty(),
             "with the refusal it superseded taken away rather than left beside it"
+        );
+    }
+
+    /// The same invariant from the other side, and the side nothing was
+    /// enforcing: a REFUSAL landing on a path a fingerprint is already filed
+    /// under.
+    ///
+    /// `cache_store` takes a refusal away because a fingerprint supersedes one;
+    /// nothing did the reverse, and `cache_lookup`'s reasoning for leaving a
+    /// stale entry where it lies ("the re-fingerprint is about to overwrite
+    /// it") is exactly what a refusal denies -- the file that is refused is the
+    /// one that never gets decoded. So an edited file whose new runtime falls
+    /// under `--min-duration` left the old fingerprint standing and wrote the
+    /// runtime beside it: one path in both tables, which `--prune-cache` then
+    /// reports as "1 stale entries and 1 stale refusal(s)" for a single file.
+    #[test]
+    fn test_a_refusal_supersedes_the_fingerprint_it_lands_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+
+        let library = dir.path().join("library");
+        std::fs::create_dir(&library).unwrap();
+        let mut fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        fixture.push("tests/fixtures/test_video.mp4");
+        let scanned = library.join("clip.mp4");
+        std::fs::copy(&fixture, &scanned).expect("the fixture video is part of the tree");
+        let root = library.to_string_lossy().to_string();
+        let path = scanned.to_string_lossy().to_string();
+
+        let run_with = |floor: &str| {
+            let args = Args::parse_from(["vid-fp", &root, "--min-duration", floor]);
+            let stats = RunStats::default();
+            run(&args, Some(&db), Instant::now(), 1, &stats).expect("the scan itself is fine");
+        };
+
+        // Run one decodes it, so the path means a fingerprint.
+        run_with("0");
+        assert_eq!(cached_paths(&db), vec![path.clone()], "the fingerprint is on record");
+
+        // The file is edited, which is the whole of what it takes: the stamp no
+        // longer matches, so run two is a cache MISS and the file reaches the
+        // weighing pass again.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&scanned).unwrap();
+            f.write_all(&[0u8; 64]).unwrap();
+        }
+
+        // Run two measures the header and files the runtime, and never decodes.
+        run_with("100");
+        assert_eq!(refused_paths(&db), vec![path.clone()], "the runtime is on record");
+        assert!(
+            cached_paths(&db).is_empty(),
+            "and the fingerprint it superseded went with it, rather than both standing at once"
+        );
+
+        // The same removal for the other shape of refusal, which the weighing
+        // pass reaches by the same route -- a file edited into something that is
+        // not video -- and which no fixture can be driven through `run` to
+        // produce. Nothing here is verdict-specific, and this is what says so.
+        let elsewhere = "/videos/was-a-video.mkv";
+        let written = stamp(1_700_000_000, 12_345);
+        cache_store(&db, elsewhere, written, &mock_fp(elsewhere)).unwrap();
+        refusals_store(
+            &db,
+            &[(
+                elsewhere.to_string(),
+                stamp(1_700_000_001, 999),
+                Refusal::NotMedia(fingerprint::NotMedia { bytes: 2048, score: 0 }),
+            )],
+        )
+        .unwrap();
+        assert!(
+            refused_paths(&db).iter().any(|p| p == elsewhere),
+            "the verdict is on record"
+        );
+        assert!(
+            !cached_paths(&db).iter().any(|p| p == elsewhere),
+            "and the fingerprint it replaced is not"
         );
     }
 
