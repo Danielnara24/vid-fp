@@ -36,6 +36,35 @@ pub fn shutdown_requested() -> bool {
     SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Set once, at start-up, when `--quiet` was asked for.
+///
+/// `log_enabled!(Info)` used to be a good enough stand-in for "the terminal is
+/// listening", because one filter stood in front of the only destination there
+/// was. It stopped being one when `--log-file` started raising that filter on
+/// its own behalf: under `-q --log-file` an Info line is now enabled, and
+/// rightly so -- the file wants it -- but the terminal is still meant to be
+/// silent. Anything drawing on stderr at Info level has to ask this as well.
+///
+/// A flag rather than a parameter because the one caller is inside `compare`,
+/// which would otherwise thread a bool through `find_all_matches` and every one
+/// of its twenty-odd test call sites to reach a progress bar. Relaxed for the
+/// same reason `SHUTDOWN` is: it is a hint about pixels, not a data handoff.
+static CONSOLE_QUIET: AtomicBool = AtomicBool::new(false);
+
+pub fn silence_console() {
+    CONSOLE_QUIET.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether an `info!` line would actually reach the terminal.
+///
+/// False under `--quiet` whatever the log filter says, and false when no logger
+/// is installed at all -- which is what keeps progress bars out of unit tests
+/// without any of them having to be told they are one.
+pub fn console_is_verbose() -> bool {
+    !CONSOLE_QUIET.load(std::sync::atomic::Ordering::Relaxed)
+        && log::log_enabled!(log::Level::Info)
+}
+
 #[derive(clap::ValueEnum, Clone, Debug, Copy, PartialEq, Eq)]
 pub enum Priority {
     Length,

@@ -1830,14 +1830,17 @@ pub fn find_all_matches(
 /// both -- and indicatif draws nothing when stderr is not a terminal, so a
 /// redirected run is unaffected either way. Unit tests install no logger at all,
 /// which leaves the max level at `Off` and the bar hidden; nothing here has to
-/// be told it is a test.
+/// be told it is a test. Both halves of that are `utils::console_is_verbose`,
+/// which is not the same question as `log_enabled!(Info)` any more: `--log-file`
+/// raises the filter for its own sake, so under `-q --log-file` an Info line is
+/// enabled and bound for the file while the terminal stays silent.
 ///
 /// No ETA, for the same reason the decode bar has none: a pair costs the product
 /// of the two files' sample counts, which spans orders of magnitude across a
 /// mixed library, so a rate extrapolated from the pairs done so far predicts the
 /// remainder badly.
 fn verification_bar(pairs: u64) -> ProgressBar {
-    if pairs == 0 || !log::log_enabled!(log::Level::Info) {
+    if pairs == 0 || !crate::utils::console_is_verbose() {
         return ProgressBar::hidden();
     }
 

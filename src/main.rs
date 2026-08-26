@@ -661,7 +661,9 @@ struct Args {
     ///
     /// A failure the end-of-run summary accounts for is not also printed while
     /// the run works, so this is where the unabridged list goes when you want
-    /// to grep it. Truncated at the start of each run.
+    /// to grep it. --quiet narrows the terminal and not this file, so the two
+    /// together give a silent run and a full account on disk. Truncated at the
+    /// start of each run.
     #[arg(long = "log-file", value_name = "PATH",
           value_hint = clap::ValueHint::FilePath)]
     log_file: Option<String>,
@@ -2138,6 +2140,40 @@ fn open_cache(db_path: &Path) -> std::result::Result<Database, CacheUnavailable>
     }
 }
 
+/// How loud each destination is, which is two answers rather than one.
+///
+/// `filter` is what `env_logger` is given, and it stands in front of BOTH
+/// destinations; `console` is applied a second time inside the format closure,
+/// after the file has been written. They differ only under `-q --log-file`.
+///
+/// One filter for both is what made `-q --log-file` lose almost everything it
+/// was asked for. `-q` is documented as suppressing TERMINAL output and
+/// `--log-file` as recording every line "including the ones the terminal
+/// hides", so the two flags pull the same knob in opposite directions and the
+/// front filter is the wrong place to settle it: `info!` never reached the
+/// closure at all, and the file the closure writes first got only whatever
+/// `error!` had left. Measured on a four-file scan, the log went from 0 lines
+/// to the same 24 a verbose run records. Failures survived either way, which is
+/// what made it look harmless -- but the flag exists to be grepped, and a run
+/// that finds nothing wrong wrote nothing at all.
+///
+/// So the filter admits whatever EITHER destination will read, and the console
+/// narrows again downstream. Note the fallback is `Off` and not `Error`: with
+/// no log file there is nothing to widen for, and the console's own level is
+/// then the whole answer, so a run without `--log-file` is filtered exactly as
+/// it was before.
+#[derive(Debug, PartialEq, Eq)]
+struct Verbosity {
+    console: log::LevelFilter,
+    filter: log::LevelFilter,
+}
+
+fn verbosity(quiet: bool, has_log_file: bool) -> Verbosity {
+    let console = if quiet { log::LevelFilter::Error } else { log::LevelFilter::Info };
+    let file = if has_log_file { log::LevelFilter::Info } else { log::LevelFilter::Off };
+    Verbosity { console, filter: console.max(file) }
+}
+
 fn main() -> Result<()> {
     let start_time = Instant::now();
     let args = Args::parse();
@@ -2175,11 +2211,14 @@ Interrupted with Ctrl-C.
     }
 
     // 1. Initialize custom CLI Logger
-    let log_level = if args.quiet {
-        log::LevelFilter::Error
-    } else {
-        log::LevelFilter::Info
-    };
+    let Verbosity { console: console_level, filter: log_level } =
+        verbosity(args.quiet, args.log_file.is_some());
+
+    // Progress bars are drawn on stderr rather than logged, so the filter above
+    // says nothing about them. See `utils::console_is_verbose`.
+    if args.quiet {
+        utils::silence_console();
+    }
 
     // Opened before the logger exists, so a bad path is reported by the ordinary
     // error path rather than by a logger that is not installed yet. Truncating
@@ -2202,9 +2241,11 @@ Interrupted with Ctrl-C.
                 format!("{}", record.args()) // Clean output for CLI tools
             };
 
-            // The file gets everything, uncapped and unconditionally -- that is
-            // what it is for, and it is the only place the unabridged list of
-            // failures exists.
+            // The file gets everything the filter admits, uncapped and before
+            // any decision about the console -- that is what it is for, and it
+            // is the only place the unabridged list of failures exists. The
+            // filter is widened to Info whenever this file exists precisely so
+            // that "everything" survives `--quiet`.
             //
             // Deliberately unbuffered: one write(2) per line. A `BufWriter`
             // would be free to add and there is nowhere honest to flush it --
@@ -2221,6 +2262,14 @@ Interrupted with Ctrl-C.
             if let Some(file) = &log_file {
                 let mut file = file.lock().unwrap_or_else(|e| e.into_inner());
                 let _ = writeln!(file, "{}", line);
+            }
+
+            // Everything below is the console's alone, and the first question
+            // is whether the console is listening at all. `-q` is answered
+            // here rather than by the filter above so that the file keeps the
+            // line either way; see the two levels at the call site.
+            if record.level() > console_level {
+                return Ok(());
             }
 
             // A failure the run is going to account for is not also announced
@@ -3542,6 +3591,43 @@ mod tests {
 
     fn dest() -> PathBuf {
         PathBuf::from("/mnt/scratch/dupes")
+    }
+
+    /// `-q` is about the terminal and `--log-file` is about the file, and one
+    /// filter in front of both let the first one silence the second.
+    ///
+    /// The case that matters is the last one: with a log file open, an `info!`
+    /// has to survive the filter to reach the closure that writes it, so
+    /// `filter` must be Info even though the console is only taking errors.
+    /// That is the whole of the bug -- `-q --log-file` wrote 0 lines of the 24
+    /// a verbose run recorded -- and it is the one assertion here that fails on
+    /// the old code.
+    #[test]
+    fn test_a_log_file_is_written_at_full_volume_however_quiet_the_terminal_is() {
+        use log::LevelFilter::{Error, Info};
+
+        // Without a log file nothing is widened, so both flags read exactly as
+        // they did: the console's level IS the filter.
+        assert_eq!(verbosity(false, false), Verbosity { console: Info, filter: Info });
+        assert_eq!(verbosity(true, false), Verbosity { console: Error, filter: Error });
+
+        // A log file on a loud run changes nothing either -- the filter was
+        // already admitting everything the file wants.
+        assert_eq!(verbosity(false, true), Verbosity { console: Info, filter: Info });
+
+        // And the pair someone actually reaches for.
+        assert_eq!(verbosity(true, true), Verbosity { console: Error, filter: Info });
+
+        // The console half is what keeps `-q` a promise about the terminal:
+        // widening the filter must not widen what is printed.
+        for has_file in [false, true] {
+            assert_eq!(verbosity(true, has_file).console, Error);
+            assert_eq!(verbosity(false, has_file).console, Info);
+        }
+
+        // The file's own level is Off rather than Error when there is no
+        // file, so `console.max(file)` can never raise the filter on its own.
+        assert!(verbosity(true, false).filter < verbosity(true, true).filter);
     }
 
     #[test]

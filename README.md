@@ -278,7 +278,7 @@ reports refused.
 | `-y`, `--yes` | Answer yes to the confirmation shown before any file is touched | off |
 | `-t`, `--threads <N>` | Worker threads (`0` = uses all cores). Raising it above that does not speed up a local scan and does raise peak memory, but can help when the videos are on a network mount or a slow disk. Capped at four per core, or 16, whichever is larger | `0` |
 | `-q`, `--quiet` | Only print errors | off |
-| `--log-file <PATH>` | Write every log line to this file, including the failures the terminal never shows. Truncated at the start of each run | |
+| `--log-file <PATH>` | Write every log line to this file, including the failures the terminal never shows. Not affected by `--quiet`. Truncated at the start of each run | |
 | `--cache <PATH>` | Use this cache file instead of the default one. Needed to run multiple scans at once, since a run locks its cache for the whole scan | `$XDG_CACHE_HOME/vid-fp/fingerprints.redb` |
 | `--clear-cache` | Wipe ALL vid-fp cache before running | off |
 | `--prune-cache` | Drop cached entries only for files not in this scan. Skipped when the scan was incomplete | off |
