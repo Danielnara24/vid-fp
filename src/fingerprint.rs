@@ -1297,6 +1297,67 @@ fn index_keyframes(ictx: &ffmpeg_next::format::context::Input, stream_index: usi
     }
 }
 
+/// Take every frame the decoder has ready, handing each to `process`.
+///
+/// The two "nothing more just now" answers are `EAGAIN` (feed me another
+/// packet) and `Eof` (I am drained), and both end the loop normally. Anything
+/// else is a frame this file was going to be sampled at and was not, and it is
+/// returned rather than swallowed -- see `refused` at the call site for why a
+/// lost sample is a wrong fingerprint rather than a smaller one.
+fn take_ready_frames(
+    decoder: &mut ffmpeg_next::decoder::Video,
+    decoded: &mut ffmpeg_next::frame::Video,
+    process: &mut impl FnMut(&ffmpeg_next::frame::Video),
+) -> Result<(), ffmpeg_next::Error> {
+    loop {
+        match decoder.receive_frame(decoded) {
+            Ok(()) => process(decoded),
+            Err(ffmpeg_next::Error::Eof) => return Ok(()),
+            Err(ffmpeg_next::Error::Other { errno }) if errno == libc::EAGAIN => return Ok(()),
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Hand one keyframe packet to the decoder and take back everything it produces.
+///
+/// `EAGAIN` from `send_packet` is not a failure and must not be read as one: it
+/// is the decoder saying its output queue is full, and the API's own contract
+/// is that the packet is to be RESENT once that output has been read, after
+/// which "the call will not fail with EAGAIN". This used to be
+/// `if decoder.send_packet(&packet).is_ok() { while receive_frame ... }`, which
+/// gets that exactly backwards in the one way that cannot recover: the drain
+/// sits behind the same `&&`, so an `EAGAIN` skipped the drain, left the queue
+/// full, and every later keyframe hit the same full queue and was dropped too.
+/// One transient EAGAIN therefore ended the sampling of the file -- silently,
+/// with the header's runtime still on the fingerprint, so the last surviving
+/// hash stood for the whole rest of the video and the file read as a complete
+/// copy of itself. That is the `_splice` and `_rescale` failure again: not a
+/// smaller answer but a wrong one, and cached.
+///
+/// One retry, because the contract allows exactly one: a second `EAGAIN` after
+/// a full drain is a decoder doing something this code has no model of, and is
+/// reported rather than papered over with a loop.
+fn feed_keyframe(
+    decoder: &mut ffmpeg_next::decoder::Video,
+    packet: &ffmpeg_next::Packet,
+    decoded: &mut ffmpeg_next::frame::Video,
+    process: &mut impl FnMut(&ffmpeg_next::frame::Video),
+) -> Result<(), ffmpeg_next::Error> {
+    match decoder.send_packet(packet) {
+        Ok(()) => take_ready_frames(decoder, decoded, process),
+        Err(ffmpeg_next::Error::Other { errno }) if errno == libc::EAGAIN => {
+            // Invisible when it works, so say so: nothing else in the run
+            // records that the decoder ever asked for its output to be read.
+            log::debug!("decoder queue full; draining and resending the keyframe");
+            take_ready_frames(decoder, decoded, process)?;
+            decoder.send_packet(packet)?;
+            take_ready_frames(decoder, decoded, process)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Fingerprint one video.
 ///
 /// `decode_threads` is this video's share of the process-wide thread budget,
@@ -1443,6 +1504,11 @@ pub fn fingerprint_video(
     // it claims to, which is the whole failure this guards against, so the file
     // is failed at the end and re-read next run rather than cached short.
     let mut unscalable: Option<ffmpeg_next::Error> = None;
+    // A keyframe the decoder would not take, or would not finish. Held for the
+    // same reason as `unscalable` above and reported separately, because "the
+    // decoder refused a frame" and "the frame could not be scaled" are two
+    // different findings about a file and the run has to say which happened.
+    let mut refused: Option<ffmpeg_next::Error> = None;
 
     // All unique frames packed back-to-back, FRAME_STRIDE bytes each. One growable
     // allocation instead of N tiny ones -> no heap fragmentation/retention, and the
@@ -1556,6 +1622,14 @@ pub fn fingerprint_video(
         }
         frame_idx += 1;
         Ok(())
+    };
+
+    // The one place a decoded frame is handed on, so both the demux loop and
+    // the drain after it record a frame they could not use identically.
+    let mut sample_frame = |dec: &ffmpeg_next::frame::Video| {
+        if let Err(e) = process_frame(dec) {
+            unscalable.get_or_insert(e);
+        }
     };
 
     // Non-key video packets are skipped, and the audio and subtitle streams are
@@ -1889,11 +1963,9 @@ pub fn fingerprint_video(
             // If PTS/DTS is missing we fall through and keep the frame (safe default).
         }
 
-        if kept && decoder.send_packet(&packet).is_ok() {
-            while decoder.receive_frame(&mut decoded).is_ok() {
-                if let Err(e) = process_frame(&decoded) {
-                    unscalable.get_or_insert(e);
-                }
+        if kept {
+            if let Err(e) = feed_keyframe(&mut decoder, &packet, &mut decoded, &mut sample_frame) {
+                refused.get_or_insert(e);
             }
         }
 
@@ -1945,11 +2017,19 @@ pub fn fingerprint_video(
     // With frame threading the decoder holds up to thread_count frames back, so
     // this drain is not a formality -- on a short video it can be where MOST of
     // the frames arrive.
-    let _ = decoder.send_eof();
-    while decoder.receive_frame(&mut decoded).is_ok() {
-        if let Err(e) = process_frame(&decoded) {
-            unscalable.get_or_insert(e);
+    //
+    // A decoder that will not be TOLD the input is over hands back nothing
+    // here, which loses exactly those frames, so that is recorded like any
+    // other lost frame. `Eof` is not a failure: it says the decoder was already
+    // draining, which is the state this call is asking for.
+    match decoder.send_eof() {
+        Ok(()) | Err(ffmpeg_next::Error::Eof) => {}
+        Err(e) => {
+            refused.get_or_insert(e);
         }
+    }
+    if let Err(e) = take_ready_frames(&mut decoder, &mut decoded, &mut sample_frame) {
+        refused.get_or_insert(e);
     }
 
     // A frame the decoder produced and this pass could not use. Failed rather
@@ -1967,6 +2047,22 @@ pub fn fingerprint_video(
     // all. Nothing in the 756-file local corpus reaches it.
     if let Some(e) = unscalable {
         return Err(anyhow!(e).context("Failed to convert a decoded frame"));
+    }
+
+    // A keyframe the decoder would not take, or would not hand back. Fatal for
+    // exactly the reason above, and it is the same damage: a sample that should
+    // be in this fingerprint is not, while the runtime it claims is the whole
+    // file's, so the surviving hash on either side of the hole stands for
+    // footage nothing looked at.
+    //
+    // It is not the ordinary reading of a damaged file: a corrupt packet is
+    // skipped by the demux loop and a corrupt FRAME is normally handed over
+    // anyway, concealment and all. What reaches here is the decoder refusing
+    // the transaction -- and the one such refusal that is routine, `EAGAIN`,
+    // never arrives, because `feed_keyframe` answers it the way the API asks
+    // rather than treating it as a failure.
+    if let Some(e) = refused {
+        return Err(anyhow!(e).context("The decoder would not take a keyframe"));
     }
 
     if frame_idx == 0 {
@@ -3305,4 +3401,149 @@ mod tests {
             }
         }
     }
+    /// Every keyframe packet of a fixture, and a decoder ready to take them.
+    ///
+    /// Keyframes only, because that is all the demux loop ever sends: the
+    /// streams are set to `AVDISCARD_NONKEY` before it starts.
+    fn keyframes_and_decoder(
+        name: &str,
+    ) -> (Vec<ffmpeg_next::Packet>, impl Fn() -> ffmpeg_next::decoder::Video) {
+        let path = fixture_named(name);
+        let mut ictx = ffmpeg_next::format::input(&path)
+            .unwrap_or_else(|e| panic!("fixture {} unreadable: {}", path.display(), e));
+        let stream = ictx.streams().best(ffmpeg_next::media::Type::Video).unwrap();
+        let index = stream.index();
+        let parameters = stream.parameters();
+
+        let mut packets = Vec::new();
+        for (stream, packet) in ictx.packets() {
+            if stream.index() == index && packet.is_key() {
+                packets.push(packet.clone());
+            }
+        }
+
+        let new_decoder = move || {
+            ffmpeg_next::codec::context::Context::from_parameters(parameters.clone())
+                .unwrap()
+                .decoder()
+                .video()
+                .unwrap()
+        };
+        (packets, new_decoder)
+    }
+
+    /// Which keyframes came back out, identified by their PICTURE.
+    ///
+    /// A set rather than a count so that priming the decoder below -- which
+    /// sends one packet more than once -- cannot inflate the answer: the
+    /// question is which keyframes of the file were sampled, and a keyframe
+    /// decoded twice is still one keyframe. By content rather than by
+    /// timestamp for the same reason: a decoder pairs the timestamps it was
+    /// given with the frames it produces in order, so an extra submission
+    /// shifts every later pairing, and the picture is what this pass actually
+    /// hashes anyway.
+    fn keyframes_taken(
+        decoder: &mut ffmpeg_next::decoder::Video,
+        packets: &[ffmpeg_next::Packet],
+    ) -> std::collections::BTreeSet<u64> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut decoded = ffmpeg_next::frame::Video::empty();
+        let mut take = |frame: &ffmpeg_next::frame::Video| {
+            let mut digest = 0xcbf2_9ce4_8422_2325u64;
+            for &byte in frame.data(0) {
+                digest = (digest ^ byte as u64).wrapping_mul(0x100_0000_01b3);
+            }
+            seen.insert(digest);
+        };
+        for packet in packets {
+            feed_keyframe(decoder, packet, &mut decoded, &mut take).expect("the fixture decodes");
+        }
+        let _ = decoder.send_eof();
+        take_ready_frames(decoder, &mut decoded, &mut take).expect("the fixture drains");
+        seen
+    }
+
+    /// A decoder asking for its output to be read is answered, not abandoned.
+    ///
+    /// `EAGAIN` from `send_packet` is the decoder saying its queue is full and
+    /// the packet must be resent once that queue has been drained. The demux
+    /// loop used to read it as a failure -- `if decoder.send_packet(&packet)
+    /// .is_ok() { while receive_frame ... }` -- which is the one reading it
+    /// cannot recover from, because the drain that would clear the queue sits
+    /// behind the same `&&`. So the queue stayed full, every later keyframe met
+    /// the same full queue, and the file simply stopped being sampled there:
+    /// no counter, no message, exit 0, and the short fingerprint cached, still
+    /// claiming the header's runtime, so its last surviving hash stood for all
+    /// the footage nothing had looked at.
+    ///
+    /// One skipped drain is all it takes to get there, and this test starts
+    /// from exactly that state: packets sent with nothing read back, until the
+    /// decoder says `EAGAIN`. Two of them are enough on this fixture.
+    #[test]
+    fn test_a_decoder_asking_for_its_output_to_be_read_keeps_every_keyframe() {
+        init_ffmpeg_for_tests();
+
+        let (packets, new_decoder) = keyframes_and_decoder("test_video_capture.ts");
+        assert!(packets.len() >= 3, "need several keyframes to lose");
+
+        let expected = keyframes_taken(&mut new_decoder(), &packets);
+        assert_eq!(expected.len(), packets.len(), "a clean run samples every keyframe");
+
+        // The wedge: send without reading until the decoder refuses to take any
+        // more. Nothing here is contrived about the decoder -- this is what the
+        // demux loop's own state looks like the moment after a drain is missed.
+        let mut decoder = new_decoder();
+        let mut wedged = false;
+        for _ in 0..8 {
+            match decoder.send_packet(&packets[0]) {
+                Ok(()) => {}
+                Err(ffmpeg_next::Error::Other { errno }) if errno == libc::EAGAIN => {
+                    wedged = true;
+                    break;
+                }
+                Err(e) => panic!("unexpected error priming the decoder: {e:?}"),
+            }
+        }
+        assert!(wedged, "the decoder never filled up, so this proves nothing");
+
+        assert_eq!(
+            keyframes_taken(&mut decoder, &packets),
+            expected,
+            "a full decoder queue must cost no keyframe: it is drained and the packet resent"
+        );
+    }
+
+    /// An answer this code has no model of is reported, not swallowed.
+    ///
+    /// A keyframe the decoder will not take is a sample missing from the middle
+    /// of a fingerprint that still claims the whole file's runtime, which is the
+    /// same wrong answer as a truncated one -- so it fails the file rather than
+    /// returning it short, exactly as an unscalable frame does. `EAGAIN` is
+    /// deliberately not one of these (see the test above); what is left has to
+    /// come back as an error.
+    ///
+    /// Sending after the input has been declared over is the one such error
+    /// that can be asked for on demand. The demux loop cannot reach it -- it
+    /// sends `EOF` once, at the end -- and that is the point: this pins the
+    /// wiring, not a route.
+    #[test]
+    fn test_a_keyframe_the_decoder_refuses_is_reported() {
+        init_ffmpeg_for_tests();
+
+        let (packets, new_decoder) = keyframes_and_decoder("test_video_capture.ts");
+        let mut decoder = new_decoder();
+        let mut decoded = ffmpeg_next::frame::Video::empty();
+        let mut taken = 0usize;
+        let mut take = |_: &ffmpeg_next::frame::Video| taken += 1;
+
+        let _ = decoder.send_eof();
+        take_ready_frames(&mut decoder, &mut decoded, &mut take).expect("draining is not an error");
+
+        let refused = feed_keyframe(&mut decoder, &packets[0], &mut decoded, &mut take);
+        assert!(
+            matches!(refused, Err(ffmpeg_next::Error::Eof)),
+            "a decoder that will take nothing more must say so to the caller, got {refused:?}"
+        );
+    }
+
 }
