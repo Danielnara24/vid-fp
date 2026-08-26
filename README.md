@@ -568,7 +568,9 @@ still reaches files with no extension.
   compared with every other, so a file marked DELETE lost the ranking to a copy
   it was actually measured against.
 - **No double-counting.** Hard links and symlinks to the same file collapse into
-  a single entry, so no set of bytes is fingerprinted or counted twice.
+  a single entry, so no set of bytes is fingerprinted or counted twice. That
+  entry keeps a real name rather than a symlink, whatever order the scan met
+  them in.
 - **"Freed" means freed.** A file whose data has another name outside the scan
   is removed like any other, but nothing is reclaimed by it. Those bytes stay
   out of the total and the row is marked UNLINKED.

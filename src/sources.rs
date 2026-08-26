@@ -58,7 +58,7 @@
 
 use anyhow::{Context, Result};
 use log::info;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Read};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -293,9 +293,11 @@ pub fn collect(sources: &Sources, stats: &RunStats) -> Result<Scan> {
     // alias all resolve to the same (device, inode) pair. Keying on that
     // identity means each set of bytes is fingerprinted exactly once, so the
     // report never lists a file as a duplicate of itself and the "space freed"
-    // figure never counts bytes that deleting a link would not return.
+    // figure never counts bytes that deleting a link would not return. WHICH of
+    // the names is the one kept is `Collecting::claim`'s business, and it is not
+    // simply the first: see the symlink preference there.
     let mut into = Collecting {
-        seen_inodes: HashSet::new(),
+        seen_inodes: HashMap::new(),
         found: Vec::new(),
         walked: Vec::new(),
     };
@@ -356,17 +358,12 @@ pub fn collect(sources: &Sources, stats: &RunStats) -> Result<Scan> {
             // as an alias of a file that never made it into the list.
             match ScannedFile::of(&resolved, &meta) {
                 None => record_undecodable(&resolved, stats),
-                Some(file) => {
-                    if into.seen_inodes.insert((meta.dev(), meta.ino())) {
-                        into.found.push(file);
-                    } else {
-                        stats.skipped_alias.bump();
-                        log::debug!(
-                            "Skipping {}: same inode as a path already queued",
-                            resolved.display()
-                        );
-                    }
-                }
+                // Never a symlink, whatever the user typed: `canonicalize`
+                // above has already resolved every link out of the path, which
+                // is why the preference `claim` applies needs nothing measured
+                // here. A named link and the file it points at are the same
+                // entry by the time either reaches this line.
+                Some(file) => into.claim((meta.dev(), meta.ino()), file, false, stats),
             }
         } else {
             // A socket, fifo, or device node. Naming one is a mistake worth
@@ -389,13 +386,79 @@ pub fn collect(sources: &Sources, stats: &RunStats) -> Result<Scan> {
 /// What a walk accumulates, carried from one scan root to the next.
 ///
 /// One bag rather than three out-parameters because the three are one thing:
-/// the answer being built. The inode set in particular has to span roots -- two
+/// the answer being built. The inode map in particular has to span roots -- two
 /// scan roots that overlap must collapse to one entry, not two -- so none of
 /// these can be per-folder.
 struct Collecting {
-    seen_inodes: HashSet<(u64, u64)>,
+    seen_inodes: HashMap<(u64, u64), Occupant>,
     found: Vec<ScannedFile>,
     walked: Vec<Reached>,
+}
+
+/// The name that currently holds one set of bytes, and whether it is a real one.
+///
+/// `symlink` is what lets a later real name displace an earlier link; it is
+/// carried rather than re-derived because both callers already know it for
+/// nothing (WalkDir keeps the entry's own type, and a named path has been
+/// through `canonicalize`), and `ScannedFile` deliberately holds neither the
+/// identity nor how the file was reached.
+#[derive(Clone, Copy)]
+struct Occupant {
+    index: usize,
+    symlink: bool,
+}
+
+impl Collecting {
+    /// Queue a file, unless these bytes are already queued under another name.
+    ///
+    /// Which name that is matters, and first-come is not good enough. A folder
+    /// holding `a.mp4`, a hard link to it and a symlink to it offers three
+    /// names for one inode, and the walk meets them in readdir order -- so the
+    /// SYMLINK could win the identity, and the two real names were then dropped
+    /// as aliases of it. That put a pointer in the library where the video
+    /// should have been: the run ranked the link against the genuine duplicate
+    /// elsewhere in the folder, marked the link DELETE, and `--delete
+    /// --permanent` unlinked it. Everything downstream stayed honest about that
+    /// -- `export::on_disk` sees the link, the row reads UNLINKED and its bytes
+    /// are struck out of the total -- but the user asked for a duplicate to go
+    /// and got a broken shortcut removed instead, with both copies of the video
+    /// still on disk and a second run needed to reach them.
+    ///
+    /// A real name is therefore preferred whenever one turns up, whatever the
+    /// order. Everything else stays first-come: two hard links to one inode are
+    /// equally good names for it, and so are two symlinks, so there is nothing
+    /// to choose between them and no reason to make the answer depend on which
+    /// arrived first any more than it already does.
+    ///
+    /// Exactly one name is skipped per collision either way, so the count the
+    /// summary prints is unchanged; only which path it is about moves.
+    fn claim(&mut self, id: (u64, u64), file: ScannedFile, symlink: bool, stats: &RunStats) {
+        let Some(held) = self.seen_inodes.get(&id).copied() else {
+            self.seen_inodes.insert(
+                id,
+                Occupant {
+                    index: self.found.len(),
+                    symlink,
+                },
+            );
+            self.found.push(file);
+            return;
+        };
+
+        let dropped = if held.symlink && !symlink {
+            self.seen_inodes.insert(id, Occupant { symlink, ..held });
+            std::mem::replace(&mut self.found[held.index], file)
+        } else {
+            file
+        };
+
+        stats.skipped_alias.bump();
+        log::debug!(
+            "Skipping {}: same inode as {}, which is already queued",
+            dropped.path,
+            self.found[held.index].path
+        );
+    }
 }
 
 /// Walk one folder, appending every video in it. Returns false if interrupted.
@@ -527,16 +590,18 @@ fn walk_folder(
             continue;
         };
 
-        if !into.seen_inodes.insert((meta.dev(), meta.ino())) {
-            stats.skipped_alias.bump();
-            log::debug!(
-                "Skipping {}: same inode as a path already queued",
-                path.display()
-            );
-            continue;
-        }
-
-        into.found.push(file);
+        // The walk is the only route by which a link can reach the library at
+        // all -- and WalkDir already knows, so preferring a real name over it
+        // costs no syscall. Under --follow-symlinks the stat above reports the
+        // TARGET's type, which is exactly the reading that hid this: the entry
+        // is a regular file by then, and only the entry's own type still says
+        // how it was reached.
+        into.claim(
+            (meta.dev(), meta.ino()),
+            file,
+            entry.path_is_symlink(),
+            stats,
+        );
     }
 
     true
@@ -1663,6 +1728,96 @@ mod tests {
             vec![original]
         );
         assert_eq!(stats.skipped_alias.count(), 2, "a repeat and a hard link");
+    }
+
+    #[test]
+    fn test_a_symlink_never_stands_in_for_the_video_it_points_at() {
+        // The whole folder the bug needs: one video, a hard link to it, and a
+        // symlink to it, all three offering the same inode to the walk. Which
+        // one readdir hands over first is not ours to choose -- so the property
+        // asserted is the one that has to hold whatever the order, that the
+        // name left standing is one a deletion would really free bytes by.
+        //
+        // Left as first-come, the link could win, and a run that then ranked it
+        // against a genuine duplicate marked the LINK for deletion: `--delete
+        // --permanent` unlinked a pointer, reported the row UNLINKED with its
+        // bytes struck out, and left both copies of the video on disk.
+        let dir = tempfile::tempdir().unwrap();
+        let original = touch(dir.path(), "episode.mkv");
+        fs::hard_link(&original, dir.path().join("hardlink.mkv")).unwrap();
+        std::os::unix::fs::symlink(&original, dir.path().join("pointer.mkv")).unwrap();
+
+        let include = vec![dir.path().to_string_lossy().to_string()];
+        let stats = RunStats::default();
+        let found = collected(&sources(&include, &[], &extensions_of(&["mkv"])), &stats);
+
+        assert_eq!(found.len(), 1, "one inode, one entry");
+        assert!(
+            !found[0].ends_with("pointer.mkv"),
+            "a link must not be the name the library carries: {}",
+            found[0]
+        );
+        assert_eq!(stats.skipped_alias.count(), 2, "the other two names");
+        assert!(!stats.had_problems(), "an alias is a skip, not a problem");
+    }
+
+    #[test]
+    fn test_a_real_name_outranks_a_link_whichever_the_walk_meets_first() {
+        // The end-to-end test above cannot reach this: readdir decides the
+        // order there, so the arm where the link is seen FIRST and displaced by
+        // a real name arriving later may simply never run. Both orders are
+        // driven here, over one identity, and each has to end the same way.
+        let name = |p: &str| ScannedFile {
+            path: p.to_string(),
+            size: 5,
+            mtime: 1,
+            mtime_nsec: 0,
+        };
+        let id = (7, 42);
+
+        for (first, second, link_first) in [
+            ("/lib/pointer.mkv", "/lib/episode.mkv", true),
+            ("/lib/episode.mkv", "/lib/pointer.mkv", false),
+        ] {
+            let stats = RunStats::default();
+            let mut into = Collecting {
+                seen_inodes: HashMap::new(),
+                found: Vec::new(),
+                walked: Vec::new(),
+            };
+
+            into.claim(id, name(first), link_first, &stats);
+            into.claim(id, name(second), !link_first, &stats);
+
+            assert_eq!(into.found.len(), 1, "one inode, one entry");
+            assert_eq!(
+                into.found[0].path, "/lib/episode.mkv",
+                "the real name survives whether it arrived first or second"
+            );
+            assert_eq!(
+                stats.skipped_alias.count(),
+                1,
+                "one name skipped per collision, however it was resolved"
+            );
+        }
+
+        // And nothing else about the preference: two equally real names are
+        // equally good, so the first still wins and does not churn.
+        let stats = RunStats::default();
+        let mut into = Collecting {
+            seen_inodes: HashMap::new(),
+            found: Vec::new(),
+            walked: Vec::new(),
+        };
+        into.claim(id, name("/lib/episode.mkv"), false, &stats);
+        into.claim(id, name("/lib/hardlink.mkv"), false, &stats);
+        into.claim((7, 43), name("/lib/other.mkv"), true, &stats);
+        assert_eq!(into.found[0].path, "/lib/episode.mkv");
+        assert_eq!(
+            into.found[1].path, "/lib/other.mkv",
+            "a lone link is still a file worth scanning -- there is no real name to prefer"
+        );
+        assert_eq!(stats.skipped_alias.count(), 1);
     }
 
     #[test]
