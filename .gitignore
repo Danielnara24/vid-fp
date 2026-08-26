@@ -2,6 +2,11 @@
 *.db
 *.xml
 
+# Fingerprint caches. redb databases, written wherever --cache points;
+# `--cache test` in the repo root once committed a 3.6MB one.
+*.redb
+/test
+
 # Static FFmpeg + dav1d prefix built by scripts/build-ffmpeg-static.sh.
 # Several hundred MB of archives, headers and upstream checkouts, all
 # reproducible from the pinned versions in that script.
