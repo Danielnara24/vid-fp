@@ -65,6 +65,20 @@ const MIN_AC_ENERGY: f32 = 8.0;
 /// even the full count costs milliseconds.
 const MAX_CONSECUTIVE_DEMUX_ERRORS: u32 = 1024;
 
+/// How many pictures in a row the decoder may fail to produce before the file
+/// is failed rather than sampled short.
+///
+/// The backstop for the other half of `is_decoding_error`: a single picture the
+/// decoder could not build is one lost sample, which is what a featureless
+/// frame already costs and is not worth failing a file over, but a decoder that
+/// produces NOTHING while claiming to consume everything is a fingerprint made
+/// of nothing at all. Counted consecutively -- one good frame resets it -- and
+/// generous for the same reason the demux figure is: a real file that stumbles
+/// this many times in a row, with not one picture in between, has nothing left
+/// worth hashing. A file whose every keyframe fails still lands on the existing
+/// "no valid frames" path, so this is only about the middle of a file.
+const MAX_CONSECUTIVE_DECODE_ERRORS: u32 = 1024;
+
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct VideoFingerprint {
@@ -1297,23 +1311,79 @@ fn index_keyframes(ictx: &ffmpeg_next::format::context::Input, stream_index: usi
     }
 }
 
+/// Whether an answer from the decoder is about the PICTURE or about the
+/// TRANSACTION, which are two different findings and must not be treated alike.
+///
+/// `avcodec_send_packet` and `avcodec_receive_frame` both document four answers
+/// about the state of the decoder -- `EAGAIN`, `EOF`, `EINVAL`, `ENOMEM` -- and
+/// then say of everything else, in as many words, "other errors: legitimate
+/// decoding errors". Those two halves want opposite handling, and the reason is
+/// what the call did with the packet before it answered. A transaction answer
+/// is a packet NOT taken: the caller has to drain, or stop, or give up. A
+/// decoding error is a packet already spent -- `avcodec_send_packet` hands it
+/// to the bitstream filter and only THEN decodes eagerly, so by the time a
+/// decode can fail the packet is gone -- and the only thing lost is the picture
+/// it would have produced. Resending such a packet decodes it twice.
+///
+/// Reading the second half as the first is what this exists to stop, and it
+/// cost whole files. A 10-bit HEVC remux sampled with `AVDISCARD_NONKEY` hands
+/// the decoder keyframes with the frames between them removed, and hevcdec
+/// eventually meets an IRAP whose POC is already in its DPB: "Duplicate POC in
+/// a sequence", `AVERROR_INVALIDDATA`, out of `send_packet`. Eight of them in a
+/// 1080p episode -- against 827 keyframes that decoded perfectly -- and the
+/// whole file was refused, cached as refused, and never looked at again. Nine
+/// files of one folder went that way on a plain build against the system
+/// FFmpeg, taking the folder from 5 groups to 1. The vendored FFmpeg 8 hands
+/// that frame back with a log line instead of an error, which is the only
+/// reason the shipped binary was not affected: the same source, the same file,
+/// a different libavcodec, and a different set of videos this tool can see.
+fn is_decoding_error(e: &ffmpeg_next::Error) -> bool {
+    match e {
+        ffmpeg_next::Error::Eof => false,
+        ffmpeg_next::Error::Other { errno } => {
+            !matches!(*errno, libc::EAGAIN | libc::EINVAL | libc::ENOMEM)
+        }
+        _ => true,
+    }
+}
+
 /// Take every frame the decoder has ready, handing each to `process`.
 ///
 /// The two "nothing more just now" answers are `EAGAIN` (feed me another
-/// packet) and `Eof` (I am drained), and both end the loop normally. Anything
-/// else is a frame this file was going to be sampled at and was not, and it is
-/// returned rather than swallowed -- see `refused` at the call site for why a
-/// lost sample is a wrong fingerprint rather than a smaller one.
+/// packet) and `Eof` (I am drained), and both end the loop normally.
+///
+/// What is left splits the way `is_decoding_error` splits it. A picture the
+/// decoder could not build is counted in `lost` and the drain CONTINUES, since
+/// the frames queued behind it are still good and stopping here is what leaves
+/// the queue full; that is one missing sample, which is exactly what a
+/// featureless frame costs and is not worth throwing a file away for.
+/// `MAX_CONSECUTIVE_DECODE_ERRORS` in a row is a decoder producing nothing, and
+/// that IS the whole file, so it comes back as an error -- as does any answer
+/// about the transaction itself, which the caller has to act on rather than
+/// count. See `refused` at the call site.
 fn take_ready_frames(
     decoder: &mut ffmpeg_next::decoder::Video,
     decoded: &mut ffmpeg_next::frame::Video,
     process: &mut impl FnMut(&ffmpeg_next::frame::Video),
+    lost: &mut u32,
 ) -> Result<(), ffmpeg_next::Error> {
+    let mut consecutive = 0u32;
     loop {
         match decoder.receive_frame(decoded) {
-            Ok(()) => process(decoded),
+            Ok(()) => {
+                consecutive = 0;
+                process(decoded);
+            }
             Err(ffmpeg_next::Error::Eof) => return Ok(()),
             Err(ffmpeg_next::Error::Other { errno }) if errno == libc::EAGAIN => return Ok(()),
+            Err(e) if is_decoding_error(&e) => {
+                *lost += 1;
+                consecutive += 1;
+                log::debug!("decoder produced no picture for a keyframe ({e}); sample lost");
+                if consecutive >= MAX_CONSECUTIVE_DECODE_ERRORS {
+                    return Err(e);
+                }
+            }
             Err(e) => return Err(e),
         }
     }
@@ -1338,21 +1408,56 @@ fn take_ready_frames(
 /// One retry, because the contract allows exactly one: a second `EAGAIN` after
 /// a full drain is a decoder doing something this code has no model of, and is
 /// reported rather than papered over with a loop.
+///
+/// `EAGAIN` is not the only answer that must not be read as a refusal, and the
+/// other one arrives by the same route for the opposite reason. `send_packet`
+/// consumes the packet and then decodes eagerly, so a picture that cannot be
+/// built is reported HERE, out of the send, with the packet already spent --
+/// see `is_decoding_error`, which is where that line is drawn and why. Such a
+/// packet is never resent (it would decode twice) and never fatal (it is one
+/// sample, the same cost as a featureless frame); it is counted in `lost` and
+/// the decoder, which is still perfectly healthy, is drained and fed the next
+/// keyframe as usual.
 fn feed_keyframe(
     decoder: &mut ffmpeg_next::decoder::Video,
     packet: &ffmpeg_next::Packet,
     decoded: &mut ffmpeg_next::frame::Video,
     process: &mut impl FnMut(&ffmpeg_next::frame::Video),
+    lost: &mut u32,
 ) -> Result<(), ffmpeg_next::Error> {
-    match decoder.send_packet(packet) {
-        Ok(()) => take_ready_frames(decoder, decoded, process),
+    match send_and_take(decoder, packet, decoded, process, lost) {
         Err(ffmpeg_next::Error::Other { errno }) if errno == libc::EAGAIN => {
             // Invisible when it works, so say so: nothing else in the run
             // records that the decoder ever asked for its output to be read.
             log::debug!("decoder queue full; draining and resending the keyframe");
-            take_ready_frames(decoder, decoded, process)?;
-            decoder.send_packet(packet)?;
-            take_ready_frames(decoder, decoded, process)
+            take_ready_frames(decoder, decoded, process, lost)?;
+            send_and_take(decoder, packet, decoded, process, lost)
+        }
+        other => other,
+    }
+}
+
+/// Hand the packet over once and take back whatever that produced.
+///
+/// Split out of `feed_keyframe` so that the retry after a full queue is the
+/// same transaction as the first attempt rather than a barer version of it: the
+/// resend used to be a plain `send_packet(packet)?`, which would have made a
+/// picture that failed to decode on the SECOND try fatal while the same failure
+/// on the first try costs one sample. `EAGAIN` is passed up for the caller to
+/// answer, and it is the only answer here that has a second attempt behind it.
+fn send_and_take(
+    decoder: &mut ffmpeg_next::decoder::Video,
+    packet: &ffmpeg_next::Packet,
+    decoded: &mut ffmpeg_next::frame::Video,
+    process: &mut impl FnMut(&ffmpeg_next::frame::Video),
+    lost: &mut u32,
+) -> Result<(), ffmpeg_next::Error> {
+    match decoder.send_packet(packet) {
+        Ok(()) => take_ready_frames(decoder, decoded, process, lost),
+        Err(e) if is_decoding_error(&e) => {
+            *lost += 1;
+            log::debug!("decoder could not build a keyframe's picture ({e}); sample lost");
+            take_ready_frames(decoder, decoded, process, lost)
         }
         Err(e) => Err(e),
     }
@@ -1509,6 +1614,14 @@ pub fn fingerprint_video(
     // decoder refused a frame" and "the frame could not be scaled" are two
     // different findings about a file and the run has to say which happened.
     let mut refused: Option<ffmpeg_next::Error> = None;
+    // Pictures the decoder consumed a keyframe for and could not produce. NOT
+    // the same finding as `refused` above and deliberately not fatal: the
+    // packet was taken, the decoder carried straight on, and what is missing is
+    // one sample -- which is what `is_featureless` drops routinely and what a
+    // skipped corrupt packet costs the demux loop. Counted so the run can say
+    // how many, because "sampled short" is the one thing a fingerprint cannot
+    // say about itself once it is cached.
+    let mut lost_pictures: u32 = 0;
 
     // All unique frames packed back-to-back, FRAME_STRIDE bytes each. One growable
     // allocation instead of N tiny ones -> no heap fragmentation/retention, and the
@@ -1964,7 +2077,13 @@ pub fn fingerprint_video(
         }
 
         if kept {
-            if let Err(e) = feed_keyframe(&mut decoder, &packet, &mut decoded, &mut sample_frame) {
+            if let Err(e) = feed_keyframe(
+                &mut decoder,
+                &packet,
+                &mut decoded,
+                &mut sample_frame,
+                &mut lost_pictures,
+            ) {
                 refused.get_or_insert(e);
             }
         }
@@ -2028,7 +2147,12 @@ pub fn fingerprint_video(
             refused.get_or_insert(e);
         }
     }
-    if let Err(e) = take_ready_frames(&mut decoder, &mut decoded, &mut sample_frame) {
+    if let Err(e) = take_ready_frames(
+        &mut decoder,
+        &mut decoded,
+        &mut sample_frame,
+        &mut lost_pictures,
+    ) {
         refused.get_or_insert(e);
     }
 
@@ -2058,15 +2182,34 @@ pub fn fingerprint_video(
     // It is not the ordinary reading of a damaged file: a corrupt packet is
     // skipped by the demux loop and a corrupt FRAME is normally handed over
     // anyway, concealment and all. What reaches here is the decoder refusing
-    // the transaction -- and the one such refusal that is routine, `EAGAIN`,
-    // never arrives, because `feed_keyframe` answers it the way the API asks
-    // rather than treating it as a failure.
+    // the TRANSACTION and nothing else -- `is_decoding_error` is where that
+    // line is drawn. The two answers about the transaction that are routine
+    // never arrive: `EAGAIN` because `feed_keyframe` drains and resends the way
+    // the API asks, and a picture the decoder could not build because that is
+    // not a refusal at all -- the packet was taken, the decoder carried on, and
+    // the cost is the one sample counted in `lost_pictures`.
     if let Some(e) = refused {
         return Err(anyhow!(e).context("The decoder would not take a keyframe"));
     }
 
     if frame_idx == 0 {
         return Err(anyhow!("No valid frames found or successfully decoded"));
+    }
+
+    // Said out loud rather than counted, and said only by a file that produced
+    // a fingerprint -- one that produced none has already returned above with a
+    // better sentence. Not a problem and not a skip: the run did what it was
+    // asked and the file is still worth comparing, it is simply covered by
+    // fewer samples than its keyframes promised. Both numbers, because 8 of 835
+    // is a remux libavcodec quibbles with and 800 of 835 is a file to go and
+    // look at, and nothing downstream can tell those apart.
+    if lost_pictures > 0 {
+        log::warn!(
+            "{}: the decoder could not build {} of {} keyframes; those samples are missing",
+            filepath,
+            lost_pictures,
+            lost_pictures as usize + frame_idx
+        );
     }
 
     // From the frames the decoder actually produced. Identical to what the
@@ -3445,6 +3588,7 @@ mod tests {
     fn keyframes_taken(
         decoder: &mut ffmpeg_next::decoder::Video,
         packets: &[ffmpeg_next::Packet],
+        lost: &mut u32,
     ) -> std::collections::BTreeSet<u64> {
         let mut seen = std::collections::BTreeSet::new();
         let mut decoded = ffmpeg_next::frame::Video::empty();
@@ -3456,10 +3600,11 @@ mod tests {
             seen.insert(digest);
         };
         for packet in packets {
-            feed_keyframe(decoder, packet, &mut decoded, &mut take).expect("the fixture decodes");
+            feed_keyframe(decoder, packet, &mut decoded, &mut take, lost)
+                .expect("the fixture decodes");
         }
         let _ = decoder.send_eof();
-        take_ready_frames(decoder, &mut decoded, &mut take).expect("the fixture drains");
+        take_ready_frames(decoder, &mut decoded, &mut take, lost).expect("the fixture drains");
         seen
     }
 
@@ -3486,7 +3631,7 @@ mod tests {
         let (packets, new_decoder) = keyframes_and_decoder("test_video_capture.ts");
         assert!(packets.len() >= 3, "need several keyframes to lose");
 
-        let expected = keyframes_taken(&mut new_decoder(), &packets);
+        let expected = keyframes_taken(&mut new_decoder(), &packets, &mut 0);
         assert_eq!(expected.len(), packets.len(), "a clean run samples every keyframe");
 
         // The wedge: send without reading until the decoder refuses to take any
@@ -3507,7 +3652,7 @@ mod tests {
         assert!(wedged, "the decoder never filled up, so this proves nothing");
 
         assert_eq!(
-            keyframes_taken(&mut decoder, &packets),
+            keyframes_taken(&mut decoder, &packets, &mut 0),
             expected,
             "a full decoder queue must cost no keyframe: it is drained and the packet resent"
         );
@@ -3537,13 +3682,100 @@ mod tests {
         let mut take = |_: &ffmpeg_next::frame::Video| taken += 1;
 
         let _ = decoder.send_eof();
-        take_ready_frames(&mut decoder, &mut decoded, &mut take).expect("draining is not an error");
+        take_ready_frames(&mut decoder, &mut decoded, &mut take, &mut 0)
+            .expect("draining is not an error");
 
-        let refused = feed_keyframe(&mut decoder, &packets[0], &mut decoded, &mut take);
+        let refused = feed_keyframe(&mut decoder, &packets[0], &mut decoded, &mut take, &mut 0);
         assert!(
             matches!(refused, Err(ffmpeg_next::Error::Eof)),
             "a decoder that will take nothing more must say so to the caller, got {refused:?}"
         );
     }
 
+    /// A picture the decoder cannot build costs one sample, not the file.
+    ///
+    /// The other half of the test above, and the half that cost nine files of
+    /// one folder. `send_packet` consumes the packet before it decodes, so a
+    /// picture it cannot build is reported out of the SEND -- and reading that
+    /// as "the decoder would not take a keyframe" threw away a 1080p episode
+    /// over 8 frames of 835, then remembered the refusal so no later run would
+    /// look at the file again. What reaches this in the wild is a 10-bit HEVC
+    /// remux sampled key-frames-only, where hevcdec meets a POC already in its
+    /// DPB; what reaches it here is one keyframe overwritten with nonsense,
+    /// which is the same finding by a route a fixture can carry.
+    ///
+    /// Both halves are asserted, because either alone passes on a mistake: that
+    /// the run does not fail, and that everything else in the file is still
+    /// sampled and still sampled to the same pictures.
+    #[test]
+    fn test_a_keyframe_the_decoder_cannot_build_costs_one_sample_and_not_the_file() {
+        init_ffmpeg_for_tests();
+
+        let (packets, new_decoder) = keyframes_and_decoder("test_video_capture.ts");
+        assert!(packets.len() >= 3, "need a keyframe in the middle to spoil");
+        let clean = keyframes_taken(&mut new_decoder(), &packets, &mut 0);
+        assert_eq!(clean.len(), packets.len(), "a clean run samples every keyframe");
+
+        let spoiled_at = packets.len() / 2;
+        let mut packets = packets;
+        for byte in packets[spoiled_at]
+            .data_mut()
+            .expect("a keyframe packet carries data")
+            .iter_mut()
+        {
+            *byte = 0xA5;
+        }
+
+        let mut lost = 0u32;
+        let taken = keyframes_taken(&mut new_decoder(), &packets, &mut lost);
+
+        assert_eq!(lost, 1, "exactly one picture was unbuildable, got {lost}");
+        assert_eq!(
+            taken.len(),
+            clean.len() - 1,
+            "one spoiled keyframe must cost one sample and no other"
+        );
+        assert!(
+            taken.is_subset(&clean),
+            "the keyframes that still decoded must decode to the same pictures"
+        );
+    }
+
+    /// The line between the two, drawn where the API draws it.
+    ///
+    /// `avcodec_send_packet` documents four answers about the decoder's state
+    /// and calls everything else a legitimate decoding error, and the whole of
+    /// this file's handling hangs off which side an answer falls on: a
+    /// transaction answer is a packet not taken, which the caller must act on;
+    /// a decoding error is a packet already spent, which costs one sample. Get
+    /// `EINVAL` or `ENOMEM` wrong and a broken decoder is silently counted
+    /// frame by frame instead of failing; get `InvalidData` wrong and a whole
+    /// video is refused over one picture.
+    #[test]
+    fn test_only_the_decoders_four_answers_about_itself_are_not_about_the_picture() {
+        for transaction in [
+            ffmpeg_next::Error::Eof,
+            ffmpeg_next::Error::Other { errno: libc::EAGAIN },
+            ffmpeg_next::Error::Other { errno: libc::EINVAL },
+            ffmpeg_next::Error::Other { errno: libc::ENOMEM },
+        ] {
+            assert!(
+                !is_decoding_error(&transaction),
+                "{transaction:?} is an answer about the decoder, not about a picture"
+            );
+        }
+
+        for decoding in [
+            ffmpeg_next::Error::InvalidData,
+            ffmpeg_next::Error::Bug,
+            ffmpeg_next::Error::Unknown,
+            ffmpeg_next::Error::PatchWelcome,
+            ffmpeg_next::Error::Other { errno: libc::EIO },
+        ] {
+            assert!(
+                is_decoding_error(&decoding),
+                "{decoding:?} is not one of the four, so it is about a picture"
+            );
+        }
+    }
 }

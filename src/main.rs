@@ -52,8 +52,11 @@ const CACHE_TABLE: TableDefinition<&str, &[u8]> =
 /// A refusal is worth half a millisecond, so it can be discarded on the merest
 /// suspicion -- and it has to be, because it depends on things `Stamp`
 /// deliberately does not record: the vendored FFmpeg's demuxer set (`ff8`) and
-/// this tool's own gate (`probe4` = `FIRST_PROBE_BYTES`/`SECOND_PROBE_BYTES`/
-/// `NO_EVIDENCE`, and what a `NotMedia` counts). Change any of those and the
+/// this tool's own gate (`probe5` = `FIRST_PROBE_BYTES`/`SECOND_PROBE_BYTES`/
+/// `NO_EVIDENCE`, and what a `NotMedia` counts). A `Refusal::Said` widens that
+/// list to everything the DECODE can decide, since it stores the sentence a run
+/// printed: which decoder answers fail a file, and the words they fail it in,
+/// are part of what is in this table. Change any of those and the
 /// entries are wrong in the direction that matters -- a file that would now be
 /// read as video, remembered as junk -- so bump the suffix and push the old name
 /// into `SUPERSEDED_REFUSAL_TABLES`, which is a separate list precisely because
@@ -62,7 +65,7 @@ const CACHE_TABLE: TableDefinition<&str, &[u8]> =
 /// in `SUPERSEDED_TABLES` would tell a user with a large library to expect a
 /// re-decode that is not coming.
 const REFUSED_TABLE: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("refused_ff8_probe4");
+    TableDefinition::new("refused_ff8_probe5");
 
 /// Tables earlier builds wrote, all dead. They are dropped whole on the first
 /// run of this one.
@@ -180,10 +183,22 @@ const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 8] = [
 /// and both video corpora were probed both ways and every one agreed. But a
 /// score CAN move in principle, and the direction that matters is a file read
 /// as junk by the old gate and as video by this one, so the entries go.
-const SUPERSEDED_REFUSAL_TABLES: [TableDefinition<&str, &[u8]>; 3] = [
+///
+/// `refused_ff8_probe4` is the first entry here that has nothing to do with the
+/// probe gate, and it is the one that shows why the wording is worth retiring
+/// over. A build in between read a decode error out of `send_packet` as the
+/// decoder refusing the keyframe, and refused the whole video for it -- nine
+/// files of one folder on a plain build against the system FFmpeg, each one a
+/// perfectly good 10-bit HEVC remux that had decoded 827 of its 835 keyframes.
+/// Every one of those went into this table as `Refusal::Said`, which is exactly
+/// the entry that stops a later run ever opening the file again. The verdict is
+/// wrong now, nothing about the file changed, and no `Stamp` can tell: the
+/// entries have to go by name or those videos stay invisible for ever.
+const SUPERSEDED_REFUSAL_TABLES: [TableDefinition<&str, &[u8]>; 4] = [
     TableDefinition::new("refused_ff8_probe1"),
     TableDefinition::new("refused_ff8_probe2"),
     TableDefinition::new("refused_ff8_probe3"),
+    TableDefinition::new("refused_ff8_probe4"),
 ];
 
 /// Hard ceiling on the cache's page cache.
