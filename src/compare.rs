@@ -1686,6 +1686,31 @@ fn corroborated(
         if needed == u32::MAX {
             continue;
         }
+        // Nothing left to learn about this row. The only thing a verdict here
+        // can do is set these two flags, both of them are already set, and
+        // `enough` is a pure predicate over a scratch space it clears on entry
+        // -- so the search is a no-op whose answer is discarded. Every strict
+        // match arrives here already flagged (`for_each_frame_match` marks them
+        // on the sweep that collected the list), and every row this loop marks
+        // flags a sample pair that later rows touching either half then inherit,
+        // so at a loose `-d` this is most of the list. Measured on the 756-file
+        // local corpus at `-p 100`, so clustering contributes nothing, three
+        // interleaved runs each: the comparison stage is 4.80-4.97 s -> 2.28-2.34 s
+        // at `-d 24` and 13.79-14.23 s -> 4.98-5.10 s at `-d 32`, 0.77-0.85 s ->
+        // 0.64-0.68 s at `-d 20`, and unmoved at `-d 18` and below, where few
+        // rows are settled twice. Whole run at `-d 24 -p 20`, 4.82-4.91 s ->
+        // 2.30-2.44 s. Peak RSS is unmoved, and the reports are byte-identical
+        // at `-d 0, 4, 8, 12, 16, 18, 20, 24` and `32`.
+        //
+        // It sits with the other refusals, below the two `while` loops, but it
+        // could sit anywhere in the body: `lo` and `hi` are absolute functions
+        // of the CURRENT offset rather than increments, and `offset` only ever
+        // rises, so a row that skips its own verdict without advancing them
+        // leaves the next row to advance them the rest of the way. Below is
+        // simply where a reader expects the window to be settled already.
+        if matched_a[i as usize] && matched_b[j as usize] {
+            continue;
+        }
         // Witnesses must be distinct from EACH OTHER as well as from the
         // candidate, on both sides, which is what makes the question a matching
         // rather than a count.
@@ -2647,6 +2672,118 @@ mod tests {
         // evidence that a long file is settled before a graph is built.
         assert!(!Witnesses::wide_sides_are_wide_enough(&window, 0, 0, 2));
         assert!(Witnesses::wide_sides_are_wide_enough(&window, 0, 0, 1));
+    }
+
+    /// Which samples the corroboration pass marks, written the slow obvious
+    /// way: every loose frame match judged on its own, against the window of
+    /// every match within `ALIGNMENT_TOLERANCE_MS` of it and the definition of
+    /// a matching in `largest_matching`. Shares no code with `corroborated` --
+    /// no sliding window, no scratch space, no order between the rows.
+    fn marked_the_slow_way(
+        fp_a: &VideoFingerprint,
+        fp_b: &VideoFingerprint,
+        tol: Tolerance,
+    ) -> (Vec<bool>, Vec<bool>) {
+        let schedule = witness_schedule();
+        let mut aligned: Vec<Aligned> = Vec::new();
+        let mut marked_a = vec![false; fp_a.valid_hashes.len()];
+        let mut marked_b = vec![false; fp_b.valid_hashes.len()];
+        for (i, &h_a) in fp_a.valid_hashes.iter().enumerate() {
+            for (j, &h_b) in fp_b.valid_hashes.iter().enumerate() {
+                let distance = (h_a ^ h_b).count_ones();
+                if distance > tol.loose {
+                    continue;
+                }
+                if distance <= tol.strict {
+                    marked_a[i] = true;
+                    marked_b[j] = true;
+                }
+                let offset = fp_a.valid_t_start[i] as i64 - fp_b.valid_t_start[j] as i64;
+                aligned.push((offset, i as u32, j as u32, distance));
+            }
+        }
+
+        for &(offset, i, j, distance) in &aligned {
+            let needed = schedule[distance.min(HASH_BITS) as usize];
+            if needed == u32::MAX {
+                continue;
+            }
+            let window: Vec<Aligned> = aligned
+                .iter()
+                .copied()
+                .filter(|&(o, _, _, _)| (o - offset).abs() <= ALIGNMENT_TOLERANCE_MS)
+                .collect();
+            if largest_matching(&window, i, j) >= needed as usize {
+                marked_a[i as usize] = true;
+                marked_b[j as usize] = true;
+            }
+        }
+        (marked_a, marked_b)
+    }
+
+    #[test]
+    fn test_a_row_already_settled_is_skipped_without_changing_what_the_pass_marks() {
+        // `corroborated` walks the rows in offset order and skips any whose two
+        // samples are BOTH already flagged, because the only thing a verdict
+        // there can do is flag them again. That skip is what makes a loose `-d`
+        // affordable -- most of the list is settled by the time it is reached --
+        // and it is sound only because a row's verdict depends on the window
+        // and never on the flags. Nothing about the answer may move with it, so
+        // this asks the definition instead: every row judged on its own, in no
+        // particular order, against a window built from scratch.
+        //
+        // What it cannot catch is the skip being deleted, and it is not meant
+        // to: a pass that judges every row reaches the same answer the slow
+        // way does. The failure it is here for is a skip that fires on a row
+        // still capable of flagging something -- `||` for `&&`, the flags read
+        // before the sweep that sets the strict ones, a row skipped on side A
+        // alone -- each of which loses a mark this asks for by name.
+        let mut state = 0x1234_5678_9ABC_DEF1u64;
+        let mut rng = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        for round in 0..40 {
+            let n = 24usize;
+            let a_hashes: Vec<u64> = (0..n as u64).map(distinct_hash).collect();
+            let a_times: Vec<u32> = (0..n as u32).map(|i| 10_000 + i * 400).collect();
+
+            // B re-encodes a random subset of A at a random distance, at time
+            // offsets drawn from a handful of clusters -- so the alignment
+            // windows overlap heavily and one sample of A can reach several of
+            // B, which is the shape that makes the matching non-trivial.
+            let mut b_hashes: Vec<u64> = (100..100 + n as u64).map(distinct_hash).collect();
+            let mut b_times: Vec<u32> = a_times.clone();
+            for i in 0..n {
+                if rng() % 4 == 0 {
+                    continue;
+                }
+                let bits = (rng() % 19) as u32;
+                let mut mask = 0u64;
+                while mask.count_ones() < bits {
+                    mask |= 1 << (rng() % 64);
+                }
+                b_hashes[i] = a_hashes[i] ^ mask;
+                let cluster = (rng() % 3) as i64 * 900;
+                let jitter = (rng() % 400) as i64;
+                b_times[i] = (a_times[i] as i64 - 5_000 + cluster + jitter) as u32;
+            }
+            b_times.sort_unstable();
+
+            let a = mock_fp_at(a_hashes, a_times);
+            let b = mock_fp_at(b_hashes, b_times);
+
+            for d in [4u32, 10, 12, 16, 20] {
+                let tol = Tolerance::for_distance(d);
+                let (got_a, got_b, _) = corroborate_with_cap(&a, &b, tol, usize::MAX);
+                let (want_a, want_b) = marked_the_slow_way(&a, &b, tol);
+                assert_eq!(got_a, want_a, "round {round}, -d {d}, side A");
+                assert_eq!(got_b, want_b, "round {round}, -d {d}, side B");
+            }
+        }
     }
 
     #[test]
