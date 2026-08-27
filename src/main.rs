@@ -1733,6 +1733,20 @@ enum Refusal {
     TooShort(f64),
 }
 
+impl Refusal {
+    /// Whether this is the verdict "no demuxer recognised it" rather than
+    /// "it opened and then something went wrong".
+    ///
+    /// Asked by the one line of a warm run that puts a NOUN on these files.
+    /// Every other place they are reported prints the sentence the refusal
+    /// carries, which has always been its own; this is the only place the two
+    /// verdicts were ever collapsed, and collapsing them told a user whose
+    /// 1080p HEVC episode the decoder gave up on that it was not video.
+    fn is_not_media(&self) -> bool {
+        matches!(self, Refusal::NotMedia(_))
+    }
+}
+
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -2490,6 +2504,38 @@ Interrupted with Ctrl-C.
     }
 }
 
+
+/// What a warm run says about the files it did not have to look at again.
+///
+/// Said out loud because it is most of what a re-run does. A `-x '*'` scan of a
+/// home directory is a quarter of a million files that are not video, and
+/// "already known not to be video" is the difference between the four minutes
+/// the first run spent finding that out and the seconds this one did.
+///
+/// Two clauses rather than one, and each says only what it knows. A file the
+/// probe gate turned away IS not video. A file that opened and then failed to
+/// decode is a video this build cannot read -- a stream that will not parse, a
+/// picture the decoder refused, nothing in the picture at all -- and calling a
+/// 1080p HEVC episode "not video" because the decoder gave up on it points the
+/// user at the wrong thing entirely: one of those is a file to stop scanning
+/// and the other is a file to go and look at. Nothing else about them moves.
+/// Both are counted in `fingerprint_failed`, both print the sentence the
+/// refusal carries, both are problems and both still exit 2 -- this line is the
+/// only place the two were ever given one noun between them.
+///
+/// Empty when there is nothing to say, because it is spliced into the middle of
+/// a sentence that reads perfectly well without it.
+fn remembered_clause(not_media: usize, failed: usize) -> String {
+    let mut clause = String::new();
+    if not_media > 0 {
+        clause.push_str(&format!(", {} already known not to be video", not_media));
+    }
+    if failed > 0 {
+        clause.push_str(&format!(", {} already known not to decode", failed));
+    }
+    clause
+}
+
 fn run(
     args: &Args,
     db: Option<&Database>,
@@ -2867,7 +2913,15 @@ fn run(
         /// Refused before, by this build's rules, against these exact bytes.
         /// The file never reaches the weighing pass -- which is the entire
         /// saving, since on a `-x '*'` run that pass IS the run.
-        Refused((String, String)),
+        ///
+        /// `not_media` is carried because the two verdicts this covers are
+        /// different findings and only one of them is about a file that is not
+        /// video. `Refusal::NotMedia` is "no demuxer recognised it"; a
+        /// `Refusal::Said` is a real video that would not decode -- a stream
+        /// that will not parse, a picture the decoder refused, a file with
+        /// nothing in the picture. The count below says which is which; the
+        /// sentence each one prints has always been its own.
+        Refused { reason: String, path: String, not_media: bool },
         /// Measured before, and shorter than THIS run's `--min-duration`. The
         /// same saving as `Refused` for the same reason, and the reason the
         /// runtime is what the cache keeps: the threshold is this run's, so the
@@ -2905,7 +2959,11 @@ fn run(
                 // numbers, so the sentence a re-run prints is this build's
                 // sentence and cannot drift from the one a first run prints.
                 Some(verdict) => {
-                    return Lookup::Refused((format!("{}", verdict), file.path.clone()))
+                    return Lookup::Refused {
+                        reason: format!("{}", verdict),
+                        path: file.path.clone(),
+                        not_media: verdict.is_not_media(),
+                    }
                 }
                 None => {}
             }
@@ -2931,7 +2989,11 @@ fn run(
     // the budget has the most to give them.
     let mut fingerprints: Vec<VideoFingerprint> = Vec::with_capacity(total_videos);
     let mut todo: Vec<Job> = Vec::new();
-    let mut remembered_refusals = 0usize;
+    // Split rather than one figure, because the line below says what these
+    // files ARE and the two verdicts say opposite things about that. See
+    // `Lookup::Refused`.
+    let mut remembered_not_media = 0usize;
+    let mut remembered_failures = 0usize;
     for lookup in lookups {
         match lookup {
             Lookup::Hit(fp) => {
@@ -2953,25 +3015,22 @@ fn run(
             // is the same finding about the same bytes -- the run simply did
             // not have to read them again. Still a problem, still exit 2: the
             // user asked for a fingerprint of this file and there is none.
-            Lookup::Refused(reason) => {
-                remembered_refusals += 1;
-                log::error!(target: stats::COUNTED, "Failed to process {}: {}", reason.1, reason.0);
-                stats.fingerprint_failed.record(format!("{}: {}", reason.1, reason.0));
+            Lookup::Refused { reason, path, not_media } => {
+                if not_media {
+                    remembered_not_media += 1;
+                } else {
+                    remembered_failures += 1;
+                }
+                log::error!(target: stats::COUNTED, "Failed to process {}: {}", path, reason);
+                stats.fingerprint_failed.record(format!("{}: {}", path, reason));
             }
         }
     }
     let cached_count = fingerprints.len();
     let todo_count = todo.len();
 
-    // Said out loud because it is most of what a re-run does. A `-x '*'` scan of
-    // a home directory is a quarter of a million files that are not video, and
-    // "already known not to be video" is the difference between the four
-    // minutes the first run spent finding that out and the seconds this one did.
-    let remembered = if remembered_refusals > 0 {
-        format!(", {} already known not to be video", remembered_refusals)
-    } else {
-        String::new()
-    };
+    let remembered = remembered_clause(remembered_not_media, remembered_failures);
+    let remembered_refusals = remembered_not_media + remembered_failures;
 
     if cached_count > 0 || remembered_refusals > 0 {
         info!(
@@ -4467,6 +4526,93 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().0.value().to_string())
             .collect()
+    }
+
+    /// Every refusal in the cache, with the verdict it holds.
+    ///
+    /// Read straight out of the table rather than through `refusal_lookup`, so
+    /// the test does not have to rebuild the `Stamp` of a file `run` stat'ed.
+    fn refusals(db: &Database) -> Vec<(String, Refusal)> {
+        let read = db.begin_read().unwrap();
+        let table = read.open_table(REFUSED_TABLE).unwrap();
+        table
+            .iter()
+            .unwrap()
+            .map(|e| {
+                let entry = e.unwrap();
+                let path = entry.0.value().to_string();
+                let (_, verdict): (Stamp, Refusal) =
+                    bincode::deserialize(entry.1.value()).expect("this build wrote it");
+                (path, verdict)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_a_video_that_would_not_decode_is_not_called_not_video() {
+        // Both halves of the same table, and only one of them is about a file
+        // that is not video. The reported case was a 1080p HEVC episode: it
+        // opened, libavcodec would not build a picture out of it, the run said
+        // so in its own words -- and then the warm run's headline counted it
+        // beside the object files and told the user it was not video.
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+
+        let library = dir.path().join("library");
+        std::fs::create_dir(&library).unwrap();
+
+        // Nothing in it a demuxer recognises: the probe gate's own verdict.
+        let junk = library.join("notes.rlib");
+        std::fs::write(&junk, "not a video at all\n".repeat(200)).unwrap();
+
+        // A real MP4 as far as the header goes, with the picture data cut off:
+        // it opens, it has a video stream, and no frame ever decodes.
+        let mut fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        fixture.push("tests/fixtures/test_video.mp4");
+        let whole = std::fs::read(&fixture).expect("the fixture video is part of the tree");
+        let broken = library.join("broken.mp4");
+        std::fs::write(&broken, &whole[..2000]).unwrap();
+
+        let args = Args::parse_from(["vid-fp", &library.to_string_lossy(), "-x", "*"]);
+        let stats = RunStats::default();
+        run(&args, Some(&db), Instant::now(), 1, &stats).unwrap();
+
+        let mut remembered = refusals(&db);
+        remembered.sort_by(|a, b| a.0.cmp(&b.0));
+        let kinds: Vec<(String, bool)> = remembered
+            .iter()
+            .map(|(path, verdict)| {
+                (
+                    PathBuf::from(path).file_name().unwrap().to_string_lossy().to_string(),
+                    verdict.is_not_media(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![("broken.mp4".to_string(), false), ("notes.rlib".to_string(), true)],
+            "the truncated video opened and failed; the object file never opened at all"
+        );
+
+        // Which is what the warm run's one line has to say. Built from the same
+        // classification the run counts on, since that is the thing that was
+        // wrong -- the sentence itself was never in doubt.
+        let not_media = remembered.iter().filter(|(_, v)| v.is_not_media()).count();
+        let failed = remembered.len() - not_media;
+        assert_eq!(
+            remembered_clause(not_media, failed),
+            ", 1 already known not to be video, 1 already known not to decode"
+        );
+    }
+
+    #[test]
+    fn test_the_warm_run_says_nothing_about_a_kind_of_refusal_it_has_none_of() {
+        // The clause is spliced into the middle of a sentence, so every count
+        // of zero has to leave no trace at all -- including both of them, which
+        // is every run over a library that is really video.
+        assert_eq!(remembered_clause(0, 0), "");
+        assert_eq!(remembered_clause(3, 0), ", 3 already known not to be video");
+        assert_eq!(remembered_clause(0, 3), ", 3 already known not to decode");
     }
 
     /// A file that is not video is reported by whichever pass discovers it, and
