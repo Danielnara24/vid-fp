@@ -1616,69 +1616,120 @@ struct Retired {
     refusals: bool,
 }
 
-/// Read one fingerprint out of the cache, or `None` for anything that isn't a
-/// clean hit.
-///
-/// A missing entry, an unreadable table, a payload that no longer deserializes,
-/// and a payload whose stamp no longer describes the file on disk all mean
-/// exactly the same thing to the caller -- fingerprint the file again -- so
-/// they collapse into one answer here rather than making every call site handle
-/// four failure shapes that need identical treatment. A stale entry is left
-/// where it is on the way past, because whichever pass takes the file next is
-/// about to write over it: `cache_store` if it decodes, `refusals_store` if it
-/// is refused. Both of those remove the path from the OTHER table in the same
-/// transaction, which is what keeps "one path, one entry" true -- leaving a
-/// stale entry here is only safe because neither of them leaves one behind.
-///
-/// The read transaction is per-call on purpose. It is a snapshot handle rather
-/// than a lock, readers never block each other or the writer, and taking it
-/// here keeps the whole thing usable from a worker without threading a borrow
-/// through the closure.
-fn cache_lookup(db: &Database, path: &str, stamp: &Stamp) -> Option<VideoFingerprint> {
-    let read = db.begin_read().ok()?;
-    let table = read.open_table(CACHE_TABLE).ok()?;
-    let stored = table.get(path).ok()??;
+/// One redb table, in the shape both of this program's are.
+type CacheTable = redb::ReadOnlyTable<&'static str, &'static [u8]>;
 
-    match bincode::deserialize::<CacheEntry>(stored.value()) {
-        // An entry with no hashes in it is one an older build wrote for a file
-        // whose every frame was featureless, back when that returned a
-        // fingerprint instead of failing. It matches nothing at any `-d`, so
-        // handing it back is what made those files silent -- and the `Stamp`
-        // cannot tell it from a good entry, since nothing about the file
-        // changed. Re-decoding is what a cache MISS means and it is what this
-        // is: the decode fails loudly, and `REFUSED_TABLE` remembers the
-        // sentence, so the cost is one decode per such file, once, rather than
-        // the whole-library re-decode a `CACHE_TABLE` rename would charge every
-        // user for a handful of blank videos. No fresh entry can be empty.
-        Ok((_, fp)) if fp.valid_hashes.is_empty() => None,
-        Ok((cached, fp)) if cached.matches(stamp) => Some(fp),
-        // The file was edited, or the sampling knobs moved. Either way the
-        // fingerprint on record describes something that is no longer there.
-        Ok(_) => None,
-        Err(e) => {
-            // Corrupt, or written by a build whose struct no longer matches.
-            // Either way it is about to be overwritten by a fresh decode.
-            log::debug!("Cache entry for {} did not deserialize ({}); re-processing.", path, e);
-            None
+/// Both cache tables as a single read transaction sees them.
+///
+/// The cache pass asks two questions of every file -- was this one refused
+/// before, and is there a fingerprint on record for it -- and each used to open
+/// a read transaction and a table of its own. A warm `-x '*'` scan of 157k
+/// files therefore took 314k transactions to answer 157k files' worth of
+/// questions, all of them against a database nothing was writing to: the pass
+/// runs before any decode, so both tables are still exactly as `open_cache`
+/// left them for the whole of it. One snapshot answers every question in the
+/// pass, so `open` is called once above the `par_iter` and the workers share it
+/// by reference.
+///
+/// The tables are owned rather than borrowed from the transaction. redb's
+/// `open_table` clones the transaction guard into the table it hands back, so
+/// each table keeps the snapshot alive by itself and the `ReadTransaction`
+/// is dropped at the end of `open` -- which is what lets this be a plain struct
+/// rather than a self-referential one.
+///
+/// A table that will not open is `None` rather than an error, and every lookup
+/// through it then answers `None`. That is what the per-call `.ok()?` did and
+/// it means the same thing here: an unreadable table is a cache that knows
+/// nothing, so every file is a miss and gets fingerprinted again.
+struct CacheView {
+    fingerprints: Option<CacheTable>,
+    refusals: Option<CacheTable>,
+}
+
+impl CacheView {
+    /// Take the snapshot. Infallible for the reason above -- there is nothing a
+    /// caller could do with a failure that answering "nothing is cached" does
+    /// not already do.
+    fn open(db: &Database) -> Self {
+        let Ok(read) = db.begin_read() else {
+            return Self { fingerprints: None, refusals: None };
+        };
+        Self {
+            fingerprints: read.open_table(CACHE_TABLE).ok(),
+            refusals: read.open_table(REFUSED_TABLE).ok(),
+        }
+    }
+
+    /// Read one fingerprint out of the cache, or `None` for anything that isn't
+    /// a clean hit.
+    ///
+    /// A missing entry, an unreadable table, a payload that no longer
+    /// deserializes, and a payload whose stamp no longer describes the file on
+    /// disk all mean exactly the same thing to the caller -- fingerprint the
+    /// file again -- so they collapse into one answer here rather than making
+    /// every call site handle four failure shapes that need identical
+    /// treatment. A stale entry is left where it is on the way past, because
+    /// whichever pass takes the file next is about to write over it:
+    /// `cache_store` if it decodes, `refusals_store` if it is refused. Both of
+    /// those remove the path from the OTHER table in the same transaction,
+    /// which is what keeps "one path, one entry" true -- leaving a stale entry
+    /// here is only safe because neither of them leaves one behind.
+    fn fingerprint(&self, path: &str, stamp: &Stamp) -> Option<VideoFingerprint> {
+        let stored = self.fingerprints.as_ref()?.get(path).ok()??;
+
+        match bincode::deserialize::<CacheEntry>(stored.value()) {
+            // An entry with no hashes in it is one an older build wrote for a
+            // file whose every frame was featureless, back when that returned a
+            // fingerprint instead of failing. It matches nothing at any `-d`, so
+            // handing it back is what made those files silent -- and the `Stamp`
+            // cannot tell it from a good entry, since nothing about the file
+            // changed. Re-decoding is what a cache MISS means and it is what
+            // this is: the decode fails loudly, and `REFUSED_TABLE` remembers
+            // the sentence, so the cost is one decode per such file, once,
+            // rather than the whole-library re-decode a `CACHE_TABLE` rename
+            // would charge every user for a handful of blank videos. No fresh
+            // entry can be empty.
+            Ok((_, fp)) if fp.valid_hashes.is_empty() => None,
+            Ok((cached, fp)) if cached.matches(stamp) => Some(fp),
+            // The file was edited, or the sampling knobs moved. Either way the
+            // fingerprint on record describes something that is no longer there.
+            Ok(_) => None,
+            Err(e) => {
+                // Corrupt, or written by a build whose struct no longer matches.
+                // Either way it is about to be overwritten by a fresh decode.
+                log::debug!("Cache entry for {} did not deserialize ({}); re-processing.", path, e);
+                None
+            }
+        }
+    }
+
+    /// The refusal on record for this path, if this exact file was refused
+    /// before.
+    ///
+    /// Guarded by the same `Stamp` a fingerprint is, so an edited file is
+    /// re-asked; the sampling knobs are in there too, which is stricter than
+    /// this verdict needs but costs nothing and cannot be wrong.
+    fn refusal(&self, path: &str, stamp: &Stamp) -> Option<Refusal> {
+        let stored = self.refusals.as_ref()?.get(path).ok()??;
+
+        match bincode::deserialize::<(Stamp, Refusal)>(stored.value()) {
+            Ok((cached, verdict)) if cached.matches(stamp) => Some(verdict),
+            Ok(_) => None,
+            Err(_) => None,
         }
     }
 }
 
-/// The refusal on record for this path, if this exact file was refused before.
-///
-/// Guarded by the same `Stamp` a fingerprint is, so an edited file is re-asked;
-/// the sampling knobs are in there too, which is stricter than this verdict
-/// needs but costs nothing and cannot be wrong.
-fn refusal_lookup(db: &Database, path: &str, stamp: &Stamp) -> Option<Refusal> {
-    let read = db.begin_read().ok()?;
-    let table = read.open_table(REFUSED_TABLE).ok()?;
-    let stored = table.get(path).ok()??;
+/// Both lookups against a snapshot of their own, for tests that ask one
+/// question of a database they have just written to and want to see the write.
+#[cfg(test)]
+fn cache_lookup(db: &Database, path: &str, stamp: &Stamp) -> Option<VideoFingerprint> {
+    CacheView::open(db).fingerprint(path, stamp)
+}
 
-    match bincode::deserialize::<(Stamp, Refusal)>(stored.value()) {
-        Ok((cached, verdict)) if cached.matches(stamp) => Some(verdict),
-        Ok(_) => None,
-        Err(_) => None,
-    }
+#[cfg(test)]
+fn refusal_lookup(db: &Database, path: &str, stamp: &Stamp) -> Option<Refusal> {
+    CacheView::open(db).refusal(path, stamp)
 }
 
 /// Why a file will not be fingerprinted, in the form the cache keeps it.
@@ -2945,6 +2996,11 @@ fn run(
         Short,
     }
 
+    // One snapshot for the whole pass rather than two transactions per file;
+    // see `CacheView`. Nothing writes to either table between here and the
+    // decode, so every worker reads the same cache the first one would have.
+    let cache = CacheView::open(db);
+
     let lookups: Vec<Lookup> = video_files
         .par_iter()
         .map(|file| {
@@ -2960,7 +3016,7 @@ fn run(
                 min_kf_samples,
             };
 
-            match refusal_lookup(db, &file.path, &stamp) {
+            match cache.refusal(&file.path, &stamp) {
                 // A remembered runtime, not a remembered verdict -- see
                 // `Refusal::TooShort`. Too short for this run's threshold is a
                 // skip; long enough for it falls through to the lookup below and
@@ -2984,7 +3040,7 @@ fn run(
                 None => {}
             }
 
-            match cache_lookup(db, &file.path, &stamp) {
+            match cache.fingerprint(&file.path, &stamp) {
                 Some(fp) => Lookup::Hit(fp),
                 None => Lookup::Miss(Job {
                     path: file.path.clone(),
@@ -2999,6 +3055,12 @@ fn run(
             }
         })
         .collect();
+
+    // Let go of the snapshot the moment the pass is done with it. A live read
+    // transaction pins every page it can see, so holding this one across the
+    // decode would stop redb reclaiming anything `cache_store` supersedes for
+    // the whole of the run's longest stage.
+    drop(cache);
 
     // collect() preserves input order, so `todo` inherits the largest-first sort
     // and the heaviest decodes are still claimed first -- which is exactly when
