@@ -17,11 +17,22 @@ The **released** binary is different: it statically links a vendored FFmpeg 8 + 
 ```bash
 ./scripts/build-ffmpeg-static.sh   # ~10 min, once; -> ./ffmpeg-static (gitignored)
 
+export FFMPEG_DIR="$PWD/ffmpeg-static"                      # per shell, NOT a profile
 cargo build --release --features static-ffmpeg              # what ships
 cargo test  --release --features static-ffmpeg -- --nocapture
 ```
 
-`build.rs` defaults to `./ffmpeg-static`, so no env var is needed day to day; `FFMPEG_DIR` overrides it for CI and for anyone relinking. **Do not export `FFMPEG_DIR` from a shell profile** — `ffmpeg-sys-next` reads it whether or not the feature is on, so a plain `cargo build` would then try to link the static archives and fail at `ld`.
+**`FFMPEG_DIR` is required for a static build, and `build.rs` cannot supply it.** It used to fall back to `./ffmpeg-static` when the variable was unset, and this file used to say that meant no env var was needed day to day. Both were wrong. `ffmpeg-sys-next`'s build script runs *first*, in its own process, and `FFMPEG_DIR` is its only prebuilt-prefix branch; unset, it falls through to a `statik(true)` pkg-config probe of the **system** FFmpeg and generates its bindings and struct layouts from those headers. Nothing `build.rs` does afterwards can reach back and change that — a downstream build script cannot influence an upstream one's environment, and the `set_var("PKG_CONFIG_PATH", …)` reaches only our own four probes. So the fallback supplied the archive half of a mismatched pair: measured here, bindings from libavcodec 60 (FFmpeg 6) over archives resolved first out of `./ffmpeg-static` (libavcodec 62). It fails at `ld` on this machine only because the system's link tail (`-lgme -lopenmpt -lgnutls` …) is not installed; **on a host that has those dev packages it links**, and the result is the silently-wrong static binary — FFmpeg-8 archives against FFmpeg-6 layouts — that the whole `_ff8` rename discipline exists to prevent. `build.rs` now refuses the build instead, and the refusal is what the `Cargo.toml` feature comment has always claimed.
+
+**A poisoned target dir does not heal when you set the variable.** `ffmpeg-sys-next` emits no `rerun-if-env-changed` of any kind, so once its build script has run in a target dir the choice is frozen — exporting `FFMPEG_DIR` afterwards leaves the bindings at whatever they were. Recovery is a clean of that one unit, and `cargo clean -p` is scoped to a single profile, so the flag has to match:
+
+```bash
+cargo clean -p ffmpeg-sys-next --release   # bare, this removes 0 files from a release dir
+```
+
+Because the refusal cannot see that case at all (there `FFMPEG_DIR` *is* set and `build.rs` is perfectly happy), there is a second guard that can: `build.rs` reads the libavcodec version out of the prefix's own `libavcodec.pc` and writes a `const _: () = assert!(…)` into `OUT_DIR` comparing it against `ffmpeg_next::ffi::LIBAVCODEC_VERSION_{MAJOR,MINOR,MICRO}` — what the bindings were *really* generated from. `main.rs` includes it under `#[cfg(feature = "static-ffmpeg")]`, so a mismatched pair fails to compile rather than shipping.
+
+**Do not export `FFMPEG_DIR` from a shell profile, and do not put it in `.cargo/config.toml` `[env]`** — `ffmpeg-sys-next` reads it whether or not the feature is on, so a plain dynamic `cargo build` would then take the prebuilt branch too and try to link the static archives. Per-shell, or per-command, is the only safe scope. Release CI is unaffected either way: `release.yml` sets `FFMPEG_DIR` on both the build and the test step.
 
 **Pass `--features static-ffmpeg` to `cargo test` as well as `cargo build`.** `cargo test` builds the bin target too, so a bare `cargo test --release` silently overwrites `target/release/vid-fp` with a *dynamic* binary and then measures it against the static baselines — which shows up as a `4-20` failure reading 75/186 that looks exactly like a real regression. The harness prints a warning when it detects this, but the warning is easy to scroll past.
 

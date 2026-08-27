@@ -29,6 +29,14 @@ use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use utils::{shutdown_requested, Priority};
 
+// Refuse a static build whose bindings and archives came from different FFmpeg
+// releases. `build.rs` writes this file from the version `libavcodec.pc` states
+// for the prefix in FFMPEG_DIR; ffmpeg-sys-next runs first and can bind itself
+// to the system FFmpeg without anything downstream being able to tell, so the
+// assertion is made against what it really generated. See build.rs's module doc.
+#[cfg(feature = "static-ffmpeg")]
+include!(concat!(env!("OUT_DIR"), "/static_ffmpeg_version_check.rs"));
+
 /// The one table in the cache: absolute file path -> bincode'd `CacheEntry`.
 ///
 /// One entry per path, overwritten in place. That is the entire invalidation
