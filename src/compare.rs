@@ -926,6 +926,10 @@ fn match_overlap(
     witnesses: &mut Witnesses,
 ) -> (f32, f32, Option<Span>, Option<Span>) {
     let tol = rule.tol;
+    // Per pair, and deliberately left that way. `Witnesses` beside them is the
+    // worker's, and moving these two (and `corroborate_pair`'s match list) in
+    // with it was tried and reverted: it is correct, it is byte-identical, and
+    // it buys NOTHING measurable -- see the note in CLAUDE.md for the numbers.
     let mut matched_a = vec![false; fp_a.valid_hashes.len()];
     let mut matched_b = vec![false; fp_b.valid_hashes.len()];
 
