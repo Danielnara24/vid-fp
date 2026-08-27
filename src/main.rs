@@ -544,7 +544,7 @@ struct Args {
     /// Minimum shared clip length in seconds; also skips shorter videos
     ///
     /// 0 = off. Independent of --match-percent; both must be satisfied.
-    /// Negative values are refused.
+    /// Negative and non-finite values are refused.
     #[arg(long = "min-duration", value_name = "SECS", default_value_t = 0.0)]
     min_duration: f64,
 
@@ -552,7 +552,7 @@ struct Args {
     ///
     /// Long videos sample at this interval; short ones use a finer spacing so
     /// they keep at least --min-keyframes samples. Higher is faster, but makes
-    /// short matches harder to find. Negative values are refused.
+    /// short matches harder to find. Negative and non-finite values are refused.
     #[arg(long = "keyframe-interval", value_name = "F", default_value_t = 0.0)]
     kf_interval: f64,
 
@@ -562,7 +562,7 @@ struct Args {
     /// Raising it is NOT monotonic: denser sampling makes each hash stand for a
     /// shorter span, so frames that match nothing dilute a pair's coverage and
     /// can push it under --match-percent. 4, 12, 20 and 28 measure well; 8 and
-    /// 16 lose pairs. Negative values are refused.
+    /// 16 lose pairs. Negative and non-finite values are refused.
     #[arg(long = "min-keyframes", value_name = "F", default_value_t = 12.0)]
     min_kf_samples: f64,
 
@@ -2565,8 +2565,24 @@ fn run(
     // because `pct_a.max(pct_b) < min_match_percent` is then false for every
     // pair and the run accepts everything the index proposed -- which with
     // --delete armed can only ever ADD files to the DELETE set.
-    // `RangeInclusive::contains` is false for NaN, so one form catches the lot.
-    if !(0.0..).contains(&min_duration) {
+    //
+    // A range test catches NaN, and only `--match-percent`'s catches infinity,
+    // because only that one has an upper end. `(0.0..)` is a `RangeFrom` with no
+    // upper bound at all, so `--min-duration=inf` -- and `--min-duration=1e400`,
+    // which is the way a typo reaches it -- passed straight through: every file
+    // with a measurable runtime is then shorter than the floor, the whole
+    // library is skipped, and the run exits 0 having compared nothing. This was
+    // the one numeric knob whose nonsense value produced a clean exit rather
+    // than a message, which is the exact failure the sampling knobs below were
+    // given `is_finite` to prevent. It is stated the same way as those two, so
+    // all four flags now refuse the same set of values.
+    //
+    // Nothing in the cache has to be retired for it. A skipped file writes
+    // `Refusal::TooShort(duration)` -- the measured runtime, not the verdict, by
+    // the invariant on that variant -- so the entries an `inf` run left behind
+    // are exactly the ones a sane run wants, and the next run re-decides from
+    // them without opening anything.
+    if !min_duration.is_finite() || min_duration < 0.0 {
         anyhow::bail!("--min-duration must be zero or more seconds (0 turns it off).");
     }
     // The upper bound is not a matter of taste. `match_overlap` clamps every
@@ -5273,12 +5289,37 @@ mod tests {
         // NaN is the reason this is a range test rather than `< 0.0`: every
         // comparison against it is false, so a NaN floor slipped through and
         // silently disabled the gate it was meant to tighten.
+        //
+        // Infinity is the other half, and it is the half a `RangeFrom` cannot
+        // see: `(0.0..)` has no upper end, so `inf` passed and every file in the
+        // library was then shorter than the floor -- a run that skipped
+        // everything, compared nothing and exited 0. `1e400` is in the list
+        // because that is how a typo reaches it; it parses to `inf` rather than
+        // being refused as unreadable, so nothing before this check objects.
         let dir = tempfile::tempdir().unwrap();
         let db = temp_db(&dir);
 
-        for bad in ["--min-duration=-5", "--min-duration=nan"] {
+        for bad in [
+            "--min-duration=-5",
+            "--min-duration=nan",
+            "--min-duration=inf",
+            "--min-duration=-inf",
+            "--min-duration=1e400",
+        ] {
             let err = run_error(&dir, &db, &[bad]);
             assert!(err.contains("--min-duration"), "{}: {}", bad, err);
+        }
+
+        // 0 is documented as the setting that turns the gate off, and a real
+        // floor is the whole point of the flag. Neither may be caught by the
+        // widened test.
+        for ok in ["--min-duration=0", "--min-duration=30"] {
+            let stats = RunStats::default();
+            assert!(
+                run(&args_over(&dir, &[ok]), Some(&db), Instant::now(), 1, &stats).is_ok(),
+                "{} is a setting, not a typo",
+                ok
+            );
         }
     }
 
