@@ -470,6 +470,73 @@ impl JsonBody {
     }
 }
 
+/// The CSV report, written one record at a time.
+///
+/// A wrapper around `csv::Writer` for one reason, and it is the same reason
+/// `ReportStream::write` swallows: nothing in the reporting pass may hand a
+/// failure back to `output_results`. By the time a body is being written the
+/// disposal pass has already run, and an error returned from there throws away
+/// `deleted_paths` on the way out -- leaving the cache claiming fingerprints for
+/// files this run has just removed, which is the one bookkeeping failure that
+/// outlives the run.
+///
+/// `ReportStream` alone is not enough for that, and this is the gap it left. It
+/// makes the SINK infallible, and a `csv::Writer` has a failure of its own that
+/// the sink underneath it never sees: a record whose field count does not match
+/// the header. So the two `write_record` calls in that pass carried a `?` each,
+/// and the guarantee held only because both records happen to be the same fixed
+/// width as the header -- true today, unenforced, and exactly the kind of thing
+/// a fourteenth column is added without thinking about. `record` returns nothing
+/// at all, so there is no longer a `?` to write by accident, which is the same
+/// shape `JsonBody` above and `let _ = writeln!` on the text body already have.
+///
+/// The first failure is kept and everything after it is skipped, for the reason
+/// `ReportStream` skips: whatever makes one record unwritable makes the next one
+/// unwritable too. `finish` answers for it, and it is answered for BEFORE the
+/// sink's own failure, because it came first -- the sink saw nothing after it
+/// and would report a truncated report as a written one.
+struct CsvBody {
+    wtr: csv::Writer<ReportStream>,
+    failed: Option<csv::Error>,
+}
+
+impl CsvBody {
+    fn open(target: &ReportTarget) -> Self {
+        CsvBody {
+            wtr: csv::WriterBuilder::new().delimiter(b';').from_writer(ReportStream::open(target)),
+            failed: None,
+        }
+    }
+
+    /// One record, header included -- the header is a row of strings like any
+    /// other, and giving it a method of its own would be two ways to reach the
+    /// same swallow.
+    fn record<const N: usize>(&mut self, fields: [&str; N]) {
+        if self.failed.is_some() {
+            return;
+        }
+        if let Err(e) = self.wtr.write_record(fields) {
+            self.failed = Some(e);
+        }
+    }
+
+    fn finish(self, target: &ReportTarget) -> Result<()> {
+        // `into_inner` flushes, so it has to happen either way: the sink owns
+        // the scratch copy, and dropping the writer instead would leave it to a
+        // destructor that cannot report what it found.
+        let stream = self
+            .wtr
+            .into_inner()
+            .map_err(|e| e.into_error())
+            .context("Failed to finalize the CSV report")?;
+
+        match self.failed {
+            Some(e) => Err(e).context("Failed to write the CSV report"),
+            None => stream.finish(target),
+        }
+    }
+}
+
 
 /// Which parts of the run stderr still says out loud once the report has a
 /// destination.
@@ -1311,11 +1378,7 @@ pub fn output_results(
     let mut txt_out = wants_txt.then(|| ReportStream::open(sink()));
 
     // Use csv crate for robust and RFC-compliant CSV generation
-    let mut csv_wtr = wants_csv.then(|| {
-        csv::WriterBuilder::new()
-            .delimiter(b';')
-            .from_writer(ReportStream::open(sink()))
-    });
+    let mut csv_wtr = wants_csv.then(|| CsvBody::open(sink()));
 
     // The CSV carries exactly what the JSON carries, field for field, in the
     // same order. Anything shown in a formatted column is immediately followed
@@ -1362,33 +1425,31 @@ pub fn output_results(
     // formatted form is still on the console line, where a human reads it, and
     // the reports keep only `framerate_fps` to sort on.
     if let Some(csv_wtr) = &mut csv_wtr {
-        csv_wtr
-            .write_record([
-                "group",
-                "action",
-                "full_path",
-                "length",
-                "length_seconds",
-                "resolution",
-                "width",
-                "height",
-                "framerate_fps",
-                "codec",
-                "size",
-                "size_bytes",
-                "bitrate",
-                "bitrate_bps",
-                "quality",
-                "quality_bits_per_frame",
-                "matched_with",
-                "samples",
-                "matched_seconds",
-                "matched_from",
-                "matched_to",
-                "matched_from_seconds",
-                "matched_to_seconds",
-            ])
-            .context("Failed to write CSV header")?;
+        csv_wtr.record([
+            "group",
+            "action",
+            "full_path",
+            "length",
+            "length_seconds",
+            "resolution",
+            "width",
+            "height",
+            "framerate_fps",
+            "codec",
+            "size",
+            "size_bytes",
+            "bitrate",
+            "bitrate_bps",
+            "quality",
+            "quality_bits_per_frame",
+            "matched_with",
+            "samples",
+            "matched_seconds",
+            "matched_from",
+            "matched_to",
+            "matched_from_seconds",
+            "matched_to_seconds",
+        ]);
     }
 
     // The JSON is written as the loop below produces it rather than collected
@@ -1672,7 +1733,7 @@ pub fn output_results(
                 let matched_from_raw = csv_seconds(best_span.map(|s| s.start_seconds()));
                 let matched_to_raw = csv_seconds(best_span.map(|s| s.end_seconds()));
 
-                csv_wtr.write_record([
+                csv_wtr.record([
                     &group_name,
                     action_str,
                     &fp.path,
@@ -1696,7 +1757,7 @@ pub fn output_results(
                     &matched_to_str,
                     &matched_from_raw,
                     &matched_to_raw,
-                ]).context("Failed to write CSV record")?;
+                ]);
             }
 
             // 3. JSON File Output
@@ -1838,24 +1899,23 @@ pub fn output_results(
         // is left is to close it and put it where it was asked for -- and for
         // the text report, to add the summary, which is the one part of it that
         // could not be known until the loop above had finished.
-        let written = (move || -> Result<()> {
-            match target.format {
-                Format::Csv => csv_wtr
-                    .expect("a CSV run opens a CSV writer")
-                    .into_inner()
-                    .map_err(|e| e.into_error())
-                    .context("Failed to finalize the CSV report")?
-                    .finish(target),
-                Format::Json => json
-                    .expect("a JSON run opens a JSON body")
-                    .finish(target),
-                Format::Txt => {
-                    let mut txt_out = txt_out.expect("a text run opens a text body");
-                    let _ = writeln!(txt_out, "{}", summary);
-                    txt_out.finish(target)
-                }
+        //
+        // A plain expression rather than the closure this used to be. The
+        // closure existed to catch a `?` on the CSV writer's `into_inner`,
+        // which is the last `?` the reporting pass had; `CsvBody::finish` now
+        // answers for that where every other report failure is answered for,
+        // so there is nothing here for a `?` to escape from and nothing to
+        // wrap. Whether the report was saved is decided in one place either
+        // way, and the three arms hand it back rather than returning it.
+        let written = match target.format {
+            Format::Csv => csv_wtr.expect("a CSV run opens a CSV writer").finish(target),
+            Format::Json => json.expect("a JSON run opens a JSON body").finish(target),
+            Format::Txt => {
+                let mut txt_out = txt_out.expect("a text run opens a text body");
+                let _ = writeln!(txt_out, "{}", summary);
+                txt_out.finish(target)
             }
-        })();
+        };
 
         match written {
             // Nothing to announce for stdout: the report is already there, and
@@ -3552,6 +3612,77 @@ matched_from_seconds;matched_to_seconds";
 
         let _ = fs::remove_file(path_str);
         let _ = fs::remove_file(empty_str);
+    }
+
+    #[test]
+    fn test_a_csv_record_that_will_not_write_is_reported_rather_than_returned() {
+        // The one guarantee `ReportStream` could not make on its own. It makes
+        // the SINK infallible, and a `csv::Writer` fails for a reason the sink
+        // never sees -- a record that is not the width of the header. That
+        // failure used to leave `output_results` through a `?`, taking
+        // `deleted_paths` with it, so the caller never dropped the cache
+        // entries of the files the disposal pass had just removed.
+        //
+        // It is unreachable from `output_results` today, because every record
+        // there is the same fixed-width array. That is the point: `record`
+        // hands nothing back, so the pass cannot start propagating one by
+        // growing a column. Driven here directly, which is the only way to make
+        // the writer fail at all.
+        let dir = tempfile::tempdir().unwrap();
+        let path = at(&dir, "dupes.csv");
+        let target = to_file(&path);
+
+        let mut body = CsvBody::open(&target);
+        body.record(["group", "action", "full_path"]);
+        // Two fields where the header set three. `csv::Writer` refuses it, and
+        // the compiler will not let this line be written with a `?` on it.
+        body.record(["group_1", "DELETE"]);
+        // And the pass carries on rather than unwinding -- everything after the
+        // first failure is skipped, exactly as the sink skips.
+        body.record(["group_1", "KEEP", "/fake/a.mp4"]);
+
+        let failure = body.finish(&target).expect_err("a refused record is a failed report");
+        assert!(
+            format!("{:#}", failure).contains("Failed to write the CSV report"),
+            "answered for in the same words a failed whole-document write uses: {:#}",
+            failure
+        );
+        assert!(
+            !Path::new(&path).exists(),
+            "and a report that could not be written is not renamed into place"
+        );
+    }
+
+    #[test]
+    fn test_a_report_that_cannot_be_written_still_hands_back_what_was_disposed_of() {
+        // The other half of the same rule, and the half with the consequence:
+        // the report is the LAST thing `output_results` does, so a failure
+        // there must not take the disposal pass's answer out with it. Without
+        // those paths `main` never calls `cache_forget`, and the cache goes on
+        // offering fingerprints for files that are gone.
+        let dir = tempfile::tempdir().unwrap();
+        let fps = vec![
+            mock_fp_at(&at(&dir, "a.mp4"), 100.0),
+            mock_fp_at(&at(&dir, "b.mp4"), 10.0),
+        ];
+        materialize_all(&fps);
+
+        // A destination that will not take a scratch file and will not take a
+        // write either: the report is a directory.
+        let blocked = at(&dir, "dupes.csv");
+        fs::create_dir(&blocked).unwrap();
+
+        let stats = RunStats::default();
+        let disposed = output_results(
+            &[vec![0, 1]], &fps, &all_compared(fps.len()), Some(&to_file(&blocked)), 0,
+            Priority::Length, Some(&Disposal::Permanent), true, &stats,
+        )
+        .expect("a report that cannot be saved is not an error this function returns");
+
+        assert_eq!(disposed, vec![fps[1].path.clone()], "the loser was removed and named");
+        assert!(!Path::new(&fps[1].path).exists(), "and it really went");
+        assert_eq!(stats.report_write_failed.count(), 1, "the failure is tallied instead");
+        assert!(stats.had_problems(), "so the run still exits 2");
     }
 
     #[test]
