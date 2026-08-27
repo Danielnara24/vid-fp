@@ -1153,6 +1153,32 @@ fn run_from_report(
     Ok(Outcome::Completed)
 }
 
+/// What the cache had to say about one file, before anything is decoded.
+///
+/// At module scope rather than inside `run` so `unpack_lookups` -- the tally
+/// that turns these into the pass's headline -- can be tested on its own.
+enum Lookup {
+    Hit(VideoFingerprint),
+    Miss(Job),
+    /// Refused before, by this build's rules, against these exact bytes.
+    /// The file never reaches the weighing pass -- which is the entire
+    /// saving, since on a `-x '*'` run that pass IS the run.
+    ///
+    /// `not_media` is carried because the two verdicts this covers are
+    /// different findings and only one of them is about a file that is not
+    /// video. `Refusal::NotMedia` is "no demuxer recognised it"; a
+    /// `Refusal::Said` is a real video that would not decode -- a stream
+    /// that will not parse, a picture the decoder refused, a file with
+    /// nothing in the picture. The count below says which is which; the
+    /// sentence each one prints has always been its own.
+    Refused { reason: String, path: String, not_media: bool },
+    /// Measured before, and shorter than THIS run's `--min-duration`. The
+    /// same saving as `Refused` for the same reason, and the reason the
+    /// runtime is what the cache keeps: the threshold is this run's, so the
+    /// decision has to be taken here rather than remembered.
+    Short,
+}
+
 /// One video that has to be decoded, and everything needed to decide how much
 /// of the machine to give it.
 ///
@@ -2595,6 +2621,92 @@ fn remembered_clause(not_media: usize, failed: usize) -> String {
     clause
 }
 
+/// What the cache pass answered, unpacked into the four things the rest of the
+/// run reads.
+///
+/// `cached_count` is the count of files the cache ANSWERED without a decode,
+/// which is not the same as `fingerprints.len()` and is the bug this struct
+/// exists to keep fixed -- see `unpack_lookups`.
+struct CachePass {
+    fingerprints: Vec<VideoFingerprint>,
+    todo: Vec<Job>,
+    cached_count: usize,
+    remembered_not_media: usize,
+    remembered_failures: usize,
+}
+
+/// Turn the cache pass's verdicts into the decode queue, the fingerprints
+/// already in hand, and the counts the headline is built from.
+///
+/// **`cached_count` counts what the cache answered, not what survived.** It was
+/// `fingerprints.len()`, read after the loop, and that vector is the survivors:
+/// a `Hit` under this run's `--min-duration` is dropped from it, and a `Short`
+/// -- a remembered runtime this pass re-decides from, see `Refusal::TooShort` --
+/// never enters it at all. So a fully warm library that `--min-duration`
+/// swallows counted zero, and the run announced "Fingerprinting..." and then
+/// decoded nothing. Both routes are reachable in two commands: the first from a
+/// library fingerprinted before the flag was raised, the second from a second
+/// run at the same flag, where every file is a `Short`. Cosmetic -- nothing else
+/// reads the figure, and `todo` was right throughout -- but that line is the
+/// only thing that says what the run is about to do, and it said the opposite.
+///
+/// The refusals stay split, because the headline says what those files ARE and
+/// the two verdicts say opposite things about it (see `Lookup::Refused`).
+fn unpack_lookups(
+    lookups: Vec<Lookup>,
+    min_duration: f64,
+    total_videos: usize,
+    stats: &RunStats,
+) -> CachePass {
+    let mut pass = CachePass {
+        fingerprints: Vec::with_capacity(total_videos),
+        todo: Vec::new(),
+        cached_count: 0,
+        remembered_not_media: 0,
+        remembered_failures: 0,
+    };
+
+    for lookup in lookups {
+        match lookup {
+            Lookup::Hit(fp) => {
+                pass.cached_count += 1;
+                if min_duration > 0.0 && fp.duration > 0.0 && fp.duration < min_duration {
+                    // Already cached, so we know without decoding that it is too
+                    // short to matter. Counted in the same bucket as the ones
+                    // discovered by reading a header: from the user's side it is
+                    // the same skip for the same reason.
+                    stats.skipped_short.bump();
+                } else {
+                    pass.fingerprints.push(fp);
+                }
+            }
+            Lookup::Miss(job) => pass.todo.push(job),
+            // Same bucket as every other way a file turns out to be too short,
+            // and the same silence: it is a skip the user asked for. Cached all
+            // the same -- the runtime it was decided from came out of the cache.
+            Lookup::Short => {
+                pass.cached_count += 1;
+                stats.skipped_short.bump();
+            }
+            // Counted and worded as if it had just been discovered, because it
+            // is the same finding about the same bytes -- the run simply did
+            // not have to read them again. Still a problem, still exit 2: the
+            // user asked for a fingerprint of this file and there is none.
+            Lookup::Refused { reason, path, not_media } => {
+                if not_media {
+                    pass.remembered_not_media += 1;
+                } else {
+                    pass.remembered_failures += 1;
+                }
+                log::error!(target: stats::COUNTED, "Failed to process {}: {}", path, reason);
+                stats.fingerprint_failed.record(format!("{}: {}", path, reason));
+            }
+        }
+    }
+
+    pass
+}
+
 fn run(
     args: &Args,
     db: Option<&Database>,
@@ -2982,27 +3094,6 @@ fn run(
     // on a large one. By the time the bar appears we know exactly how much real
     // work there is, and that work is what the decoder thread budget is
     // apportioned against.
-    enum Lookup {
-        Hit(VideoFingerprint),
-        Miss(Job),
-        /// Refused before, by this build's rules, against these exact bytes.
-        /// The file never reaches the weighing pass -- which is the entire
-        /// saving, since on a `-x '*'` run that pass IS the run.
-        ///
-        /// `not_media` is carried because the two verdicts this covers are
-        /// different findings and only one of them is about a file that is not
-        /// video. `Refusal::NotMedia` is "no demuxer recognised it"; a
-        /// `Refusal::Said` is a real video that would not decode -- a stream
-        /// that will not parse, a picture the decoder refused, a file with
-        /// nothing in the picture. The count below says which is which; the
-        /// sentence each one prints has always been its own.
-        Refused { reason: String, path: String, not_media: bool },
-        /// Measured before, and shorter than THIS run's `--min-duration`. The
-        /// same saving as `Refused` for the same reason, and the reason the
-        /// runtime is what the cache keeps: the threshold is this run's, so the
-        /// decision has to be taken here rather than remembered.
-        Short,
-    }
 
     // One snapshot for the whole pass rather than two transactions per file;
     // see `CacheView`. Nothing writes to either table between here and the
@@ -3073,46 +3164,14 @@ fn run(
     // collect() preserves input order, so `todo` inherits the largest-first sort
     // and the heaviest decodes are still claimed first -- which is exactly when
     // the budget has the most to give them.
-    let mut fingerprints: Vec<VideoFingerprint> = Vec::with_capacity(total_videos);
-    let mut todo: Vec<Job> = Vec::new();
-    // Split rather than one figure, because the line below says what these
-    // files ARE and the two verdicts say opposite things about that. See
-    // `Lookup::Refused`.
-    let mut remembered_not_media = 0usize;
-    let mut remembered_failures = 0usize;
-    for lookup in lookups {
-        match lookup {
-            Lookup::Hit(fp) => {
-                if min_duration > 0.0 && fp.duration > 0.0 && fp.duration < min_duration {
-                    // Already cached, so we know without decoding that it is too
-                    // short to matter. Counted in the same bucket as the ones
-                    // discovered by reading a header: from the user's side it is
-                    // the same skip for the same reason.
-                    stats.skipped_short.bump();
-                } else {
-                    fingerprints.push(fp);
-                }
-            }
-            Lookup::Miss(job) => todo.push(job),
-            // Same bucket as every other way a file turns out to be too short,
-            // and the same silence: it is a skip the user asked for.
-            Lookup::Short => stats.skipped_short.bump(),
-            // Counted and worded as if it had just been discovered, because it
-            // is the same finding about the same bytes -- the run simply did
-            // not have to read them again. Still a problem, still exit 2: the
-            // user asked for a fingerprint of this file and there is none.
-            Lookup::Refused { reason, path, not_media } => {
-                if not_media {
-                    remembered_not_media += 1;
-                } else {
-                    remembered_failures += 1;
-                }
-                log::error!(target: stats::COUNTED, "Failed to process {}: {}", path, reason);
-                stats.fingerprint_failed.record(format!("{}: {}", path, reason));
-            }
-        }
-    }
-    let cached_count = fingerprints.len();
+    let CachePass {
+        mut fingerprints,
+        mut todo,
+        cached_count,
+        remembered_not_media,
+        remembered_failures,
+    } = unpack_lookups(lookups, min_duration, total_videos, stats);
+
     let todo_count = todo.len();
 
     let remembered = remembered_clause(remembered_not_media, remembered_failures);
@@ -4324,6 +4383,76 @@ mod tests {
             assert!(!a.matches(&sampled), "12 samples is a floor, none is not");
             assert!(!sampled.matches(&a));
         }
+    }
+
+    /// The headline is the only line that says what a run is about to do, and it
+    /// used to say the opposite of the truth whenever `--min-duration` reached a
+    /// warm library: `cached_count` was `fingerprints.len()`, read after this
+    /// loop, and that vector holds the SURVIVORS. Two arms answer from the cache
+    /// and then drop the file -- a `Hit` under the floor, and a `Short`, which
+    /// never enters the vector at all -- so a run that decoded nothing announced
+    /// "Fingerprinting...". Both are counted here, which also makes the line's
+    /// arithmetic add up: every file the pass saw is cached, queued, or refused.
+    #[test]
+    fn test_the_cache_pass_counts_what_it_answered_and_not_what_survived() {
+        let long = || Lookup::Hit(mock_fp("/videos/long.mkv"));
+        let short = || Lookup::Hit(VideoFingerprint { duration: 2.0, ..mock_fp("/videos/short.mkv") });
+        let miss = || {
+            Lookup::Miss(Job {
+                path: "/videos/new.mkv".to_string(),
+                stamp: stamp(1_700_000_000, 12_345),
+                weight: 12_345,
+                size: 12_345,
+            })
+        };
+        let refused = |not_media| Lookup::Refused {
+            reason: "no demuxer recognised it".to_string(),
+            path: "/videos/junk.o".to_string(),
+            not_media,
+        };
+
+        // The reported case: every file cached, every one of them swallowed by
+        // the floor. Nothing to fingerprint and nothing kept, and the pass still
+        // has to say it answered for all four.
+        let stats = RunStats::default();
+        let pass = unpack_lookups(vec![short(), short(), short(), short()], 100_000.0, 4, &stats);
+        assert_eq!(pass.cached_count, 4, "the cache answered for every one of them");
+        assert!(pass.todo.is_empty(), "and so there is nothing to decode");
+        assert!(pass.fingerprints.is_empty(), "which is not the same question");
+        assert_eq!(stats.skipped_short.count(), 4);
+
+        // The second run at that same floor, where the files were never
+        // fingerprinted at all and every verdict is a remembered runtime. This
+        // arm was counted nowhere before.
+        let stats = RunStats::default();
+        let pass = unpack_lookups(vec![Lookup::Short, Lookup::Short], 100_000.0, 2, &stats);
+        assert_eq!(pass.cached_count, 2, "a remembered runtime is a cache answer too");
+        assert_eq!(stats.skipped_short.count(), 2);
+
+        // One of each, so the split between the two refusal verdicts is pinned
+        // beside the count, and the arithmetic the headline implies holds: what
+        // the pass saw is what it cached, queued or refused.
+        let stats = RunStats::default();
+        let lookups = vec![long(), short(), Lookup::Short, miss(), refused(true), refused(false)];
+        let total = lookups.len();
+        let pass = unpack_lookups(lookups, 10.0, total, &stats);
+        assert_eq!(pass.cached_count, 3, "two hits and a remembered runtime");
+        assert_eq!(pass.fingerprints.len(), 1, "only one of them survived the floor");
+        assert_eq!(pass.todo.len(), 1);
+        assert_eq!(pass.remembered_not_media, 1);
+        assert_eq!(pass.remembered_failures, 1);
+        assert_eq!(
+            pass.cached_count + pass.todo.len() + pass.remembered_not_media + pass.remembered_failures,
+            total,
+            "every file the pass saw is accounted for by the line it prints"
+        );
+
+        // And the floor is still a floor: with it off, a short file is kept.
+        let stats = RunStats::default();
+        let pass = unpack_lookups(vec![short(), long()], 0.0, 2, &stats);
+        assert_eq!(pass.cached_count, 2);
+        assert_eq!(pass.fingerprints.len(), 2, "nothing is short of no floor");
+        assert_eq!(stats.skipped_short.count(), 0);
     }
 
     fn mock_fp(path: &str) -> VideoFingerprint {
