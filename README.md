@@ -1,15 +1,38 @@
 # vid-fp
 
-Fast video **duplicate and clip finder** for Linux. It fingerprints videos from
-their keyframes and groups together files with the same content, even when they
-differ in resolution, file size, or container, and even when one video is only a
-**trimmed clip inside another**. It reports duplicate groups and can optionally
-move the redundant copies to the trash.
+[![Release](https://img.shields.io/github/v/release/Danielnara24/vid-fp?logo=github)](https://github.com/Danielnara24/vid-fp/releases/latest)
+[![CI](https://github.com/Danielnara24/vid-fp/actions/workflows/ci.yml/badge.svg)](https://github.com/Danielnara24/vid-fp/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 
-> **Note:** `vid-fp` can delete files. By default it only reports. Deletion
-> happens *only* when you pass `--delete`, it asks you to confirm first, and
-> files go to the system trash (recoverable) unless you also pass `--permanent`.
-> See [Safety](#safety).
+**Find duplicate videos from the Linux command line**, including clips cut out
+of a longer recording.
+
+![vid-fp scanning a folder and grouping a 360p re-encode and a 10-second clip with the 720p original, marking the original KEEP](docs/demo.gif)
+
+`vid-fp` is a duplicate video finder that fingerprints every file from its
+keyframes using a perceptual hash. It groups videos that hold the same footage
+even when they differ in resolution, bitrate, frame rate, codec or container,
+and even when one file is only a section of another. Checksums, file sizes and
+filename matching find none of that.
+
+## What it finds
+
+- The same video re-encoded at a different resolution, bitrate or quality
+- The same video in a different container: MP4, MKV, AVI, MOV, WebM, TS, etc.
+- A trimmed clip, highlight or excerpt sitting inside a longer recording
+- Copies under different names, in different folders, across several drives
+
+## What it does about it
+
+It reports, and nothing else, until you say otherwise. `--delete` moves the
+redundant copies to the system trash, `--move-to` relocates them instead, and
+`--permanent` is the only way to erase anything. Reports are written as plain
+text, CSV or JSON, and `--from-report` acts on one you have reviewed and edited
+by hand.
+
+There is no daemon, no GUI and nothing running in the background. Fingerprints
+are cached between runs, so re-scanning a library only decodes the files that
+changed.
 
 ## Requirements
 
