@@ -285,7 +285,7 @@ reports refused.
 | `-r`, `--recursive` | Include subfolders | off |
 | `--follow-symlinks` | Descend into symlinked folders. Deletions act on the file the link leads to | off |
 | `-e`, `--exclude <PATH>` | Exclude a folder or a single file; repeat for several. Matched by whole path components, so a file must be named exactly, and resolved through symlinks | |
-| `-x`, `--extensions <EXT>` | Extensions a **folder walk** treats as videos, comma-separated or repeated. `-x '*'` (quoted) takes every file, including ones with no extension; an entry prefixed with `!` is an exception, so `-x '!flac'` takes every file but those | `mp4,m4v,mkv,webm,avi,mov,flv,wmv,asf,mpg,mpeg,m2ts,mts,ts,vob,ogv,3gp,divx` |
+| `-x`, `--extensions <EXT>` | Extensions a **folder walk** treats as videos, comma-separated or repeated. `-x '*'` (quoted) takes every file, including ones with no extension; an entry prefixed with `!` is an exception, so `-x '!flac'` takes every file but those | 18 extensions, listed below |
 | `-d`, `--hamming-distance <N>` | Frame-match tolerance, in bits out of 64; higher = less strict matching. Raise to find more duplicates, at the cost of false positives. See [Tuning](#tuning). Values above `32` are refused | `4` |
 | `-p`, `--match-percent <F>` | Min % of overlap to count as a duplicate, from `0` to `100`. Lower includes shorter matches, at the cost of false positives. `0` turns the gate off and reports every pair sharing any footage at all; a pair sharing none is never reported | `20.0` |
 | `--min-duration <SECS>` | Min shared clip length in seconds for a match. Videos shorter than this are skipped entirely. `0` = off | `0.0` |
@@ -307,6 +307,14 @@ reports refused.
 | `--prune-cache` | Drop cached entries only for files not in this scan. Skipped when the scan was incomplete | off |
 | `--completions <SHELL>` | Print a completion script for `bash`, `zsh`, `fish`, `elvish`, or `powershell` and exit | |
 | `--man` | Print the man page (roff) and exit | |
+
+A folder walk treats these 18 extensions as video by default:
+
+`mp4` `m4v` `mkv` `webm` `avi` `mov` `flv` `wmv` `asf` `mpg` `mpeg` `m2ts`
+`mts` `ts` `vob` `ogv` `3gp` `divx`
+
+A positive `-x` list replaces that default rather than narrowing it, so `-x mp4`
+walks for `.mp4` alone.
 
 ## Tuning
 
