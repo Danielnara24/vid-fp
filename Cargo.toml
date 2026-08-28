@@ -11,7 +11,11 @@ homepage = "https://github.com/Danielnara24/vid-fp"
 readme = "README.md"
 keywords = ["video", "duplicate", "deduplication", "fingerprint", "cli"]
 categories = ["command-line-utilities", "multimedia::video"]
-exclude = ["tests/fixtures/*"]
+# CLAUDE.md is 147 KB of internal design notes addressed to a coding agent; it
+# is on GitHub for contributors and has nothing to say to a crate consumer.
+# tests/fixtures IS shipped (188 KB) so `cargo test` works from the published
+# source; tests/local_accuracy_test.rs is gitignored and never packaged.
+exclude = ["CLAUDE.md"]
 
 [[bin]]
 name = "vid-fp"
