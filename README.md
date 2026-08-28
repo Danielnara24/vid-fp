@@ -1,6 +1,7 @@
 # vid-fp
 
 [![Release](https://img.shields.io/github/v/release/Danielnara24/vid-fp?logo=github)](https://github.com/Danielnara24/vid-fp/releases/latest)
+[![crates.io](https://img.shields.io/crates/v/vid-fp?logo=rust)](https://crates.io/crates/vid-fp)
 [![CI](https://github.com/Danielnara24/vid-fp/actions/workflows/ci.yml/badge.svg)](https://github.com/Danielnara24/vid-fp/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 
@@ -78,7 +79,7 @@ sudo pacman -S ffmpeg clang pkgconf
 ```
 
 ```bash
-cargo install --git https://github.com/Danielnara24/vid-fp
+cargo install vid-fp --locked
 ```
 
 This links your system's shared FFmpeg, so the binary is small but tied to that

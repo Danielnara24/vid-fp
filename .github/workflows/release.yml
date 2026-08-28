@@ -18,6 +18,10 @@
 #   vid-fp-<version>-extras.tar.gz     -> completions + man page
 #   vid-fp-<version>-ffmpeg-static-libs.tar.gz
 #     -> the LGPL relink kit; see the "LGPL" step below. Not optional.
+#
+# The same tag also publishes the crate to crates.io (`publish-crate`),
+# gated on the binary build so nothing reaches a registry that cannot take
+# a version back.
 
 name: release
 
@@ -276,3 +280,87 @@ jobs:
 
             `*-ffmpeg-static-libs.tar.gz` is the LGPL relink kit -- see
             `RELINKING.md` inside it. vid-fp itself remains MIT OR Apache-2.0.
+
+  publish-crate:
+    name: Publish to crates.io
+    # Gated on the static build, and deliberately so: a GitHub Release can be
+    # deleted and re-cut, while a crates.io version can only be yanked and its
+    # number is spent for ever. Nothing reaches the registry from a tag that
+    # could not produce a working binary.
+    needs: build-static
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read # this job publishes elsewhere; it writes nothing here
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install FFmpeg development libraries
+        # The opposite of the build job above, on purpose. What crates.io ships
+        # is source, built by `cargo install vid-fp` against the user's SHARED
+        # FFmpeg -- so the verification build `cargo publish` runs before
+        # uploading has to be that build. Nothing here sets FFMPEG_DIR: a
+        # prebuilt prefix would verify a binary no crates.io user will ever get.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+            clang pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check the token is configured
+        # Failing here costs nothing; failing inside `cargo publish` happens
+        # after a full verification build.
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is not set. Add it under" \
+                 "Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+
+      - name: Check the tag matches Cargo.toml
+        # The version lives in two places now: the tag that triggers this
+        # workflow and the `version` cargo publishes. They drift silently, and
+        # the drift is expensive in one direction -- publishing 0.37.16 from a
+        # tag called v0.37.17 cannot be undone, only yanked. Read out of the
+        # [package] section alone, so a dependency's `version` cannot answer.
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CRATE="$(sed -n '/^\[package\]/,/^\[/{s/^version = "\(.*\)"/\1/p}' Cargo.toml)"
+          if [ -z "$CRATE" ]; then
+            echo "::error::could not read version from Cargo.toml [package]"
+            exit 1
+          fi
+          if [ "$TAG" != "$CRATE" ]; then
+            echo "::error::tag v$TAG does not match Cargo.toml version $CRATE"
+            exit 1
+          fi
+          echo "publishing vid-fp $CRATE"
+
+      - name: Skip if this version is already published
+        # Re-running a release to fix an artifact must not hard-fail on
+        # `crate version already exists`. A version goes up once; every later
+        # run of the same tag is a no-op rather than a red cross.
+        id: published
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          CODE="$(curl -sS -o /dev/null -w '%{http_code}' \
+                    -H 'User-Agent: vid-fp release workflow' \
+                    "https://crates.io/api/v1/crates/vid-fp/$VERSION")"
+          if [ "$CODE" = "200" ]; then
+            echo "already=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::vid-fp $VERSION is already on crates.io; not publishing again"
+          else
+            echo "already=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish
+        if: steps.published.outputs.already == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        # --locked so the registry gets the dependency versions this release was
+        # tested against, the same flag the build and test steps above use.
+        run: cargo publish --locked
