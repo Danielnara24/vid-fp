@@ -7,7 +7,6 @@ description = "Fast video duplicate and clip finder using perceptual keyframe fi
 authors = ["Danielnara24"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Danielnara24/vid-fp"
-homepage = "https://github.com/Danielnara24/vid-fp"
 readme = "README.md"
 keywords = ["video", "duplicate", "deduplication", "fingerprint", "cli"]
 categories = ["command-line-utilities", "multimedia::video"]
