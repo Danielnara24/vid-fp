@@ -350,9 +350,7 @@ raising it finds more, and starts admitting false positives past about `-d 10`.
 files to the report; lowering `-d` or raising `-p` only ever *removes* them. The
 report at any setting is a subset of the report at every looser one, so start at
 the defaults and walk one knob outward until you see something you don't
-recognise. The one exception is a `-d` loose enough to link nearly everything,
-where a set of files can form too many overlapping groups to report and is left
-out of it entirely and listed under `Problems` instead.
+recognise.
 
 **Not finding duplicates you expect?** Raise `-d`, or lower `-p` if the match is
 a short clip inside a long video. Two encodes of the same footage only line up
@@ -426,9 +424,10 @@ file.
 
 ## Reading the results
 
-**Every file in a group matched every other file in it.** A group is the tool's
-evidence for deleting something, so it never asserts a comparison it did not
-make.
+**A group is one file and everything that matched it.** That file is listed
+first. Every other member was compared with it directly, but not necessarily
+with each other, so a group never asserts a comparison the run did not make.
+The first file is the one most of the others matched, not the one kept.
 
 **A file can appear in more than one group**, but its action is decided once for
 the file, not once per group. A file marked DELETE in one group reads DELETE in
@@ -501,7 +500,7 @@ Column positions are not stable across versions, and nothing needs them to be.
 replays.
 
 The JSON additionally gives every file a `matches` array, one entry per group
-member it was directly compared against, strongest first, each with its own
+member it matched, strongest first, each with its own
 `matched_seconds` and range. The top-level fields describe entry `[0]`.
 
 ### Actions
@@ -510,10 +509,11 @@ Every file in a duplicate group is labeled with an action. The label belongs to
 the file, not the group: a file in several groups shows the same one in all of
 them, resolved as REVIEW > DELETE > KEEP.
 
-- **KEEP**: the best copy in the group, chosen by your `--priority`. One per
-  group, except in a codec standoff (above), and except where that best copy is
-  itself redundant against something in another group.
-- **DELETE**: a redundant copy, in at least one of the groups it appears in.
+- **KEEP**: the best copy in the group, chosen by your `--priority`, and any
+  member that ranks above every file it matched. Usually one per group. A
+  KEEP is still deleted if it is redundant against something in another group.
+- **DELETE**: a copy that lost the ranking to a file it matched, in at least
+  one of the groups it appears in.
   Nothing happens to it without `--delete`; the summary totals these into the
   reclaimable figure.
 - **REVIEW**: worth a manual look before deleting, for example when the KEEP
@@ -596,9 +596,8 @@ still reaches files with no extension.
   choosing is recoverable in the same way and always available.
 - **Do a dry run first.** Look at the output (or a saved `--output` report)
   before running with `--delete`.
-- **DELETE always rests on a measurement.** Every member of a group was directly
-  compared with every other, so a file marked DELETE lost the ranking to a copy
-  it was actually measured against.
+- **DELETE always rests on a measurement.** A file is marked DELETE only when it
+  lost the ranking to a copy it was directly measured against.
 - **No double-counting.** Hard links and symlinks to the same file collapse into
   a single entry, so no set of bytes is fingerprinted or counted twice. That
   entry keeps a real name rather than a symlink, whatever order the scan met

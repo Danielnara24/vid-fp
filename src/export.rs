@@ -6,7 +6,7 @@ use crate::fingerprint::VideoFingerprint;
 use crate::stats::RunStats;
 use crate::utils::{
     find_best, format_bitrate, format_codec, format_duration, format_frame_rate, format_quality,
-    format_shared, format_size, measurable, shutdown_requested, GroupMaxima, Priority,
+    format_shared, format_size, measurable, outranks, shutdown_requested, GroupMaxima, Priority,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs::{FileTimes, OpenOptions};
@@ -953,6 +953,178 @@ fn copy_durably(src: &Path, dest: &Path, meta: &std::fs::Metadata) -> Result<()>
     Ok(())
 }
 
+/// One ranking of `group`: the file `--priority` keeps, and every file the
+/// group wants held for REVIEW beside it.
+///
+/// It decides who SURVIVES and nothing else. Which of the rest are deleted is
+/// the caller's question, because it depends on what each of them was measured
+/// against -- see the labeling pass in `output_results`.
+fn judge(
+    group: &[usize],
+    fingerprints: &[VideoFingerprint],
+    priority: Priority,
+) -> (usize, HashSet<usize>) {
+    let maxima = GroupMaxima::of(group, fingerprints);
+    let keep_idx = find_best(group, fingerprints, priority, &maxima);
+    let keep_fp = &fingerprints[keep_idx];
+
+    // Everything this group wants held back from deletion. A group can now
+    // raise more than one, so it is a set rather than an Option.
+    let mut group_review: HashSet<usize> = HashSet::new();
+
+    // --- A runtime nobody could measure ---------------------------------
+    // Length is the first thing the ranking compares and the property that
+    // keeps a long file safe from the clip cut out of it. A file whose
+    // container never reported a runtime, and whose packets carried no
+    // clock to measure one from, has no length to compare with anything:
+    // it ties on that metric rather than losing it (`GroupMaxima::tier`),
+    // which stops it being condemned for a measurement nobody took, and it
+    // is held back here, which stops it being condemned on the metrics that
+    // are left. Size is the one that would decide, and size is no
+    // substitute -- a five-minute clip at a high bitrate is comfortably
+    // larger than the two-hour capture it was cut from, so the fall-through
+    // marks the host for deletion just as surely as the zero did.
+    //
+    // That is the same shape as the codec standoff below and it is answered
+    // the same way: an unmeasurable runtime makes a file INCOMPARABLE with
+    // the rest, not worse than it, so the group ends with one survivor per
+    // class rather than one survivor. Every unmeasured file lives, and the
+    // measured ones elect a champion of their own to live beside them --
+    // deferring to the group's pick when the pick is one of them, for the
+    // same reason the standoff defers to it. The also-rans of the measured
+    // side are deleted exactly as they always were, because they lost to a
+    // file they really were measured against.
+    let unmeasured: Vec<usize> = group
+        .iter()
+        .copied()
+        .filter(|&idx| !measurable(&fingerprints[idx], Priority::Length))
+        .collect();
+
+    if !unmeasured.is_empty() {
+        group_review.extend(unmeasured.iter().copied());
+
+        let measured: Vec<usize> = group
+            .iter()
+            .copied()
+            .filter(|&idx| measurable(&fingerprints[idx], Priority::Length))
+            .collect();
+
+        if !measured.is_empty() {
+            let champion = if measurable(keep_fp, Priority::Length) {
+                keep_idx
+            } else {
+                let measured_maxima = GroupMaxima::of(&measured, fingerprints);
+                find_best(&measured, fingerprints, priority, &measured_maxima)
+            };
+            group_review.insert(champion);
+        }
+    }
+
+    // If the KEEP pick isn't top-tier on some quality metric, surface the
+    // file that IS as worth a manual look. Metrics are checked in default
+    // precedence order, skipping the one the user prioritised (KEEP wins
+    // that by construction). Laziness matters here: find_best only runs for
+    // the first metric KEEP actually falls short on.
+    if let Some(r) = REVIEW_METRICS
+        .iter()
+        .copied()
+        .filter(|&m| m != priority && maxima.tier(keep_fp, m) == 0)
+        .map(|m| find_best(group, fingerprints, m, &maxima))
+        .find(|&candidate| candidate != keep_idx)
+    {
+        group_review.insert(r);
+    }
+
+    // --- The codec standoff ----------------------------------------------
+    // Contenders are the files that are top-tier on every codec-independent
+    // metric: same footage length, same resolution, nothing yet separating
+    // them. Below that tier something already has separated them and the
+    // ranking is safe.
+    //
+    // Among contenders the only metrics left are quality and size, and both
+    // are bit counts, which say nothing across codecs -- an AV1 copy is
+    // SUPPOSED to carry fewer bits than an H.264 one of the same footage.
+    // So nothing can choose BETWEEN the codecs, and the group has to end
+    // with one survivor per codec rather than one survivor.
+    //
+    // Within a codec, though, everything still works: those files are
+    // directly comparable and one of them is plainly the best. So each
+    // codec elects a champion and the also-rans are deleted exactly as they
+    // would be in a single-codec group -- a library holding five HEVC
+    // encodes of one episode does not need five of them held for review.
+    //
+    // The election runs against maxima built from the codec's own
+    // contenders, not the group's, so a file that already lost a
+    // codec-blind metric cannot set the bar its codec's contenders are
+    // tiered against -- its quality or size is no longer the standard any
+    // of them has to reach.
+    let contenders: Vec<usize> = group
+        .iter()
+        .copied()
+        .filter(|&idx| {
+            REVIEW_METRICS
+                .iter()
+                .all(|&m| maxima.tier(&fingerprints[idx], m) == 1)
+        })
+        .collect();
+
+    let mut codecs: Vec<&str> = contenders
+        .iter()
+        .map(|&idx| fingerprints[idx].codec.as_str())
+        .collect();
+    codecs.sort_unstable();
+    codecs.dedup();
+
+    let standoff = codecs.len() > 1;
+
+    // Whether the standoff has anything to say about the pick at all: it
+    // ranks contenders, and a pick that is not one of them never stood in
+    // its codec's election.
+    let pick_contends = contenders.contains(&keep_idx);
+
+    if standoff {
+        for codec in codecs {
+            let same_codec: Vec<usize> = contenders
+                .iter()
+                .copied()
+                .filter(|&idx| fingerprints[idx].codec == codec)
+                .collect();
+
+            // The KEEP pick IS its own codec's champion, by decree rather
+            // than by re-election. Re-tiering against the codec's own
+            // contenders can only widen the top band (dropping files lowers
+            // every maximum, and a lower maximum admits more of them), so
+            // the smaller election sees ties the group-wide one had already
+            // broken -- and breaks them again, on a metric that comes
+            // EARLIER in the order than the one which settled the group.
+            // Two full-length h264 copies half a second apart, with a dense
+            // clip owning the group's h264 quality bar: group-wide both are
+            // tier 0 on quality and length decides, among contenders alone
+            // the denser one takes the quality tier and wins. The champion
+            // then replaced the pick below and the pick -- the file this
+            // group's own ranking chose -- was deleted in favour of one it
+            // had just outranked. Armed, that is the KEEP copy destroyed.
+            //
+            // Deferring to the pick keeps both rules whole: still exactly
+            // one survivor per codec, and the survivor of the pick's codec
+            // is the same file a group with no foreign codec in it would
+            // have kept. Every other codec is elected as before, because
+            // nothing group-wide ever ranked those files against each other
+            // -- that is what the standoff means.
+            let champion = if pick_contends && fingerprints[keep_idx].codec == codec {
+                keep_idx
+            } else {
+                let codec_maxima = GroupMaxima::of(&same_codec, fingerprints);
+                find_best(&same_codec, fingerprints, priority, &codec_maxima)
+            };
+
+            group_review.insert(champion);
+        }
+    }
+
+    (keep_idx, group_review)
+}
+
 /// Report every duplicate group, act on the deletion flags, and hand back the
 /// paths that are no longer where they were as a result.
 ///
@@ -987,7 +1159,7 @@ pub fn output_results(
 ) -> Result<Vec<String>> {
 
     // --- Pass 1: resolve each file's fate across ALL groups ------------------
-    // Cliques overlap, so a file can appear in several groups with different
+    // Groups overlap, so a file can appear in several groups with different
     // per-group roles. Precedence is REVIEW > DELETE > KEEP:
     //   * REVIEW anywhere -> always kept for manual inspection (never deleted).
     //   * DELETE anywhere -> deleted, even if it is the KEEP pick of another
@@ -998,10 +1170,10 @@ pub fn output_results(
     // Using sets also guarantees each file is considered exactly once, so a
     // file shared by several groups is never queued for deletion twice.
     //
-    // Every DELETE here still rests on a direct measurement, which is the point
-    // of insisting on cliques upstream: the file lost the ranking inside a group
-    // whose members were all compared with each other, so it was compared with
-    // the file that beat it. What the global rule does add is a step of
+    // Every DELETE here rests on a direct measurement, and the rounds below are
+    // what enforce it: a file is marked DELETE only against a survivor of the
+    // same ranking that it was actually compared with. What the global rule
+    // does add is a step of
     // indirection at the far end -- the winner of that group may itself lose
     // another one and be removed -- so a run can leave one survivor for a chain
     // of files that were never all measured together. Every hop of such a chain
@@ -1013,192 +1185,54 @@ pub fn output_results(
     let mut delete_candidates: HashSet<usize> = HashSet::new();
 
     for group in final_groups {
-        let maxima = GroupMaxima::of(group, fingerprints);
+        let (keep_idx, group_review) = judge(group, fingerprints, priority);
 
-        let keep_idx = find_best(group, fingerprints, priority, &maxima);
-        let keep_fp = &fingerprints[keep_idx];
-
-        // Everything this group wants held back from deletion. A group can now
-        // raise more than one, so it is a set rather than an Option.
-        let mut group_review: HashSet<usize> = HashSet::new();
-
-        // --- A runtime nobody could measure ---------------------------------
-        // Length is the first thing the ranking compares and the property that
-        // keeps a long file safe from the clip cut out of it. A file whose
-        // container never reported a runtime, and whose packets carried no
-        // clock to measure one from, has no length to compare with anything:
-        // it ties on that metric rather than losing it (`GroupMaxima::tier`),
-        // which stops it being condemned for a measurement nobody took, and it
-        // is held back here, which stops it being condemned on the metrics that
-        // are left. Size is the one that would decide, and size is no
-        // substitute -- a five-minute clip at a high bitrate is comfortably
-        // larger than the two-hour capture it was cut from, so the fall-through
-        // marks the host for deletion just as surely as the zero did.
-        //
-        // That is the same shape as the codec standoff below and it is answered
-        // the same way: an unmeasurable runtime makes a file INCOMPARABLE with
-        // the rest, not worse than it, so the group ends with one survivor per
-        // class rather than one survivor. Every unmeasured file lives, and the
-        // measured ones elect a champion of their own to live beside them --
-        // deferring to the group's pick when the pick is one of them, for the
-        // same reason the standoff defers to it. The also-rans of the measured
-        // side are deleted exactly as they always were, because they lost to a
-        // file they really were measured against.
-        let unmeasured: Vec<usize> = group
-            .iter()
-            .copied()
-            .filter(|&idx| !measurable(&fingerprints[idx], Priority::Length))
-            .collect();
-
-        if !unmeasured.is_empty() {
-            group_review.extend(unmeasured.iter().copied());
-
-            let measured: Vec<usize> = group
-                .iter()
-                .copied()
-                .filter(|&idx| measurable(&fingerprints[idx], Priority::Length))
-                .collect();
-
-            if !measured.is_empty() {
-                let champion = if measurable(keep_fp, Priority::Length) {
-                    keep_idx
-                } else {
-                    let measured_maxima = GroupMaxima::of(&measured, fingerprints);
-                    find_best(&measured, fingerprints, priority, &measured_maxima)
-                };
-                group_review.insert(champion);
-            }
-        }
-
-        // If the KEEP pick isn't top-tier on some quality metric, surface the
-        // file that IS as worth a manual look. Metrics are checked in default
-        // precedence order, skipping the one the user prioritised (KEEP wins
-        // that by construction). Laziness matters here: find_best only runs for
-        // the first metric KEEP actually falls short on.
-        if let Some(r) = REVIEW_METRICS
-            .iter()
-            .copied()
-            .filter(|&m| m != priority && maxima.tier(keep_fp, m) == 0)
-            .map(|m| find_best(group, fingerprints, m, &maxima))
-            .find(|&candidate| candidate != keep_idx)
-        {
-            group_review.insert(r);
-        }
-
-        // --- The codec standoff ----------------------------------------------
-        // Contenders are the files that are top-tier on every codec-independent
-        // metric: same footage length, same resolution, nothing yet separating
-        // them. Below that tier something already has separated them and the
-        // ranking is safe.
-        //
-        // Among contenders the only metrics left are quality and size, and both
-        // are bit counts, which say nothing across codecs -- an AV1 copy is
-        // SUPPOSED to carry fewer bits than an H.264 one of the same footage.
-        // So nothing can choose BETWEEN the codecs, and the group has to end
-        // with one survivor per codec rather than one survivor.
-        //
-        // Within a codec, though, everything still works: those files are
-        // directly comparable and one of them is plainly the best. So each
-        // codec elects a champion and the also-rans are deleted exactly as they
-        // would be in a single-codec group -- a library holding five HEVC
-        // encodes of one episode does not need five of them held for review.
-        //
-        // The election runs against maxima built from the codec's own
-        // contenders, not the group's, so a file that already lost a
-        // codec-blind metric cannot set the bar its codec's contenders are
-        // tiered against -- its quality or size is no longer the standard any
-        // of them has to reach.
-        let contenders: Vec<usize> = group
-            .iter()
-            .copied()
-            .filter(|&idx| {
-                REVIEW_METRICS
-                    .iter()
-                    .all(|&m| maxima.tier(&fingerprints[idx], m) == 1)
-            })
-            .collect();
-
-        let mut codecs: Vec<&str> = contenders
-            .iter()
-            .map(|&idx| fingerprints[idx].codec.as_str())
-            .collect();
-        codecs.sort_unstable();
-        codecs.dedup();
-
-        let standoff = codecs.len() > 1;
-
-        // Whether the standoff has anything to say about the pick at all: it
-        // ranks contenders, and a pick that is not one of them never stood in
-        // its codec's election.
-        let pick_contends = contenders.contains(&keep_idx);
-
-        if standoff {
-            for codec in codecs {
-                let same_codec: Vec<usize> = contenders
-                    .iter()
-                    .copied()
-                    .filter(|&idx| fingerprints[idx].codec == codec)
-                    .collect();
-
-                // The KEEP pick IS its own codec's champion, by decree rather
-                // than by re-election. Re-tiering against the codec's own
-                // contenders can only widen the top band (dropping files lowers
-                // every maximum, and a lower maximum admits more of them), so
-                // the smaller election sees ties the group-wide one had already
-                // broken -- and breaks them again, on a metric that comes
-                // EARLIER in the order than the one which settled the group.
-                // Two full-length h264 copies half a second apart, with a dense
-                // clip owning the group's h264 quality bar: group-wide both are
-                // tier 0 on quality and length decides, among contenders alone
-                // the denser one takes the quality tier and wins. The champion
-                // then replaced the pick below and the pick -- the file this
-                // group's own ranking chose -- was deleted in favour of one it
-                // had just outranked. Armed, that is the KEEP copy destroyed.
-                //
-                // Deferring to the pick keeps both rules whole: still exactly
-                // one survivor per codec, and the survivor of the pick's codec
-                // is the same file a group with no foreign codec in it would
-                // have kept. Every other codec is elected as before, because
-                // nothing group-wide ever ranked those files against each other
-                // -- that is what the standoff means.
-                let champion = if pick_contends && fingerprints[keep_idx].codec == codec {
-                    keep_idx
-                } else {
-                    let codec_maxima = GroupMaxima::of(&same_codec, fingerprints);
-                    find_best(&same_codec, fingerprints, priority, &codec_maxima)
-                };
-
-                group_review.insert(champion);
-            }
-        }
-
-        // Everything in the group that isn't KEEP or REVIEW is a delete
-        // candidate. DELETE wins over KEEP globally, so we don't care whether
-        // the file is a KEEP pick in some other group.
-        //
         // The KEEP pick is protected unconditionally, and a standoff does not
-        // change that. It used to: the champions REPLACED the pick rather than
-        // joining it, so that a group could not end with two survivors of one
-        // codec -- one because it won its codec, one because it won the group.
-        // That reasoning holds, but the way to have it is to make the pick its
-        // own codec's champion (above), not to leave it unprotected on the
-        // strength of an election it did not stand in. The insert is therefore
-        // redundant whenever the pick contends, and load-bearing when it does
-        // not (a pick that leads on the prioritised metric but lost a
+        // change that. A pick that leads on the prioritised metric but lost a
         // codec-blind one is no contender, and the standoff says nothing about
-        // it) -- so it is stated once, for every group, and the group's own
-        // ranking can never be overturned by a smaller one.
+        // it -- so the insert is stated once, for every group, and the group's
+        // own ranking can never be overturned by a smaller election. DELETE
+        // still wins over KEEP globally, so the pick may yet be deleted as a
+        // loser in another group.
         let mut protected: HashSet<usize> = group_review.clone();
         protected.insert(keep_idx);
 
+        // A group is a star (see `clustering`): every member was measured
+        // against the representative, and nothing promises two other members
+        // were ever measured against each other. So a file is marked DELETE
+        // only if it lost the ranking to a member it has a measurement with.
+        // A member that outranks everything it matched survives beside the KEEP
+        // pick: it matched the representative, the representative lost to a
+        // file this one never matched, and nothing in the group it could be a
+        // duplicate of ranks above it. Where every member matched every other
+        // this is exactly the old rule -- everything unprotected lost to the
+        // pick and was measured against it.
+        //
+        // The chain is the case that decides between this and "DELETE only
+        // against a survivor". 0-1-2 with 0 the best and 0-2 unmatched is one
+        // star around 1; 1 lost to 0 and 2 lost to 1, and both are removed
+        // exactly as they are when the same edges arrive as two groups. The
+        // survivor-only rule would spare 2 here and not there, so the same
+        // library would dispose of different files depending on how the
+        // grouping happened to cut it.
+        let maxima = GroupMaxima::of(group, fingerprints);
         for &idx in group {
-            if !protected.contains(&idx) {
+            if protected.contains(&idx) {
+                continue;
+            }
+            let lost = group.iter().any(|&w| {
+                w != idx
+                    && matches.coverage(idx, w).is_some()
+                    && outranks(&fingerprints[w], &fingerprints[idx], priority, &maxima)
+            });
+            if lost {
                 delete_candidates.insert(idx);
             }
         }
 
         review_set.extend(group_review);
     }
+
 
     // REVIEW protection overrides DELETE. Sorted for deterministic ordering.
     //
@@ -2519,10 +2553,9 @@ matched_from_seconds;matched_to_seconds";
 
     #[test]
     fn test_a_chained_member_reports_only_the_links_it_actually_has() {
-        // 0-1 and 1-2 were measured; 0 and 2 never were. Clustering would report
-        // that as two groups rather than the one this test passes in, so the
-        // case is defensive: the reporting pass reads the links it has rather
-        // than assuming the group is complete. 0's list must hold one entry, not
+        // 0-1 and 1-2 matched; 0 and 2 did not -- a star around 1, which is
+        // what clustering hands over for a chain. The reporting pass reads the
+        // links it has rather than assuming the group is complete. 0's list must hold one entry, not
         // two with a fabricated zero -- the absent pair is unmeasured, which is
         // a different claim from "these two share nothing".
         let fps = vec![
@@ -3292,6 +3325,94 @@ matched_from_seconds;matched_to_seconds";
     }
 
     #[test]
+    fn test_a_chain_inside_one_star_collapses_exactly_as_across_two_groups() {
+        // The same chain as above, but grouped the way `clustering` groups it:
+        // one star around the bridge. 1 lost to 0 and 2 lost to 1, each against
+        // a file it was measured with, so both go -- the same files the two
+        // group split removes. How the grouping cut the edges must not decide
+        // what is deleted.
+        let dir = tempfile::tempdir().unwrap();
+        let p0 = at(&dir, "best.mkv");
+        let p1 = at(&dir, "bridge.mkv");
+        let p2 = at(&dir, "tail.mkv");
+
+        let fps = vec![
+            mock_fp_at(&p0, 100.0),
+            mock_fp_at(&p1, 90.0),
+            mock_fp_at(&p2, 10.0),
+        ];
+        materialize_all(&fps);
+
+        let groups = vec![vec![1, 0, 2]];
+
+        let mut deleted = output_results(
+            &groups, &fps, &chain_of_three(), None, 0, Priority::Length,
+            Some(&Disposal::Permanent), true, &RunStats::default(),
+        ).unwrap();
+        deleted.sort();
+
+        let mut expected = vec![p1, p2];
+        expected.sort();
+        assert_eq!(deleted, expected);
+        assert!(Path::new(&p0).exists());
+    }
+
+    #[test]
+    fn test_a_star_member_that_outranks_everything_it_matched_survives() {
+        // A star around 1, the worst copy: 0 and 2 each matched it and did not
+        // match each other. 0 is the group's pick and 1 lost to it. 2 lost the
+        // group's ranking to 0 as well -- but never met 0, and the only file it
+        // was measured against is the one being removed. Nothing it is a
+        // duplicate of ranks above it, so it is kept beside 0 rather than
+        // deleted on the strength of a comparison nobody made.
+        let dir = tempfile::tempdir().unwrap();
+        let p0 = at(&dir, "best.mkv");
+        let p1 = at(&dir, "hub.mkv");
+        let p2 = at(&dir, "second.mkv");
+
+        let fps = vec![
+            mock_fp_at(&p0, 100.0),
+            mock_fp_at(&p1, 10.0),
+            mock_fp_at(&p2, 90.0),
+        ];
+        materialize_all(&fps);
+
+        let matches = MatchIndex::new(vec![
+            Match::new(1, 0, 1.0, 1.0),
+            Match::new(1, 2, 1.0, 1.0),
+        ]);
+        let groups = vec![vec![1, 0, 2]];
+        let path_str = report_to("json");
+
+        let deleted = output_results(
+            &groups, &fps, &matches, Some(&to_file(&path_str)), 0, Priority::Length,
+            Some(&Disposal::Permanent), true, &RunStats::default(),
+        ).unwrap();
+
+        assert_eq!(deleted, vec![p1.clone()], "only the hub lost to a file it matched");
+        assert!(Path::new(&p0).exists());
+        assert!(Path::new(&p2).exists());
+
+        let report = read_json(&path_str);
+        let action_of = |path: &str| -> String {
+            report["results"][0]["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|f| f["full_path"] == path)
+                .unwrap()["action"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(action_of(&p0), "KEPT");
+        assert_eq!(action_of(&p2), "KEPT");
+        assert_eq!(report["summary"]["files_marked_delete"], 1);
+
+        let _ = fs::remove_file(path_str);
+    }
+
+    #[test]
     fn test_a_file_marked_delete_anywhere_reads_delete_everywhere() {
         // File 1 is the best copy of its second group and redundant in its
         // first. It is removed, and BOTH of its rows say so -- a report whose
@@ -3418,10 +3539,8 @@ matched_from_seconds;matched_to_seconds";
 
     #[test]
     fn test_a_group_keeps_exactly_one_file() {
-        // The rule the partition buys: one survivor per group. Files 0 and 1 are
-        // equally good and would each have won a group of their own under the
-        // old overlapping cliques; here they are related, so they are ranked
-        // against each other and only one is kept.
+        // Files 0 and 1 are equally good and were measured against each other,
+        // so they are ranked against each other and only one is kept.
         let dir = tempfile::tempdir().unwrap();
         let p0 = at(&dir, "a_best.mkv");
         let p1 = at(&dir, "b_equal.mkv");

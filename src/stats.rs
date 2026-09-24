@@ -100,7 +100,6 @@ pub struct RunStats {
     pub unwalkable: Tally,
     pub unreadable: Tally,
     pub fingerprint_failed: Tally,
-    pub clustering_abandoned: Tally,
     pub cache_write_failed: Tally,
     pub cache_purge_failed: Tally,
     pub cache_prune_skipped: Tally,
@@ -128,7 +127,7 @@ pub struct RunStats {
 }
 
 impl RunStats {
-    fn problems(&self) -> [(&Tally, &'static str); 13] {
+    fn problems(&self) -> [(&Tally, &'static str); 12] {
         [
             // "path" rather than "folder": a scan target can now be a single
             // file, or a line piped in from another tool.
@@ -146,22 +145,6 @@ impl RunStats {
             // large counts. It costs nothing that the neighbouring label is also
             // about files -- read and fingerprinted are different failures.
             (&self.fingerprint_failed, "file(s) could not be fingerprinted"),
-            // The files were fingerprinted and compared; what could not be done
-            // is enumerating every group they form, because a set of files that
-            // nearly all match each other has combinatorially many. Squarely a
-            // problem: those files are absent from the report entirely, and a
-            // tighter --hamming-distance is what resolves it.
-            //
-            // Counted in clusters rather than files -- one entry is one set of
-            // interlinked files, and the sample line beside it says how many
-            // files that was. Counting the files would put a five-figure number
-            // under a heading the user would then look for five figures of
-            // detail behind.
-            (
-                &self.clustering_abandoned,
-                "cluster(s) of files were too densely linked to group and are NOT in \
-                 the report (try a tighter --hamming-distance)",
-            ),
             (
                 &self.cache_write_failed,
                 "fingerprint(s) could not be cached (they will be redone next run)",
@@ -177,9 +160,9 @@ impl RunStats {
             ),
             // The refusal IS the feature -- see `prune_obstacle` -- but the user
             // asked for a prune and did not get one, and the next run will find
-            // the same entries still there. Counted for the same reason
-            // `clustering_abandoned` is: declining to answer is not the same as
-            // having answered, and the exit code is the only part a script sees.
+            // the same entries still there. Declining to answer is not the same
+            // as having answered, and the exit code is the only part a script
+            // sees.
             (
                 &self.cache_prune_skipped,
                 "cache prune(s) skipped -- nothing was removed from the cache",
@@ -400,7 +383,6 @@ mod tests {
         s.unwalkable.record("/root/private");
         s.unreadable.record("/a.mp4");
         s.fingerprint_failed.record("/b.mkv");
-        s.clustering_abandoned.record("900 file(s) linked too densely to group");
         s.cache_write_failed.record("/c.mp4");
         s.cache_purge_failed.record("cache write failed");
         s.cache_prune_skipped.record("1 scan path(s) could not be resolved");
@@ -409,7 +391,7 @@ mod tests {
         s.report_unusable.record("report.csv line 4");
         s.report_write_failed.record("dupes.csv: permission denied");
 
-        assert_eq!(s.problem_count(), 13);
+        assert_eq!(s.problem_count(), 12);
         assert!(s.had_problems());
     }
 }

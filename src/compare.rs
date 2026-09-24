@@ -19,14 +19,6 @@ pub const HASH_BITS: u32 = 64;
 /// nothing left to control: every file matches every other, the report is one
 /// group holding the library, and with `--delete` armed that is the whole
 /// library minus one file marked DELETE.
-///
-/// It is also where the clustering stage stops being able to answer at all. Just
-/// below chance the graph is dense but incomplete, which is combinatorial and
-/// gets refused in seconds by the ceilings in `clustering`; above it the graph
-/// is nearly COMPLETE, which has few enough maximal cliques to slip under those
-/// ceilings while taking minutes of quadratic pivot work to establish. Refusing
-/// the flag there is cheaper and clearer than teaching every later stage to cope
-/// with an input that cannot produce an answer worth having.
 pub fn max_hamming_distance() -> u32 {
     sigma_below_chance(0.0)
 }
@@ -629,16 +621,15 @@ impl MatchIndex {
     /// Every measured link `subject` has *within `group`*, strongest first.
     ///
     /// The group has to be supplied because groups overlap: a file that is a
-    /// duplicate in two cliques matched files in both, and a row reported under
+    /// duplicate in two groups matched files in both, and a row reported under
     /// one of them must not name a file the reader cannot see beside it. So the
     /// neighbour list is filtered to the group being printed.
     ///
-    /// Inside a clique that filter is the only thing doing any work -- every
-    /// other member was measured against the subject by construction, so the
-    /// result always has `group.len() - 1` entries. It is written as a lookup
-    /// rather than assumed, because the assumption is exactly what a change to
-    /// the clustering rule would break silently: a group whose members were not
-    /// all compared with each other simply reports fewer links.
+    /// A group is a star (see `clustering`), so only the representative is
+    /// guaranteed a link to every member; any other member has the
+    /// representative and whichever other members it also matched. A pair with
+    /// no link reports nothing rather than a zero, because it is a comparison
+    /// that did not clear the gate, not a figure.
     ///
     /// It walks the GROUP and probes the pair map, rather than walking the
     /// subject's neighbours and testing each against the group. The two answer
@@ -3144,9 +3135,8 @@ mod tests {
 
     #[test]
     fn test_a_pair_that_was_never_compared_is_skipped_rather_than_erasing_the_figure() {
-        // A chain: 0-1 and 1-2 matched, 0 and 2 never did. Clustering does not
-        // hand this module a group like that -- every real group is a clique --
-        // but the lookup must not depend on that, so it is asked directly: 0's
+        // A chain: 0-1 and 1-2 matched, 0 and 2 never did -- the ordinary shape
+        // of a star group around 1. 0's
         // row reports what it shares with 1, the link that exists. Treating the
         // absent 0-2 pair as unknown would blank the column, and treating it as
         // zero would claim a comparison nobody made.

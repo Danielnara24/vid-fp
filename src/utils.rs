@@ -521,6 +521,19 @@ pub fn find_best(
         .unwrap()
 }
 
+/// Whether `a` ranks above `b` in the ordering `find_best` picks the maximum of.
+///
+/// `export.rs` asks this of pairs that were measured against each other, which
+/// is what makes a DELETE rest on a comparison the run actually made.
+pub fn outranks(
+    a: &VideoFingerprint,
+    b: &VideoFingerprint,
+    priority: Priority,
+    maxima: &GroupMaxima,
+) -> bool {
+    maxima.rank(a, b, ordered_metrics(priority)) == Ordering::Greater
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

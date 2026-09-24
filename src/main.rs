@@ -2780,12 +2780,8 @@ fn run(
     //
     // The ceiling used to be 64 -- the widest two hashes can possibly be apart --
     // which refused only the arithmetic that could not mean anything and let
-    // through a whole range that could not mean anything either. Past chance the
-    // graph also stops being sparse enough to enumerate: `-d 36` on the local
-    // corpus is refused by the clustering ceiling in 9 seconds, but `-d 40` is a
-    // nearly COMPLETE graph, which has few enough groups to slip under that
-    // ceiling while costing minutes of quadratic pivot work to prove it. Chance
-    // is the honest edge of the range, and it is comfortably past the edge of the
+    // through a whole range that could not mean anything either. Chance is the
+    // honest edge of the range, and it is comfortably past the edge of the
     // useful one (`--help` says 2 to 12).
     //
     // MAX_HAMMING_DISTANCE itself stays legal, the mirror of `-p 0`: it is a
@@ -3738,7 +3734,7 @@ fn run(
     // where they are the only thing that tells a genuine re-encode apart from a
     // clip that happened to clear --match-percent.
     let edges: Vec<(usize, usize)> = matches.iter().map(|m| (m.a, m.b)).collect();
-    let final_groups = clustering::find_duplicate_groups(n, edges, &fingerprints, stats);
+    let final_groups = clustering::find_duplicate_groups(n, edges, &fingerprints);
 
     // Consumes the Vec, so the pair list is not kept alive alongside the index.
     let matches = MatchIndex::new(matches);
@@ -5460,9 +5456,7 @@ mod tests {
         // every file matches every other and the flag has nothing left to
         // control. It used to be refused only above 64 -- the widest two hashes
         // can be apart -- which let through a whole range where the answer was
-        // one group holding the library, and where the clustering ceilings stop
-        // helping: a NEARLY complete graph has few enough maximal cliques to slip
-        // under them while costing minutes to prove it.
+        // one group holding the library.
         let dir = tempfile::tempdir().unwrap();
         let db = temp_db(&dir);
 
