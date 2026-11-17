@@ -407,7 +407,7 @@ fn rational_f64(r: ffmpeg_next::Rational) -> f64 {
 ///
 /// Lifted out of `fingerprint_video` unchanged so the header-completeness check
 /// below can ask the same question and get the same answer.
-fn duration_seconds(
+pub(crate) fn duration_seconds(
     stream: &ffmpeg_next::format::stream::Stream<'_>,
     ictx: &ffmpeg_next::format::context::Input,
 ) -> f64 {
@@ -829,7 +829,7 @@ fn probe_head(buf: &mut [u8], len: usize, filename: &std::ffi::CStr) -> i32 {
 /// file read one way on the run that discovered it and another on the run that
 /// remembered it. Everything else keeps the context: an `ENOENT` or an `EACCES`
 /// is exactly a failure to open a file.
-fn open_video(filepath: &str) -> Result<ffmpeg_next::format::context::Input> {
+pub(crate) fn open_video(filepath: &str) -> Result<ffmpeg_next::format::context::Input> {
     open_input(filepath).map_err(|e| {
         if not_media(&e).is_some() {
             e
@@ -879,7 +879,7 @@ fn clock_may_restart(ictx: &ffmpeg_next::format::context::Input) -> bool {
 /// It does not take the path, and nothing here names one: every caller of every
 /// route out of this module already prints the file it was asked about, so a
 /// name in the message is the same name twice on one line.
-fn probe_streams(ictx: &mut ffmpeg_next::format::context::Input) -> Result<()> {
+pub(crate) fn probe_streams(ictx: &mut ffmpeg_next::format::context::Input) -> Result<()> {
     unsafe {
         let e =
             ffmpeg_next::ffi::avformat_find_stream_info(ictx.as_mut_ptr(), std::ptr::null_mut());
@@ -898,7 +898,7 @@ fn probe_streams(ictx: &mut ffmpeg_next::format::context::Input) -> Result<()> {
 /// the subtle one -- for streams that need parsing (raw H.264 in TS, say) the
 /// probe is where the SPS gets extracted into the codec parameters, so a stream
 /// that has not already got extradata from its header must not skip it.
-fn header_is_complete(ictx: &ffmpeg_next::format::context::Input) -> bool {
+pub(crate) fn header_is_complete(ictx: &ffmpeg_next::format::context::Input) -> bool {
     let Some(stream) = ictx.streams().best(ffmpeg_next::media::Type::Video) else {
         return false;
     };

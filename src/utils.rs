@@ -65,8 +65,26 @@ pub fn console_is_verbose() -> bool {
         && log::log_enabled!(log::Level::Info)
 }
 
-#[derive(clap::ValueEnum, Clone, Debug, Copy, PartialEq, Eq)]
+/// Set once, at start-up, by the desktop app's worker (`worker_main`).
+///
+/// Its terminal is the window's scan log, and the window shows the groups on a
+/// page of their own, so two things a terminal is told are not said there:
+/// the per-group listing, which is that page again line by line, and the
+/// closing advice to run again with `--delete`, a flag the window has no use
+/// for. Everything else is said exactly as it would be.
+static FOR_WINDOW: AtomicBool = AtomicBool::new(false);
+
+pub fn for_window() {
+    FOR_WINDOW.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn is_for_window() -> bool {
+    FOR_WINDOW.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[derive(clap::ValueEnum, Clone, Debug, Copy, PartialEq, Eq, Default)]
 pub enum Priority {
+    #[default]
     Length,
     Resolution,
     // Not raw bitrate, which double-counts frame rate (a 60 fps copy needs
@@ -82,6 +100,26 @@ pub enum Priority {
 ///
 /// `--priority X` does not reshuffle the rest of the list, it only moves X to
 /// the front: `--priority quality` ranks quality > length > resolution > size.
+impl Priority {
+    /// Every ranking, in the order `--help` lists them.
+    pub const ALL: [Priority; 4] = DEFAULT_ORDER;
+
+    /// Its place in `ALL`.
+    pub fn index(self) -> usize {
+        Priority::ALL.iter().position(|&p| p == self).unwrap_or(0)
+    }
+
+    /// As `--priority` takes it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Priority::Length => "length",
+            Priority::Resolution => "resolution",
+            Priority::Quality => "quality",
+            Priority::Size => "size",
+        }
+    }
+}
+
 const DEFAULT_ORDER: [Priority; 4] = [
     Priority::Length,
     Priority::Resolution,

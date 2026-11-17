@@ -1,0 +1,461 @@
+//! vid-fp-gui: a window over vid-fp.
+//!
+//! One binary, two roles. Started by a person it is the window; started by the
+//! window with `--worker` it is the scan, which is `vid-fp`'s own run in a
+//! process of its own (`vid_fp::worker_main`). A scan is a process rather than
+//! a thread so that Cancel can be exactly what Ctrl-C is on the command line:
+//! a signal the scan answers, keeping every fingerprint it has finished in the
+//! cache, and after which everything the scan held is gone. See `scan.rs`.
+//!
+//! The window itself is plain GTK 4, with no libadwaita and no builder files:
+//!
+//! - `setup.rs`   what to scan and how, on two tabs, and the scan's progress
+//! - `settings.rs` those choices as a value: what is kept between runs (the
+//!   paths, and options set away from vid-fp's defaults), and all of it turned
+//!   into a vid-fp command line
+//! - `options.rs` each option the window shows, said once: its flag, how it
+//!   is shown and in what words
+//! - `scan.rs`    the child process and what it says
+//! - `results.rs` the groups, for choosing what to move to the Trash
+//! - `model.rs`   what that page knows, apart from how it is drawn: the
+//!   scan's suggestions, the marks, and the files gone or changed since
+//! - `folders.rs` the grouped videos as a tree of folders, for its tree view
+//! - `thumbs.rs`  a frame of each video, decoded off the main thread
+//! - `last.rs`    the last finished scan, kept so that a closed window does
+//!   not cost it
+//! - `labels.rs`  every mnemonic in the window, checked for clashes by a test
+//! - `commands.rs` every key the window answers to, and the F1 list read off
+//!   them
+//!
+//! Every control can be reached from the keyboard: Tab and the arrow keys move
+//! focus, and every labelled control has an Alt mnemonic.
+
+// The window is built only with the `gui` feature, whose GTK bindings need a
+// newer compiler (1.92) than the command line's `rust-version`, which is the
+// one that field promises; what this file and its modules use beyond that is
+// the window's to require.
+#![allow(clippy::incompatible_msrv)]
+
+mod commands;
+mod folders;
+mod labels;
+mod last;
+mod model;
+mod options;
+mod results;
+mod rows;
+mod scan;
+mod settings;
+mod setup;
+mod still;
+mod thumbs;
+
+use gtk::prelude::*;
+use gtk::{gio, glib};
+use std::cell::RefCell;
+use std::path::PathBuf;
+use std::rc::Rc;
+
+const APP_ID: &str = "io.github.danielnara24.vid-fp";
+
+/// The window's own command line: folders to start with, and the two flags
+/// every program answers.
+///
+/// Parsed by clap, as `vid-fp`'s is: `--help` and `--version` print and
+/// exit, anything else starting with `-` is refused with clap's message, and
+/// `--` ends the flags for a folder whose name starts with one.
+#[derive(clap::Parser)]
+#[command(
+    name = "vid-fp-gui",
+    version,
+    about = "Find duplicate videos and clips, and choose which to move to the Trash.",
+    long_about = None
+)]
+struct GuiArgs {
+    /// Folders to scan, in place of the ones remembered from last time.
+    #[arg(value_name = "FOLDER")]
+    folders: Vec<PathBuf>,
+}
+
+fn main() -> glib::ExitCode {
+    let mut args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if args.get(1).is_some_and(|a| a == scan::WORKER_FLAG) {
+        return worker(args.split_off(2));
+    }
+    // Absolute, as every folder the window keeps is: they are remembered for
+    // the next window, which may start anywhere.
+    let folders: Vec<PathBuf> = <GuiArgs as clap::Parser>::parse_from(&args)
+        .folders
+        .into_iter()
+        .map(|f| std::path::absolute(&f).unwrap_or(f))
+        .collect();
+    // Drawn in software unless someone asks otherwise. The window is a form
+    // and a grid of still pictures, which a GPU does not draw any better, and
+    // the GL renderer brings Mesa's shader compiler with it: measured idle,
+    // 100 MB of PSS against 73, most of the difference being libLLVM.
+    // `GSK_RENDERER=gl` (or `ngl`, `vulkan`) still chooses.
+    if std::env::var_os("GSK_RENDERER").is_none() {
+        // SAFETY: nothing else is running yet; this is the first thing the
+        // process does and no thread has been started.
+        unsafe { std::env::set_var("GSK_RENDERER", "cairo") };
+    }
+    few_arenas();
+    quiet_theme_errors();
+    // The thumbnails are decoded in this process, by the FFmpeg the scan uses.
+    if let Err(e) = vid_fp::thumbnail::init() {
+        eprintln!("Error: {e:#}");
+        return glib::ExitCode::FAILURE;
+    }
+    // The folders on the command line are the ones to start with, which is
+    // what a file manager's "Open With Other Application" hands over. The
+    // desktop entry names no MIME type, `inode/directory` least of all:
+    // where the desktop sets no default for folders, the first entry that
+    // claims them is the default, and every "show in folder" would open the
+    // window.
+    let app = gtk::Application::builder().application_id(APP_ID).flags(gio::ApplicationFlags::NON_UNIQUE).build();
+    let folders = RefCell::new(Some(folders));
+    app.connect_activate(move |app| {
+        let start = folders.borrow_mut().take().unwrap_or_default();
+        build(app, start);
+    });
+    let quit = commands::accels(commands::Window::Quit);
+    app.set_accels_for_action("window.close", &quit.iter().map(String::as_str).collect::<Vec<_>>());
+    // GTK is not handed the arguments: they are folders, not GTK options.
+    app.run_with_args(&[args[0].to_string_lossy().into_owned()])
+}
+
+/// Two allocator arenas rather than eight a core. glibc keeps what a thread
+/// frees in that thread's own arena, and the window's decoders each free a
+/// whole frame per thumbnail.
+fn few_arenas() {
+    #[cfg(target_env = "gnu")]
+    {
+        const M_ARENA_MAX: i32 = -8;
+        unsafe extern "C" {
+            fn mallopt(param: i32, value: i32) -> i32;
+        }
+        // SAFETY: called first thing, before any thread is started.
+        unsafe {
+            mallopt(M_ARENA_MAX, 2);
+        }
+    }
+}
+
+/// The scan, in the child. `rest` is the result path and then a vid-fp
+/// command line, program name first.
+fn worker(rest: Vec<std::ffi::OsString>) -> glib::ExitCode {
+    let Some((result, argv)) = rest.split_first() else {
+        eprintln!("--worker needs a result path");
+        return glib::ExitCode::FAILURE;
+    };
+    match vid_fp::worker_main(std::path::Path::new(result), argv.iter().cloned()) {
+        Ok(()) => glib::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            glib::ExitCode::FAILURE
+        }
+    }
+}
+
+/// The two pages the window moves between, and what they share.
+pub struct App {
+    pub window: gtk::ApplicationWindow,
+    pub stack: gtk::Stack,
+    /// Everything the scan said about itself, for the log on both pages.
+    pub log: gtk::TextBuffer,
+    /// The log's window while it is open, so that asking again raises it.
+    log_window: Rc<RefCell<Option<gtk::Window>>>,
+}
+
+impl App {
+    pub fn show_setup(&self) {
+        self.stack.set_visible_child_name("setup");
+    }
+
+    pub fn show_results(&self) {
+        self.stack.set_visible_child_name("results");
+    }
+
+    /// A line for the scan log, kept to its last few thousand lines.
+    pub fn log_line(&self, line: &str) {
+        let mut end = self.log.end_iter();
+        self.log.insert(&mut end, line);
+        self.log.insert(&mut end, "\n");
+        const KEEP: i32 = 5000;
+        let lines = self.log.line_count();
+        if lines > KEEP + 500 {
+            let mut start = self.log.start_iter();
+            if let Some(mut cut) = self.log.iter_at_line(lines - KEEP) {
+                self.log.delete(&mut start, &mut cut);
+            }
+        }
+    }
+
+    /// A window that says the log, for either page.
+    ///
+    /// Not modal: the log fills in while a scan runs, and watching it is no
+    /// reason to lose Cancel, or the cards its lines are about. One at a
+    /// time, so the button raises the open one rather than stacking copies.
+    pub fn show_log(&self) {
+        if let Some(win) = self.log_window.borrow().as_ref() {
+            win.present();
+            return;
+        }
+        let view = gtk::TextView::builder()
+            .buffer(&self.log)
+            .editable(false)
+            .monospace(true)
+            .wrap_mode(gtk::WrapMode::WordChar)
+            .left_margin(8)
+            .right_margin(8)
+            .top_margin(8)
+            .bottom_margin(8)
+            .build();
+        let scroll = gtk::ScrolledWindow::builder().child(&view).vexpand(true).build();
+        let win = gtk::Window::builder()
+            .title("Scan log")
+            .transient_for(&self.window)
+            .default_width(864)
+            .default_height(608)
+            .child(&scroll)
+            .build();
+        close_on_escape(&win);
+        keep_mnemonics_visible(&win);
+        let open = self.log_window.clone();
+        win.connect_close_request(move |_| {
+            open.borrow_mut().take();
+            glib::Propagation::Proceed
+        });
+        *self.log_window.borrow_mut() = Some(win.clone());
+        win.present();
+        view.grab_focus();
+        let mut end = self.log.end_iter();
+        view.scroll_to_iter(&mut end, 0.0, false, 0.0, 1.0);
+    }
+}
+
+/// Drop GTK's complaints about the user's own stylesheet.
+///
+/// `~/.config/gtk-4.0/gtk.css` is loaded into every GTK 4 app, and the ones
+/// written for a newer GTK (CSS variables such as `--accent-bg-color` came in
+/// with 4.16) make GTK print a "Theme parser error" per rule it cannot read,
+/// every start, in every plain GTK app on that desktop. Nothing here can act
+/// on them and nothing is wrong with the window, so only those are dropped;
+/// every other message is written as it would have been.
+fn quiet_theme_errors() {
+    glib::log_set_writer_func(|level, fields| {
+        let field = |key: &str| fields.iter().find(|f| f.key() == key).and_then(|f| f.value_str());
+        if field("GLIB_DOMAIN") == Some("Gtk") && field("MESSAGE").is_some_and(|m| m.starts_with("Theme parser error")) {
+            return glib::LogWriterOutput::Handled;
+        }
+        glib::log_writer_default(level, fields)
+    });
+}
+
+/// Keep the mnemonics underlined all the time.
+///
+/// GTK shows them while Alt is held, which needs the app to see a bare Alt
+/// press, and not every desktop lets it: Cinnamon holds a passive grab on the
+/// left Alt key (the X server's `XF86LogGrabInfo` names it), so under Cinnamon
+/// a lone Alt never reaches any application and the underlines only flashed
+/// as Alt+letter was pressed. A window meant to be driven from the keyboard is
+/// better off saying its keys up front.
+///
+/// Call it once the window's contents are in place; see `build`.
+pub fn keep_mnemonics_visible(window: &impl IsA<gtk::Window>) {
+    window.set_mnemonics_visible(true);
+    window.connect_mnemonics_visible_notify(|w| {
+        if !w.is_mnemonics_visible() {
+            w.set_mnemonics_visible(true);
+        }
+    });
+}
+
+/// Use GTK's dark base when the desktop's styling is dark.
+///
+/// A plain GTK 4 app is drawn by GTK's own theme plus whatever the user has in
+/// `~/.config/gtk-4.0/gtk.css`, and desktops that theme libadwaita apps put a
+/// whole dark theme there. It sets light text and dark windows, and leaves
+/// buttons and entries to the base theme, which is light unless asked
+/// otherwise: light text on light buttons, unreadable. So the base follows the
+/// text. If the styled window's text is light, or the desktop theme's name
+/// says dark (a GTK 3 theme with no GTK 4 variant falls back to the light
+/// default), the dark variant is asked for.
+fn follow_dark_text(window: &gtk::ApplicationWindow) {
+    let Some(settings) = gtk::Settings::default() else { return };
+    let named_dark = settings.gtk_theme_name().is_some_and(|n| n.to_lowercase().contains("dark"));
+    let c = window.color();
+    let light_text = 0.2126 * c.red() + 0.7152 * c.green() + 0.0722 * c.blue() > 0.5;
+    if named_dark || light_text {
+        // GTK 4.20 has a colour scheme in its place, and says so on stderr
+        // each start the old setting is used.
+        if gtk::check_version(4, 20, 0).is_some() || !set_by_nick(&settings, "gtk-interface-color-scheme", "GtkInterfaceColorScheme", "dark") {
+            settings.set_gtk_application_prefer_dark_theme(true);
+        }
+    }
+}
+
+/// Draw text as the desktop's font settings say.
+///
+/// From GTK 4.16, `gtk-font-rendering` is "automatic" unless the desktop
+/// sets it, which Cinnamon, MATE and Xfce do not: GTK then leaves out the
+/// hinting and subpixel antialiasing the desktop asks for (`Xft/HintStyle`,
+/// `Xft/RGBA`), and draws metrics unhinted. Next to a GTK 4.14 build of the
+/// same window, the Flatpak's (GTK 4.24) text was soft and grey and its
+/// underlines thinner. "Manual" is GTK 4.14's behaviour: those settings, as
+/// set.
+fn follow_desktop_fonts() {
+    if gtk::check_version(4, 16, 0).is_none() {
+        if let Some(settings) = gtk::Settings::default() {
+            set_by_nick(&settings, "gtk-font-rendering", "GtkFontRendering", "manual");
+        }
+    }
+}
+
+/// Load the desktop's own GTK 4 stylesheet when `XDG_CONFIG_HOME` points
+/// elsewhere, as it does inside a sandbox: GTK reads
+/// `$XDG_CONFIG_HOME/gtk-4.0/gtk.css`, and desktops such as Cinnamon put their
+/// whole theme in `~/.config/gtk-4.0/gtk.css`. Where the two are one file GTK
+/// has loaded it already.
+fn desktop_stylesheet() {
+    let own = std::env::var_os("XDG_CONFIG_HOME").map(|d| PathBuf::from(d).join("gtk-4.0/gtk.css"));
+    let Some(desktop) = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/gtk-4.0/gtk.css")) else { return };
+    if own.as_ref() == Some(&desktop) || own.as_ref().is_some_and(|o| o.exists()) || !desktop.is_file() {
+        return;
+    }
+    let Some(display) = gtk::gdk::Display::default() else { return };
+    let provider = gtk::CssProvider::new();
+    // What GTK cannot read in it is the stylesheet's, as `quiet_theme_errors`
+    // says of GTK's own loading of it.
+    provider.connect_parsing_error(|_, _, _| {});
+    provider.load_from_path(&desktop);
+    #[allow(deprecated)]
+    gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_USER);
+}
+
+/// Set an enum property of `GtkSettings` newer than the GTK this is built
+/// against, by its value's nick; whether it was.
+fn set_by_nick(settings: &gtk::Settings, property: &str, type_name: &str, nick: &str) -> bool {
+    let Some(class) = glib::Type::from_name(type_name).and_then(glib::EnumClass::with_type) else { return false };
+    let Some(value) = class.to_value_by_nick(nick) else { return false };
+    if settings.find_property(property).is_none() {
+        return false;
+    }
+    settings.set_property_from_value(property, &value);
+    true
+}
+
+/// Escape closes a secondary window, as it does a dialog.
+pub fn close_on_escape(win: &gtk::Window) {
+    let keys = gtk::EventControllerKey::new();
+    let w = win.downgrade();
+    keys.connect_key_pressed(move |_, key, _, _| {
+        if key == gtk::gdk::Key::Escape {
+            if let Some(w) = w.upgrade() {
+                w.close();
+            }
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    });
+    win.add_controller(keys);
+}
+
+fn build(app: &gtk::Application, start: Vec<PathBuf>) {
+    let window = gtk::ApplicationWindow::builder()
+        .application(app)
+        .title("vid-fp")
+        .default_width(1500)
+        .default_height(860)
+        .build();
+    let stack = gtk::Stack::builder().transition_type(gtk::StackTransitionType::None).build();
+    window.set_child(Some(&stack));
+    let app = Rc::new(App { window: window.clone(), stack: stack.clone(), log: gtk::TextBuffer::new(None), log_window: Rc::default() });
+
+    // The last scan's results are read from the start, beside building the
+    // window, and the window opens on them, an empty page saying so until
+    // they come: opening on the settings flashed them first. Not when it was
+    // opened on folders, which is asking for a new scan: then the results
+    // wait behind "Back to results".
+    let open_on_last = start.is_empty() && last::exists();
+    let kept = gio::spawn_blocking(last::load);
+    let mut settings = settings::Settings::load();
+    // Folders handed over at start — "Open With" in a file manager — are what
+    // to scan, in place of the ones remembered from last time. They used to be
+    // added to those, so opening the window on one folder scanned every folder
+    // it had ever been pointed at, and nothing on the button said so.
+    if !start.is_empty() {
+        let mut folders: Vec<PathBuf> = Vec::new();
+        for f in start {
+            let f = std::fs::canonicalize(&f).unwrap_or(f);
+            if !folders.contains(&f) {
+                folders.push(f);
+            }
+        }
+        settings.folders = folders;
+    }
+    follow_desktop_fonts();
+    desktop_stylesheet();
+    follow_dark_text(&window);
+    // No animations: the theme's transitions on focus and hover are frames
+    // drawn for nothing a person needs to see.
+    if let Some(s) = gtk::Settings::default() {
+        s.set_gtk_enable_animations(false);
+    }
+    let results = results::Results::new(app.clone());
+    let setup = setup::Setup::new(app.clone(), settings, results.clone());
+    stack.add_named(&setup.root, Some("setup"));
+    stack.add_named(&results.root, Some("results"));
+    results.set_to_settings({
+        let app = app.clone();
+        let setup = setup.clone();
+        move || {
+            setup.results_available(true);
+            app.show_setup();
+            setup.focus_scan();
+        }
+    });
+    if open_on_last {
+        results.loading();
+        app.show_results();
+    } else {
+        app.show_setup();
+    }
+
+    // Closing the window stops a scan the way Cancel does, and does not wait
+    // for it: the worker answers the signal on its own, and it is also told
+    // to stop by the kernel should this process die first.
+    window.connect_close_request({
+        let setup = setup.clone();
+        let results = results.clone();
+        move |_| {
+            setup.stop_scan();
+            results.flush_marks();
+            glib::Propagation::Proceed
+        }
+    });
+    // F1 lists the keys, wherever the keyboard is.
+    let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    keys.connect_key_pressed({
+        let w = window.clone();
+        move |_, key, _, mods| match commands::WINDOW.find(key, mods) {
+            Some(commands::Window::Help) => {
+                commands::show_help(&w);
+                glib::Propagation::Stop
+            }
+            _ => glib::Propagation::Proceed,
+        }
+    });
+    window.add_controller(keys);
+    // After the pages exist: GTK applies the flag to the labels in the window
+    // when it is set, and a label added later does not look it up.
+    keep_mnemonics_visible(&window);
+    window.present();
+    if !open_on_last {
+        setup.focus_scan();
+    }
+    glib::spawn_future_local(async move {
+        setup.restore(kept.await.ok().flatten());
+    });
+}

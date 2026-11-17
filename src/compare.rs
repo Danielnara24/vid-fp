@@ -1835,6 +1835,10 @@ pub fn find_all_matches(
 /// mixed library, so a rate extrapolated from the pairs done so far predicts the
 /// remainder badly.
 fn verification_bar(pairs: u64) -> ProgressBar {
+    // Under the desktop app the bar is the window's (`progress`).
+    if let Some(pb) = crate::progress::spoken(pairs, crate::progress::Stage::Comparing) {
+        return pb;
+    }
     if pairs == 0 || !crate::utils::console_is_verbose() {
         return ProgressBar::hidden();
     }

@@ -1125,6 +1125,111 @@ fn judge(
     (keep_idx, group_review)
 }
 
+/// Each file's fate, from the groups: what the report labels REVIEW and
+/// DELETE, and everything else is KEEP.
+pub struct Verdicts {
+    /// Held for a person to look at, in every group it is in.
+    pub review: HashSet<usize>,
+    /// Marked DELETE, ascending. Never one of `review`.
+    pub delete: Vec<usize>,
+    /// For each file of `delete`, every member of a group it shares that it
+    /// was measured against and lost the ranking to, ascending: what its
+    /// DELETE rests on. The report needs only that there is one; the desktop
+    /// app asks, before it suggests a deletion, whether any of them is still
+    /// there and unchanged.
+    pub lost_to: HashMap<usize, Vec<usize>>,
+}
+
+/// Pass 1 of `output_results`: resolve each file's fate across ALL groups.
+/// Its own function so that the desktop app's result (`found`) is labelled by
+/// the very code the report is, rather than by a copy of it.
+pub fn verdicts(
+    final_groups: &[Vec<usize>],
+    fingerprints: &[VideoFingerprint],
+    matches: &MatchIndex,
+    priority: Priority,
+) -> Verdicts {
+    let mut review_set: HashSet<usize> = HashSet::new();
+    let mut delete_candidates: HashSet<usize> = HashSet::new();
+    let mut lost_to: HashMap<usize, Vec<usize>> = HashMap::new();
+
+    for group in final_groups {
+        let (keep_idx, group_review) = judge(group, fingerprints, priority);
+
+        // The KEEP pick is protected unconditionally, and a standoff does not
+        // change that. A pick that leads on the prioritised metric but lost a
+        // codec-blind one is no contender, and the standoff says nothing about
+        // it -- so the insert is stated once, for every group, and the group's
+        // own ranking can never be overturned by a smaller election. DELETE
+        // still wins over KEEP globally, so the pick may yet be deleted as a
+        // loser in another group.
+        let mut protected: HashSet<usize> = group_review.clone();
+        protected.insert(keep_idx);
+
+        // A group is a star (see `clustering`): every member was measured
+        // against the representative, and nothing promises two other members
+        // were ever measured against each other. So a file is marked DELETE
+        // only if it lost the ranking to a member it has a measurement with.
+        // A member that outranks everything it matched survives beside the KEEP
+        // pick: it matched the representative, the representative lost to a
+        // file this one never matched, and nothing in the group it could be a
+        // duplicate of ranks above it. Where every member matched every other
+        // this is exactly the old rule -- everything unprotected lost to the
+        // pick and was measured against it.
+        //
+        // The chain is the case that decides between this and "DELETE only
+        // against a survivor". 0-1-2 with 0 the best and 0-2 unmatched is one
+        // star around 1; 1 lost to 0 and 2 lost to 1, and both are removed
+        // exactly as they are when the same edges arrive as two groups. The
+        // survivor-only rule would spare 2 here and not there, so the same
+        // library would dispose of different files depending on how the
+        // grouping happened to cut it.
+        let maxima = GroupMaxima::of(group, fingerprints);
+        for &idx in group {
+            if protected.contains(&idx) {
+                continue;
+            }
+            // Every member it lost to, not just the first: the window asks
+            // whether any of them is still there before it suggests deleting
+            // this one (`found::File::lost_to`). Whether there is one is the
+            // whole of what the report decides on.
+            let winners: Vec<usize> = group
+                .iter()
+                .copied()
+                .filter(|&w| {
+                    w != idx
+                        && matches.coverage(idx, w).is_some()
+                        && outranks(&fingerprints[w], &fingerprints[idx], priority, &maxima)
+                })
+                .collect();
+            if !winners.is_empty() {
+                delete_candidates.insert(idx);
+                lost_to.entry(idx).or_default().extend(winners);
+            }
+        }
+
+        review_set.extend(group_review);
+    }
+
+
+    // REVIEW protection overrides DELETE. Sorted for deterministic ordering.
+    //
+    // The subtraction is what makes the precedence global rather than
+    // per-group: a file held back in one group is held back everywhere, even
+    // where another group ranked it bottom. A group can therefore end up with
+    // no DELETE at all, which is the conservative direction.
+    let mut delete_indices: Vec<usize> =
+        delete_candidates.difference(&review_set).copied().collect();
+    delete_indices.sort_unstable();
+
+    lost_to.retain(|idx, _| delete_candidates.contains(idx) && !review_set.contains(idx));
+    for winners in lost_to.values_mut() {
+        winners.sort_unstable();
+        winners.dedup();
+    }
+    Verdicts { review: review_set, delete: delete_indices, lost_to }
+}
+
 /// Report every duplicate group, act on the deletion flags, and hand back the
 /// paths that are no longer where they were as a result.
 ///
@@ -1181,68 +1286,9 @@ pub fn output_results(
     // end-to-end conclusion is their sum. That is deliberate: the alternative is
     // holding the tail of every chain back and asking the user to re-run until
     // it has collapsed a hop at a time.
-    let mut review_set: HashSet<usize> = HashSet::new();
-    let mut delete_candidates: HashSet<usize> = HashSet::new();
-
-    for group in final_groups {
-        let (keep_idx, group_review) = judge(group, fingerprints, priority);
-
-        // The KEEP pick is protected unconditionally, and a standoff does not
-        // change that. A pick that leads on the prioritised metric but lost a
-        // codec-blind one is no contender, and the standoff says nothing about
-        // it -- so the insert is stated once, for every group, and the group's
-        // own ranking can never be overturned by a smaller election. DELETE
-        // still wins over KEEP globally, so the pick may yet be deleted as a
-        // loser in another group.
-        let mut protected: HashSet<usize> = group_review.clone();
-        protected.insert(keep_idx);
-
-        // A group is a star (see `clustering`): every member was measured
-        // against the representative, and nothing promises two other members
-        // were ever measured against each other. So a file is marked DELETE
-        // only if it lost the ranking to a member it has a measurement with.
-        // A member that outranks everything it matched survives beside the KEEP
-        // pick: it matched the representative, the representative lost to a
-        // file this one never matched, and nothing in the group it could be a
-        // duplicate of ranks above it. Where every member matched every other
-        // this is exactly the old rule -- everything unprotected lost to the
-        // pick and was measured against it.
-        //
-        // The chain is the case that decides between this and "DELETE only
-        // against a survivor". 0-1-2 with 0 the best and 0-2 unmatched is one
-        // star around 1; 1 lost to 0 and 2 lost to 1, and both are removed
-        // exactly as they are when the same edges arrive as two groups. The
-        // survivor-only rule would spare 2 here and not there, so the same
-        // library would dispose of different files depending on how the
-        // grouping happened to cut it.
-        let maxima = GroupMaxima::of(group, fingerprints);
-        for &idx in group {
-            if protected.contains(&idx) {
-                continue;
-            }
-            let lost = group.iter().any(|&w| {
-                w != idx
-                    && matches.coverage(idx, w).is_some()
-                    && outranks(&fingerprints[w], &fingerprints[idx], priority, &maxima)
-            });
-            if lost {
-                delete_candidates.insert(idx);
-            }
-        }
-
-        review_set.extend(group_review);
-    }
-
-
-    // REVIEW protection overrides DELETE. Sorted for deterministic ordering.
-    //
-    // The subtraction is what makes the precedence global rather than
-    // per-group: a file held back in one group is held back everywhere, even
-    // where another group ranked it bottom. A group can therefore end up with
-    // no DELETE at all, which is the conservative direction.
-    let mut delete_indices: Vec<usize> =
-        delete_candidates.difference(&review_set).copied().collect();
-    delete_indices.sort_unstable();
+    let Verdicts { review: review_set, delete: delete_indices, .. } =
+        verdicts(final_groups, fingerprints, matches, priority);
+    let delete_candidates: HashSet<usize> = delete_indices.iter().copied().collect();
 
     // --- The confirmation ----------------------------------------------------
     // Here rather than at start-up because only now is there a question worth
@@ -1359,7 +1405,8 @@ pub fn output_results(
     // macro was already dropping those lines; what it cannot drop is the
     // `format!` that built each one, and on the local corpus at `-d 18` that is
     // 65,441 lines assembled and thrown away.
-    let show_listing = listing && log::log_enabled!(log::Level::Info);
+    // Nor under the desktop app, whose results page is this listing.
+    let show_listing = listing && log::log_enabled!(log::Level::Info) && !crate::utils::is_for_window();
     let show_summary = summarise && log::log_enabled!(log::Level::Info);
 
     if show_listing {
@@ -1977,7 +2024,7 @@ pub fn output_results(
     // -- on `-o -` it was landing on stderr while the report it refers to was
     // still being built, so the terminal read "run with --delete" and only then
     // showed the run it was talking about.
-    if !acting && !declined && delete_candidate_count > 0 {
+    if !acting && !declined && delete_candidate_count > 0 && !crate::utils::is_for_window() {
         info!(
             "\nRun with --delete to move the file(s) marked DELETE to the trash or with --move-to <DIR> to relocate them instead."
         );

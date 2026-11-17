@@ -15,7 +15,12 @@
 #   vid-fp-<version>-x86_64-linux-gnu  -> archival, one per release
 #   vid-fp-x86_64-linux-gnu            -> stable name, so this URL always works:
 #     https://github.com/Danielnara24/vid-fp/releases/latest/download/vid-fp-x86_64-linux-gnu
-#   vid-fp-<version>-extras.tar.gz     -> completions + man page
+#   vid-fp-<version>-extras.tar.gz     -> completions, man page, desktop entry
+#                                         and icon
+#   vid-fp-gui-<version>-x86_64-linux-gnu, vid-fp-gui-x86_64-linux-gnu
+#                                      -> the desktop app, same two names
+#                                         (`build-gui`); FFmpeg bundled the
+#                                         same way, GTK 4 from the system
 #   vid-fp-<version>-ffmpeg-static-libs.tar.gz
 #     -> the LGPL relink kit; see the "LGPL" step below. Not optional.
 #
@@ -136,7 +141,10 @@ jobs:
           "$BIN" --completions zsh  > dist/extras/completions/_vid-fp
           "$BIN" --completions fish > dist/extras/completions/vid-fp.fish
           "$BIN" --man              > dist/extras/man/vid-fp.1
-          tar -C dist/extras -czf "dist/vid-fp-${VERSION}-extras.tar.gz" completions man
+          mkdir -p dist/extras/applications dist/extras/icons
+          cp data/io.github.danielnara24.vid-fp.desktop dist/extras/applications/
+          cp data/io.github.danielnara24.vid-fp.svg dist/extras/icons/
+          tar -C dist/extras -czf "dist/vid-fp-${VERSION}-extras.tar.gz" completions man applications icons
           rm -rf dist/extras
           # Same binary, two names: a versioned copy for history and a stable
           # copy so the /releases/latest/download/ URL never changes.
@@ -278,8 +286,102 @@ jobs:
 
             Requires glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+, Fedora 36+).
 
+            The desktop app, `vid-fp-gui`, bundles FFmpeg the same way and
+            needs GTK 4.10 or newer (Ubuntu 23.04+, Debian 13+, Fedora 38+):
+
+            ```bash
+            sudo apt install libgtk-4-1
+            curl -L -o vid-fp-gui \
+              https://github.com/Danielnara24/vid-fp/releases/latest/download/vid-fp-gui-x86_64-linux-gnu
+            chmod +x vid-fp-gui && sudo install -m 755 vid-fp-gui /usr/local/bin/vid-fp-gui
+            ```
+
             `*-ffmpeg-static-libs.tar.gz` is the LGPL relink kit -- see
             `RELINKING.md` inside it. vid-fp itself remains MIT OR Apache-2.0.
+
+  build-gui:
+    name: Desktop app (bundles FFmpeg 8 + dav1d, links the system's GTK 4)
+    # Not on 22.04 with the CLI: its GTK is 4.6 and the window needs 4.10.
+    # After the CLI, so the two never race to create the release, and so the
+    # FFmpeg prefix it cached is there to restore; static archives built on
+    # 22.04 link the same here.
+    needs: build-static
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        # As the CLI's job, no libav*-dev, plus GTK 4.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential git make nasm pkg-config \
+            python3 python3-venv clang libgtk-4-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: gui
+
+      - name: Cache static FFmpeg prefix
+        uses: actions/cache@v4
+        with:
+          path: ffmpeg-static
+          key: ffmpeg-static-${{ runner.os }}-${{ hashFiles('scripts/build-ffmpeg-static.sh') }}
+
+      - name: Build static FFmpeg + dav1d
+        # A no-op when the cache above was restored.
+        run: ./scripts/build-ffmpeg-static.sh "$PWD/ffmpeg-static"
+
+      - name: Build
+        env:
+          FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-static
+        run: cargo build --release --locked --features static-ffmpeg,gui --bin vid-fp-gui
+
+      - name: Test
+        # The window's own tests, and tests/window_matches_cli.rs, which runs
+        # this vid-fp-gui's scan beside a vid-fp of the same build and demands
+        # the same groups and labels. Same features as the Build above, so
+        # target/release/vid-fp-gui is still the binary that ships.
+        env:
+          FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-static
+        run: cargo test --release --locked --features static-ffmpeg,gui --bin vid-fp-gui --test window_matches_cli
+
+      - name: Verify the binary
+        # FFmpeg bundled, not linked; and its scan runs without a display, so
+        # it can be smoke tested: an empty folder is a clean run that finds
+        # nothing.
+        run: |
+          BIN=target/release/vid-fp-gui
+          if objdump -p "$BIN" | grep -qE 'NEEDED.*lib(av|sw)'; then
+            echo "::error::the window links FFmpeg dynamically:"
+            objdump -p "$BIN" | grep NEEDED
+            exit 1
+          fi
+          echo "DT_NEEDED:"; objdump -p "$BIN" | grep NEEDED
+          echo "newest glibc symbol: $(objdump -T "$BIN" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"
+          "$BIN" --version
+          mkdir -p "$RUNNER_TEMP/empty"
+          "$BIN" --worker "$RUNNER_TEMP/r.json" vid-fp --cache "$RUNNER_TEMP/c.redb" -- "$RUNNER_TEMP/empty"
+          grep -q '"found":0' "$RUNNER_TEMP/r.json"
+
+      - name: Package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          cp target/release/vid-fp-gui "dist/vid-fp-gui-${VERSION}-x86_64-linux-gnu"
+          cp target/release/vid-fp-gui "dist/vid-fp-gui-x86_64-linux-gnu"
+          cd dist
+          for f in *; do sha256sum "$f" > "$f.sha256"; done
+          ls -la
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
 
   publish-crate:
     name: Publish to crates.io

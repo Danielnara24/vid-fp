@@ -58,12 +58,13 @@ jobs:
         # The four libav* libraries and nothing else -- ffmpeg-next is pinned
         # with default-features = false, so avdevice and avfilter are unused.
         # The -dev packages pull in the matching runtime .so, which the
-        # fingerprint.rs tests need: they decode tests/fixtures/*.
+        # fingerprint.rs tests need: they decode tests/fixtures/*. GTK 4 for
+        # the desktop app, which this job builds and tests too.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
-            clang pkg-config
+            clang pkg-config libgtk-4-dev
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -78,11 +79,16 @@ jobs:
           key: ci
 
       # --locked so a drifted Cargo.lock fails here rather than at release.
+      # With the window, so its code is linted and its tests (and
+      # tests/window_matches_cli.rs) run; and without it, as `cargo install
+      # vid-fp` builds, so nothing the CLI needs hides behind the feature.
       - name: Clippy
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: |
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo clippy --all-targets --locked --features gui -- -D warnings
 
       - name: Tests
-        run: cargo test --locked
+        run: cargo test --locked --features gui
 
   msrv:
     name: MSRV (rust-version in Cargo.toml)

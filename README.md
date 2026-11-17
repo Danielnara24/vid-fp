@@ -31,9 +31,9 @@ redundant copies to the system trash, `--move-to` relocates them instead, and
 text, CSV or JSON, and `--from-report` acts on one you have reviewed and edited
 by hand.
 
-There is no daemon, no GUI and nothing running in the background. Fingerprints
-are cached between runs, so re-scanning a library only decodes the files that
-changed.
+There is no daemon and nothing running in the background, and the
+[desktop app](#desktop-app) is optional. Fingerprints are cached between runs,
+so re-scanning a library only decodes the files that changed.
 
 ## Requirements
 
@@ -98,6 +98,22 @@ cargo build --release --features static-ffmpeg    # -> target/release/vid-fp
 Needs `git make nasm pkg-config python3 python3-venv build-essential`. The
 script builds pinned FFmpeg and dav1d releases into `./ffmpeg-static` and is a
 no-op on later runs.
+
+### Installing the desktop app
+
+`vid-fp-gui` needs GTK 4.10 or newer (Ubuntu 23.04+, Debian 13+, Fedora 38+):
+
+```bash
+sudo apt install libgtk-4-1
+curl -L -o vid-fp-gui \
+  https://github.com/Danielnara24/vid-fp/releases/latest/download/vid-fp-gui-x86_64-linux-gnu
+chmod +x vid-fp-gui
+sudo install -m 755 vid-fp-gui /usr/local/bin/vid-fp-gui
+```
+
+From source, add `libgtk-4-dev` to the packages above and build with
+`cargo install vid-fp --locked --features gui`. The extras tarball below holds
+a desktop entry and an icon.
 
 ### Shell completions and man page
 
@@ -275,6 +291,32 @@ before you get to it. Columns are found by name, so a reordered report still
 works, and the format is read from the file rather than its name, so a report
 kept as `dupes.bak` replays. Only CSV and JSON reports are accepted; `.txt`
 reports refused.
+
+## Desktop app
+
+`vid-fp-gui` runs the same scan in a window. Pick folders and options, press
+*Scan*, then go through the groups and choose which videos to move to the
+Trash. Folders given on its command line are the ones to scan
+(`vid-fp-gui ~/Videos`).
+
+- The groups are listed down the left, each shown by a frame of the video the
+  scan keeps. A group's videos are listed beside it, each with a thumbnail,
+  the figures the terminal listing prints, how much of it matched which file,
+  and KEEP, DELETE or REVIEW exactly as the report would say it.
+- *Rank by* picks which copy is kept, as `-k` does. Every ranking is worked
+  out during the scan, so switching scans nothing again.
+- Space, or the check box, marks a video for the Trash. Enter or a double
+  click plays it in your video player. *Mark suggested deletions* marks
+  exactly the files marked DELETE.
+- The menu at the top right, or a right click, shows the file in its folder,
+  marks every other video of the group, unmarks, or switches to a tree of
+  folders. F1 lists every key.
+- The Trash button asks first, and leaves alone any file that changed since the
+  scan or whose kept copy has gone or changed. A drive with no Trash is offered
+  permanent deletion instead.
+
+The last scan's results and marks are kept, so closing the window loses
+nothing.
 
 ## Options
 

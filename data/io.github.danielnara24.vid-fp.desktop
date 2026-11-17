@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=vid-fp
+GenericName=Duplicate Video Finder
+Comment=Find duplicate videos and clips
+Exec=vid-fp-gui %F
+Icon=io.github.danielnara24.vid-fp
+Terminal=false
+Categories=AudioVideo;Video;
+Keywords=duplicate;duplicates;videos;clips;movies;
+StartupNotify=true
