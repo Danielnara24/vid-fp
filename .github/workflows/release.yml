@@ -50,7 +50,7 @@ jobs:
     # so the runner's glibc becomes the floor for every user. 22.04 is 2.35.
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install build tools
         # No libav*-dev here on purpose: this build must not be able to find a
@@ -74,7 +74,7 @@ jobs:
       # versions in the script do -- so the script itself is the cache key.
       - name: Cache static FFmpeg prefix
         id: ffmpeg-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ffmpeg-static
           key: ffmpeg-static-${{ runner.os }}-${{ hashFiles('scripts/build-ffmpeg-static.sh') }}
@@ -275,7 +275,7 @@ jobs:
           ls -la
 
       - name: Upload to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/*
           body: |
@@ -312,7 +312,7 @@ jobs:
     needs: build-static
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install build tools
         # As the CLI's job, no libav*-dev, plus GTK 4.
@@ -331,7 +331,7 @@ jobs:
           key: gui
 
       - name: Cache static FFmpeg prefix
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ffmpeg-static
           key: ffmpeg-static-${{ runner.os }}-${{ hashFiles('scripts/build-ffmpeg-static.sh') }}
@@ -383,7 +383,7 @@ jobs:
           ls -la
 
       - name: Upload to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/*
 
@@ -401,7 +401,7 @@ jobs:
       image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-51
       options: --privileged
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Check cargo-sources.json matches Cargo.lock
         # A crate in Cargo.lock that the generated sources lack fails the
@@ -468,7 +468,7 @@ jobs:
           cp vid-fp-x86_64.flatpak dist/vid-fp-x86_64.flatpak
           cd dist && for f in *; do sha256sum "$f" > "$f.sha256"; done
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: dist/*
 
@@ -483,7 +483,7 @@ jobs:
     permissions:
       contents: read # this job publishes elsewhere; it writes nothing here
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install FFmpeg development libraries
         # The opposite of the build job above, on purpose. What crates.io ships
