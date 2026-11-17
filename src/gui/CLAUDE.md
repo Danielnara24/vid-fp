@@ -55,6 +55,27 @@ one differs, it is said below.
   gdk-pixbuf. Premultiplied BGRA at drawn size; two decoders for rows, one for
   the strip; held to bytes (`Budget`). Rotation metadata (phone video) is not
   applied.
+- **Compare (`matched.rs`) shows the scan's evidence, not a player.** The
+  user chose matched frames over side-by-side playback. Each `Member` carries
+  `compared`: against its best link (first) and the group's reference, the
+  matched frame pairs (thinned to `found::MOST_PAIRS`), and each side's
+  matched stretches, made by `compare::evidence`. The window decodes each
+  frame with `thumbnail::frame_at` through `Thumbs` (`Size::at(ms)`), draws a
+  chart (`Chart`: bar, link band, bar, on ONE time scale, the shorter slid
+  to the offset most pairs agree on, `alignment`, so a real copy draws
+  vertical lines and a look-alike draws slanted ones; user's choice; a zoom
+  toggle, or Z, narrows the same scale to the matched footage, `View`.
+  "One scale from 0" and "each bar full width" were tried and dropped: the
+  first keeps a clip a sliver, the second makes every line converge on a
+  sliver of the long video), and
+  shows a pair full size (`Shown::Picture`). Click selects (row, ticks and
+  line red), double click / Enter opens full size. A tick on A is one pair
+  (pairs are one per A sample); a tick on B can be several, and clicking it
+  again steps through them (`Chart::choose`). A frame
+  is found by the scan's own clock: the first keyframe is the anchor, and in a
+  container whose clock may restart (TS/PS) a keyframe index replaying that
+  clock is read once per file and the frame found by byte position, since one
+  timestamp can occur in each `cat`ted segment.
 - Strip of groups and the tree view by folder (`folders.rs`) as in img-fp; a
   group's face is its KEEP file. Marks are on the file (by number in
   `Found::files`), so a mark shows in every group the file is in.

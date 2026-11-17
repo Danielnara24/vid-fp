@@ -40,6 +40,7 @@ mod commands;
 mod folders;
 mod labels;
 mod last;
+mod matched;
 mod model;
 mod options;
 mod results;

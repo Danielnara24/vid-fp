@@ -1037,6 +1037,23 @@ fn corroborate_pair(
     cap: usize,
     witnesses: &mut Witnesses,
 ) -> usize {
+    corroborate_pair_with(fp_a, fp_b, rule, matched_a, matched_b, cap, witnesses, &mut |_, _, _| {})
+}
+
+/// `corroborate_pair`, telling `on_mark` of every loose frame match it admits
+/// (`corroborated_with`). The comparison passes a closure that does nothing,
+/// which compiles away; only `evidence` listens.
+#[allow(clippy::too_many_arguments)]
+fn corroborate_pair_with<M: FnMut(u32, u32, u32)>(
+    fp_a: &VideoFingerprint,
+    fp_b: &VideoFingerprint,
+    rule: Rule,
+    matched_a: &mut [bool],
+    matched_b: &mut [bool],
+    cap: usize,
+    witnesses: &mut Witnesses,
+    on_mark: &mut M,
+) -> usize {
     let tol = rule.tol;
     let mut aligned: Vec<Aligned> = Vec::new();
     let mut total = 0usize;
@@ -1049,7 +1066,7 @@ fn corroborate_pair(
 
     if total <= cap {
         let held = aligned.len();
-        corroborated(&mut aligned, rule.schedule, matched_a, matched_b, EVERY_OFFSET, witnesses);
+        corroborated_with(&mut aligned, rule.schedule, matched_a, matched_b, EVERY_OFFSET, witnesses, on_mark);
         return held;
     }
 
@@ -1080,7 +1097,7 @@ fn corroborate_pair(
             }
         });
         held = held.max(aligned.len());
-        corroborated(&mut aligned, rule.schedule, matched_a, matched_b, (lo, hi), witnesses);
+        corroborated_with(&mut aligned, rule.schedule, matched_a, matched_b, (lo, hi), witnesses, on_mark);
     }
 
     held
@@ -1631,13 +1648,19 @@ fn augment(
 /// `O(m log m)` in the number of loose matches, against the `O(n * m)` popcount
 /// loop that produced them. `m` is small on anything unrelated -- an unrelated
 /// frame pair sits ~32 bits apart and never enters this list at all.
-fn corroborated(
+///
+/// `on_mark` is told of each row it admits, as `(i, j, distance)`: only a row
+/// that flags something, since a row whose two samples are already flagged is
+/// skipped unjudged. The comparison passes a closure that does nothing;
+/// `evidence` listens.
+fn corroborated_with<M: FnMut(u32, u32, u32)>(
     aligned: &mut [Aligned],
     schedule: &[u32; HASH_BITS as usize + 1],
     matched_a: &mut [bool],
     matched_b: &mut [bool],
     targets: (i64, i64),
     witnesses: &mut Witnesses,
+    on_mark: &mut M,
 ) {
     if aligned.len() < 2 {
         return;
@@ -1712,8 +1735,86 @@ fn corroborated(
         if witnesses.enough(&aligned[lo..hi], i, j, needed as usize) {
             matched_a[i as usize] = true;
             matched_b[j as usize] = true;
+            on_mark(i, j, distance);
         }
     }
+}
+
+/// What one measured pair matched, in the terms a person can check: which
+/// frames of `a` were matched to which frames of `b`, and where in each the
+/// matched footage lies. The desktop app shows it (`found::Comparison`).
+///
+/// It is the decision `match_overlap` makes, made again for one pair with the
+/// matches recorded rather than only flagged: the same tolerances, the same
+/// corroboration and the same flags, so every sample it lists is one the
+/// coverage figures counted. Kept out of the comparison itself, which runs for
+/// every candidate pair and has no use for any of this; it is asked only of
+/// the pairs the window will show.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Evidence {
+    /// For each matched sample of `a`, in `a`'s order, the closest sample of
+    /// `b` it was matched to: `(t_a_ms, t_b_ms, distance)`, each time the
+    /// sample's start on its fingerprint's clock.
+    pub pairs: Vec<(u32, u32, u32)>,
+    /// The matched footage of each side as `(start_ms, end_ms)` stretches, in
+    /// order, touching samples merged.
+    pub stretches_a: Vec<(u32, u32)>,
+    pub stretches_b: Vec<(u32, u32)>,
+}
+
+/// `Evidence` for `fp_a` against `fp_b` at `-d max_hamming_dist`.
+pub fn evidence(fp_a: &VideoFingerprint, fp_b: &VideoFingerprint, max_hamming_dist: u32) -> Evidence {
+    let tol = Tolerance::for_distance(max_hamming_dist);
+    let schedule = witness_schedule();
+    let rule = Rule { tol, schedule: &schedule };
+    let mut matched_a = vec![false; fp_a.valid_hashes.len()];
+    let mut matched_b = vec![false; fp_b.valid_hashes.len()];
+    // The closest partner of each sample of `a`, of the matches admitted.
+    let mut best: Vec<Option<(u32, u32)>> = vec![None; fp_a.valid_hashes.len()];
+    let note = |best: &mut Vec<Option<(u32, u32)>>, i: u32, j: u32, d: u32| {
+        let slot = &mut best[i as usize];
+        if slot.is_none_or(|(_, bd)| d < bd) {
+            *slot = Some((j, d));
+        }
+    };
+    if tol.loose > tol.strict {
+        let mut witnesses = Witnesses::new();
+        corroborate_pair_with(fp_a, fp_b, rule, &mut matched_a, &mut matched_b, MAX_ALIGNED_MATCHES, &mut witnesses, &mut |i, j, d| {
+            note(&mut best, i, j, d)
+        });
+    } else {
+        for_each_frame_match(fp_a, fp_b, tol, &mut matched_a, &mut matched_b, |_| {});
+    }
+    // A strict match is admitted outright, so every one of them is a match;
+    // `for_each_frame_match` flagged them without saying which they were.
+    for (i, &h_a) in fp_a.valid_hashes.iter().enumerate() {
+        for (j, &h_b) in fp_b.valid_hashes.iter().enumerate() {
+            let d = (h_a ^ h_b).count_ones();
+            if d <= tol.strict {
+                note(&mut best, i as u32, j as u32, d);
+            }
+        }
+    }
+    let pairs = best
+        .iter()
+        .enumerate()
+        .filter_map(|(i, b)| b.map(|(j, d)| (fp_a.valid_t_start[i], fp_b.valid_t_start[j as usize], d)))
+        .collect();
+    Evidence { pairs, stretches_a: stretches(&matched_a, fp_a), stretches_b: stretches(&matched_b, fp_b) }
+}
+
+/// The flagged samples of `fp` as stretches of footage: each sample stands for
+/// `[t_start, t_end)`, and samples that touch are one stretch.
+fn stretches(matched: &[bool], fp: &VideoFingerprint) -> Vec<(u32, u32)> {
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    for (i, _) in matched.iter().enumerate().filter(|(_, &m)| m) {
+        let (s, e) = (fp.valid_t_start[i], fp.valid_t_end[i]);
+        match out.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => out.push((s, e)),
+        }
+    }
+    out
 }
 
 /// Every pair of videos that clears both gates, with the coverage that got them
@@ -2490,6 +2591,66 @@ mod tests {
                     );
                 }
                 previous = Some((cov_a, cov_b));
+            }
+        }
+    }
+
+    /// What the window is shown of a pair is what the comparison measured:
+    /// the stretches `evidence` returns are exactly the footage the coverage
+    /// figures counted, their ends are the spans, every sample it lists is
+    /// one of them, and no distance it lists is past the loose tolerance.
+    #[test]
+    fn test_the_evidence_shown_is_the_match_that_was_measured() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let covered = |st: &[(u32, u32)]| st.iter().map(|&(s, e)| (e - s) as u64).sum::<u64>();
+        for case in 0..200 {
+            let base = next();
+            let noisy = |bits: u32, r: &mut dyn FnMut() -> u64| {
+                let mut h = base;
+                for _ in 0..bits {
+                    h ^= 1u64 << (r() % 64);
+                }
+                h
+            };
+            let n = 3 + (next() % 8) as usize;
+            let a: Vec<u64> = (0..n).map(|_| noisy(4 + (next() % 14) as u32, &mut next)).collect();
+            let b: Vec<u64> = (0..n).map(|_| noisy(4 + (next() % 14) as u32, &mut next)).collect();
+            let times = |r: &mut dyn FnMut() -> u64| -> Vec<u32> {
+                let mut t = 10_000u32;
+                (0..n)
+                    .map(|_| {
+                        t += 60 + (r() % 400) as u32;
+                        t
+                    })
+                    .collect()
+            };
+            let fp_a = mock_fp_at(a, times(&mut next));
+            let fp_b = mock_fp_at(b, times(&mut next));
+            for d in [0, 4, 8, 12, 16] {
+                let rule = Rule { tol: Tolerance::for_distance(d), schedule: &witness_schedule() };
+                let (cov_a, cov_b, span_a, span_b) = match_overlap(&fp_a, &fp_b, rule, &mut Witnesses::new());
+                let ev = evidence(&fp_a, &fp_b, d);
+                let pct = |ms: u64, fp: &VideoFingerprint| (ms as f32 / fp.total_ms as f32).min(1.0);
+                assert_eq!(pct(covered(&ev.stretches_a), &fp_a), cov_a, "case {case} -d {d}: a's footage");
+                assert_eq!(pct(covered(&ev.stretches_b), &fp_b), cov_b, "case {case} -d {d}: b's footage");
+                let envelope = |st: &[(u32, u32)]| st.first().map(|f| Span { start_ms: f.0, end_ms: st.last().unwrap().1 });
+                assert_eq!(envelope(&ev.stretches_a), span_a, "case {case} -d {d}");
+                assert_eq!(envelope(&ev.stretches_b), span_b, "case {case} -d {d}");
+                // Every matched sample of a is listed, with a partner inside b's
+                // matched footage, within the loose tolerance.
+                let flagged_a = fp_a.valid_t_start.iter().zip(&fp_a.valid_t_end).filter(|(s, e)| ev.stretches_a.iter().any(|st| st.0 <= **s && **e <= st.1)).count();
+                assert_eq!(ev.pairs.len(), flagged_a, "case {case} -d {d}: one pair per matched sample of a");
+                for &(ta, tb, dist) in &ev.pairs {
+                    assert!(dist <= rule.tol.loose);
+                    assert!(ev.stretches_a.iter().any(|st| st.0 <= ta && ta < st.1));
+                    assert!(ev.stretches_b.iter().any(|st| st.0 <= tb && tb < st.1), "case {case} -d {d}: {tb} is not matched footage of b");
+                }
             }
         }
     }

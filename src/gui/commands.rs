@@ -200,6 +200,7 @@ pub enum Page {
     Menu,
     // The menu's.
     Open,
+    Compare,
     ShowFolder,
     MarkOthers,
     MarkFolder,
@@ -216,6 +217,7 @@ impl Page {
     pub fn action(self) -> &'static str {
         match self {
             Page::Open => "open",
+            Page::Compare => "compare",
             Page::ShowFolder => "folder",
             Page::MarkOthers => "mark-others",
             Page::MarkFolder => "mark-folder",
@@ -233,6 +235,7 @@ impl Page {
         let tree = view == View::Folders;
         Some(match self {
             Page::Open => l::OPEN,
+            Page::Compare => l::COMPARE,
             Page::ShowFolder => l::SHOW_FOLDER,
             Page::MarkOthers => l::MARK_OTHERS,
             Page::MarkFolder if tree => l::MARK_FOLDER,
@@ -248,7 +251,7 @@ impl Page {
 
     /// Whether it acts on the selected video, and so waits for one.
     pub fn needs_video(self) -> bool {
-        matches!(self, Page::Mark | Page::Menu | Page::Open | Page::ShowFolder | Page::MarkOthers)
+        matches!(self, Page::Mark | Page::Menu | Page::Open | Page::Compare | Page::ShowFolder | Page::MarkOthers)
     }
 }
 
@@ -260,7 +263,7 @@ impl Command for Page {
 
 /// The menu, in sections; each view shows the items it has a label for.
 pub const MENU: &[&[Page]] = &[
-    &[Page::Open, Page::ShowFolder],
+    &[Page::Open, Page::Compare, Page::ShowFolder],
     &[Page::MarkOthers, Page::MarkFolder, Page::Unmark, Page::UnmarkAll],
     &[Page::SwitchView],
 ];
@@ -294,6 +297,11 @@ pub static RESULTS: Section<Page> = Section {
             binds: &[Bind::Key(plain(&[K::Return, K::KP_Enter, K::ISO_Enter]), Page::Open)],
         },
         Row { keys: "", what: "Play it, show it in its folder", binds: &[Bind::Mnemonic(Page::Open), Bind::Mnemonic(Page::ShowFolder)] },
+        Row {
+            keys: "C",
+            what: "Compare it with what it matched, frame by frame",
+            binds: &[Bind::Key(plain(&[K::c, K::C]), Page::Compare), Bind::Mnemonic(Page::Compare)],
+        },
         Row { keys: "", what: "Mark every other video of the group", binds: &[Bind::Mnemonic(Page::MarkOthers)] },
         Row {
             keys: "",
@@ -358,7 +366,7 @@ pub fn show_help(parent: &gtk::ApplicationWindow) {
 mod tests {
     use super::*;
 
-    const PAGE: [Page; 15] = [
+    const PAGE: [Page; 16] = [
         Page::Up,
         Page::Down,
         Page::First,
@@ -366,6 +374,7 @@ mod tests {
         Page::Mark,
         Page::Menu,
         Page::Open,
+        Page::Compare,
         Page::ShowFolder,
         Page::MarkOthers,
         Page::MarkFolder,

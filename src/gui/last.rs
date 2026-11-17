@@ -214,7 +214,7 @@ mod tests {
         let (a, b) = (root.join("a.mp4"), root.join("b.mp4"));
         std::fs::write(&a, b"x").unwrap();
         let result = |name: &str, files: &[&Path]| {
-            let members = (0..files.len()).map(|i| Member { file: i, matched_with: None, matched_seconds: None, matched_from: None, matched_to: None }).collect();
+            let members = (0..files.len()).map(|i| Member { file: i, matched_with: None, matched_seconds: None, matched_from: None, matched_to: None, compared: Vec::new() }).collect();
             let found = Found { found: 7, compared: 7, files: files.iter().map(|p| file(p)).collect(), groups: vec![Group { members }], ..Found::default() };
             let p = root.join(name);
             found.save(&p).unwrap();

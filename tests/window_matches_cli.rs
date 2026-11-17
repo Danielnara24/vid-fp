@@ -149,6 +149,31 @@ fn the_window_shows_what_the_command_line_reports() {
             assert_eq!(window, cli, "{settings:?} -k {name}");
             labellings.insert(format!("{:?}", cli.iter().flatten().map(|r| &r.action).collect::<Vec<_>>()));
         }
+        // What the window's Compare shows: every member has its strongest
+        // link's frames, first, and the reference's when that is another
+        // video; each pair inside the footage it says matched.
+        for g in found["groups"].as_array().unwrap() {
+            let members = g["members"].as_array().unwrap();
+            let reference = &members[0]["file"];
+            for m in members {
+                let compared = m["compared"].as_array().unwrap();
+                if !m["matched_with"].is_null() {
+                    assert_eq!(compared[0]["with"], m["matched_with"], "{settings:?}: the best match comes first");
+                }
+                if &m["file"] != reference {
+                    assert!(compared.iter().any(|c| &c["with"] == reference), "{settings:?}: compared with the reference too");
+                }
+                for c in compared {
+                    let pairs = c["pairs"].as_array().unwrap();
+                    assert!(!pairs.is_empty(), "{settings:?}: a measured link matched frames");
+                    assert!(c["matched_frames"].as_u64().unwrap() >= pairs.len() as u64);
+                    let inside = |t: u64, key: &str| c[key].as_array().unwrap().iter().any(|st| st[0].as_u64().unwrap() <= t && t < st[1].as_u64().unwrap());
+                    for p in pairs {
+                        assert!(inside(p[0].as_u64().unwrap(), "stretches") && inside(p[1].as_u64().unwrap(), "other_stretches"), "{settings:?}: {p} is matched footage");
+                    }
+                }
+            }
+        }
         // Not four copies of one answer: on these fixtures, at least one
         // setting has rankings that disagree.
         if settings.is_empty() {

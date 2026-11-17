@@ -305,6 +305,14 @@ Trash. Folders given on its command line are the ones to scan
   and KEEP, DELETE or REVIEW exactly as the report would say it.
 - *Rank by* picks which copy is kept, as `-k` does. Every ranking is worked
   out during the scan, so switching scans nothing again.
+- *Compare…* (or C) shows the frames the scan matched between a video and
+  its best match, side by side with their times. A chart above draws both
+  videos on one time scale with a line per pair: when the pairs agree on
+  where one video sits in the other, it is drawn there and the lines run
+  straight down; crossing lines are frames that only look alike. The zoom
+  button (or Z) narrows it to the matched footage on the same scale, so a
+  short clip of a long video fills the width. Click a pair or a line to find it
+  in both, double click to see it full size.
 - Space, or the check box, marks a video for the Trash. Enter or a double
   click plays it in your video player. *Mark suggested deletions* marks
   exactly the files marked DELETE.

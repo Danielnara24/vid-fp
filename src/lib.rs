@@ -48,7 +48,7 @@ include!(concat!(env!("OUT_DIR"), "/static_ffmpeg_version_check.rs"));
 /// re-encoded, re-muxed, or scanned with different sampling settings replaces
 /// its own entry instead of growing a second one beside it.
 const CACHE_TABLE: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("fingerprints_dct_ct_ff8_kffloor");
+    TableDefinition::new("fingerprints_dct_ct_ff8_pts");
 
 /// Files this build looked at and refused before opening: see `NotMedia`.
 ///
@@ -154,7 +154,18 @@ const REFUSED_TABLE: TableDefinition<&str, &[u8]> =
 ///   it needs that flag pair to have been typed, and a cache that never saw it
 ///   holds nothing wrong -- but there is no bit in the stamp that separates the
 ///   two, which is the only test that has ever decided this.
-const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 8] = [
+/// - `fingerprints_dct_ct_ff8_kffloor` holds, for HEVC files with open-GOP
+///   (CRA) keyframes more than 128 frames apart, pictures filed under another
+///   keyframe's time. A decoder shown only keyframes cannot see the CRA's
+///   picture order count wrap, hands them back out of order, and the scan read
+///   each frame's time from `best_effort_timestamp`, which then falls back to
+///   the dts of the packet being SENT -- a later keyframe's. It now reads the
+///   frame's own `pts`. Only builds linking FFmpeg 6.x did it (17 of the local
+///   corpus's 19 HEVC files); the vendored FFmpeg 8 never did, and its entries
+///   are right -- but no field of an entry says which libavcodec wrote it, so
+///   the whole table goes. Same fields, same units, values moved between
+///   samples, invisible to the `Stamp`.
+const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 9] = [
     TableDefinition::new("fingerprints"),
     TableDefinition::new("fingerprints_by_path"),
     TableDefinition::new("fingerprints_dct"),
@@ -163,6 +174,7 @@ const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 8] = [
     TableDefinition::new("fingerprints_dct_ct_ff8_tail"),
     TableDefinition::new("fingerprints_dct_ct_ff8_splice"),
     TableDefinition::new("fingerprints_dct_ct_ff8_rescale"),
+    TableDefinition::new("fingerprints_dct_ct_ff8_kffloor"),
 ];
 
 /// Refusal tables earlier builds wrote. Kept apart from the list above because
@@ -3858,7 +3870,7 @@ fn run(
     // then fails to save still leaves the window its groups to show.
     if let Some(path) = &args.window_result {
         progress::stage("Saving the results");
-        found::Found::of(&final_groups, &fingerprints, &matches, total_videos).save(path)?;
+        found::Found::of(&final_groups, &fingerprints, &matches, total_videos, max_hamming).save(path)?;
     }
 
     let deleted_paths = export::output_results(

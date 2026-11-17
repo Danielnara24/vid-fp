@@ -61,6 +61,7 @@ pub const MARK_FOLDER: &str = "_Mark current folder";
 pub const TO_TREE: &str = "S_witch to tree view";
 pub const TO_GROUPS: &str = "S_witch to group view";
 pub const OPEN: &str = "_Open";
+pub const COMPARE: &str = "_Compare matched frames";
 pub const SHOW_FOLDER: &str = "Show in _folder";
 pub const MARK_SUGGESTED: &str = "Mark suggested _deletions";
 pub const RANK_BY: &str = "_Rank by";

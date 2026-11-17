@@ -41,17 +41,25 @@ pub struct Size {
     pub h: u32,
     /// Fill the place and cut what overhangs, rather than fit inside it.
     pub cover: bool,
+    /// The keyframe the scan sampled at this many milliseconds, rather than
+    /// a picture chosen to stand for the whole video (`thumbnail::frame_at`).
+    pub at: Option<u32>,
 }
 
 impl Size {
     /// No larger than `w` x `h`, whole.
     pub fn within(w: u32, h: u32) -> Size {
-        Size { w: w.max(1), h: h.max(1), cover: false }
+        Size { w: w.max(1), h: h.max(1), cover: false, at: None }
     }
 
     /// Exactly `w` x `h`, filled.
     pub fn cover(w: u32, h: u32) -> Size {
-        Size { w: w.max(1), h: h.max(1), cover: true }
+        Size { w: w.max(1), h: h.max(1), cover: true, at: None }
+    }
+
+    /// The frame the scan sampled at `ms`, in this place, whole.
+    pub fn at(self, ms: u32) -> Size {
+        Size { at: Some(ms), cover: false, ..self }
     }
 }
 
@@ -68,6 +76,9 @@ struct Queue {
 /// What a picture widget is waiting for.
 pub enum Shown {
     Still(crate::still::Still),
+    /// A picture that takes whatever room it is given: the comparison's
+    /// full-size view.
+    Picture(gtk::Picture),
 }
 
 pub struct Thumbs {
@@ -205,10 +216,13 @@ impl Thumbs {
 /// A picture of `path` for `size`, as RGBA: the desktop's thumbnail when it
 /// has a current one large enough, else a frame of the video.
 fn make(path: &Path, size: Size) -> Decoded {
+    let Some(p) = path.to_str() else { return Err("its name is not UTF-8".into()) };
+    if let Some(ms) = size.at {
+        return vid_fp::thumbnail::frame_at(p, ms, size.w, size.h).map_err(|e| format!("{e:#}"));
+    }
     if let Some(t) = thumbnail_dir().and_then(|dir| from_cache(&dir, path, size)) {
         return Ok(t);
     }
-    let Some(p) = path.to_str() else { return Err("its name is not UTF-8".into()) };
     vid_fp::thumbnail::still(p, size.w, size.h, size.cover).map_err(|e| format!("{e:#}"))
 }
 
@@ -356,6 +370,16 @@ fn deliver(shown: &Shown, r: Result<gdk::Texture, String>) {
             Err(e) => {
                 p.set_texture(None);
                 p.set_tooltip_text(Some(&format!("No picture of this video: {e}")));
+            }
+        },
+        Shown::Picture(p) => match r {
+            Ok(t) => {
+                p.set_paintable(Some(&t));
+                p.set_tooltip_text(None);
+            }
+            Err(e) => {
+                p.set_paintable(gdk::Paintable::NONE);
+                p.set_tooltip_text(Some(&format!("No picture of this frame: {e}")));
             }
         },
     }

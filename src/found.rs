@@ -32,12 +32,17 @@ use crate::fingerprint::VideoFingerprint;
 use crate::utils::Priority;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::Path;
 
 /// Bumped whenever a field changes meaning; a result of another version is
 /// not read.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
+
+/// The most frame pairs a comparison keeps, spread evenly along the member's
+/// own runtime: enough to see every part of a match, few enough to show.
+pub const MOST_PAIRS: usize = 48;
 
 /// What the scan decided for a file, in every group it is in.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,6 +118,42 @@ pub struct Member {
     /// Where that footage starts and ends in it, in seconds.
     pub matched_from: Option<f64>,
     pub matched_to: Option<f64>,
+    /// What it matched, against its strongest link (`matched_with`) and, when
+    /// that is another file, against the group's representative: the frames
+    /// the scan matched and where the matched footage lies in each.
+    pub compared: Vec<Comparison>,
+}
+
+/// One measured pair as the scan matched it, seen from one member: the frames
+/// of it that matched and the frames of the other file they matched, and the
+/// stretches of footage each side matched. Times are milliseconds on each
+/// fingerprint's own clock, from its first keyframe (`compare::Evidence`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Comparison {
+    /// The other file, by its place in `Found::files`.
+    pub with: usize,
+    /// `(this file's ms, the other's ms, hash distance)`, in this file's
+    /// order, at most `MOST_PAIRS` of them, spread evenly.
+    pub pairs: Vec<(u32, u32, u32)>,
+    /// How many matched frames there were before the spreading.
+    pub matched_frames: usize,
+    pub stretches: Vec<(u32, u32)>,
+    pub other_stretches: Vec<(u32, u32)>,
+    /// The tolerance it was measured at, `-d`: a distance is read against it.
+    pub tolerance: u32,
+}
+
+impl Comparison {
+    fn of(evidence: crate::compare::Evidence, with: usize, tolerance: u32) -> Comparison {
+        let n = evidence.pairs.len();
+        let pairs = if n <= MOST_PAIRS {
+            evidence.pairs
+        } else {
+            // First and last kept, the rest evenly between.
+            (0..MOST_PAIRS).map(|k| evidence.pairs[k * (n - 1) / (MOST_PAIRS - 1)]).collect()
+        };
+        Comparison { with, pairs, matched_frames: n, stretches: evidence.stretches_a, other_stretches: evidence.stretches_b, tolerance }
+    }
 }
 
 /// A group: every member matched the first, its representative.
@@ -142,7 +183,7 @@ impl Default for Found {
 impl Found {
     /// The scan's groups, labelled as the report labels them under each
     /// ranking.
-    pub(crate) fn of(groups: &[Vec<usize>], fingerprints: &[VideoFingerprint], matches: &MatchIndex, found: usize) -> Found {
+    pub(crate) fn of(groups: &[Vec<usize>], fingerprints: &[VideoFingerprint], matches: &MatchIndex, found: usize, tolerance: u32) -> Found {
         let rankings: Vec<export::Verdicts> = Priority::ALL.iter().map(|&p| export::verdicts(groups, fingerprints, matches, p)).collect();
         // Each fingerprint that some group holds, numbered as first met.
         let mut number: HashMap<usize, usize> = HashMap::new();
@@ -188,7 +229,7 @@ impl Found {
             })
             .collect();
         let groups = groups
-            .iter()
+            .par_iter()
             .map(|group| Group {
                 members: group
                     .iter()
@@ -197,8 +238,19 @@ impl Found {
                         // group, its seconds blank where the runtime is.
                         let best = matches.links_of(idx, group, fingerprints).into_iter().next();
                         let seconds_known = fingerprints[idx].duration > 0.0;
+                        // Against its best link and the representative, each
+                        // once, never itself.
+                        let mut partners: Vec<usize> = best.as_ref().map(|l| l.other).into_iter().collect();
+                        if group[0] != idx && !partners.contains(&group[0]) {
+                            partners.push(group[0]);
+                        }
+                        let compared = partners
+                            .into_iter()
+                            .map(|o| Comparison::of(crate::compare::evidence(&fingerprints[idx], &fingerprints[o], tolerance), number[&o], tolerance))
+                            .collect();
                         Member {
                             file: number[&idx],
+                            compared,
                             matched_with: best.as_ref().map(|l| number[&l.other]),
                             matched_seconds: best.as_ref().map(|l| l.matched_seconds).filter(|_| seconds_known),
                             matched_from: best.as_ref().and_then(|l| l.span).map(|s| s.start_seconds()),

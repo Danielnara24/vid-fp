@@ -862,7 +862,7 @@ fn input_is_spent(ictx: &ffmpeg_next::format::context::Input) -> bool {
 /// Every container that has to be remuxed rather than concatenated -- MP4,
 /// Matroska, AVI, ASF -- leaves it clear, so the seek path this gates keeps the
 /// file it was written for.
-fn clock_may_restart(ictx: &ffmpeg_next::format::context::Input) -> bool {
+pub(crate) fn clock_may_restart(ictx: &ffmpeg_next::format::context::Input) -> bool {
     unsafe {
         let iformat = (*ictx.as_ptr()).iformat;
         !iformat.is_null() && ((*iformat).flags & ffmpeg_next::ffi::AVFMT_TS_DISCONT) != 0
@@ -1463,6 +1463,96 @@ fn send_and_take(
     }
 }
 
+/// The hash of each 64x64 GRAY8 frame in `u_frames` (packed back to back),
+/// and whether it is featureless, after cropping away the border every frame
+/// of the video shares: a letterbox or a pillarbox is a property of the
+/// encode, not of the picture, and would otherwise weigh on every hash.
+///
+/// The crop is found from all of the frames together, so this is asked of a
+/// whole video at once.
+fn hash_frames(u_frames: &[u8]) -> (Vec<u64>, Vec<bool>) {
+    let n_unique = u_frames.len() / FRAME_STRIDE;
+    let n_f32 = n_unique as f32;
+    let mut sum = vec![0u64; FRAME_STRIDE];
+    let mut sum_sq = vec![0u64; FRAME_STRIDE];
+    for frame in u_frames.chunks_exact(FRAME_STRIDE) {
+        for (i, &val) in frame.iter().enumerate() {
+            let v = val as u64;
+            sum[i] += v;
+            sum_sq[i] += v * v;
+        }
+    }
+
+    // Variance & Auto-Crop Algebra (Untouched - accurate)
+    let mut row_max_var = [0.0f32; 64];
+    let mut col_max_var = [0.0f32; 64];
+
+    // Indexed rather than iterated on purpose, and clippy's needless_range_loop
+    // is wrong about it: each cell reads two flat 64x64 buffers and updates two
+    // 64-entry projections, so the iterator form is a zip of chunks_exact(64)
+    // over sum and sum_sq nested inside a zip against row_max_var -- and
+    // col_max_var is walked afresh on every row rather than consumed once.
+    // y and x are coordinates here, not stand-ins for a cursor.
+    #[allow(clippy::needless_range_loop)]
+    for y in 0..64 {
+        for x in 0..64 {
+            let i = y * 64 + x;
+            let mean = sum[i] as f32 / n_f32;
+            let mean_sq = sum_sq[i] as f32 / n_f32;
+            let variance = mean_sq - (mean * mean);
+
+            if variance > row_max_var[y] { row_max_var[y] = variance; }
+            if variance > col_max_var[x] { col_max_var[x] = variance; }
+        }
+    }
+
+    let var_threshold = 2.0;
+    let valid_rows: Vec<usize> = (0..64).filter(|&i| row_max_var[i] > var_threshold).collect();
+    let valid_cols: Vec<usize> = (0..64).filter(|&i| col_max_var[i] > var_threshold).collect();
+
+    let mut y1 = 0; let mut y2 = 63;
+    let mut x1 = 0; let mut x2 = 63;
+
+    if !valid_rows.is_empty() && !valid_cols.is_empty() {
+        let temp_y1 = *valid_rows.first().unwrap();
+        let temp_y2 = *valid_rows.last().unwrap();
+        let temp_x1 = *valid_cols.first().unwrap();
+        let temp_x2 = *valid_cols.last().unwrap();
+
+        if (temp_y2 - temp_y1 + 1) >= 16 && (temp_x2 - temp_x1 + 1) >= 16 {
+            y1 = if temp_y1 > 0 { temp_y1 + 1 } else { temp_y1 };
+            y2 = if temp_y2 < 63 { temp_y2 - 1 } else { temp_y2 };
+            x1 = if temp_x1 > 0 { temp_x1 + 1 } else { temp_x1 };
+            x2 = if temp_x2 < 63 { temp_x2 - 1 } else { temp_x2 };
+        }
+    }
+
+    let crop_h = y2 - y1 + 1;
+    let crop_w = x2 - x1 + 1;
+
+    // The crop rectangle is fixed for the whole video, so the resampler and the
+    // transform basis are built once here and reused for every frame.
+    let rows = box_weights(y1, crop_h);
+    let cols = box_weights(x1, crop_w);
+    let basis = dct_basis();
+
+    let mut hashes = Vec::with_capacity(n_unique);
+    let mut flat = Vec::with_capacity(n_unique);
+    let mut thumb = [0.0f32; THUMB * THUMB];
+    let mut band = [0.0f32; 64 * THUMB];
+
+    // Iterate the flat buffer in FRAME_STRIDE-sized windows; each `frame` is a
+    // &[u8] of length 4096.
+    for frame in u_frames.chunks_exact(FRAME_STRIDE) {
+        resample(frame, &rows, &cols, &mut band, &mut thumb);
+        let coefficients = low_frequency_block(&thumb, &basis);
+        hashes.push(hash_of(&coefficients));
+        flat.push(is_featureless(&coefficients));
+    }
+
+    (hashes, flat)
+}
+
 /// Fingerprint one video.
 ///
 /// `decode_threads` is this video's share of the process-wide thread budget,
@@ -1632,9 +1722,6 @@ pub fn fingerprint_video(
     // spacing its samples evenly (see `sample_times`).
     let mut unique_frame_times: Vec<Option<u32>> = Vec::new();
 
-    let mut sum = vec![0u64; 64 * 64];
-    let mut sum_sq = vec![0u64; 64 * 64];
-
     // Seconds per unit of the video stream's timestamps. Zero when the header
     // never said, which makes every frame time unknown.
     let stream_time_base = {
@@ -1717,18 +1804,27 @@ pub fn fingerprint_video(
             // onto its packet -- see `sample_ts` there -- so this is the
             // container's own clock making the round trip, not the decoder's
             // opinion of it.
-            unique_frame_times.push(match dec.timestamp() {
+            //
+            // The frame's own `pts`, and NOT `best_effort_timestamp`, which is
+            // what `Frame::timestamp` reads. That is libavcodec's guess, and
+            // once it has seen presentation times go backwards it stops
+            // trusting them and answers with `pkt_dts` -- the dts of the packet
+            // being SENT when this frame came out, which is a later keyframe's.
+            // HEVC hands keyframes back out of order whenever two open-GOP
+            // keyframes are more than half the picture-order-count range apart
+            // (the decoder never sees the frames between them to tell that the
+            // count wrapped), and from the first such reordering on every
+            // picture was filed under someone else's time: the matched-frames
+            // window showed a 0-bit match between two different shots. Seen with
+            // FFmpeg 6.1 on 17 of the local corpus's 19 HEVC files, and never
+            // with the vendored FFmpeg 8. See
+            // `test_a_sample_is_the_picture_of_the_keyframe_it_is_timed_at`.
+            unique_frame_times.push(match dec.pts() {
                 Some(pts) if stream_time_base > 0.0 && pts >= 0 => {
                     Some((pts as f64 * stream_time_base * 1000.0) as u32)
                 }
                 _ => None,
             });
-
-            for (i, &val) in current_frame.iter().enumerate() {
-                let v = val as u64;
-                sum[i] += v;
-                sum_sq[i] += v * v;
-            }
 
             prev_frame.copy_from_slice(&current_frame);
             is_first = false;
@@ -2220,74 +2316,8 @@ pub fn fingerprint_video(
 
     // u_frames holds n_unique * FRAME_STRIDE bytes; the frame count is the time list.
     let n_unique = unique_frame_times.len();
-    let n_f32 = n_unique as f32;
 
-    // 2. Variance & Auto-Crop Algebra (Untouched - accurate)
-    let mut row_max_var = [0.0f32; 64];
-    let mut col_max_var = [0.0f32; 64];
-
-    // Indexed rather than iterated on purpose, and clippy's needless_range_loop
-    // is wrong about it: each cell reads two flat 64x64 buffers and updates two
-    // 64-entry projections, so the iterator form is a zip of chunks_exact(64)
-    // over sum and sum_sq nested inside a zip against row_max_var -- and
-    // col_max_var is walked afresh on every row rather than consumed once.
-    // y and x are coordinates here, not stand-ins for a cursor.
-    #[allow(clippy::needless_range_loop)]
-    for y in 0..64 {
-        for x in 0..64 {
-            let i = y * 64 + x;
-            let mean = sum[i] as f32 / n_f32;
-            let mean_sq = sum_sq[i] as f32 / n_f32;
-            let variance = mean_sq - (mean * mean);
-
-            if variance > row_max_var[y] { row_max_var[y] = variance; }
-            if variance > col_max_var[x] { col_max_var[x] = variance; }
-        }
-    }
-
-    let var_threshold = 2.0;
-    let valid_rows: Vec<usize> = (0..64).filter(|&i| row_max_var[i] > var_threshold).collect();
-    let valid_cols: Vec<usize> = (0..64).filter(|&i| col_max_var[i] > var_threshold).collect();
-
-    let mut y1 = 0; let mut y2 = 63;
-    let mut x1 = 0; let mut x2 = 63;
-
-    if !valid_rows.is_empty() && !valid_cols.is_empty() {
-        let temp_y1 = *valid_rows.first().unwrap();
-        let temp_y2 = *valid_rows.last().unwrap();
-        let temp_x1 = *valid_cols.first().unwrap();
-        let temp_x2 = *valid_cols.last().unwrap();
-
-        if (temp_y2 - temp_y1 + 1) >= 16 && (temp_x2 - temp_x1 + 1) >= 16 {
-            y1 = if temp_y1 > 0 { temp_y1 + 1 } else { temp_y1 };
-            y2 = if temp_y2 < 63 { temp_y2 - 1 } else { temp_y2 };
-            x1 = if temp_x1 > 0 { temp_x1 + 1 } else { temp_x1 };
-            x2 = if temp_x2 < 63 { temp_x2 - 1 } else { temp_x2 };
-        }
-    }
-
-    let crop_h = y2 - y1 + 1;
-    let crop_w = x2 - x1 + 1;
-
-    // The crop rectangle is fixed for the whole video, so the resampler and the
-    // transform basis are built once here and reused for every frame.
-    let rows = box_weights(y1, crop_h);
-    let cols = box_weights(x1, crop_w);
-    let basis = dct_basis();
-
-    let mut hashes = Vec::with_capacity(n_unique);
-    let mut flat = Vec::with_capacity(n_unique);
-    let mut thumb = [0.0f32; THUMB * THUMB];
-    let mut band = [0.0f32; 64 * THUMB];
-
-    // Iterate the flat buffer in FRAME_STRIDE-sized windows; each `frame` is a
-    // &[u8] of length 4096.
-    for frame in u_frames.chunks_exact(FRAME_STRIDE) {
-        resample(frame, &rows, &cols, &mut band, &mut thumb);
-        let coefficients = low_frequency_block(&thumb, &basis);
-        hashes.push(hash_of(&coefficients));
-        flat.push(is_featureless(&coefficients));
-    }
+    let (hashes, flat) = hash_frames(&u_frames);
 
     // Frame pixels are no longer needed; release the large buffer (munmap) now
     // rather than at end of scope, trimming the peak during the cheap tail work.
@@ -2700,6 +2730,85 @@ mod tests {
                 "fingerprint_video did not return: the demux loop is asking a demuxer that \
                  will never say EOF for another packet"
             ),
+        }
+    }
+
+    /// A sample is the picture of the keyframe it is timed at, whatever order
+    /// the decoder hands keyframes back in.
+    ///
+    /// HEVC's open-GOP keyframes (CRA pictures) carry their picture order
+    /// count modulo 2^k, and a decoder that is only ever shown keyframes cannot
+    /// tell when that count wrapped: two keyframes more than half the range
+    /// apart (128 frames at x265's default, 5.3 s at 24 fps) and it reads the
+    /// later as the earlier, and outputs the two the wrong way round. The scan
+    /// used to time each picture by `best_effort_timestamp`, which FFmpeg
+    /// switches to the dts of whatever packet is being SENT once it has seen
+    /// presentation times go backwards -- so from the first reordering on,
+    /// every picture was filed under a later keyframe's time. FFmpeg 6.1 does
+    /// this to 17 of the 19 HEVC files in the local corpus and the vendored
+    /// FFmpeg 8 to none, so on a static build this test cannot fail; on a
+    /// dynamic one against 6.1 it is what tells the two answers apart.
+    ///
+    /// The fixture is x265 at a 150-frame keyframe interval, open GOP. The
+    /// oracle decodes each keyframe alone with a fresh decoder, in demux
+    /// order, where nothing can be reordered, times it by the scan's clock and
+    /// hashes it the way the scan does.
+    #[test]
+    fn test_a_sample_is_the_picture_of_the_keyframe_it_is_timed_at() {
+        init_ffmpeg_for_tests();
+        let path = fixture_named("test_video_open_gop.mkv").to_str().unwrap().to_string();
+        let size = std::fs::metadata(&path).unwrap().len();
+        let fp = fingerprint_video(&path, 0.0, 0.0, 1, 0.0, size, &|_| {}).unwrap().expect("the fixture fingerprints");
+
+        let mut ictx = open_video(&path).unwrap();
+        let stream = ictx.streams().best(ffmpeg_next::media::Type::Video).unwrap();
+        let (index, tb, params) = (stream.index(), f64::from(stream.time_base()), stream.parameters());
+        let packets: Vec<ffmpeg_next::Packet> =
+            ictx.packets().filter(|(s, p)| s.index() == index && p.is_key()).map(|(_, p)| p).collect();
+        assert!(packets.len() >= 4, "the fixture has keyframes enough to reorder");
+        let (mut frames, mut times, mut first) = (Vec::new(), Vec::new(), None);
+        for packet in &packets {
+            let ts = packet.dts().or_else(|| packet.pts()).unwrap();
+            let anchor = *first.get_or_insert(ts);
+            let mut ctx = ffmpeg_next::codec::context::Context::from_parameters(params.clone()).unwrap();
+            unsafe { (*ctx.as_mut_ptr()).thread_count = 1 };
+            let mut dec = ctx.decoder().video().unwrap();
+            let mut frame = ffmpeg_next::frame::Video::empty();
+            let _ = dec.send_packet(packet);
+            if dec.receive_frame(&mut frame).is_err() {
+                dec.send_eof().unwrap();
+                dec.receive_frame(&mut frame).unwrap();
+            }
+            let mut scaler = ffmpeg_next::software::scaling::context::Context::get(
+                frame.format(),
+                frame.width(),
+                frame.height(),
+                ffmpeg_next::format::Pixel::GRAY8,
+                64,
+                64,
+                ffmpeg_next::software::scaling::flag::Flags::FAST_BILINEAR,
+            )
+            .unwrap();
+            let mut gray = ffmpeg_next::frame::Video::empty();
+            scaler.run(&frame, &mut gray).unwrap();
+            for y in 0..64 {
+                frames.extend_from_slice(&gray.data(0)[y * gray.stride(0)..][..64]);
+            }
+            times.push(((ts - anchor) as f64 * tb * 1000.0) as u32);
+        }
+        let (hashes, _) = hash_frames(&frames);
+
+        assert!(!fp.valid_t_start.is_empty());
+        for (&t, &h) in fp.valid_t_start.iter().zip(&fp.valid_hashes) {
+            let k = times.iter().position(|&kt| kt == t).unwrap_or_else(|| panic!("no keyframe at {t} ms; they are at {times:?}"));
+            // Decoded alone rather than after the keyframes before it, a
+            // keyframe can come out a bit or two apart; another keyframe of
+            // this fixture is never that close.
+            let d = |k: usize| (h ^ hashes[k]).count_ones();
+            assert!(d(k) <= 4, "the sample at {t} ms is {} bits from that keyframe: {:?}", d(k), fp.valid_t_start);
+            for other in (0..hashes.len()).filter(|&o| times[o] != t) {
+                assert!(d(other) > d(k), "the sample at {t} ms looks more like the keyframe at {} ms", times[other]);
+            }
         }
     }
 

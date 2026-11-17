@@ -74,6 +74,9 @@ rows.files checkbutton.mark > check { min-width: 26px; min-height: 26px; border-
 rows.files > box { padding: 6px 10px; border-bottom: 1px solid alpha(@theme_fg_color, 0.08); }
 rows.files > box:hover { background-color: alpha(@theme_fg_color, 0.04); }
 rows.files > box.selected { background-color: alpha(@theme_selected_bg_color, 0.3); }
+box.pairs > box.pair { padding: 6px; border-radius: 8px; }
+box.pairs > box.pair:hover { background-color: alpha(currentColor, 0.05); }
+box.pairs > box.pair.selected { background-color: alpha(@theme_selected_bg_color, 0.3); }
 rows.files > box.marked { background-color: alpha(@error_color, 0.15); }
 rows.files > box.marked.selected { background-color: mix(alpha(@error_color, 0.25), alpha(@theme_selected_bg_color, 0.3), 0.5); }
 .files still.frame { background-color: alpha(black, 0.85); border-radius: 3px; }
@@ -905,11 +908,27 @@ impl Results {
             text.append(w);
         }
         let pill = gtk::Label::builder().css_classes(["suggest"]).valign(gtk::Align::Center).build();
+        let compare = gtk::Button::builder()
+            .label("Compare…")
+            .valign(gtk::Align::Center)
+            .focusable(false)
+            .tooltip_text("Compare it with what it matched, frame by frame (C)")
+            .build();
+        compare.connect_clicked({
+            let (weak, item) = (Rc::downgrade(self), item.clone());
+            move |_| {
+                if let (Some(me), Some(i)) = (weak.upgrade(), item.get()) {
+                    me.select_quietly(i);
+                    me.compare();
+                }
+            }
+        });
         let root = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         root.set_focusable(true);
         root.append(&check);
         root.append(&picture);
         root.append(&text);
+        root.append(&compare);
         root.append(&pill);
 
         check.connect_toggled({
@@ -932,9 +951,14 @@ impl Results {
         let click = gtk::GestureClick::builder().button(0).propagation_phase(gtk::PropagationPhase::Capture).build();
         click.connect_pressed({
             let (weak, item) = (Rc::downgrade(self), item.clone());
-            let (root, check) = (root.downgrade(), check.downgrade());
+            let (root, check, compare) = (root.downgrade(), check.downgrade(), compare.downgrade());
             move |g, n, x, y| {
-                let (Some(me), Some(root), Some(check), Some(i)) = (weak.upgrade(), root.upgrade(), check.upgrade(), item.get()) else { return };
+                let (Some(me), Some(root), Some(check), Some(compare), Some(i)) = (weak.upgrade(), root.upgrade(), check.upgrade(), compare.upgrade(), item.get()) else { return };
+                // The Compare button is a button: left to take its own click.
+                let picked = root.pick(x, y, gtk::PickFlags::DEFAULT);
+                if g.current_button() == gdk::BUTTON_PRIMARY && picked.as_ref().is_some_and(|w| w == compare.upcast_ref::<gtk::Widget>() || w.is_ancestor(&compare)) {
+                    return;
+                }
                 let primary = g.current_button() == gdk::BUTTON_PRIMARY;
                 let shift = g.current_event_state().contains(gdk::ModifierType::SHIFT_MASK);
                 if shift && n == 1 && primary {
@@ -942,7 +966,7 @@ impl Results {
                     me.mark_range(i);
                     return;
                 }
-                let on_check = root.pick(x, y, gtk::PickFlags::DEFAULT).is_some_and(|w| w == check || w.is_ancestor(&check));
+                let on_check = picked.is_some_and(|w| w == check || w.is_ancestor(&check));
                 if primary && on_check {
                     // Every press, a quick second one too: two clicks on the
                     // check are two toggles, never a double click that plays.
@@ -1043,6 +1067,7 @@ impl Results {
             (Page::Mark, Some(i)) => self.toggle(i),
             (Page::Menu, Some(_)) => self.popup_menu(None),
             (Page::Open, Some(_)) => self.launch(false),
+            (Page::Compare, Some(_)) => self.compare(),
             (Page::ShowFolder, Some(_)) => self.launch(true),
             (Page::MarkOthers, Some(_)) => self.mark_all_but_selected(),
             (Page::MarkFolder, _) => self.mark_shown(true),
@@ -1946,6 +1971,31 @@ impl Results {
         self.mark_suggested.set_sensitive(!same);
     }
 
+    /// The frames the scan matched between the selected video and what it
+    /// matched, in a window of their own (`matched.rs`).
+    fn compare(self: &Rc<Self>) {
+        let Some(i) = self.selected.get() else { return };
+        let Some((m, _)) = self.shown.borrow().get(i).cloned() else { return };
+        let subject = {
+            let s = self.state.borrow();
+            let model = &s.model;
+            let against = m
+                .compared
+                .iter()
+                .map(|c| {
+                    let how = if Some(c.with) == m.matched_with { "Best match" } else { "Group reference" };
+                    (how, c.clone(), model.file(c.with).clone())
+                })
+                .collect::<Vec<_>>();
+            crate::matched::Subject { file: model.file(m.file).clone(), against }
+        };
+        if subject.against.is_empty() {
+            self.status.set_text("Nothing in its group was measured against it.");
+            return;
+        }
+        crate::matched::open(&self.app, subject);
+    }
+
     /// Play the selected video in the desktop's player, or show its folder.
     fn launch(self: &Rc<Self>, folder: bool) {
         let Some(i) = self.selected.get() else { return };
@@ -2276,7 +2326,7 @@ fn file_name(p: &Path) -> String {
 /// A video's figures as `vid-fp`'s listing prints them, in its order:
 /// length, resolution, frame rate, codec, size, bitrate, bits a frame, and
 /// the samples its fingerprint holds.
-fn facts(f: &vid_fp::found::File) -> String {
+pub(crate) fn facts(f: &vid_fp::found::File) -> String {
     let length = if f.duration > 0.0 { utils::format_duration(f.duration) } else { "-".to_string() };
     [
         length,
