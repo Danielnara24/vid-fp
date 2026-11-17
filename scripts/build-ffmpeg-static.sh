@@ -9,6 +9,12 @@
 #   ./scripts/build-ffmpeg-static.sh                 # -> ./ffmpeg-static
 #   ./scripts/build-ffmpeg-static.sh /opt/ffmpeg     # -> /opt/ffmpeg
 #
+# The Flatpak (flatpak/) builds the same versions with the same configure line
+# through two more options: --shared installs shared libraries instead, and
+# --from=DIR builds the sources already unpacked in DIR/dav1d and DIR/ffmpeg
+# (the manifest fetches them, pinned by sha256, since its build has no
+# network) rather than cloning them.
+#
 # Then, from the repo root:
 #
 #   FFMPEG_DIR="$PWD/ffmpeg-static" cargo build --release --features static-ffmpeg
@@ -57,10 +63,14 @@ DAV1D_COMMIT="54706fc6bc0cdecab7e9593974a4039cc038fca7"
 
 PREFIX=""
 FORCE=0
+SHARED=0
+FROM=""
 for arg in "$@"; do
     case "$arg" in
         --force) FORCE=1 ;;
-        -h|--help) sed -n '2,20p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        --shared) SHARED=1 ;;
+        --from=*) FROM="${arg#--from=}" ;;
+        -h|--help) sed -n '2,26p' "$0" | sed 's/^# \?//'; exit 0 ;;
         -*) echo "error: unknown option $arg" >&2; exit 1 ;;
         *)
             if [[ -n "$PREFIX" ]]; then
@@ -75,11 +85,26 @@ PREFIX="${PREFIX:-$PWD/ffmpeg-static}"
 
 mkdir -p "$PREFIX"
 PREFIX="$(cd "$PREFIX" && pwd)"
-BUILD="$PREFIX/.build"
-STAMP="$PREFIX/.stamp"
+if [[ -n "$FROM" ]]; then
+    # Sources someone else fetched and pinned: build them where they are, and
+    # leave nothing under the prefix but what is installed.
+    BUILD="$(cd "$FROM" && pwd)"
+    STAMP=/dev/null
+else
+    BUILD="$PREFIX/.build"
+    STAMP="$PREFIX/.stamp"
+fi
 WANT="ffmpeg=$FFMPEG_VERSION dav1d=$DAV1D_VERSION"
+if [[ "$SHARED" == "1" ]]; then
+    LINKAGE=shared
+    WANT="$WANT shared"
+else
+    LINKAGE=static
+fi
 
-if [[ "$FORCE" == "1" ]]; then
+if [[ -n "$FROM" ]]; then
+    :
+elif [[ "$FORCE" == "1" ]]; then
     rm -rf "$PREFIX"/{.build,.stamp,lib,include,share,bin}
 elif [[ -f "$STAMP" && "$(cat "$STAMP")" == "$WANT" ]]; then
     echo "==> $PREFIX is already at $WANT -- nothing to do (--force to rebuild)"
@@ -92,7 +117,9 @@ fi
 # missing, so rather than send you to your package manager they go in a venv
 # under the prefix. Everything else has to come from the system.
 missing=()
-for tool in git make nasm pkg-config python3; do
+tools=(make nasm pkg-config python3)
+[[ -n "$FROM" ]] || tools+=(git)
+for tool in "${tools[@]}"; do
     command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
 done
 command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1 || missing+=("gcc")
@@ -126,8 +153,9 @@ JOBS="$(nproc 2>/dev/null || echo 4)"
 
 # --- dav1d -----------------------------------------------------------------
 #
-# Static only, and with its own tools/tests off: we want libdav1d.a and its
-# headers, nothing else. BSD-2-Clause, so it adds attribution but no copyleft.
+# Static (shared with --shared), and with its own tools/tests off: we want the
+# library and its headers, nothing else. BSD-2-Clause, so it adds attribution
+# but no copyleft.
 #
 # Fetched from VideoLAN's GitHub mirror rather than from code.videolan.org,
 # which is upstream's canonical host and cannot be cloned any more: it sits
@@ -151,11 +179,15 @@ JOBS="$(nproc 2>/dev/null || echo 4)"
 # That host is a plain file mirror and is NOT behind Anubis, so it is the place
 # to look if the GitHub mirror is ever missing a tag this script wants.
 echo "==> building dav1d $DAV1D_VERSION"
-if [[ ! -d "$BUILD/dav1d" ]]; then
+if [[ -z "$FROM" && ! -d "$BUILD/dav1d" ]]; then
     git clone --depth 1 -b "$DAV1D_VERSION" \
         https://github.com/videolan/dav1d.git "$BUILD/dav1d"
 fi
-got="$(git -C "$BUILD/dav1d" rev-parse HEAD)"
+if [[ -n "$FROM" ]]; then
+    got="$DAV1D_COMMIT" # pinned by the caller's checksum
+else
+    got="$(git -C "$BUILD/dav1d" rev-parse HEAD)"
+fi
 if [[ "$got" != "$DAV1D_COMMIT" ]]; then
     echo "error: dav1d $DAV1D_VERSION is not the commit this script expects." >&2
     echo "  expected $DAV1D_COMMIT" >&2
@@ -169,7 +201,7 @@ meson setup "$BUILD/dav1d/build" "$BUILD/dav1d" \
     --prefix="$PREFIX" \
     --libdir=lib \
     --buildtype=release \
-    --default-library=static \
+    --default-library="$LINKAGE" \
     -Denable_tools=false \
     -Denable_tests=false
 ninja -C "$BUILD/dav1d/build" -j "$JOBS"
@@ -195,11 +227,15 @@ ninja -C "$BUILD/dav1d/build" install
 # postproc takes no flag here -- FFmpeg 8 dropped it from LIBRARY_LIST, so
 # --disable-postproc is now an "Unknown option" that aborts configure.
 echo "==> building FFmpeg $FFMPEG_VERSION"
-if [[ ! -d "$BUILD/ffmpeg" ]]; then
+if [[ -z "$FROM" && ! -d "$BUILD/ffmpeg" ]]; then
     git clone --depth 1 -b "$FFMPEG_VERSION" \
         https://github.com/FFmpeg/FFmpeg "$BUILD/ffmpeg"
 fi
-got="$(git -C "$BUILD/ffmpeg" rev-parse HEAD)"
+if [[ -n "$FROM" ]]; then
+    got="$FFMPEG_COMMIT" # pinned by the caller's checksum
+else
+    got="$(git -C "$BUILD/ffmpeg" rev-parse HEAD)"
+fi
 if [[ "$got" != "$FFMPEG_COMMIT" ]]; then
     echo "error: FFmpeg $FFMPEG_VERSION is not the commit this script expects." >&2
     echo "  expected $FFMPEG_COMMIT" >&2
@@ -213,13 +249,16 @@ fi
 
 pushd "$BUILD/ffmpeg" >/dev/null
 make distclean >/dev/null 2>&1 || true
+if [[ "$SHARED" == "1" ]]; then
+    linkage=(--enable-shared --disable-static)
+else
+    linkage=(--pkg-config-flags="--static" --enable-static --disable-shared)
+fi
 ./configure \
     --prefix="$PREFIX" \
-    --pkg-config-flags="--static" \
+    "${linkage[@]}" \
     --extra-cflags="-I$PREFIX/include" \
     --extra-ldflags="-L$PREFIX/lib" \
-    --enable-static \
-    --disable-shared \
     --enable-pic \
     --enable-libdav1d \
     --disable-autodetect \
@@ -250,10 +289,10 @@ popd >/dev/null
 # dav1d, which produces a working build that cannot decode a single AV1 frame.
 # Cheap to check, and catastrophic to miss.
 echo "==> verifying"
-for lib in libavcodec libavformat libavutil libswscale; do
-    [[ -f "$PREFIX/lib/$lib.a" ]] || { echo "error: $lib.a was not installed" >&2; exit 1; }
+if [[ "$SHARED" == "1" ]]; then ext=so; else ext=a; fi
+for lib in libavcodec libavformat libavutil libswscale libdav1d; do
+    [[ -e "$PREFIX/lib/$lib.$ext" ]] || { echo "error: $lib.$ext was not installed" >&2; exit 1; }
 done
-[[ -f "$PREFIX/lib/libdav1d.a" ]] || { echo "error: libdav1d.a was not installed" >&2; exit 1; }
 
 if ! grep -q '^#define CONFIG_LIBDAV1D 1' "$BUILD/ffmpeg/config.h" 2>/dev/null; then
     echo "error: FFmpeg was configured WITHOUT libdav1d -- the resulting binary" >&2
@@ -264,6 +303,8 @@ fi
 echo "$WANT" > "$STAMP"
 echo
 echo "==> done: $PREFIX  ($WANT, LGPL 2.1+, AV1 via dav1d)"
-echo
-echo "Build vid-fp against it with:"
-echo "  FFMPEG_DIR=\"$PREFIX\" cargo build --release --features static-ffmpeg"
+if [[ "$SHARED" == "0" ]]; then
+    echo
+    echo "Build vid-fp against it with:"
+    echo "  FFMPEG_DIR=\"$PREFIX\" cargo build --release --features static-ffmpeg"
+fi

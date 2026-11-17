@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.danielnara24.vid-fp</id>
+  <name>vid-fp</name>
+  <summary>Find duplicate videos and clips</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <developer id="io.github.danielnara24">
+    <name>Danielnara24</name>
+  </developer>
+
+  <description>
+    <p>
+      vid-fp finds copies of the same video, even when they are not the same
+      file. It fingerprints each video from its keyframes, so it still finds a
+      match after a video has been re-encoded at another resolution, bitrate,
+      frame rate, codec or container, and when one file is only a section of
+      another.
+    </p>
+    <p>It finds:</p>
+    <ul>
+      <li>The same video re-encoded at a different resolution, bitrate or quality</li>
+      <li>The same video in a different container: MP4, MKV, AVI, MOV, WebM, TS and more</li>
+      <li>A clip, highlight or excerpt cut out of a longer recording</li>
+      <li>Copies under different names, in different folders, across several drives</li>
+    </ul>
+    <p>
+      Pick folders and start the scan, then go through the groups and choose
+      which videos to move to the Trash. For each video the scan suggests
+      whether to keep or delete it, and nothing is marked until you ask. The
+      frames behind a match can be compared side by side, with a chart of where
+      one video sits in the other.
+    </p>
+    <p>
+      The command-line tool is included as well:
+      flatpak run --command=vid-fp io.github.danielnara24.vid-fp --help
+    </p>
+  </description>
+
+  <launchable type="desktop-id">io.github.danielnara24.vid-fp.desktop</launchable>
+  <provides>
+    <binary>vid-fp</binary>
+    <binary>vid-fp-gui</binary>
+  </provides>
+
+  <url type="homepage">https://github.com/Danielnara24/vid-fp</url>
+  <url type="bugtracker">https://github.com/Danielnara24/vid-fp/issues</url>
+  <url type="vcs-browser">https://github.com/Danielnara24/vid-fp</url>
+
+  <screenshots>
+    <screenshot type="default">
+      <caption>A film, a re-encoded copy and a clip cut from it, with the copies to delete marked</caption>
+      <image>https://raw.githubusercontent.com/Danielnara24/vid-fp/main/flatpak/screenshots/results.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>The frames a clip shares with the film it was cut from, on one time scale</caption>
+      <image>https://raw.githubusercontent.com/Danielnara24/vid-fp/main/flatpak/screenshots/compare.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Folders and options, after a scan</caption>
+      <image>https://raw.githubusercontent.com/Danielnara24/vid-fp/main/flatpak/screenshots/setup.png</image>
+    </screenshot>
+  </screenshots>
+
+  <categories>
+    <category>AudioVideo</category>
+    <category>Video</category>
+  </categories>
+  <keywords>
+    <keyword>duplicate</keyword>
+    <keyword>duplicates</keyword>
+    <keyword>videos</keyword>
+    <keyword>clips</keyword>
+    <keyword>movies</keyword>
+  </keywords>
+
+  <requires>
+    <display_length compare="ge">768</display_length>
+  </requires>
+  <supports>
+    <control>keyboard</control>
+    <control>pointing</control>
+  </supports>
+
+  <branding>
+    <color type="primary" scheme_preference="light">#99c1f1</color>
+    <color type="primary" scheme_preference="dark">#405a86</color>
+  </branding>
+
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="0.39.0" date="2026-11-17">
+      <description>
+        <p>A Compare window shows the frames behind each match. HEVC videos are timed correctly when built against FFmpeg 6, so every video's fingerprint is made again once after the update. A Trash or recycle bin inside a scanned folder is no longer scanned.</p>
+      </description>
+    </release>
+  </releases>
+</component>

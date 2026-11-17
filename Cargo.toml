@@ -1,6 +1,6 @@
 [package]
 name = "vid-fp"
-version = "0.38.0"
+version = "0.39.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Fast video duplicate and clip finder using perceptual keyframe fingerprints"
@@ -14,7 +14,8 @@ categories = ["command-line-utilities", "multimedia::video"]
 # is on GitHub for contributors and has nothing to say to a crate consumer.
 # tests/fixtures IS shipped (188 KB) so `cargo test` works from the published
 # source; tests/local_accuracy_test.rs is gitignored and never packaged.
-exclude = ["CLAUDE.md"]
+# flatpak/ is packaging for the window (sources list, screenshots), not source.
+exclude = ["CLAUDE.md", "flatpak/"]
 
 # The scan, the report and the disposal, shared by the two binaries below.
 [lib]

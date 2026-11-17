@@ -1,0 +1,92 @@
+# The desktop app as a Flatpak: GTK 4 from the GNOME runtime, and FFmpeg 8 +
+# dav1d at exactly the versions the released binaries link statically, so it
+# runs the same on every distribution and fingerprints exactly as they do.
+#
+# Build and install it locally from the repository's root:
+#
+#   flatpak run org.flatpak.Builder --user --install --force-clean \
+#     --install-deps-from=flathub build-flatpak flatpak/io.github.danielnara24.vid-fp.yml
+#
+# The build has no network: the crates come from cargo-sources.json, made
+# from Cargo.lock by flatpak-builder-tools' flatpak-cargo-generator.py, and
+# made again whenever Cargo.lock changes:
+#
+#   python3 flatpak-cargo-generator.py Cargo.lock -o flatpak/cargo-sources.json
+id: io.github.danielnara24.vid-fp
+runtime: org.gnome.Platform
+runtime-version: '51'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+  # libclang, which bindgen needs to read FFmpeg's headers.
+  - org.freedesktop.Sdk.Extension.llvm22
+command: vid-fp-gui
+finish-args:
+  - --share=ipc
+  - --socket=fallback-x11
+  - --socket=wayland
+  - --device=dri
+  # A duplicate finder is pointed at any folder: the home folder, a second
+  # disk under /mnt or /media, a camera card under /run/media. It reads the
+  # desktop's thumbnail cache (~/.cache/thumbnails) to draw its rows and
+  # moves what the user chooses to the Trash, through the Trash portal. And
+  # it loads the desktop's GTK 4 stylesheet from there itself
+  # (`main::desktop_stylesheet`).
+  - --filesystem=host
+modules:
+  # FFmpeg n8.1.2 and dav1d 1.5.4, built by the script the release uses, with
+  # its configure line, as shared libraries: the LGPL is met by the user being
+  # able to replace them. In /app/lib, ahead of the runtime's own libavcodec,
+  # which has the same soname and fewer decoders.
+  - name: ffmpeg
+    buildsystem: simple
+    build-commands:
+      - bash build-ffmpeg-static.sh --shared --from=. /app
+    cleanup:
+      - /include
+      - /lib/pkgconfig
+      - /share
+    sources:
+      - type: archive
+        url: https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz
+        sha256: 464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c
+        dest: ffmpeg
+      - type: archive
+        url: https://downloads.videolan.org/pub/videolan/dav1d/1.5.4/dav1d-1.5.4.tar.xz
+        sha256: 686616b7c69eb88d44459391ab25cac13b6647a3b288835c5784e71c1514a5c5
+        dest: dav1d
+      - type: file
+        path: ../scripts/build-ffmpeg-static.sh
+
+  - name: vid-fp
+    buildsystem: simple
+    build-options:
+      # clang on the PATH as well as libclang: bindgen asks the binary for
+      # its include paths, and without them glibc's <limits.h> cannot find
+      # clang's own.
+      append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm22/bin
+      prepend-ld-library-path: /usr/lib/sdk/llvm22/lib
+      env:
+        CARGO_HOME: /run/build/vid-fp/cargo
+        LIBCLANG_PATH: /usr/lib/sdk/llvm22/lib
+    build-commands:
+      - cargo --offline fetch --manifest-path Cargo.toml
+      - cargo --offline build --release --locked --features gui
+      - install -Dm755 target/release/vid-fp /app/bin/vid-fp
+      - install -Dm755 target/release/vid-fp-gui /app/bin/vid-fp-gui
+      - install -Dm644 data/io.github.danielnara24.vid-fp.desktop /app/share/applications/io.github.danielnara24.vid-fp.desktop
+      - install -Dm644 data/io.github.danielnara24.vid-fp.svg /app/share/icons/hicolor/scalable/apps/io.github.danielnara24.vid-fp.svg
+      - install -Dm644 flatpak/io.github.danielnara24.vid-fp.metainfo.xml /app/share/metainfo/io.github.danielnara24.vid-fp.metainfo.xml
+    sources:
+      - type: dir
+        path: ..
+        skip:
+          - target
+          - ffmpeg-static
+          - benchmark
+          - build-flatpak
+          - repo-flatpak
+          - .flatpak-builder
+          - .git
+          - .claude
+      - cargo-sources.json

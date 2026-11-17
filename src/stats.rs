@@ -112,6 +112,7 @@ pub struct RunStats {
     pub skipped_short: Tally,
     pub skipped_alias: Tally,
     pub skipped_excluded: Tally,
+    pub skipped_trash: Tally,
 
     // --- neither: what the run DID, for the one caller that has to know ------
     /// How many cache entries the prune removed.
@@ -204,7 +205,7 @@ impl RunStats {
     // Work dropped by an interrupt is deliberately absent. The user pressed the
     // key; "you stopped it" already explains everything the number would, and
     // the exit code says it more precisely than a count of half-decoded files.
-    fn skips(&self) -> [(&Tally, &'static str); 3] {
+    fn skips(&self) -> [(&Tally, &'static str); 4] {
         [
             (&self.skipped_short, "video(s) shorter than --min-duration"),
             (
@@ -226,6 +227,12 @@ impl RunStats {
             (
                 &self.skipped_excluded,
                 "named path(s) skipped because --exclude covers them",
+            ),
+            // Listed by path, so a walk that passed one over says where: a
+            // Trash is how a user looks inside one, by naming it.
+            (
+                &self.skipped_trash,
+                "Trash or recycle bin folder(s) not walked (name one to scan it)",
             ),
         ]
     }

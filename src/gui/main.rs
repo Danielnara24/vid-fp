@@ -320,7 +320,7 @@ fn follow_desktop_fonts() {
 /// has loaded it already.
 fn desktop_stylesheet() {
     let own = std::env::var_os("XDG_CONFIG_HOME").map(|d| PathBuf::from(d).join("gtk-4.0/gtk.css"));
-    let Some(desktop) = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/gtk-4.0/gtk.css")) else { return };
+    let Some(desktop) = vid_fp::desktop_dir("XDG_CONFIG_HOME", ".config").map(|d| d.join("gtk-4.0/gtk.css")) else { return };
     if own.as_ref() == Some(&desktop) || own.as_ref().is_some_and(|o| o.exists()) || !desktop.is_file() {
         return;
     }

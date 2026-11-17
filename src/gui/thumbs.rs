@@ -246,13 +246,9 @@ fn to_bgra_premultiplied(px: &mut [u8]) {
 }
 
 /// The desktop's thumbnail cache: `$XDG_CACHE_HOME/thumbnails`, or
-/// `~/.cache/thumbnails`.
+/// `~/.cache/thumbnails`; the host's, inside a Flatpak (`desktop_dir`).
 fn thumbnail_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
-    Some(base.join("thumbnails"))
+    Some(vid_fp::desktop_dir("XDG_CACHE_HOME", ".cache")?.join("thumbnails"))
 }
 
 /// A picture from the freedesktop thumbnail cache under `dir`, made for

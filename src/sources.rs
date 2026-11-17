@@ -461,6 +461,105 @@ impl Collecting {
     }
 }
 
+/// The user's XDG folder `var` (`$XDG_DATA_HOME`, `$XDG_CACHE_HOME`, ...), or
+/// `~/under_home` when it is not set, as the desktop has it.
+///
+/// Inside a Flatpak these variables name the app's own folders under
+/// `~/.var/app/<id>`, not the desktop's: the Trash the file manager empties and
+/// the thumbnail cache it fills are where the host's variables say
+/// (`$HOST_XDG_DATA_HOME`, which Flatpak sets only when the host had it) or at
+/// the defaults under the home folder, which is the same in both.
+pub fn desktop_dir(var: &str, under_home: &str) -> Option<PathBuf> {
+    user_dir(&|k: &str| std::env::var_os(k), sandboxed(), var, under_home)
+}
+
+/// Whether this process runs inside a Flatpak, which puts `/.flatpak-info` at
+/// the root of every sandbox.
+fn sandboxed() -> bool {
+    Path::new("/.flatpak-info").exists()
+}
+
+fn user_dir(
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    sandboxed: bool,
+    var: &str,
+    under_home: &str,
+) -> Option<PathBuf> {
+    let set = if sandboxed { env(&format!("HOST_{var}")) } else { env(var) };
+    // A relative path is to be ignored, the XDG spec says.
+    set.map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| env("HOME").map(|h| PathBuf::from(h).join(under_home)))
+}
+
+/// Folders a walk does not go into because what is in them is not the library:
+/// a Trash or a recycle bin. Those hold files someone already decided to throw
+/// away, and the window moves duplicates there, so walking one found every
+/// discarded copy again, beside the file that was kept, as a duplicate of it.
+///
+/// By name, the ones a removable drive or a home folder carries: the
+/// freedesktop topdir trashes (`.Trash`, `.Trash-1000`), macOS's `.Trashes`,
+/// Windows's `$RECYCLE.BIN` and `RECYCLER`, a NAS's recycle bins and snapshot
+/// views (Synology's `#recycle` and `#snapshot`, QNAP's `@Recycle` and
+/// `@Recently-Snapshot`), and fsck's `lost+found`, which is root's alone and
+/// would otherwise be a folder the walk cannot open on every ext4 drive. By
+/// place, the home Trash (`$XDG_DATA_HOME/Trash`), whose own name is too
+/// ordinary to go by: the desktop's, and inside a Flatpak the app's own too.
+///
+/// Only a folder met during a walk is passed over. Named as a root it is
+/// scanned like any other, which is how to look inside one, and each one
+/// passed over is listed among the skips (`skipped_trash`).
+struct SetAside {
+    /// Canonical paths of the home Trash, where it exists.
+    places: Vec<PathBuf>,
+}
+
+impl SetAside {
+    fn here() -> SetAside {
+        let env = |k: &str| std::env::var_os(k);
+        let mut places: Vec<PathBuf> = [false, sandboxed()]
+            .into_iter()
+            .filter_map(|desktop| user_dir(&env, desktop, "XDG_DATA_HOME", ".local/share"))
+            .filter_map(|d| std::fs::canonicalize(d.join("Trash")).ok())
+            .collect();
+        places.sort();
+        places.dedup();
+        SetAside { places }
+    }
+
+    /// Whether a directory the walk has met is one of them. `path` is
+    /// canonical unless a link led here, which `through_links` says.
+    fn holds(&self, path: &Path, through_links: bool) -> bool {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if name == ".trash"
+            || name.starts_with(".trash-")
+            || matches!(
+                name.as_str(),
+                ".trashes"
+                    | "$recycle.bin"
+                    | "recycler"
+                    | "#recycle"
+                    | "#snapshot"
+                    | "@recycle"
+                    | "@recently-snapshot"
+                    | "lost+found"
+            )
+        {
+            return true;
+        }
+        if self.places.is_empty() {
+            return false;
+        }
+        if self.places.iter().any(|p| p == path) {
+            return true;
+        }
+        through_links && std::fs::canonicalize(path).is_ok_and(|real| self.places.contains(&real))
+    }
+}
+
 /// Walk one folder, appending every video in it. Returns false if interrupted.
 fn walk_folder(
     base: &Path,
@@ -484,9 +583,19 @@ fn walk_folder(
     // a link is PRUNED rather than merely rejected file by file. Folders are
     // few, so a realpath each is cheap; the files inside are checked further
     // down, once the extension filter has thinned them out.
+    let set_aside = SetAside::here();
     let it = walker.into_iter().filter_entry(|e| {
         let through_links = e.file_type().is_dir() && (follow || e.path_is_symlink());
-        !is_excluded_target(e.path(), excludes, through_links)
+        if is_excluded_target(e.path(), excludes, through_links) {
+            return false;
+        }
+        // Without -r a subfolder is never entered, so there is nothing to set aside.
+        if sources.recursive && e.depth() > 0 && e.file_type().is_dir() && set_aside.holds(e.path(), through_links) {
+            log::debug!("Not walking {}: a Trash or recycle bin", e.path().display());
+            stats.skipped_trash.record(e.path().display().to_string());
+            return false;
+        }
+        true
     });
 
     for entry in it {
@@ -1002,6 +1111,76 @@ mod tests {
 
     fn scanned(sources: &Sources, stats: &RunStats) -> Vec<ScannedFile> {
         library(sources, stats).files
+    }
+
+    /// A Trash or recycle bin met during a walk is passed over and listed, and
+    /// named as a root it is scanned like any other folder.
+    #[test]
+    fn test_a_walk_does_not_go_into_a_trash() {
+        let dir = tempfile::tempdir().unwrap();
+        let kept = touch(dir.path(), "lib/a.mkv");
+        touch(dir.path(), "lib/.Trash-1000/files/a.mkv");
+        touch(dir.path(), "lib/$RECYCLE.BIN/b.mkv");
+        touch(dir.path(), "lib/#recycle/c.mkv");
+        let include = vec![dir.path().join("lib").to_string_lossy().to_string()];
+        let mkv = extensions_of(&["mkv"]);
+        let mut src = sources(&include, &[], &mkv);
+        src.recursive = true;
+        let stats = RunStats::default();
+        assert_eq!(collected(&src, &stats), vec![kept.clone()]);
+        assert_eq!(stats.skipped_trash.count(), 3);
+
+        src.recursive = false;
+        let stats = RunStats::default();
+        assert_eq!(collected(&src, &stats), vec![kept]);
+        assert_eq!(stats.skipped_trash.count(), 0, "a walk without -r enters no folder to set aside");
+
+        let named = vec![dir.path().join("lib/.Trash-1000").to_string_lossy().to_string()];
+        let mut src = sources(&named, &[], &mkv);
+        src.recursive = true;
+        let stats = RunStats::default();
+        assert_eq!(collected(&src, &stats).len(), 1, "a Trash named as a root is scanned");
+        assert_eq!(stats.skipped_trash.count(), 0);
+    }
+
+    /// The home Trash is set aside by place, since `Trash` is too ordinary a
+    /// name to go by.
+    #[test]
+    fn test_the_home_trash_is_known_by_place_and_not_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let trash = dir.path().join("home/.local/share/Trash");
+        fs::create_dir_all(&trash).unwrap();
+        let set = SetAside { places: vec![fs::canonicalize(&trash).unwrap()] };
+        assert!(set.holds(&fs::canonicalize(&trash).unwrap(), false));
+        let other = dir.path().join("Videos/Trash");
+        fs::create_dir_all(&other).unwrap();
+        assert!(!set.holds(&fs::canonicalize(&other).unwrap(), false), "a folder of that name elsewhere is a folder");
+    }
+
+    #[test]
+    fn test_inside_a_flatpak_the_desktops_folders_are_the_hosts() {
+        let vars = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| std::ffi::OsString::from(v))
+        };
+        let sandbox = vars(&[("HOME", "/home/u"), ("XDG_DATA_HOME", "/home/u/.var/app/x/data")]);
+        assert_eq!(
+            user_dir(&sandbox, false, "XDG_DATA_HOME", ".local/share"),
+            Some(PathBuf::from("/home/u/.var/app/x/data")),
+            "the app's own"
+        );
+        assert_eq!(
+            user_dir(&sandbox, true, "XDG_DATA_HOME", ".local/share"),
+            Some(PathBuf::from("/home/u/.local/share")),
+            "the desktop's default"
+        );
+        let host_set = vars(&[("HOME", "/home/u"), ("HOST_XDG_CACHE_HOME", "/cache/u")]);
+        assert_eq!(user_dir(&host_set, true, "XDG_CACHE_HOME", ".cache"), Some(PathBuf::from("/cache/u")));
+        let relative = vars(&[("HOME", "/home/u"), ("XDG_CACHE_HOME", "cache")]);
+        assert_eq!(
+            user_dir(&relative, false, "XDG_CACHE_HOME", ".cache"),
+            Some(PathBuf::from("/home/u/.cache")),
+            "a relative path is ignored, as the spec says"
+        );
     }
 
     /// The walk's own answer to "are these video files, or just files", which is

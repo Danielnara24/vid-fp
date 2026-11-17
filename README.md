@@ -99,7 +99,35 @@ Needs `git make nasm pkg-config python3 python3-venv build-essential`. The
 script builds pinned FFmpeg and dav1d releases into `./ffmpeg-static` and is a
 no-op on later runs.
 
-### Installing the desktop app
+### Installing the desktop app: Flatpak
+
+The Flatpak runs on any distribution with Flatpak, Ubuntu 22.04 included.
+Download `vid-fp-x86_64.flatpak` from the
+[latest release](https://github.com/Danielnara24/vid-fp/releases/latest) and
+install it:
+
+```bash
+flatpak install --user vid-fp-x86_64.flatpak
+flatpak run io.github.danielnara24.vid-fp
+```
+
+Flatpak itself is installed on Fedora, Linux Mint and most other desktops
+already; on Ubuntu, `sudo apt install flatpak` first, then add Flathub as
+[its setup page](https://flathub.org/setup) shows.
+
+The command line comes with it. To start either by its short name, add these
+lines to `~/.bashrc` (or your shell's own file):
+
+```bash
+alias vid-fp='flatpak run --command=vid-fp io.github.danielnara24.vid-fp'
+alias vid-fp-gui='flatpak run io.github.danielnara24.vid-fp'
+```
+
+The Flatpak keeps its cache, settings and last scan in
+`~/.var/app/io.github.danielnara24.vid-fp/`, apart from those of a `vid-fp`
+installed otherwise.
+
+### Installing the desktop app: binary
 
 `vid-fp-gui` needs GTK 4.10 or newer (Ubuntu 23.04+, Debian 13+, Fedora 38+):
 
@@ -179,6 +207,8 @@ vid-fp ~/Videos -r -o - --format csv | grep DELETE
 ```
 
 By default the scan is **not** recursive. Add `-r` to descend into subfolders.
+A Trash or recycle bin inside a scanned folder (`.Trash-1000`, `$RECYCLE.BIN`,
+a NAS's `#recycle`, the home Trash) is not walked; name it to scan it.
 
 Files are identified by inode, not by path, so a file reachable through a
 symlink, a hard link, or two overlapping scan folders is fingerprinted and

@@ -21,6 +21,10 @@
 #                                      -> the desktop app, same two names
 #                                         (`build-gui`); FFmpeg bundled the
 #                                         same way, GTK 4 from the system
+#   vid-fp-<version>-x86_64.flatpak, vid-fp-x86_64.flatpak
+#                                      -> the desktop app as a Flatpak
+#                                         (`flatpak`): GTK 4 from the GNOME
+#                                         runtime, FFmpeg 8 + dav1d shared
 #   vid-fp-<version>-ffmpeg-static-libs.tar.gz
 #     -> the LGPL relink kit; see the "LGPL" step below. Not optional.
 #
@@ -380,6 +384,91 @@ jobs:
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+
+  flatpak:
+    name: Flatpak bundle
+    # The desktop app with GTK 4 from the GNOME runtime, for distributions
+    # whose own GTK is older than 4.10 (Ubuntu 22.04). FFmpeg and dav1d are
+    # the release's versions, built by the same script, as shared libraries.
+    # Built from the same manifest as a local flatpak-builder build, offline,
+    # from flatpak/cargo-sources.json. After the window's job, so it ships
+    # only what was tested and never races it to create the release.
+    needs: build-gui
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-51
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check cargo-sources.json matches Cargo.lock
+        # A crate in Cargo.lock that the generated sources lack fails the
+        # offline build half an hour in; say which one here instead.
+        run: |
+          python3 - <<'PY'
+          import json, re
+          lock = set(re.findall(r'name = "([^"]+)"\nversion = "([^"]+)"\nsource = "registry', open("Cargo.lock").read()))
+          dests = {s.get("dest", "") for s in json.load(open("flatpak/cargo-sources.json"))}
+          missing = sorted(f"{n}-{v}" for n, v in lock if f"cargo/vendor/{n}-{v}" not in dests)
+          if missing:
+              raise SystemExit("::error::flatpak/cargo-sources.json is out of date; regenerate it from Cargo.lock. Missing: " + ", ".join(missing))
+          PY
+
+      - name: Check the metainfo names this release
+        # Software centres show the newest <release> as what is installed.
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          NEWEST=$(grep -o '<release version="[^"]*"' flatpak/io.github.danielnara24.vid-fp.metainfo.xml | head -1 | cut -d'"' -f2)
+          if [ "$NEWEST" != "$VERSION" ]; then
+            echo "::error::add a <release> for $VERSION at the top of the metainfo's <releases> (newest is $NEWEST)"
+            exit 1
+          fi
+
+      - name: Build
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: vid-fp-x86_64.flatpak
+          manifest-path: flatpak/io.github.danielnara24.vid-fp.yml
+          cache-key: flatpak-builder-${{ github.sha }}
+          upload-artifact: false
+
+      - name: Verify the bundle
+        # The window's scan runs without a display, so the installed app can
+        # be smoke tested as the binary is: an empty folder is a clean run.
+        # FFmpeg must be the bundled one (the runtime has a libavcodec of the
+        # same soname and fewer decoders), and AV1 must decode.
+        run: |
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y --noninteractive vid-fp-x86_64.flatpak
+          APP=io.github.danielnara24.vid-fp
+          flatpak run --command=vid-fp $APP --version
+          mkdir -p "$HOME/check/empty"
+          flatpak run --command=vid-fp-gui $APP --worker "$HOME/check/r.json" vid-fp -- "$HOME/check/empty"
+          grep -q '"found":0' "$HOME/check/r.json"
+          flatpak run --command=sh $APP -c 'ldd /app/bin/vid-fp' | tee "$HOME/check/ldd"
+          grep -q 'libavcodec.so.62 => /app/lib/' "$HOME/check/ldd"
+          dnf install -y ffmpeg-free 2>/dev/null || apt-get install -y ffmpeg 2>/dev/null || true
+          if command -v ffmpeg >/dev/null; then
+            mkdir -p "$HOME/check/av1"
+            ffmpeg -v error -f lavfi -i "testsrc=size=320x240:rate=10:duration=6" \
+              -c:v libaom-av1 -cpu-used 8 -g 10 "$HOME/check/av1/a.mkv"
+            cp "$HOME/check/av1/a.mkv" "$HOME/check/av1/b.mkv"
+            flatpak run --command=vid-fp $APP "$HOME/check/av1" -q
+          else
+            echo "::warning::no ffmpeg in the container to make an AV1 sample; AV1 not checked"
+          fi
+
+      - name: Upload to release
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          cp vid-fp-x86_64.flatpak "dist/vid-fp-${VERSION}-x86_64.flatpak"
+          cp vid-fp-x86_64.flatpak dist/vid-fp-x86_64.flatpak
+          cd dist && for f in *; do sha256sum "$f" > "$f.sha256"; done
+
+      - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
 

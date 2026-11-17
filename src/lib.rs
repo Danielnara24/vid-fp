@@ -10,6 +10,7 @@ mod stats;
 pub mod thumbnail;
 pub mod utils;
 mod sources;
+pub use sources::desktop_dir;
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
@@ -516,6 +517,8 @@ struct Args {
     null: bool,
 
     /// Scan folders recursively (off by default)
+    ///
+    /// A Trash or recycle bin met on the way is not walked; name it to scan it.
     #[arg(short = 'r', long = "recursive")]
     recursive: bool,
 
