@@ -265,8 +265,8 @@ impl Chart {
         let mut drawn = std::collections::HashSet::new();
         cr.set_line_width(1.0);
         fg(0.3);
-        for i in 0..self.pairs.len() {
-            if drawn.insert((self.pairs[i].0, self.pairs[i].1)) {
+        for (i, &(a, b, _)) in self.pairs.iter().enumerate() {
+            if drawn.insert((a, b)) {
                 line(i);
             }
         }

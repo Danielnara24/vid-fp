@@ -74,7 +74,7 @@ unsafe extern "C" {
     fn dup2(old: i32, new: i32) -> i32;
     fn signal(sig: i32, handler: usize) -> usize;
     fn execv(path: *const std::ffi::c_char, argv: *const *const std::ffi::c_char) -> i32;
-    fn write(fd: i32, buf: *const u8, n: usize) -> isize;
+    fn write(fd: i32, buf: *const std::ffi::c_void, n: usize) -> isize;
     fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
     fn getpid() -> i32;
     fn getppid() -> i32;
@@ -148,7 +148,7 @@ fn spawn(program: &Path, argv: &[OsString]) -> std::io::Result<Child> {
                 execv(program.as_ptr(), argp.as_ptr());
             }
             let errno = (*__errno_location()).to_ne_bytes();
-            write(fail_fd, errno.as_ptr(), errno.len());
+            write(fail_fd, errno.as_ptr().cast(), errno.len());
             _exit(127);
         }
     }
