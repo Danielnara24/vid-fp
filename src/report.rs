@@ -884,7 +884,7 @@ mod tests {
 
     const HEADER: &str = "group;action;full_path;length;length_seconds;resolution;width;height;\
 framerate_fps;codec;size;size_bytes;bitrate;bitrate_bps;quality;quality_bits_per_frame;\
-matched_with;samples;matched_seconds;matched_from;matched_to;matched_from_seconds;\
+matched_with;identical;samples;matched_seconds;matched_from;matched_to;matched_from_seconds;\
 matched_to_seconds";
 
     /// The layout shipped before the link columns went directional: a

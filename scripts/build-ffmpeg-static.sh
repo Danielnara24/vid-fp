@@ -117,8 +117,11 @@ fi
 # missing, so rather than send you to your package manager they go in a venv
 # under the prefix. Everything else has to come from the system.
 missing=()
-tools=(make nasm pkg-config python3)
+tools=(make pkg-config python3)
 [[ -n "$FROM" ]] || tools+=(git)
+# nasm assembles FFmpeg's and dav1d's x86 code; on ARM their assembly goes
+# through the C compiler and nothing else is needed.
+case "$(uname -m)" in x86_64 | i?86) tools+=(nasm) ;; esac
 for tool in "${tools[@]}"; do
     command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
 done

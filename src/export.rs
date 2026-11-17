@@ -959,7 +959,7 @@ fn copy_durably(src: &Path, dest: &Path, meta: &std::fs::Metadata) -> Result<()>
 /// It decides who SURVIVES and nothing else. Which of the rest are deleted is
 /// the caller's question, because it depends on what each of them was measured
 /// against -- see the labeling pass in `output_results`.
-fn judge(
+pub(crate) fn judge(
     group: &[usize],
     fingerprints: &[VideoFingerprint],
     priority: Priority,
@@ -1127,6 +1127,21 @@ fn judge(
 
 /// Each file's fate, from the groups: what the report labels REVIEW and
 /// DELETE, and everything else is KEEP.
+/// How a run's labels are decided: elected over its groups by one ranking,
+/// the ordinary scan, or handed over already decided, which is `--against`
+/// (see `against`). A `Priority` converts, so a caller with nothing special to
+/// say passes one.
+pub enum Ranking {
+    By(Priority),
+    Pinned(Verdicts),
+}
+
+impl From<Priority> for Ranking {
+    fn from(priority: Priority) -> Self {
+        Ranking::By(priority)
+    }
+}
+
 pub struct Verdicts {
     /// Held for a person to look at, in every group it is in.
     pub review: HashSet<usize>,
@@ -1257,7 +1272,7 @@ pub fn output_results(
     matches: &MatchIndex,
     report_target: Option<&ReportTarget>,
     total_elapsed_secs: u64,
-    priority: Priority,
+    ranking: impl Into<Ranking>,
     disposal: Option<&Disposal>,
     assume_yes: bool,
     stats: &RunStats,
@@ -1286,8 +1301,10 @@ pub fn output_results(
     // end-to-end conclusion is their sum. That is deliberate: the alternative is
     // holding the tail of every chain back and asking the user to re-run until
     // it has collapsed a hop at a time.
-    let Verdicts { review: review_set, delete: delete_indices, .. } =
-        verdicts(final_groups, fingerprints, matches, priority);
+    let Verdicts { review: review_set, delete: delete_indices, .. } = match ranking.into() {
+        Ranking::By(priority) => verdicts(final_groups, fingerprints, matches, priority),
+        Ranking::Pinned(decided) => decided,
+    };
     let delete_candidates: HashSet<usize> = delete_indices.iter().copied().collect();
 
     // --- The confirmation ----------------------------------------------------
@@ -1420,8 +1437,13 @@ pub fn output_results(
     // scanned and means nothing to anyone. What is actually being reported is
     // how many distinct files are implicated in a duplicate relationship at
     // all, which is the same set the KEEP/DELETE/REVIEW labels below describe.
+    //
+    // A group of one implicates nothing. A scan never makes one; `--against`
+    // lists a file the library did not match that way, and that file is not
+    // "matched".
     let matched_file_count = final_groups
         .iter()
+        .filter(|g| g.len() > 1)
         .flatten()
         .copied()
         .collect::<HashSet<usize>>()
@@ -1524,6 +1546,7 @@ pub fn output_results(
             "quality",
             "quality_bits_per_frame",
             "matched_with",
+            "identical",
             "samples",
             "matched_seconds",
             "matched_from",
@@ -1736,9 +1759,10 @@ pub fn output_results(
                 // a glance. The CSV states the same match in seconds and the
                 // JSON as a number, so neither of them wants this string.
                 let matched_str = format_shared(matched);
+                let identical_str = if best.is_some_and(|l| l.identical) { " (identical)" } else { "" };
 
                 let line = format!(
-                    "\t{:<width$} {}, {}, {}, {}, {}, {}, {}, {} samples, {} matched, {}",
+                    "\t{:<width$} {}, {}, {}, {}, {}, {}, {}, {} samples, {} matched{}, {}",
                     format!("{},", action_str),
                     duration_str,
                     res_str,
@@ -1753,6 +1777,7 @@ pub fn output_results(
                     // that explains the row.
                     fp.valid_hashes.len(),
                     matched_str,
+                    identical_str,
                     fp.path,
                     width = ACTION_COLUMN
                 );
@@ -1805,6 +1830,9 @@ pub fn output_results(
                 let matched_with_raw = best
                     .map(|l| fingerprints[l.other].path.as_str())
                     .unwrap_or_default();
+                // Whether that file is this one's bytes again, as opposed to a
+                // match of the picture. Blank with no link, like the path.
+                let identical_raw = best.map(|l| if l.identical { "true" } else { "false" }).unwrap_or_default();
 
                 // The envelope both ways, like every other figure here.
                 let matched_from_str =
@@ -1832,6 +1860,7 @@ pub fn output_results(
                     &quality_str,
                     &quality_raw,
                     matched_with_raw,
+                    identical_raw,
                     &samples_raw,
                     &matched_seconds_raw,
                     &matched_from_str,
@@ -1856,6 +1885,7 @@ pub fn output_results(
                 .map(|l| {
                     serde_json::json!({
                         "full_path": fingerprints[l.other].path,
+                        "identical": l.identical,
                         "matched_seconds": seconds_known
                             .then(|| (l.matched_seconds * 100.0).round() / 100.0),
                         "matched_from": l.span.map(|s| format_duration(s.start_seconds())),
@@ -1890,6 +1920,7 @@ pub fn output_results(
                 // thing the CSV does without a consumer having to re-derive it
                 // from the list below.
                 "matched_with": best.map(|l| &fingerprints[l.other].path),
+                "identical": best.map(|l| l.identical),
                 "samples": fp.valid_hashes.len(),
                 "matched_seconds": matched.map(|s| (s * 100.0).round() / 100.0),
                 "matched_from": best_span.map(|s| format_duration(s.start_seconds())),
@@ -2135,7 +2166,7 @@ mod tests {
 
     const CSV_HEADER: &str = "group;action;full_path;length;length_seconds;resolution;width;\
 height;framerate_fps;codec;size;size_bytes;bitrate;bitrate_bps;quality;\
-quality_bits_per_frame;matched_with;samples;matched_seconds;matched_from;matched_to;\
+quality_bits_per_frame;matched_with;identical;samples;matched_seconds;matched_from;matched_to;\
 matched_from_seconds;matched_to_seconds";
 
     fn mock_fp() -> VideoFingerprint {
@@ -2308,7 +2339,7 @@ matched_from_seconds;matched_to_seconds";
         // that describes a link is empty too.
         assert!(contents.contains(
             "group_1;KEEP;/fake/path/vid.mp4;00:01:00;60.00;1920x1080;1920;1080;30;h264;\
-1.0MB;1048576;140kbps;139810;4.7kb/f;4660;;0;;;;;"
+1.0MB;1048576;140kbps;139810;4.7kb/f;4660;;;0;;;;;"
         ), "{}", contents);
 
         // Clean up
@@ -2403,7 +2434,7 @@ matched_from_seconds;matched_to_seconds";
         assert!(
             csv.contains(
                 "group_1;KEEP;/fake/a.mp4;00:01:40;100.00;1920x1080;1920;1080;30;h264;\
-12.5MB;13107200;1.0Mbps;1048576;35.0kb/f;34952;/fake/b.mp4;0;80.00;"
+12.5MB;13107200;1.0Mbps;1048576;35.0kb/f;34952;/fake/b.mp4;false;0;80.00;"
             ),
             "{}",
             csv
@@ -2456,9 +2487,9 @@ matched_from_seconds;matched_to_seconds";
         let contents = fs::read_to_string(&path_str).unwrap();
         for line in contents.lines().skip(1) {
             let cells: Vec<&str> = line.split(';').collect();
-            let matched: f64 = cells[18].parse().unwrap();
-            let from: f64 = cells[21].parse().unwrap();
-            let to: f64 = cells[22].parse().unwrap();
+            let matched: f64 = cells[19].parse().unwrap();
+            let from: f64 = cells[22].parse().unwrap();
+            let to: f64 = cells[23].parse().unwrap();
             assert!(
                 matched <= to - from + 1e-9,
                 "matched footage must fit inside its own envelope: {}",
@@ -2467,8 +2498,8 @@ matched_from_seconds;matched_to_seconds";
         }
 
         // And the two rows now differ, which is the signal the minimum hid.
-        assert!(contents.contains(";/fake/_19.mp4;10;1.88;"), "_18 row: {}", contents);
-        assert!(contents.contains(";/fake/_18.mp4;1;8.84;"), "_19 row: {}", contents);
+        assert!(contents.contains(";/fake/_19.mp4;false;10;1.88;"), "_18 row: {}", contents);
+        assert!(contents.contains(";/fake/_18.mp4;false;1;8.84;"), "_19 row: {}", contents);
 
         let _ = fs::remove_file(path_str);
     }
@@ -2503,8 +2534,8 @@ matched_from_seconds;matched_to_seconds";
         // Read as `matched_with;matched_seconds`: each row names the other file
         // and reports the same minute of footage.
         let contents = fs::read_to_string(&path_str).unwrap();
-        assert!(contents.contains(";/fake/clip.mp4;0;60.00;"), "host row: {}", contents);
-        assert!(contents.contains(";/fake/host.mp4;0;60.00;"), "clip row: {}", contents);
+        assert!(contents.contains(";/fake/clip.mp4;false;0;60.00;"), "host row: {}", contents);
+        assert!(contents.contains(";/fake/host.mp4;false;0;60.00;"), "clip row: {}", contents);
 
         let _ = fs::remove_file(path_str);
     }
@@ -2535,13 +2566,13 @@ matched_from_seconds;matched_to_seconds";
 
         assert!(
             contents.contains("group_1;KEEP;/fake/host.mp4;")
-                && contents.contains("/fake/clip.mp4;0;60.00;00:14:00;00:15:00;840.00;900.00"),
+                && contents.contains("/fake/clip.mp4;false;0;60.00;00:14:00;00:15:00;840.00;900.00"),
             "the host row should point into the host's own timeline: {}",
             contents
         );
         assert!(
             contents.contains("group_1;DELETE;/fake/clip.mp4;")
-                && contents.contains("/fake/host.mp4;0;60.00;00:00:00;00:01:00;0.00;60.00"),
+                && contents.contains("/fake/host.mp4;false;0;60.00;00:00:00;00:01:00;0.00;60.00"),
             "the clip row should point into the clip's own timeline: {}",
             contents
         );

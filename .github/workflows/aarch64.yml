@@ -1,0 +1,99 @@
+# .github/workflows/aarch64.yml
+#
+# vid-fp on 64-bit ARM Linux, on a native ARM runner: does the static build
+# (FFmpeg 8 + dav1d, glibc 2.28) build, do the tests pass, does AV1 decode, and
+# does it fingerprint the fixtures as the x86_64 release does. Nothing ships
+# from here; it is the evidence an aarch64 release would rest on.
+#
+# It is the release's own build, run the release's own way
+# (scripts/manylinux-build.sh in the manylinux_2_28 image), so a green run
+# says the artifact an aarch64 release would publish works, not merely that
+# the crate compiles on ARM.
+#
+# The window is not built here: its tests compare it against the CLI on the
+# same machine, which this job already covers for the CLI's half.
+
+name: aarch64
+
+on:
+  push:
+    branches: ["**"]
+    paths-ignore: ["**.md", "LICENSE*"]
+  workflow_dispatch:
+
+concurrency:
+  group: aarch64-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: aarch64 static build and tests
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache static FFmpeg prefix
+        uses: actions/cache@v6
+        with:
+          path: ffmpeg-static
+          key: ffmpeg-static-manylinux_2_28-aarch64-${{ hashFiles('scripts/build-ffmpeg-static.sh') }}
+
+      - name: Build and test in manylinux_2_28
+        run: |
+          docker run --rm -v "$PWD:$PWD" -w "$PWD" -e FFMPEG_DIR="$PWD/ffmpeg-static" \
+            quay.io/pypa/manylinux_2_28_aarch64 scripts/manylinux-build.sh
+
+      - name: Verify the binary is self-contained and asks for glibc 2.28
+        run: |
+          BIN=target/release/vid-fp
+          file "$BIN"
+          echo "DT_NEEDED:"; objdump -p "$BIN" | grep NEEDED
+          if objdump -p "$BIN" | grep -qE 'NEEDED.*lib(av|sw)'; then
+            echo "::error::binary links FFmpeg dynamically"; exit 1
+          fi
+          NEWEST="$(objdump -T "$BIN" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"
+          echo "newest glibc symbol: $NEWEST"
+          if [ "$(printf '%s\nGLIBC_2.28\n' "$NEWEST" | sort -V | tail -1)" != "GLIBC_2.28" ]; then
+            echo "::error::the binary needs $NEWEST, newer than glibc 2.28"; exit 1
+          fi
+          "$BIN" --version
+
+      - name: Verify AV1 decoding works
+        # As in release.yml: libaom is only the encoder that makes the sample.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          mkdir -p "$RUNNER_TEMP/av1"
+          ffmpeg -v error -f lavfi -i "testsrc=size=320x240:rate=10:duration=6" \
+            -c:v libaom-av1 -cpu-used 8 -g 10 "$RUNNER_TEMP/av1/a.mkv"
+          cp "$RUNNER_TEMP/av1/a.mkv" "$RUNNER_TEMP/av1/b.mkv"
+          ./target/release/vid-fp "$RUNNER_TEMP/av1" -q --cache "$RUNNER_TEMP/av1.redb"
+
+      - name: The fixtures' report against the x86_64 build
+        # Every figure in a report of the fixtures (samples, matched seconds,
+        # coverage, the groups and labels) comes out of the decoded pictures,
+        # so a checksum of it says whether this build sees what the x86_64
+        # release sees. The decoders are bit-exact by specification, but
+        # libswscale's scaling runs per-architecture code and floating point
+        # may round otherwise, so a difference is a warning to look into
+        # rather than a failure. The expected sum is the x86_64 static
+        # build's; refresh it when the fixtures or the report layout change.
+        #
+        # Exit 2 is expected: one fixture is featureless on purpose and cannot
+        # be fingerprinted.
+        run: |
+          rc=0
+          ./target/release/vid-fp "$PWD/tests/fixtures" -d 10 -q \
+            --cache "$RUNNER_TEMP/fx.redb" -o "$RUNNER_TEMP/fx.csv" || rc=$?
+          if [ "$rc" -gt 2 ]; then echo "::error::vid-fp exited $rc"; exit 1; fi
+          GOT="$(sed "s|$PWD/||g" "$RUNNER_TEMP/fx.csv" | sha256sum | cut -c1-16)"
+          WANT="170a8d9e994782b1"
+          if [ "$GOT" = "$WANT" ]; then
+            echo "matches x86_64: $GOT"
+          else
+            echo "::warning::the fixtures' report differs from the x86_64 build's ($GOT, x86_64 $WANT)"
+            cat "$RUNNER_TEMP/fx.csv"
+          fi

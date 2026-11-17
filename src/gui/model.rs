@@ -314,7 +314,7 @@ mod tests {
     }
 
     fn member(file: usize) -> Member {
-        Member { file, matched_with: None, matched_seconds: None, matched_from: None, matched_to: None, compared: Vec::new() }
+        Member { file, matched_with: None, identical: false, matched_seconds: None, matched_from: None, matched_to: None, compared: Vec::new() }
     }
 
     /// a (KEEP) <- b (DELETE, lost to a) <- c (DELETE, lost to b): a chain,

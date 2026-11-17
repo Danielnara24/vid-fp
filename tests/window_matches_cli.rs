@@ -41,6 +41,7 @@ struct Row {
     resolution: (u64, u64),
     samples: u64,
     matched_with: Option<String>,
+    identical: bool,
     matched_seconds: Option<f64>,
 }
 
@@ -67,6 +68,8 @@ fn from_report(report: &Value) -> Vec<Vec<Row>> {
                     resolution: (f["width"].as_u64().unwrap(), f["height"].as_u64().unwrap()),
                     samples: f["samples"].as_u64().unwrap(),
                     matched_with: f["matched_with"].as_str().map(str::to_string),
+                    // null when the row has no link, which the window states as false.
+                    identical: f["identical"].as_bool().unwrap_or(false),
                     matched_seconds: f["matched_seconds"].as_f64(),
                 })
                 .collect()
@@ -99,6 +102,7 @@ fn from_window(found: &Value, ranking: usize) -> Vec<Vec<Row>> {
                         resolution: (f["width"].as_u64().unwrap(), f["height"].as_u64().unwrap()),
                         samples: f["samples"].as_u64().unwrap(),
                         matched_with: (!m["matched_with"].is_null()).then(|| path(&m["matched_with"])),
+                        identical: m["identical"].as_bool().unwrap(),
                         matched_seconds: round(m["matched_seconds"].as_f64()),
                     }
                 })
@@ -147,6 +151,13 @@ fn the_window_shows_what_the_command_line_reports() {
             let (cli, window) = (from_report(&report), from_window(&found, ranking));
             assert!(!cli.is_empty() || settings.contains(&"60"), "{settings:?}: the fixtures group");
             assert_eq!(window, cli, "{settings:?} -k {name}");
+            // `copy of test_video.mp4` is the fixture's bytes again, so the
+            // flag is compared on a row that carries it, not only on falses.
+            // `--min-duration 2` drops the fixture and its copy with it.
+            assert!(
+                settings.contains(&"--min-duration") || cli.iter().flatten().any(|r| r.identical),
+                "{settings:?}: the copy is reported identical"
+            );
             labellings.insert(format!("{:?}", cli.iter().flatten().map(|r| &r.action).collect::<Vec<_>>()));
         }
         // What the window's Compare shows: every member has its strongest

@@ -1,6 +1,8 @@
+mod against;
 mod clustering;
 mod compare;
 mod confirm;
+mod content;
 mod export;
 mod fingerprint;
 pub mod found;
@@ -25,7 +27,7 @@ use redb::{Database, DatabaseError, ReadableTable, StorageError, TableDefinition
 use serde::{Deserialize, Serialize};
 use stats::RunStats;
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -78,6 +80,21 @@ const CACHE_TABLE: TableDefinition<&str, &[u8]> =
 /// re-decode that is not coming.
 const REFUSED_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("refused_ff8_probe5");
+
+/// What each fingerprinted path held: absolute path -> bincode'd
+/// `content::Identity`.
+///
+/// Beside the fingerprints rather than inside them, so adding it cost no
+/// `CACHE_TABLE` rename and no re-decode. An identity vouches for a fingerprint
+/// only while that path's `CACHE_TABLE` stamp is the stat the identity was
+/// taken at (`IdentityIndex`), which is what lets either table be written,
+/// overwritten or lost without the other one lying: a mismatch is a record
+/// nobody reads. See `content` for what an identity is for.
+///
+/// No FFmpeg or decoder suffix, because nothing in it comes out of a decoder:
+/// it is bytes on disk. A change to what `content::sample` reads is a rename
+/// here and a re-sample, never a re-decode.
+const IDENTITY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("identity_s1");
 
 /// Tables earlier builds wrote, all dead. They are dropped whole on the first
 /// run of this one.
@@ -512,7 +529,8 @@ struct Args {
 
     /// Paths in the list are NUL-separated, for `find -print0` or `fd -0`
     ///
-    /// The only way to pass a filename containing a newline.
+    /// The only way to pass a filename containing a newline. Also separates
+    /// what --list prints.
     #[arg(short = '0', long = "null")]
     null: bool,
 
@@ -656,10 +674,33 @@ struct Args {
             "include", "exclude", "from_file", "null", "recursive", "follow_symlinks",
             "extensions", "hamming_distance", "match_percent", "min_duration",
             "kf_interval", "min_kf_samples", "priority", "output", "format",
-            "prune_cache", "threads",
+            "prune_cache", "threads", "against",
         ]
     )]
     from_report: Option<String>,
+
+    /// Answer each scanned file against this library instead of grouping them
+    ///
+    /// Repeat for several. The library is scanned with the same options and
+    /// cached the same way, but never compared with itself and never touched:
+    /// each scanned file is a repeat (the library holds it at least as well:
+    /// marked DELETE, so --delete and --move-to act on repeats only), better
+    /// (it outranks every library file it matched), review, or new. A file
+    /// reached from both sides belongs to the side whose folder holds it more
+    /// closely, the scan's on a tie.
+    #[arg(long = "against", value_name = "LIBRARY",
+          value_hint = clap::ValueHint::AnyPath)]
+    against: Vec<String>,
+
+    /// With --against, print the paths given these answers to stdout
+    ///
+    /// Comma-separated or repeated: repeat, better, review, new. One path a
+    /// line, or NUL-separated with -0; without -0 a path holding a newline
+    /// stops the run, since it would read as two. Nothing else is printed to
+    /// stdout, so the list can be piped straight on.
+    #[arg(long = "list", value_name = "ANSWER", value_enum, value_delimiter = ',',
+          requires = "against")]
+    list: Vec<against::Answer>,
 
     /// Answer yes to the confirmation shown before any file is touched
     ///
@@ -700,7 +741,9 @@ struct Args {
     /// loudly, when the scan was not complete enough to measure against: a path
     /// that would not resolve, a folder that could not be read, or a scan that
     /// found no videos. Pruning against a partial scan would throw away good
-    /// fingerprints, so the run keeps them and exits 2.
+    /// fingerprints, so the run keeps them and exits 2. A file moved since the
+    /// last run is recognised by its content before anything is dropped, so it
+    /// keeps its fingerprint.
     #[arg(long = "prune-cache")]
     prune_cache: bool,
 
@@ -1222,6 +1265,10 @@ struct Job {
     stamp: Stamp,
     weight: u64,
     size: u64,
+    /// Byte-identical copies of this file that are waiting too. Not decoded:
+    /// each takes this file's fingerprint under its own path, or its failure,
+    /// or its skip. See `identify`.
+    followers: Vec<Job>,
 }
 
 /// The progress bar's speedometer: work units a second, as pixels of keyframe.
@@ -1614,6 +1661,7 @@ fn ensure_cache_table(db: &Database) -> Result<()> {
     let txn = db.begin_write().context("Failed to start a cache transaction")?;
     txn.open_table(CACHE_TABLE).context("Failed to create the cache table")?;
     txn.open_table(REFUSED_TABLE).context("Failed to create the refusals table")?;
+    txn.open_table(IDENTITY_TABLE).context("Failed to create the identity table")?;
     txn.commit().context("Failed to commit the cache table")?;
     Ok(())
 }
@@ -1636,6 +1684,7 @@ fn clear_cache(db: &mut Database) -> Result<()> {
     let txn = db.begin_write().context("Failed to start a cache transaction")?;
     txn.delete_table(CACHE_TABLE).context("Failed to clear cache database")?;
     txn.delete_table(REFUSED_TABLE).context("Failed to clear the refusals table")?;
+    txn.delete_table(IDENTITY_TABLE).context("Failed to clear the identity table")?;
     txn.commit().context("Failed to commit the cache clear")?;
 
     // Dropping the table dropped its definition too; every later lookup needs
@@ -2055,6 +2104,8 @@ fn cache_forget(db: &Database, paths: &[String]) -> Result<usize> {
         // way a fingerprint would.
         let mut refused =
             txn.open_table(REFUSED_TABLE).context("Failed to open the refusals table")?;
+        let mut identities =
+            txn.open_table(IDENTITY_TABLE).context("Failed to open the identity table")?;
         for path in paths {
             let had_fingerprint = table
                 .remove(path.as_str())
@@ -2062,6 +2113,10 @@ fn cache_forget(db: &Database, paths: &[String]) -> Result<usize> {
                 .is_some();
             let had_refusal =
                 refused.remove(path.as_str()).context("Failed to remove a refusal")?.is_some();
+            // Not counted: an identity is only ever beside a fingerprint, and
+            // without one it vouches for nothing. Removed so a file moved by
+            // this run is not later "recognised" through the path it left.
+            identities.remove(path.as_str()).context("Failed to remove an identity")?;
             // Either table counts, and a path is remembered by at most one of
             // them -- each of the two writers removes the path from the other
             // table in the same transaction (`cache_store` and
@@ -2081,6 +2136,139 @@ fn cache_forget(db: &Database, paths: &[String]) -> Result<usize> {
     txn.commit().context("Failed to commit the cache removals")?;
 
     Ok(forgotten)
+}
+
+/// `--prune-cache`: remove every entry whose path is not in `valid_files`.
+/// `Ok(false)` means the run was interrupted, with nothing removed.
+fn prune_cache(db: &Database, valid_files: &HashSet<&str>, stats: &RunStats) -> Result<bool> {
+    info!("Pruning cache for files not in the current scan...");
+
+    // A key IS a path now, so this is the whole of pruning: an entry
+    // survives exactly when the file it describes is in front of us. It
+    // used to have to reconstruct a path out of a compound key and could
+    // not see the difference between the current entry for a file and four
+    // superseded ones -- all five matched a live path, so all five stayed.
+    //
+    // Collected under a read transaction and removed under a write one,
+    // rather than filtered in place. Only this shape can abandon the scan
+    // partway through on Ctrl-C without leaving a half-applied prune behind
+    // -- the removals are one atomic commit or nothing at all.
+    // Both tables, for one reason: an entry the scan cannot see is an entry
+    // nothing will ever overwrite, and that is as true of a refusal as of a
+    // fingerprint. The refusals table is also the one that GROWS without
+    // bound -- a `-x '*'` run files one entry per file that is not video,
+    // so a library that moves around leaves far more of them behind than it
+    // ever leaves fingerprints.
+    let mut stale: Vec<String> = Vec::new();
+    let mut stale_refusals: Vec<String> = Vec::new();
+    // Not reported on their own: an identity only ever stands beside a
+    // fingerprint, so its count is the fingerprints' count again.
+    let mut stale_identities: Vec<String> = Vec::new();
+    {
+        let read = db.begin_read().context("Failed to open the cache for reading")?;
+        let table = read
+            .open_table(CACHE_TABLE)
+            .context("Failed to open the cache table")?;
+
+        for entry in table.iter().context("Failed to iterate the cache")? {
+            if shutdown_requested() {
+                return Ok(false);
+            }
+
+            let (key, _) = entry.context("Failed to read a cache entry")?;
+            let path = key.value();
+
+            if !valid_files.contains(path) {
+                stale.push(path.to_string());
+            }
+        }
+
+        let refused = read
+            .open_table(REFUSED_TABLE)
+            .context("Failed to open the refusals table")?;
+
+        for entry in refused.iter().context("Failed to iterate the refusals")? {
+            if shutdown_requested() {
+                return Ok(false);
+            }
+
+            let (key, _) = entry.context("Failed to read a refusal")?;
+            let path = key.value();
+
+            if !valid_files.contains(path) {
+                stale_refusals.push(path.to_string());
+            }
+        }
+
+        let identities = read
+            .open_table(IDENTITY_TABLE)
+            .context("Failed to open the identity table")?;
+
+        for entry in identities.iter().context("Failed to iterate the identities")? {
+            if shutdown_requested() {
+                return Ok(false);
+            }
+
+            let (key, _) = entry.context("Failed to read an identity")?;
+            let path = key.value();
+
+            if !valid_files.contains(path) {
+                stale_identities.push(path.to_string());
+            }
+        }
+    }
+
+    if !stale.is_empty() || !stale_refusals.is_empty() || !stale_identities.is_empty() {
+        let txn = db.begin_write().context("Failed to start a cache transaction")?;
+        {
+            let mut table = txn
+                .open_table(CACHE_TABLE)
+                .context("Failed to open the cache table")?;
+            for key in &stale {
+                table
+                    .remove(key.as_str())
+                    .context("Failed to remove a stale cache entry")?;
+            }
+
+            let mut refused = txn
+                .open_table(REFUSED_TABLE)
+                .context("Failed to open the refusals table")?;
+            for key in &stale_refusals {
+                refused
+                    .remove(key.as_str())
+                    .context("Failed to remove a stale refusal")?;
+            }
+
+            let mut identities = txn
+                .open_table(IDENTITY_TABLE)
+                .context("Failed to open the identity table")?;
+            for key in &stale_identities {
+                identities
+                    .remove(key.as_str())
+                    .context("Failed to remove a stale identity")?;
+            }
+        }
+        txn.commit().context("Failed to apply cache pruning")?;
+        // The one thing `main` needs from this block: entries were really
+        // removed, so the file now holds dead pages and the compaction it
+        // does after `run` returns has something to reclaim. Both tables
+        // count, because a page freed by a refusal is the same page.
+        stats.record_prune(stale.len() + stale_refusals.len() + stale_identities.len());
+        // Counted apart: they are different things, and a user watching the
+        // fingerprint count is watching the one that cost something.
+        if stale_refusals.is_empty() {
+            info!("Pruned {} stale entries from cache.", stale.len());
+        } else {
+            info!(
+                "Pruned {} stale entries and {} stale refusal(s) from cache.",
+                stale.len(),
+                stale_refusals.len()
+            );
+        }
+    } else {
+        info!("No stale entries found to prune.");
+    }
+    Ok(true)
 }
 
 /// Why `--prune-cache` must not run this time, if it must not.
@@ -2912,6 +3100,388 @@ fn unpack_lookups(
     pass
 }
 
+/// A bar over a count of `len`, drawn in the style of the weighing bar, or the
+/// window's when the window is listening.
+fn content_bar(len: u64, stage: progress::Stage, unit: &str, quiet: bool) -> ProgressBar {
+    if let Some(pb) = progress::spoken(len, stage) {
+        return pb;
+    }
+    if quiet {
+        return ProgressBar::hidden();
+    }
+    let template = if unit == "bytes" {
+        "{elapsed_precise} \u{2502} [{bar:28.cyan/blue}] \u{2502} {percent}% \u{2502} {bytes}/{total_bytes} \u{2502} checking for identical copies"
+    } else {
+        "{elapsed_precise} \u{2502} [{bar:28.cyan/blue}] \u{2502} {percent}% \u{2502} {pos}/{len} \u{2502} identifying files"
+    };
+    let pb = ProgressBar::new(len);
+    pb.set_style(ProgressStyle::with_template(template).unwrap().progress_chars("=>-"));
+    pb
+}
+
+/// The identities the cache holds, sorted by what they can be used for.
+///
+/// `current` are the records still describing a walked file as it is now: that
+/// file's sample and digest without reading it. `former` are the rest -- a path
+/// this run did not walk, or one whose file has changed since -- keyed by what
+/// the path HELD, and kept only where that path's fingerprint is still the one
+/// the identity was taken beside. Those are what a moved or touched file is
+/// recognised by.
+///
+/// The fingerprint behind a `former` record is read only when a file asks for
+/// it, through the same kind of owned table `CacheView` holds, so a cache
+/// thousands of files bigger than the scan costs a pass over small records and
+/// not a deserialization of every fingerprint in it.
+struct IdentityIndex {
+    current: HashMap<String, content::Identity>,
+    former: HashMap<(u64, content::Sample), Vec<(String, content::Identity)>>,
+    fingerprints: Option<CacheTable>,
+}
+
+impl IdentityIndex {
+    fn open(db: &Database, files: &HashMap<&str, &sources::ScannedFile>) -> Self {
+        let mut index =
+            Self { current: HashMap::new(), former: HashMap::new(), fingerprints: None };
+        let Ok(read) = db.begin_read() else { return index };
+        index.fingerprints = read.open_table(CACHE_TABLE).ok();
+        let Ok(table) = read.open_table(IDENTITY_TABLE) else { return index };
+        let Ok(iter) = table.iter() else { return index };
+        for entry in iter.flatten() {
+            let (key, value) = entry;
+            let Ok(identity) = bincode::deserialize::<content::Identity>(value.value()) else {
+                continue;
+            };
+            let path = key.value();
+            match files.get(path) {
+                Some(file) if identity.describes(file) => {
+                    index.current.insert(path.to_string(), identity);
+                }
+                _ => index
+                    .former
+                    .entry((identity.size, identity.sample))
+                    .or_default()
+                    .push((path.to_string(), identity)),
+            }
+        }
+        for candidates in index.former.values_mut() {
+            candidates.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+        index
+    }
+
+    /// The fingerprint a file holding `identity` can take over, if a former
+    /// holder of the same bytes left one this run's settings can use.
+    ///
+    /// The holder's `CACHE_TABLE` entry has to carry exactly the stat its
+    /// identity was taken at -- that is the whole proof the fingerprint was
+    /// made from these bytes, and it holds however either table was written,
+    /// overwritten or lost since -- and this run's sampling knobs, which
+    /// `Stamp::matches` checks in the same breath. Where both sides were read
+    /// whole, the digests have to agree as well; where either was not, the
+    /// sample is the cache key it is documented to be.
+    fn adoptable(
+        &self,
+        identity: &content::Identity,
+        kf_interval: f64,
+        min_kf_samples: f64,
+    ) -> Option<VideoFingerprint> {
+        let table = self.fingerprints.as_ref()?;
+        for (path, held) in self.former.get(&(identity.size, identity.sample))? {
+            if let (Some(a), Some(b)) = (identity.full, held.full) {
+                if a != b {
+                    continue;
+                }
+            }
+            let Ok(Some(stored)) = table.get(path.as_str()) else { continue };
+            let Ok((stamp, fp)) = bincode::deserialize::<CacheEntry>(stored.value()) else {
+                continue;
+            };
+            let then = Stamp {
+                mtime: held.mtime,
+                mtime_nsec: held.mtime_nsec,
+                size: held.size,
+                kf_interval,
+                min_kf_samples,
+            };
+            if stamp.matches(&then) && !fp.valid_hashes.is_empty() {
+                return Some(fp);
+            }
+        }
+        None
+    }
+}
+
+/// What the content pass decided.
+struct Identified {
+    /// The files left to decode. A file whose byte-identical copies are also
+    /// waiting carries them as `followers`, and they take its fingerprint.
+    todo: Vec<Job>,
+    /// Files recognised by their content, with the fingerprint they took over.
+    /// Already written to the cache under their own path.
+    adopted: Vec<VideoFingerprint>,
+    /// Every set of byte-identical files among those that may be compared, by
+    /// path.
+    identical: Vec<Vec<String>>,
+}
+
+/// The content pass: recognise moved files, and find byte-identical copies.
+///
+/// Runs after the weighing pass, so a file refused as not video or skipped as
+/// too short is never sampled -- on a `-x '*'` scan of a home directory that is
+/// nearly every file. `hits` are the files the cache answered by path, which
+/// take part so a new copy of an old video is recognised, and so that two copies
+/// already fingerprinted are still reported as identical. See `content`.
+///
+/// `Ok(None)` is an interrupt.
+#[allow(clippy::too_many_arguments)]
+fn identify(
+    db: &Database,
+    files: &HashMap<&str, &sources::ScannedFile>,
+    hits: &[VideoFingerprint],
+    todo: Vec<Job>,
+    kf_interval: f64,
+    min_kf_samples: f64,
+    quiet: bool,
+) -> Result<Option<Identified>> {
+    let index = IdentityIndex::open(db, files);
+
+    // Every subject is a walked file: hits first, then the queue, so a subject
+    // number below `hits.len()` is a hit.
+    let paths: Vec<String> =
+        hits.iter().map(|f| f.path.clone()).chain(todo.iter().map(|j| j.path.clone())).collect();
+    let n_hits = hits.len();
+
+    let mut identities: Vec<Option<content::Identity>> =
+        paths.iter().map(|p| index.current.get(p.as_str()).copied()).collect();
+    let mut dirty = vec![false; paths.len()];
+
+    // 1. Sample whatever has no identity yet.
+    let unsampled: Vec<usize> = (0..paths.len()).filter(|&i| identities[i].is_none()).collect();
+    if !unsampled.is_empty() {
+        progress::stage("Identifying files");
+        let bar = content_bar(unsampled.len() as u64, progress::Stage::Identifying, "files", quiet);
+        let sampled: Vec<(usize, Option<content::Identity>)> = unsampled
+            .par_iter()
+            .map(|&i| {
+                let found = if shutdown_requested() {
+                    None
+                } else {
+                    let file = files[paths[i].as_str()];
+                    match content::sample(&file.path, file.size) {
+                        Ok(s) => Some(content::Identity::of(file, s)),
+                        Err(e) => {
+                            // Not a problem: the file is fingerprinted the
+                            // ordinary way and simply cannot be recognised.
+                            log::debug!("Could not sample {}: {}", file.path, e);
+                            None
+                        }
+                    }
+                };
+                bar.inc(1);
+                (i, found)
+            })
+            .collect();
+        bar.finish_and_clear();
+        if shutdown_requested() {
+            return Ok(None);
+        }
+        for (i, found) in sampled {
+            dirty[i] = found.is_some();
+            identities[i] = found;
+        }
+    }
+
+    // 2. Files agreeing on size and sample might be copies: read them whole.
+    let possible = content::sets_by(
+        identities.iter().enumerate().filter_map(|(i, id)| id.map(|id| (i, (id.size, id.sample)))),
+    );
+    let to_read: Vec<usize> = possible
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|&i| identities[i].is_some_and(|id| id.full.is_none()))
+        .collect();
+    if !to_read.is_empty() {
+        progress::stage("Checking for identical copies");
+        let total: u64 = to_read.iter().map(|&i| files[paths[i].as_str()].size).sum();
+        let bar = content_bar(total, progress::Stage::Hashing, "bytes", quiet);
+        let read: Vec<(usize, Option<content::Digest>)> = to_read
+            .par_iter()
+            .map(|&i| {
+                let file = files[paths[i].as_str()];
+                let tick = |n: u64| bar.inc(n);
+                match content::digest(&file.path, file.size, &tick) {
+                    Ok(d) => (i, d),
+                    Err(e) => {
+                        log::debug!("Could not read {} whole: {}", file.path, e);
+                        (i, None)
+                    }
+                }
+            })
+            .collect();
+        bar.finish_and_clear();
+        if shutdown_requested() {
+            return Ok(None);
+        }
+        for (i, digest) in read {
+            if let (Some(id), Some(d)) = (identities[i].as_mut(), digest) {
+                id.full = Some(d);
+                dirty[i] = true;
+            }
+        }
+    }
+
+    // 3. Equal digests are identical files.
+    let exact = content::sets_by(identities.iter().enumerate().filter_map(|(i, id)| {
+        id.and_then(|id| id.full.map(|d| (i, (id.size, d))))
+    }));
+
+    // 4. Decide every queued file: taken from a copy, following a copy, taken
+    // from a former holder of its bytes, or decoded.
+    enum Fate {
+        Decode,
+        Adopt(VideoFingerprint),
+        Follow(usize),
+    }
+    // A former holder of the bytes first, for every queued file: a copy of
+    // something the cache already knows needs no decode at all.
+    let mut fates: Vec<Fate> = (0..todo.len())
+        .map(|t| {
+            identities[n_hits + t]
+                .and_then(|id| index.adoptable(&id, kf_interval, min_kf_samples))
+                .map_or(Fate::Decode, Fate::Adopt)
+        })
+        .collect();
+    // Then the copies among this run's own files. A set takes its fingerprint
+    // from a member that already has one -- a cache hit, or a queued file the
+    // step above just answered -- and only a set where nobody has one decodes,
+    // once, for all of it.
+    for set in &exact {
+        let known = set.iter().find_map(|&i| {
+            if i < n_hits {
+                Some(hits[i].clone())
+            } else {
+                match &fates[i - n_hits] {
+                    Fate::Adopt(fp) => Some(fp.clone()),
+                    _ => None,
+                }
+            }
+        });
+        let queued: Vec<usize> = set.iter().filter(|&&i| i >= n_hits).map(|&i| i - n_hits).collect();
+        match known {
+            Some(fp) => {
+                for &t in &queued {
+                    fates[t] = Fate::Adopt(fp.clone());
+                }
+            }
+            None => {
+                for &t in &queued[1..] {
+                    fates[t] = Fate::Follow(queued[0]);
+                }
+            }
+        }
+    }
+    drop(index);
+
+    // 5. Write what was learned, and what was adopted, in one transaction.
+    let mut adopted: Vec<(String, Stamp, VideoFingerprint)> = Vec::new();
+    let mut kept: Vec<Option<Job>> = Vec::with_capacity(todo.len());
+    let mut followers: Vec<(usize, Job)> = Vec::new();
+    for (job, fate) in todo.into_iter().zip(fates) {
+        match fate {
+            Fate::Decode => kept.push(Some(job)),
+            Fate::Adopt(mut fp) => {
+                fp.path = job.path.clone();
+                adopted.push((job.path, job.stamp, fp));
+                kept.push(None);
+            }
+            Fate::Follow(leader) => {
+                followers.push((leader, job));
+                kept.push(None);
+            }
+        }
+    }
+    let follower_count = followers.len();
+    for (leader, job) in followers {
+        if let Some(lead) = kept[leader].as_mut() {
+            lead.followers.push(job);
+        }
+    }
+
+    let learned: Vec<(&str, content::Identity)> = (0..paths.len())
+        .filter(|&i| dirty[i])
+        .filter_map(|i| identities[i].map(|id| (paths[i].as_str(), id)))
+        .collect();
+    if let Err(e) = identities_store(db, &learned, &adopted) {
+        // Losing these costs the next run a re-sample, or a re-adoption, and
+        // nothing else -- the fingerprints adopted are in hand either way.
+        log::debug!("Could not record {} identit(ies): {:#}", learned.len(), e);
+    }
+
+    let identical: Vec<Vec<String>> = exact
+        .iter()
+        .map(|set| set.iter().map(|&i| paths[i].clone()).collect())
+        .collect();
+
+    if !adopted.is_empty() {
+        info!(
+            "Recognised {} file(s) by their content (moved, renamed or touched since they were \
+             fingerprinted), so they are not decoded again.",
+            adopted.len()
+        );
+    }
+    if follower_count > 0 {
+        info!(
+            "{} file(s) are byte-identical copies of another file being fingerprinted and share \
+             its decode.",
+            follower_count
+        );
+    }
+
+    Ok(Some(Identified {
+        todo: kept.into_iter().flatten().collect(),
+        adopted: adopted.into_iter().map(|(_, _, fp)| fp).collect(),
+        identical,
+    }))
+}
+
+/// Record identities, and the fingerprints files took over by content, in one
+/// transaction.
+///
+/// An adopted fingerprint is written exactly as `cache_store` writes a fresh
+/// one -- under the new path, with the new stamp, and taking any refusal at
+/// that path away -- and its identity beside it at the same stat, which is
+/// what lets the next run find it by path and the run after a move find it by
+/// content again.
+fn identities_store(
+    db: &Database,
+    learned: &[(&str, content::Identity)],
+    adopted: &[(String, Stamp, VideoFingerprint)],
+) -> Result<()> {
+    if learned.is_empty() && adopted.is_empty() {
+        return Ok(());
+    }
+    let txn = db.begin_write().context("Failed to start a cache transaction")?;
+    {
+        let mut ids = txn.open_table(IDENTITY_TABLE).context("Failed to open the identity table")?;
+        for (path, identity) in learned {
+            let encoded = bincode::serialize(identity).context("Failed to serialize an identity")?;
+            ids.insert(*path, encoded.as_slice()).context("Failed to record an identity")?;
+        }
+        let mut table = txn.open_table(CACHE_TABLE).context("Failed to open the cache table")?;
+        let mut refused =
+            txn.open_table(REFUSED_TABLE).context("Failed to open the refusals table")?;
+        for (path, stamp, fp) in adopted {
+            let encoded =
+                bincode::serialize(&(stamp, fp)).context("Failed to serialize fingerprint")?;
+            table.insert(path.as_str(), encoded.as_slice()).context("Failed to insert the fingerprint")?;
+            refused.remove(path.as_str()).context("Failed to drop a superseded refusal")?;
+        }
+    }
+    txn.commit().context("Failed to commit the identities")?;
+    Ok(())
+}
+
 fn run(
     args: &Args,
     db: Option<&Database>,
@@ -2938,6 +3508,18 @@ fn run(
 
     let (move_to, mut conjured) = resolve_move_to(args.move_to.as_ref())?;
     let report_target = report_target_for(args.output.as_deref(), args.format)?;
+
+    // `--list` is the one thing an `--against` run prints to stdout, which is
+    // what lets it be piped; a report there as well would be two documents
+    // run together.
+    if !args.list.is_empty() && report_target.as_ref().is_some_and(|t| matches!(t.sink, Sink::Stdout)) {
+        anyhow::bail!("--list prints to stdout, so the report cannot go there too; give -o a file.");
+    }
+    // The window is not offered this mode, and its results would carry a
+    // scan's labels rather than the answers.
+    if !args.against.is_empty() && args.window_result.is_some() {
+        anyhow::bail!("--against is not available in the desktop app.");
+    }
 
     // Say out loud which flags are not doing anything. A user who passed
     // --permanent and watched a report scroll by has to be told the files were
@@ -2978,7 +3560,7 @@ fn run(
     // network mount that is the difference between three round trips per file
     // and one.
     progress::stage("Looking for videos");
-    let library = match sources::collect(
+    let mut library = match sources::collect(
         &sources::Sources {
             include: &args.include,
             exclude: &args.exclude,
@@ -2994,6 +3576,29 @@ fn run(
         sources::Scan::Interrupted => return Ok(Outcome::Interrupted),
     };
 
+    // `--against`: the library is walked with the scan's own options, so the
+    // two sides are found by the same rules, and its files join the run as
+    // files that are answered against rather than answered.
+    let held = if args.against.is_empty() {
+        None
+    } else {
+        match sources::collect(
+            &sources::Sources {
+                include: &args.against,
+                exclude: &args.exclude,
+                from_file: None,
+                null_separated: args.null,
+                extensions: &args.extensions,
+                recursive: args.recursive,
+                follow_symlinks: args.follow_symlinks,
+            },
+            stats,
+        )? {
+            sources::Scan::Complete(held) => Some(held),
+            sources::Scan::Interrupted => return Ok(Outcome::Interrupted),
+        }
+    };
+
     // Moving a duplicate into a folder that is itself being scanned puts the
     // file straight back into the next run's input, where it is still a
     // duplicate of the copy that was kept -- and the run after that would move
@@ -3001,6 +3606,19 @@ fn run(
     // thing this mode is for (getting files OUT of the library, reversibly) is
     // quietly not happening, so it is worth stopping over rather than warning
     // about.
+    if let (Some(dest), Some(held)) = (&move_to, &held) {
+        // A repeat moved into the library would be a second copy of what the
+        // library already holds, and the next run would find it there.
+        if let Some(reached) = held.walk_reaches(dest) {
+            anyhow::bail!(
+                "The --move-to folder {} is in the library: it is {}. Choose a destination \
+                 outside both the scanned folders and the library.",
+                dest.display(),
+                reached
+            );
+        }
+    }
+
     if let Some(dest) = &move_to {
         if let Some(scanned) = library.walk_reaches(dest) {
             anyhow::bail!(
@@ -3043,116 +3661,56 @@ fn run(
 
     // Every question about the REQUEST has been answered; from here on the run
     // works from what it found.
-    let mut video_files = library.files;
+    let mut video_files = std::mem::take(&mut library.files);
+
+    // Which files are the library's. A file both walks reached goes to the
+    // side whose folder holds it more closely, the scan's on a tie: scanning
+    // an import folder inside the library answers the import folder, and
+    // scanning a folder that holds the library answers everything but it.
+    let held_paths: HashSet<String> = match held {
+        None => HashSet::new(),
+        Some(held) => {
+            let closeness = |side: &sources::Library, path: &str| {
+                side.closeness(Path::new(path)).unwrap_or(usize::MAX)
+            };
+            let scanned: HashSet<&str> = video_files.iter().map(|f| f.path.as_str()).collect();
+            let held_paths: HashSet<String> = held
+                .files
+                .iter()
+                .filter(|f| {
+                    !scanned.contains(f.path.as_str())
+                        || closeness(&held, &f.path) > closeness(&library, &f.path)
+                })
+                .map(|f| f.path.clone())
+                .collect();
+            // The scan's copy of a file the library took is dropped, and the
+            // library's added, so every path is in the run once.
+            video_files.retain(|f| !held_paths.contains(&f.path));
+            let answering = video_files.len();
+            video_files.extend(held.files.into_iter().filter(|f| held_paths.contains(&f.path)));
+            info!(
+                "Answering {} scanned file(s) against a library of {}.",
+                answering,
+                held_paths.len()
+            );
+            held_paths
+        }
+    };
+    let answering = !args.against.is_empty();
 
     // A prune is measured against what the scan FOUND, so it is only ever as
     // correct as the scan was complete -- and a run that fell short knows it.
     let pruning = args.prune_cache && !args.clear_cache;
     let obstacle = if pruning { prune_obstacle(stats, video_files.len()) } else { None };
+    // The prune itself runs after the content pass, not here: a file that
+    // moved is still under its OLD path in the cache until that pass adopts
+    // its fingerprint under the new one, and pruning first would discard the
+    // very entry the move was going to be recognised by.
+    let prune_now = pruning && obstacle.is_none();
 
     if let Some(reason) = obstacle {
         log::warn!("Not pruning the cache: {}, so this run cannot tell what is stale.", reason);
         stats.cache_prune_skipped.record(reason);
-    } else if pruning {
-        info!("Pruning cache for files not in the current scan...");
-        let valid_files: HashSet<&str> = video_files.iter().map(|f| f.path.as_str()).collect();
-
-        // A key IS a path now, so this is the whole of pruning: an entry
-        // survives exactly when the file it describes is in front of us. It
-        // used to have to reconstruct a path out of a compound key and could
-        // not see the difference between the current entry for a file and four
-        // superseded ones -- all five matched a live path, so all five stayed.
-        //
-        // Collected under a read transaction and removed under a write one,
-        // rather than filtered in place. Only this shape can abandon the scan
-        // partway through on Ctrl-C without leaving a half-applied prune behind
-        // -- the removals are one atomic commit or nothing at all.
-        // Both tables, for one reason: an entry the scan cannot see is an entry
-        // nothing will ever overwrite, and that is as true of a refusal as of a
-        // fingerprint. The refusals table is also the one that GROWS without
-        // bound -- a `-x '*'` run files one entry per file that is not video,
-        // so a library that moves around leaves far more of them behind than it
-        // ever leaves fingerprints.
-        let mut stale: Vec<String> = Vec::new();
-        let mut stale_refusals: Vec<String> = Vec::new();
-        {
-            let read = db.begin_read().context("Failed to open the cache for reading")?;
-            let table = read
-                .open_table(CACHE_TABLE)
-                .context("Failed to open the cache table")?;
-
-            for entry in table.iter().context("Failed to iterate the cache")? {
-                if shutdown_requested() {
-                    return Ok(Outcome::Interrupted);
-                }
-
-                let (key, _) = entry.context("Failed to read a cache entry")?;
-                let path = key.value();
-
-                if !valid_files.contains(path) {
-                    stale.push(path.to_string());
-                }
-            }
-
-            let refused = read
-                .open_table(REFUSED_TABLE)
-                .context("Failed to open the refusals table")?;
-
-            for entry in refused.iter().context("Failed to iterate the refusals")? {
-                if shutdown_requested() {
-                    return Ok(Outcome::Interrupted);
-                }
-
-                let (key, _) = entry.context("Failed to read a refusal")?;
-                let path = key.value();
-
-                if !valid_files.contains(path) {
-                    stale_refusals.push(path.to_string());
-                }
-            }
-        }
-
-        if !stale.is_empty() || !stale_refusals.is_empty() {
-            let txn = db.begin_write().context("Failed to start a cache transaction")?;
-            {
-                let mut table = txn
-                    .open_table(CACHE_TABLE)
-                    .context("Failed to open the cache table")?;
-                for key in &stale {
-                    table
-                        .remove(key.as_str())
-                        .context("Failed to remove a stale cache entry")?;
-                }
-
-                let mut refused = txn
-                    .open_table(REFUSED_TABLE)
-                    .context("Failed to open the refusals table")?;
-                for key in &stale_refusals {
-                    refused
-                        .remove(key.as_str())
-                        .context("Failed to remove a stale refusal")?;
-                }
-            }
-            txn.commit().context("Failed to apply cache pruning")?;
-            // The one thing `main` needs from this block: entries were really
-            // removed, so the file now holds dead pages and the compaction it
-            // does after `run` returns has something to reclaim. Both tables
-            // count, because a page freed by a refusal is the same page.
-            stats.record_prune(stale.len() + stale_refusals.len());
-            // Counted apart: they are different things, and a user watching the
-            // fingerprint count is watching the one that cost something.
-            if stale_refusals.is_empty() {
-                info!("Pruned {} stale entries from cache.", stale.len());
-            } else {
-                info!(
-                    "Pruned {} stale entries and {} stale refusal(s) from cache.",
-                    stale.len(),
-                    stale_refusals.len()
-                );
-            }
-        } else {
-            info!("No stale entries found to prune.");
-        }
     }
 
     if video_files.is_empty() {
@@ -3257,6 +3815,7 @@ fn run(
                     // then is the `sort_by_key` that put this list in order.
                     weight: file.size,
                     size: file.size,
+                    followers: Vec::new(),
                 }),
             }
         })
@@ -3423,6 +3982,52 @@ fn run(
         // and an HEVC copy of the same footage differ threefold in cost and
         // barely at all in the direction size predicts.
         todo.sort_by_key(|job| std::cmp::Reverse(job.weight));
+    }
+
+    if shutdown_requested() {
+        return Ok(Outcome::Interrupted);
+    }
+
+    // --- Pass 1c: what the files hold -----------------------------------------
+    // A file the cache missed by path may still be one it holds a fingerprint
+    // for -- moved, renamed, touched, restored -- and two files in this run may
+    // be the same bytes twice. Both are answered from the files' contents
+    // rather than their names; see `content` and `identify`. After the weighing
+    // pass, so nothing it refused or skipped is read.
+    let identical_paths = {
+        let by_path: HashMap<&str, &sources::ScannedFile> =
+            video_files.iter().map(|f| (f.path.as_str(), f)).collect();
+        let Some(identified) = identify(
+            db,
+            &by_path,
+            &fingerprints,
+            std::mem::take(&mut todo),
+            kf_interval,
+            min_kf_samples,
+            args.quiet,
+        )?
+        else {
+            return Ok(Outcome::Interrupted);
+        };
+        todo = identified.todo;
+        for fp in identified.adopted {
+            // The same test a cache hit is put to in `unpack_lookups`: the
+            // fingerprint is in hand, so its runtime decides without a header.
+            if min_duration > 0.0 && fp.duration > 0.0 && fp.duration < min_duration {
+                stats.skipped_short.bump();
+            } else {
+                fingerprints.push(fp);
+            }
+        }
+        identified.identical
+    };
+
+    // Here rather than with the obstacle check above: see `prune_now`.
+    if prune_now {
+        let valid_files: HashSet<&str> = video_files.iter().map(|f| f.path.as_str()).collect();
+        if !prune_cache(db, &valid_files, stats)? {
+            return Ok(Outcome::Interrupted);
+        }
     }
 
     // What the decode is actually facing, which is not what was queued for it:
@@ -3718,8 +4323,11 @@ fn run(
                             Ok(None) => {
                                 // Shorter than --min-duration. Not a failure, and
                                 // nothing to cache: the header read that decided
-                                // this is cheap enough to repeat next run.
-                                stats.skipped_short.bump();
+                                // this is cheap enough to repeat next run. Its
+                                // identical copies are exactly as short.
+                                for _ in std::iter::once(job).chain(&job.followers) {
+                                    stats.skipped_short.bump();
+                                }
                                 finish(idx, job, charged_work.get());
                                 continue;
                             }
@@ -3736,24 +4344,31 @@ fn run(
                                 // "unreadable" bucket, which is the honest
                                 // description: the run was asked to fingerprint
                                 // it and could not.
-                                if !shutdown_requested() {
-                                    log::error!(target: stats::COUNTED, "Failed to process {}: {:#}", job.path, e);
-                                    stats
-                                        .fingerprint_failed
-                                        .record(format!("{}: {:#}", job.path, e));
+                                //
+                                // Its identical copies fail with it, each named
+                                // and counted: the same bytes would have failed
+                                // the same way, and each is a file the run was
+                                // asked to fingerprint.
+                                for member in std::iter::once(job).chain(&job.followers) {
+                                    if !shutdown_requested() {
+                                        log::error!(target: stats::COUNTED, "Failed to process {}: {:#}", member.path, e);
+                                        stats
+                                            .fingerprint_failed
+                                            .record(format!("{}: {:#}", member.path, e));
 
-                                    // The half of the memory that saves a
-                                    // DECODE rather than a probe. These are the
-                                    // files that open and then turn out to hold
-                                    // nothing to fingerprint -- an image
-                                    // container with no frame, a stream that
-                                    // will not parse -- and re-reading them
-                                    // every run was the whole of a warm scan.
-                                    if let Some(verdict) = worth_remembering(&e) {
-                                        refused_here
-                                            .lock()
-                                            .unwrap_or_else(|p| p.into_inner())
-                                            .push((job.path.clone(), job.stamp, verdict));
+                                        // The half of the memory that saves a
+                                        // DECODE rather than a probe. These are the
+                                        // files that open and then turn out to hold
+                                        // nothing to fingerprint -- an image
+                                        // container with no frame, a stream that
+                                        // will not parse -- and re-reading them
+                                        // every run was the whole of a warm scan.
+                                        if let Some(verdict) = worth_remembering(&e) {
+                                            refused_here
+                                                .lock()
+                                                .unwrap_or_else(|p| p.into_inner())
+                                                .push((member.path.clone(), member.stamp, verdict));
+                                        }
                                     }
                                 }
                                 finish(idx, job, charged_work.get()); // Work attempted
@@ -3765,24 +4380,38 @@ fn run(
                         // held before. See cache_store: this is one transaction
                         // per video on purpose, so an interrupt (or a kill, or a
                         // crash) can only ever cost the decode still in flight.
-                        match cache_store(db, &job.path, job.stamp, &fp) {
-                            Ok(()) => {
-                                newly_cached.fetch_add(1, Ordering::Relaxed);
+                        //
+                        // The file's identical copies take the same fingerprint
+                        // under their own paths, and are cached the same way.
+                        // Pushed after it under the same index, which the stable
+                        // sort below keeps in that order.
+                        let copies: Vec<VideoFingerprint> = job
+                            .followers
+                            .iter()
+                            .map(|f| VideoFingerprint { path: f.path.clone(), ..fp.clone() })
+                            .collect();
+                        for (member, made) in
+                            std::iter::once(job).chain(&job.followers).zip(std::iter::once(fp).chain(copies))
+                        {
+                            match cache_store(db, &member.path, member.stamp, &made) {
+                                Ok(()) => {
+                                    newly_cached.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(e) => {
+                                    log::error!(
+                                        target: stats::COUNTED,
+                                        "Failed to cache fingerprint for {}: {:#}",
+                                        member.path,
+                                        e
+                                    );
+                                    stats
+                                        .cache_write_failed
+                                        .record(format!("{}: {:#}", member.path, e));
+                                }
                             }
-                            Err(e) => {
-                                log::error!(
-                                    target: stats::COUNTED,
-                                    "Failed to cache fingerprint for {}: {:#}",
-                                    job.path,
-                                    e
-                                );
-                                stats
-                                    .cache_write_failed
-                                    .record(format!("{}: {:#}", job.path, e));
-                            }
+                            local.push((idx, made));
                         }
 
-                        local.push((idx, fp));
                         finish(idx, job, charged_work.get());
                     }
 
@@ -3805,7 +4434,8 @@ fn run(
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .split_off(0);
-        fresh.sort_unstable_by_key(|(idx, _)| *idx);
+        // Stable, so a file's identical copies stay behind it in path order.
+        fresh.sort_by_key(|(idx, _)| *idx);
         fingerprints.extend(fresh.into_iter().map(|(_, fp)| fp));
     }
 
@@ -3822,7 +4452,7 @@ fn run(
     }
 
     let n = fingerprints.len();
-    if n < 2 {
+    if n < 2 && !answering {
         info!("Not enough valid videos to compare.");
         // The elapsed time used to be formatted again here so this ending would
         // say it too; the report's summary carries it, in the same format, for
@@ -3841,24 +4471,55 @@ fn run(
     info!("\nFingerprinting complete. Cross-analyzing {} videos...", n);
     progress::stage("Comparing videos");
 
-    let matches = find_all_matches(&fingerprints, max_hamming, min_match_pct, min_duration);
+    // Which fingerprints are the library's, by their place in the list.
+    let library_side: Vec<bool> = fingerprints.iter().map(|f| held_paths.contains(&f.path)).collect();
+
+    let matches = if answering {
+        compare::find_matches_across(&fingerprints, &library_side, max_hamming, min_match_pct, min_duration)
+    } else {
+        find_all_matches(&fingerprints, max_hamming, min_match_pct, min_duration)
+    };
 
     if shutdown_requested() {
         return Ok(Outcome::Interrupted);
     }
 
-    info!("Grouping duplicate clusters...");
+    if answering {
+        info!("Answering each scanned file against the library...");
+    } else {
+        info!("Grouping duplicate clusters...");
+    }
     progress::stage("Grouping duplicates");
 
     // Clustering only needs to know which pairs matched -- it decides membership
     // and nothing else. The coverage figures travel separately to the report,
     // where they are the only thing that tells a genuine re-encode apart from a
     // clip that happened to clear --match-percent.
-    let edges: Vec<(usize, usize)> = matches.iter().map(|m| (m.a, m.b)).collect();
-    let final_groups = clustering::find_duplicate_groups(n, edges, &fingerprints);
+    // `--against` is not grouped: each scanned file is answered against the
+    // library files it matched, and its labels come with the answer.
+    let (final_groups, answered) = if answering {
+        let mut answered = against::answer(&fingerprints, &matches, &library_side, args.priority);
+        (std::mem::take(&mut answered.groups), Some(answered))
+    } else {
+        let edges: Vec<(usize, usize)> = matches.iter().map(|m| (m.a, m.b)).collect();
+        (clustering::find_duplicate_groups(n, edges, &fingerprints), None)
+    };
 
     // Consumes the Vec, so the pair list is not kept alive alongside the index.
-    let matches = MatchIndex::new(matches);
+    // Which compared files are the same bytes, by their place in the list the
+    // comparison read. A set can lose members on the way here -- a copy too
+    // short for `--min-duration`, one whose decode failed -- and a set of one
+    // says nothing.
+    let identical: Vec<Vec<usize>> = {
+        let at: HashMap<&str, usize> =
+            fingerprints.iter().enumerate().map(|(i, f)| (f.path.as_str(), i)).collect();
+        identical_paths
+            .iter()
+            .map(|set| set.iter().filter_map(|p| at.get(p.as_str()).copied()).collect::<Vec<_>>())
+            .filter(|set| set.len() > 1)
+            .collect()
+    };
+    let matches = MatchIndex::new(matches).with_identical(n, &identical);
 
     if shutdown_requested() {
         return Ok(Outcome::Interrupted);
@@ -3871,6 +4532,38 @@ fn run(
 
     // The desktop app's copy, before anything else is written: a report that
     // then fails to save still leaves the window its groups to show.
+    // `--list` writes paths for a script to act on, so a path that cannot be
+    // written that way stops the run here, before anything is disposed of.
+    let listed: Vec<&str> = match &answered {
+        Some(a) => a
+            .answers
+            .iter()
+            .filter(|(_, answer)| args.list.contains(answer))
+            .map(|&(i, _)| fingerprints[i].path.as_str())
+            .collect(),
+        None => Vec::new(),
+    };
+    if !args.null {
+        if let Some(bad) = listed.iter().find(|p| p.contains('\n')) {
+            anyhow::bail!(
+                "{:?} holds a line break, so --list would print it as two paths. Add -0 to \
+                 separate the list with NUL bytes instead.",
+                bad
+            );
+        }
+    }
+
+    if let Some(a) = &answered {
+        let count = |want| a.answers.iter().filter(|(_, got)| *got == want).count();
+        info!(
+            "Against the library: {} repeat(s), {} better, {} to review, {} new.",
+            count(against::Answer::Repeat),
+            count(against::Answer::Better),
+            count(against::Answer::Review),
+            count(against::Answer::New)
+        );
+    }
+
     if let Some(path) = &args.window_result {
         progress::stage("Saving the results");
         found::Found::of(&final_groups, &fingerprints, &matches, total_videos, max_hamming).save(path)?;
@@ -3882,11 +4575,26 @@ fn run(
         &matches,
         report_target.as_ref(),
         start_time.elapsed().as_secs(),
-        args.priority,
+        match answered {
+            Some(a) => export::Ranking::Pinned(a.verdicts),
+            None => export::Ranking::By(args.priority),
+        },
         disposal.as_ref(),
         args.yes,
         stats,
     )?;
+
+    if !listed.is_empty() {
+        let end = if args.null { '\0' } else { '\n' };
+        let mut out = std::io::stdout().lock();
+        for path in &listed {
+            // A reader closing early is how a pipeline ends (`| head`).
+            if write!(out, "{}{}", path, end).is_err() {
+                break;
+            }
+        }
+        let _ = out.flush();
+    }
 
     // Those files are no longer where they were, so the fingerprints filed
     // under their paths describe nothing at all. Deliberately BEFORE the
@@ -4223,6 +4931,7 @@ mod tests {
                 stamp: stamp(0, 0),
                 weight,
                 size: 0,
+                followers: Vec::new(),
             })
             .collect();
 
@@ -4527,6 +5236,7 @@ mod tests {
                 stamp: stamp(1_700_000_000, 12_345),
                 weight: 12_345,
                 size: 12_345,
+                followers: Vec::new(),
             })
         };
         let refused = |not_media| Lookup::Refused {
@@ -6053,5 +6763,313 @@ mod tests {
 
         assert_eq!(resolved, not_yet.join(CACHE_FILE_NAME));
         assert!(not_yet.is_dir(), "the directory it named is created, not a file called `scratch`");
+    }
+
+    // --- What a file holds (`identify`, `content`) -----------------------------
+
+    fn fixture(name: &str) -> PathBuf {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("tests/fixtures");
+        path.push(name);
+        path
+    }
+
+    fn scanned(path: &Path) -> sources::ScannedFile {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(path).unwrap();
+        sources::ScannedFile {
+            path: path.to_string_lossy().into_owned(),
+            size: meta.len(),
+            mtime: meta.mtime(),
+            mtime_nsec: meta.mtime_nsec(),
+        }
+    }
+
+    fn job_for(file: &sources::ScannedFile, kf_interval: f64) -> Job {
+        Job {
+            path: file.path.clone(),
+            stamp: Stamp {
+                mtime: file.mtime,
+                mtime_nsec: file.mtime_nsec,
+                size: file.size,
+                kf_interval,
+                min_kf_samples: 12.0,
+            },
+            weight: file.size,
+            size: file.size,
+            followers: Vec::new(),
+        }
+    }
+
+    /// The content pass over `queued`, as `run` would call it with `hits`
+    /// already answered by path.
+    fn identify_over(
+        db: &Database,
+        hits: &[VideoFingerprint],
+        queued: &[&Path],
+        kf_interval: f64,
+    ) -> Identified {
+        let files: Vec<sources::ScannedFile> = hits
+            .iter()
+            .map(|fp| scanned(Path::new(&fp.path)))
+            .chain(queued.iter().map(|p| scanned(p)))
+            .collect();
+        let by_path: HashMap<&str, &sources::ScannedFile> =
+            files.iter().map(|f| (f.path.as_str(), f)).collect();
+        let todo = files[hits.len()..].iter().map(|f| job_for(f, kf_interval)).collect();
+        identify(db, &by_path, hits, todo, kf_interval, 12.0, true).unwrap().unwrap()
+    }
+
+    /// Fingerprint everything under `dir` the ordinary way, so the cache holds
+    /// it as a real run left it.
+    fn scan(dir: &Path, db: &Database, extra: &[&str]) -> RunStats {
+        let mut argv = vec!["vid-fp".to_string(), dir.to_string_lossy().into_owned()];
+        argv.extend(extra.iter().map(|s| s.to_string()));
+        let stats = RunStats::default();
+        run(&Args::parse_from(argv), Some(db), Instant::now(), 1, &stats).unwrap();
+        stats
+    }
+
+    fn cached(db: &Database, path: &Path) -> Option<VideoFingerprint> {
+        let read = db.begin_read().unwrap();
+        let table = read.open_table(CACHE_TABLE).unwrap();
+        let stored = table.get(path.to_string_lossy().as_ref()).unwrap()?;
+        Some(bincode::deserialize::<CacheEntry>(stored.value()).unwrap().1)
+    }
+
+    #[test]
+    fn test_a_moved_file_takes_its_fingerprint_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+        let library = dir.path().join("library");
+        std::fs::create_dir(&library).unwrap();
+        let before = library.join("a.mp4");
+        std::fs::copy(fixture("test_video.mp4"), &before).unwrap();
+        scan(&library, &db, &[]);
+        let original = cached(&db, &before).expect("the first run fingerprints it");
+
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let after = elsewhere.join("renamed.mp4");
+        std::fs::rename(&before, &after).unwrap();
+
+        let identified = identify_over(&db, &[], &[&after], 0.0);
+        assert!(identified.todo.is_empty(), "nothing is left to decode");
+        assert_eq!(identified.adopted.len(), 1);
+        let adopted = &identified.adopted[0];
+        assert_eq!(adopted.path, after.to_string_lossy());
+        assert_eq!(adopted.valid_hashes, original.valid_hashes);
+
+        // Filed under the new path, so the next run is an ordinary hit.
+        assert_eq!(cached(&db, &after).unwrap().valid_hashes, original.valid_hashes);
+        let hit = CacheView::open(&db).fingerprint(
+            &after.to_string_lossy(),
+            &job_for(&scanned(&after), 0.0).stamp,
+        );
+        assert!(hit.is_some(), "the adopted entry carries the new path's stamp");
+    }
+
+    #[test]
+    fn test_a_touched_file_is_not_decoded_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+        let path = dir.path().join("a.mp4");
+        std::fs::copy(fixture("test_video.mp4"), &path).unwrap();
+        scan(dir.path(), &db, &[]);
+
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(std::time::SystemTime::now() + Duration::from_secs(3600)).unwrap();
+        drop(file);
+
+        let identified = identify_over(&db, &[], &[&path], 0.0);
+        assert!(identified.todo.is_empty());
+        assert_eq!(identified.adopted.len(), 1);
+    }
+
+    #[test]
+    fn test_a_fingerprint_made_with_other_sampling_settings_is_not_taken_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+        let library = dir.path().join("library");
+        std::fs::create_dir(&library).unwrap();
+        let before = library.join("a.mp4");
+        std::fs::copy(fixture("test_video.mp4"), &before).unwrap();
+        scan(&library, &db, &[]);
+
+        let after = dir.path().join("b.mp4");
+        std::fs::rename(&before, &after).unwrap();
+
+        let identified = identify_over(&db, &[], &[&after], 5.0);
+        assert!(identified.adopted.is_empty(), "those hashes are not the ones -i 5 takes");
+        assert_eq!(identified.todo.len(), 1);
+    }
+
+    #[test]
+    fn test_an_identity_whose_fingerprint_was_replaced_vouches_for_nothing() {
+        // The proof that a fingerprint came from a file's bytes is that its
+        // stamp is the stat the identity was taken at. Overwrite the entry
+        // with one stamped otherwise and the identity has to stop answering.
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+        let library = dir.path().join("library");
+        std::fs::create_dir(&library).unwrap();
+        let before = library.join("a.mp4");
+        std::fs::copy(fixture("test_video.mp4"), &before).unwrap();
+        scan(&library, &db, &[]);
+
+        let mut other = job_for(&scanned(&before), 0.0).stamp;
+        other.mtime += 1;
+        cache_store(&db, &before.to_string_lossy(), other, &mock_fp(&before.to_string_lossy()))
+            .unwrap();
+
+        let after = dir.path().join("b.mp4");
+        std::fs::rename(&before, &after).unwrap();
+        let identified = identify_over(&db, &[], &[&after], 0.0);
+        assert!(identified.adopted.is_empty());
+        assert_eq!(identified.todo.len(), 1);
+    }
+
+    #[test]
+    fn test_identical_copies_waiting_together_are_decoded_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+        let paths: Vec<PathBuf> = ["a.mp4", "b.mp4", "c.mp4"]
+            .iter()
+            .map(|n| {
+                let p = dir.path().join(n);
+                std::fs::copy(fixture("test_video.mp4"), &p).unwrap();
+                p
+            })
+            .collect();
+        let other = dir.path().join("d.ts");
+        std::fs::copy(fixture("test_video_segment.ts"), &other).unwrap();
+
+        let queued: Vec<&Path> =
+            paths.iter().map(|p| p.as_path()).chain([other.as_path()]).collect();
+        let identified = identify_over(&db, &[], &queued, 0.0);
+
+        assert_eq!(identified.todo.len(), 2, "one of the copies, and the other video");
+        let leader = identified.todo.iter().find(|j| j.path.ends_with("a.mp4")).unwrap();
+        let followers: Vec<&str> = leader.followers.iter().map(|j| j.path.as_str()).collect();
+        assert_eq!(followers.len(), 2);
+        assert!(followers[0].ends_with("b.mp4") && followers[1].ends_with("c.mp4"));
+        assert_eq!(identified.identical.len(), 1);
+        assert_eq!(identified.identical[0].len(), 3);
+    }
+
+    #[test]
+    fn test_a_new_copy_of_a_fingerprinted_video_takes_its_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+        let library = dir.path().join("library");
+        std::fs::create_dir(&library).unwrap();
+        let a = library.join("a.mp4");
+        std::fs::copy(fixture("test_video.mp4"), &a).unwrap();
+        scan(&library, &db, &[]);
+        let hit = cached(&db, &a).unwrap();
+
+        let b = library.join("b.mp4");
+        std::fs::copy(&a, &b).unwrap();
+        let identified = identify_over(&db, &[hit], &[&b], 0.0);
+        assert!(identified.todo.is_empty());
+        assert_eq!(identified.adopted.len(), 1);
+        assert_eq!(identified.identical.len(), 1);
+    }
+
+    #[test]
+    fn test_copies_of_a_video_that_moved_are_all_recognised() {
+        // Two copies of a file the cache knows under a path that is gone. The
+        // first of them used to be both the set's decoder and a file the cache
+        // answered, and the other was left with neither.
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+        let library = dir.path().join("library");
+        std::fs::create_dir(&library).unwrap();
+        let original = library.join("a.mp4");
+        std::fs::copy(fixture("test_video.mp4"), &original).unwrap();
+        scan(&library, &db, &[]);
+
+        let b = dir.path().join("b.mp4");
+        let c = dir.path().join("c.mp4");
+        std::fs::copy(&original, &b).unwrap();
+        std::fs::rename(&original, &c).unwrap();
+
+        let identified = identify_over(&db, &[], &[&b, &c], 0.0);
+        assert!(identified.todo.is_empty(), "nothing to decode");
+        assert_eq!(identified.adopted.len(), 2, "and nothing dropped");
+        assert_eq!(identified.identical.len(), 1);
+    }
+
+    #[test]
+    fn test_files_that_share_a_sample_but_not_their_bytes_are_not_identical() {
+        // Same length, same three sampled stretches, one byte apart between
+        // them: a cache may treat them alike, the report may not.
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+        let size = 20 * content::CHUNK as usize;
+        let bytes: Vec<u8> = (0..size).map(|i| (i * 31 % 251) as u8).collect();
+        let a = dir.path().join("a.mp4");
+        let b = dir.path().join("b.mp4");
+        std::fs::write(&a, &bytes).unwrap();
+        let mut changed = bytes.clone();
+        changed[3 * content::CHUNK as usize] ^= 0xff;
+        std::fs::write(&b, &changed).unwrap();
+
+        let identified = identify_over(&db, &[], &[&a, &b], 0.0);
+        assert!(identified.identical.is_empty());
+        assert_eq!(identified.todo.len(), 2, "and neither stands in for the other's decode");
+        assert!(identified.todo.iter().all(|j| j.followers.is_empty()));
+    }
+
+    #[test]
+    fn test_a_run_over_identical_copies_says_so_in_the_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+        let (library, report) = library_with_a_pair(&dir);
+        let stats = scan(&library, &db, &["-o", &report.to_string_lossy()]);
+        assert!(!stats.had_problems());
+
+        let csv = std::fs::read_to_string(&report).unwrap();
+        let header: Vec<&str> = csv.lines().next().unwrap().split(';').collect();
+        let col = header.iter().position(|h| *h == "identical").unwrap();
+        let rows: Vec<Vec<&str>> =
+            csv.lines().skip(1).filter(|l| !l.is_empty()).map(|l| l.split(';').collect()).collect();
+        assert_eq!(rows.len(), 2, "{}", csv);
+        assert!(rows.iter().all(|r| r[col] == "true"), "{}", csv);
+
+        // Both copies are cached, each under its own path, from the one decode.
+        let a = cached(&db, &library.join("a.mp4")).unwrap();
+        let b = cached(&db, &library.join("b.mp4")).unwrap();
+        assert_eq!(a.valid_hashes, b.valid_hashes);
+        assert_ne!(a.path, b.path);
+    }
+
+    #[test]
+    fn test_a_prune_after_a_move_keeps_the_moved_file_s_fingerprint() {
+        // The prune used to run before the cache pass; now that a moved file
+        // is found through its OLD entry, pruning first would have thrown that
+        // entry away and decoded the file again.
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir);
+        let library = dir.path().join("library");
+        std::fs::create_dir(&library).unwrap();
+        let before = library.join("a.mp4");
+        std::fs::copy(fixture("test_video.mp4"), &before).unwrap();
+        scan(&library, &db, &[]);
+
+        // A marker in place of the real fingerprint, under the same stamp, so
+        // the identity still vouches for it: a run that decodes the moved file
+        // instead of adopting it ends up holding the real hashes, not these.
+        let marker = mock_fp(&before.to_string_lossy());
+        cache_store(&db, &before.to_string_lossy(), job_for(&scanned(&before), 0.0).stamp, &marker)
+            .unwrap();
+
+        let after = library.join("renamed.mp4");
+        std::fs::rename(&before, &after).unwrap();
+        let stats = scan(&library, &db, &["--prune-cache"]);
+        assert!(!stats.had_problems());
+        assert_eq!(cached_paths(&db), vec![after.to_string_lossy().into_owned()]);
+        assert_eq!(cached(&db, &after).unwrap().valid_hashes, marker.valid_hashes);
+        assert_eq!(stats.entries_pruned(), 2, "the old fingerprint and its identity");
     }
 }

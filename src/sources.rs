@@ -216,6 +216,18 @@ impl Library {
     /// symlink cannot walk around it: `dest` comes from `resolve_move_to`, and
     /// a folder reached through a link contributes its target rather than the
     /// path the walk spelled.
+    /// How closely this walk holds `path`: the depth, in path components, of
+    /// the deepest walked folder it lies under, or `None` for a file no walked
+    /// folder holds -- one named outright, which is held more closely than any
+    /// folder could. `--against` asks it of a file both sides reached.
+    pub fn closeness(&self, path: &Path) -> Option<usize> {
+        self.walked
+            .iter()
+            .filter(|r| path.starts_with(&r.root))
+            .map(|r| r.root.components().count())
+            .max()
+    }
+
     pub fn walk_reaches(&self, dest: &Path) -> Option<&Reached> {
         if is_excluded(dest, &self.excluded) {
             return None;

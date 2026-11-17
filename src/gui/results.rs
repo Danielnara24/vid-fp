@@ -1675,7 +1675,13 @@ impl Results {
                     _ => String::new(),
                 };
                 let gone = if model.gone(w) { ", which is gone since the scan" } else { "" };
-                format!("{} matched with {other}{span}{gone}", utils::format_shared(m.matched_seconds))
+                if m.identical {
+                    // Every byte agrees, so the footage and where it sits go
+                    // without saying.
+                    format!("Identical copy of {other}{gone}")
+                } else {
+                    format!("{} matched with {other}{span}{gone}", utils::format_shared(m.matched_seconds))
+                }
             }
             None => "Nothing in this group could be measured against it".to_string(),
         };
@@ -1983,7 +1989,11 @@ impl Results {
                 .compared
                 .iter()
                 .map(|c| {
-                    let how = if Some(c.with) == m.matched_with { "Best match" } else { "Group reference" };
+                    let how = match (Some(c.with) == m.matched_with, m.identical) {
+                        (true, true) => "Identical copy",
+                        (true, false) => "Best match",
+                        (false, _) => "Group reference",
+                    };
                     (how, c.clone(), model.file(c.with).clone())
                 })
                 .collect::<Vec<_>>();

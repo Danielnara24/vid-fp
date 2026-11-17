@@ -112,6 +112,11 @@ pub struct Member {
     pub file: usize,
     /// The file of the group it shares the most of its own footage with.
     pub matched_with: Option<usize>,
+    /// Whether `matched_with` is this file's bytes again rather than a match
+    /// of its picture: the report's `identical` column. Defaults to false for
+    /// a scan kept by a build that did not know, which is what it knew.
+    #[serde(default)]
+    pub identical: bool,
     /// How much of its own footage that is, in seconds; `None` when its own
     /// runtime is unknown.
     pub matched_seconds: Option<f64>,
@@ -252,6 +257,7 @@ impl Found {
                             file: number[&idx],
                             compared,
                             matched_with: best.as_ref().map(|l| number[&l.other]),
+                            identical: best.as_ref().is_some_and(|l| l.identical),
                             matched_seconds: best.as_ref().map(|l| l.matched_seconds).filter(|_| seconds_known),
                             matched_from: best.as_ref().and_then(|l| l.span).map(|s| s.start_seconds()),
                             matched_to: best.as_ref().and_then(|l| l.span).map(|s| s.end_seconds()),

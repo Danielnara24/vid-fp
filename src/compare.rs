@@ -534,6 +534,10 @@ pub struct Link {
 /// `Vec` per file for a loose scan to grow.
 pub struct MatchIndex {
     links: HashMap<(usize, usize), Link>,
+    /// Which set of byte-identical files each file belongs to, as the set's
+    /// number plus one; 0, or past the end, for a file in none. Empty unless
+    /// `with_identical` filled it.
+    same_bytes: Vec<u32>,
 }
 
 impl MatchIndex {
@@ -545,7 +549,30 @@ impl MatchIndex {
             links.insert((m.b, m.a), Link { coverage: m.coverage_b, span: m.span_b });
         }
 
-        Self { links }
+        Self { links, same_bytes: Vec::new() }
+    }
+
+    /// Record which files are byte-identical copies of each other: `sets` are
+    /// indices into the fingerprint list, each set two or more files whose
+    /// every byte agrees (see `content`). It changes no coverage and no
+    /// verdict -- identical files match each other in full already -- only what
+    /// the report can say about the link.
+    pub fn with_identical(mut self, files: usize, sets: &[Vec<usize>]) -> Self {
+        self.same_bytes = vec![0; files];
+        for (n, set) in sets.iter().enumerate() {
+            for &i in set {
+                if let Some(slot) = self.same_bytes.get_mut(i) {
+                    *slot = n as u32 + 1;
+                }
+            }
+        }
+        self
+    }
+
+    /// Whether `a` and `b` are the same bytes.
+    pub fn identical(&self, a: usize, b: usize) -> bool {
+        let of = |i: usize| self.same_bytes.get(i).copied().unwrap_or(0);
+        a != b && of(a) != 0 && of(a) == of(b)
     }
 
     /// How much of `subject` is contained in `other`, if the two were compared.
@@ -662,6 +689,7 @@ impl MatchIndex {
                     other,
                     matched_seconds: self.matched_seconds(subject, other, fps)?,
                     span: self.span(subject, other),
+                    identical: self.identical(subject, other),
                 })
             })
             .collect();
@@ -670,6 +698,9 @@ impl MatchIndex {
             y.matched_seconds
                 .partial_cmp(&x.matched_seconds)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                // Of two links accounting for the same footage, the copy is
+                // the stronger statement, so it is the one the row names.
+                .then_with(|| y.identical.cmp(&x.identical))
                 .then_with(|| fps[x.other].path.cmp(&fps[y.other].path))
         });
 
@@ -763,6 +794,8 @@ pub struct GroupLink {
     /// Where that footage sits in the SUBJECT's runtime, not the other file's.
     /// Always an envelope of `matched_seconds`, never narrower than it.
     pub span: Option<Span>,
+    /// Whether `other` is a byte-identical copy of the subject.
+    pub identical: bool,
 }
 
 /// --- Phase 1: candidate generation ---------------------------------------
@@ -1832,6 +1865,33 @@ pub fn find_all_matches(
     min_match_percent: f32,
     min_duration: f64,
 ) -> Vec<Match> {
+    find_matches_where(fingerprints, None, max_hamming_dist, min_match_percent, min_duration)
+}
+
+/// `find_all_matches` for `--against`: only pairs with one file on each side
+/// of `library` are measured. A library file is never compared with another
+/// library file, nor a scanned file with another scanned file, so the cost is
+/// the product of the two sides rather than the square of their sum -- which
+/// is the difference between this mode being usable on a large library and
+/// not. Every pair it does measure is measured exactly as a scan measures it.
+pub fn find_matches_across(
+    fingerprints: &[VideoFingerprint],
+    library: &[bool],
+    max_hamming_dist: u32,
+    min_match_percent: f32,
+    min_duration: f64,
+) -> Vec<Match> {
+    find_matches_where(fingerprints, Some(library), max_hamming_dist, min_match_percent, min_duration)
+}
+
+fn find_matches_where(
+    fingerprints: &[VideoFingerprint],
+    sides: Option<&[bool]>,
+    max_hamming_dist: u32,
+    min_match_percent: f32,
+    min_duration: f64,
+) -> Vec<Match> {
+    let wanted = |a: usize, b: usize| sides.is_none_or(|s| s[a] != s[b]);
     let n = fingerprints.len();
     let total_hashes: usize = fingerprints.iter().map(|fp| fp.valid_hashes.len()).sum();
     // Phase 1 has to be exhaustive at the WIDEST distance phase 2 can admit, not
@@ -1850,7 +1910,8 @@ pub fn find_all_matches(
     // "exhaustive" means. Measuring one pair is the same work either way, so it
     // lives in `measure_pair` and neither arm can drift from the other.
     let pairs: Vec<(usize, usize)> = if index_is_cheaper(masks.len(), n, total_hashes) {
-        let candidates = candidate_pairs(fingerprints, &masks, tol.widest());
+        let mut candidates = candidate_pairs(fingerprints, &masks, tol.widest());
+        candidates.retain(|&(a, b)| wanted(a, b));
         info!("Index scan produced {} candidate pair(s); verifying...", candidates.len());
         candidates
     } else {
@@ -1865,12 +1926,19 @@ pub fn find_all_matches(
         // built -- `n * (n - 1) / 2` is what the ranges below yield, and the bar
         // needs a denominator rather than the pairs themselves. In u64 because
         // this is the arm that runs on the libraries where it overflows a u32.
-        let total = n as u64 * n.saturating_sub(1) as u64 / 2;
+        let total = match sides {
+            None => n as u64 * n.saturating_sub(1) as u64 / 2,
+            Some(s) => {
+                let held = s.iter().filter(|&&h| h).count() as u64;
+                held * (n as u64 - held)
+            }
+        };
         let pb = verification_bar(total);
 
         let matches = (0..n)
             .into_par_iter()
             .flat_map(|v_a| ((v_a + 1)..n).into_par_iter().map(move |v_b| (v_a, v_b)))
+            .filter(|&(a, b)| wanted(a, b))
             .map_init(
                 || (Ticker::new(&pb), Witnesses::new()),
                 |(ticker, witnesses), pair| {
@@ -2077,6 +2145,21 @@ mod tests {
     }
 
     /// Only the runtime matters for the shared-duration arithmetic.
+    #[test]
+    fn test_across_measures_only_pairs_with_one_file_on_each_side() {
+        // Four copies of one fingerprint: a scan links all six pairs, and
+        // `--against` only the four that cross from scanned to library.
+        let hashes: Vec<u64> = (0..12).map(|i| 0x0F0F_0F0F_0F0F_0F0F_u64.rotate_left(i * 5)).collect();
+        let fps: Vec<VideoFingerprint> = (0..4).map(|_| mock_fp_with_hashes(hashes.clone(), 12)).collect();
+        assert_eq!(find_all_matches(&fps, 4, 0.2, 0.0).len(), 6);
+
+        let library = [true, true, false, false];
+        let mut pairs: Vec<(usize, usize)> =
+            find_matches_across(&fps, &library, 4, 0.2, 0.0).iter().map(|m| (m.a, m.b)).collect();
+        pairs.sort_unstable();
+        assert_eq!(pairs, vec![(0, 2), (0, 3), (1, 2), (1, 3)]);
+    }
+
     fn mock_fp_lasting(seconds: f64) -> VideoFingerprint {
         let mut fp = mock_fp_with_hashes(vec![], 1);
         fp.duration = seconds;

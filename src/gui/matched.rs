@@ -50,7 +50,8 @@ const FULL_W: u32 = 1920;
 const FULL_H: u32 = 1080;
 
 /// A video and what it was compared against: each other video with how it
-/// came to be one (`"Best match"`, `"Group reference"`) and the comparison.
+/// came to be one (`"Best match"`, `"Identical copy"`, `"Group reference"`)
+/// and the comparison.
 pub struct Subject {
     pub file: File,
     pub against: Vec<(&'static str, Comparison, File)>,

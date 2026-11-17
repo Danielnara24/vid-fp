@@ -42,6 +42,10 @@ const EVERY: Duration = Duration::from_millis(150);
 pub enum Stage {
     /// The weighing pass: files opened to price their decode.
     Weighing,
+    /// Sampling files the cache could not answer by path, in files.
+    Identifying,
+    /// Reading possible copies whole, in bytes.
+    Hashing,
     /// The decode: keyframe-pixels, with the files done in the bar's prefix
     /// and the file being waited on in its message.
     Fingerprinting,
@@ -120,6 +124,12 @@ fn describe(pb: &ProgressBar, stage: Stage) -> (f64, String) {
     let p = if len == 0 { 0.0 } else { (pos as f64 / len as f64).clamp(0.0, 1.0) };
     let m = match stage {
         Stage::Weighing => format!("Measuring decode cost: {pos} of {len} files"),
+        Stage::Identifying => format!("Identifying files: {pos} of {len}"),
+        Stage::Hashing => format!(
+            "Checking for identical copies: {} of {} MB",
+            pos / 1_000_000,
+            len / 1_000_000
+        ),
         Stage::Fingerprinting => {
             // The prefix is "done/total" files, the message the file the run
             // is waiting on; see the decode bar in `run`.

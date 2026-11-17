@@ -37,9 +37,13 @@ so re-scanning a library only decodes the files that changed.
 
 ## Requirements
 
-Linux, x86_64, **glibc 2.35 or newer** (Ubuntu 22.04+, Debian 12+, Fedora 36+,
-current Arch and Mint). The release binary bundles FFmpeg 8 and dav1d, so you do
-**not** need FFmpeg installed.
+Linux, x86_64, **glibc 2.28 or newer** (Ubuntu 20.04+, Debian 10+, RHEL and its
+rebuilds 8+, Fedora 29+, current Arch and Mint). The release binary bundles
+FFmpeg 8 and dav1d, so you do **not** need FFmpeg installed. Any x86_64 CPU
+works; FFmpeg picks the fastest instructions it has when it starts.
+
+On 64-bit ARM there is no prebuilt binary yet; install it
+[from source](#from-source).
 
 ## Installation
 
@@ -92,7 +96,8 @@ To reproduce the release exactly instead, self-contained and with AV1 support:
 ```bash
 git clone https://github.com/Danielnara24/vid-fp && cd vid-fp
 ./scripts/build-ffmpeg-static.sh                  # ~10 min, once
-cargo build --release --features static-ffmpeg    # -> target/release/vid-fp
+FFMPEG_DIR="$PWD/ffmpeg-static" \
+  cargo build --release --features static-ffmpeg  # -> target/release/vid-fp
 ```
 
 Needs `git make nasm pkg-config python3 python3-venv build-essential`. The
@@ -322,6 +327,33 @@ works, and the format is read from the file rather than its name, so a report
 kept as `dupes.bak` replays. Only CSV and JSON reports are accepted; `.txt`
 reports refused.
 
+### Checking new files against a library
+
+`--against` asks which scanned files a library already has, instead of grouping
+them. The library is scanned and cached like any folder but never compared with
+itself and never touched.
+
+```bash
+vid-fp ~/Downloads --against ~/Videos -r --list new
+```
+
+Each scanned file gets one answer:
+
+| Answer | Meaning | `action` |
+| --- | --- | --- |
+| `repeat` | A library file it matched ranks level with it or above it | `DELETE` |
+| `better` | It outranks every library file it matched | `KEEP` |
+| `review` | Matched, but held for the same reasons a scan holds a file for review | `REVIEW` |
+| `new` | Nothing in the library matched it | `KEEP`, with no `matched_with` |
+
+So `--delete` and `--move-to` remove repeats only, and the report replays with
+`--from-report`. `--list` prints the paths given the answers you name, one a line
+(NUL-separated with `-0`), and nothing else goes to stdout. Scanned files are not
+compared with each other: two copies of something the library lacks are both
+`new`. A file both sides reach belongs to the side whose folder holds it more
+closely, so scanning `~/Videos/import` against `~/Videos` answers the import
+folder.
+
 ## Desktop app
 
 `vid-fp-gui` runs the same scan in a window. Pick folders and options, press
@@ -362,7 +394,7 @@ nothing.
 | --- | --- | --- |
 | `<PATH>...` | Folders and/or video files to scan (required). `-` reads a list of paths from stdin | |
 | `--from-file <FILE>` | Read the paths to scan from a file, one per line (`-` = stdin) | |
-| `-0`, `--null` | Paths in the list are NUL-separated, for `find -print0` / `fd -0` | off |
+| `-0`, `--null` | Paths in the list are NUL-separated, for `find -print0` / `fd -0`; also separates `--list` output | off |
 | `-r`, `--recursive` | Include subfolders | off |
 | `--follow-symlinks` | Descend into symlinked folders. Deletions act on the file the link leads to | off |
 | `-e`, `--exclude <PATH>` | Exclude a folder or a single file; repeat for several. Matched by whole path components, so a file must be named exactly, and resolved through symlinks | |
@@ -378,6 +410,8 @@ nothing.
 | `--delete` | Move files marked DELETE to the trash | off |
 | `--permanent` | With `--delete`, permanently remove instead | off |
 | `--move-to <DIR>` | Move the files marked DELETE under `DIR`, recreating their absolute paths inside it. Arms the run on its own and supersedes `--delete`/`--permanent` | |
+| `--against <LIBRARY>` | Answer each scanned file against this library (`repeat`, `better`, `review`, `new`) instead of grouping. Repeatable. See [above](#checking-new-files-against-a-library) | |
+| `--list <ANSWER>` | With `--against`, print the paths given these answers to stdout, comma-separated (`-0` for NUL) | |
 | `--from-report <FILE>` | Act on a `.csv` or `.json` report from an earlier run instead of scanning. Requires `--delete` or `--move-to`. See [above](#acting-on-a-report-you-have-reviewed) | |
 | `-y`, `--yes` | Answer yes to the confirmation shown before any file is touched | off |
 | `-t`, `--threads <N>` | Worker threads (`0` = uses all cores). Raising it above that does not speed up a local scan and does raise peak memory, but can help when the videos are on a network mount or a slow disk. Capped at four per core, or 16, whichever is larger | `0` |
@@ -552,6 +586,7 @@ formats carry more data:
 | Column | Meaning |
 | --- | --- |
 | `matched_with` | The group member the `matched_seconds` figure on this row describes |
+| `identical` | `true` when that member is a byte-identical copy of this file |
 | `samples` | How many frame hashes this file's fingerprint holds |
 | `matched_from`, `matched_to` | Where that footage sits **in this file's own runtime** |
 | `matched_from_seconds`, `matched_to_seconds` | The same two as raw seconds |
@@ -637,6 +672,13 @@ the two flags that decide which frames get sampled, `--keyframe-interval` and,
 while an interval is in force, `--min-keyframes`. The comparison flags (`-d`,
 `-p`, `--min-duration`) are applied to cached fingerprints and never invalidate
 them, so re-running a scan at a different tolerance is instant.
+
+The cache also remembers what each file holds, as a hash of its length and three
+64 KB stretches of it. A file that was moved, renamed, touched or restored from
+a backup is recognised by that hash and keeps its fingerprint instead of being
+decoded again. Files whose length and hash agree are then read whole: those that
+are byte-identical are decoded once between them, and the report marks the link
+`identical`.
 
 ### Files that are not video
 
