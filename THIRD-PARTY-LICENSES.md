@@ -34,7 +34,8 @@ distributing whatever a recipient needs to **relink** the executable against a
 modified FFmpeg.
 
 Every release therefore ships `vid-fp-<version>-ffmpeg-static-libs.tar.gz`,
-containing:
+and `vid-fp-<version>-aarch64-ffmpeg-static-libs.tar.gz` beside the ARM
+binary, each containing:
 
 - the exact `.a` archives the binary was linked against,
 - their headers,

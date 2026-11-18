@@ -37,13 +37,12 @@ so re-scanning a library only decodes the files that changed.
 
 ## Requirements
 
-Linux, x86_64, **glibc 2.28 or newer** (Ubuntu 20.04+, Debian 10+, RHEL and its
-rebuilds 8+, Fedora 29+, current Arch and Mint). The release binary bundles
-FFmpeg 8 and dav1d, so you do **not** need FFmpeg installed. Any x86_64 CPU
-works; FFmpeg picks the fastest instructions it has when it starts.
-
-On 64-bit ARM there is no prebuilt binary yet; install it
-[from source](#from-source).
+Linux on x86_64 or 64-bit ARM (aarch64), **glibc 2.28 or newer** (Ubuntu
+20.04+, Debian 10+, RHEL and its rebuilds 8+, Fedora 29+, current Arch and
+Mint, Raspberry Pi OS 64-bit). The release binary bundles FFmpeg 8 and dav1d,
+so you do **not** need FFmpeg installed. Any CPU of either kind works; FFmpeg
+picks the fastest instructions it has when it starts. The desktop app is
+x86_64 only.
 
 ## Installation
 
@@ -55,6 +54,10 @@ curl -L -o vid-fp \
 chmod +x vid-fp
 sudo install -m 755 vid-fp /usr/local/bin/vid-fp
 ```
+
+On 64-bit ARM, download `vid-fp-aarch64-linux-gnu` instead. Its matches can
+differ from the x86_64 binary's by a second or so on a few files, because
+FFmpeg scales pictures with code written for each processor.
 
 That URL always points at the newest version. Prefer not to use `sudo`? Install
 into `~/.local/bin` instead and make sure that directory is on your `PATH`.
@@ -751,7 +754,8 @@ The **released binary** additionally contains FFmpeg (LGPL 2.1+) and dav1d
 (BSD-2-Clause), statically linked. That does not affect the licence above, but
 because the FFmpeg link is static, LGPL 2.1 §6 entitles you to relink the
 program against your own build of FFmpeg. Every release therefore ships
-`vid-fp-<version>-ffmpeg-static-libs.tar.gz` with the archives, headers, build
+`vid-fp-<version>-ffmpeg-static-libs.tar.gz` (and
+`vid-fp-<version>-aarch64-ffmpeg-static-libs.tar.gz` for ARM) with the archives, headers, build
 script and instructions needed to do that. The FFmpeg in it is configured
 `--disable-gpl --disable-nonfree`, so it is LGPL only.
 

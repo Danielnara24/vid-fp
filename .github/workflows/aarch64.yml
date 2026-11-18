@@ -2,8 +2,12 @@
 #
 # vid-fp on 64-bit ARM Linux, on a native ARM runner: does the static build
 # (FFmpeg 8 + dav1d, glibc 2.28) build, do the tests pass, does AV1 decode, and
-# does it fingerprint the fixtures as the x86_64 release does. Nothing ships
-# from here; it is the evidence an aarch64 release would rest on.
+# does it fingerprint the fixtures as the x86_64 release does.
+#
+# release.yml calls this same workflow with the tag (`workflow_call`), and
+# publishes the binary and relink kit it leaves as an artifact, so the aarch64
+# download is exactly what these checks passed. On an ordinary push the
+# artifact is kept a week, for trying a branch's build on an ARM machine.
 #
 # It is the release's own build, run the release's own way
 # (scripts/manylinux-build.sh in the manylinux_2_28 image), so a green run
@@ -20,6 +24,12 @@ on:
     branches: ["**"]
     paths-ignore: ["**.md", "LICENSE*"]
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      tag:
+        description: The release tag (v1.2.3) the files are named after.
+        type: string
+        required: true
 
 concurrency:
   group: aarch64-${{ github.ref }}
@@ -105,3 +115,27 @@ jobs:
             echo "::warning::the fixtures' report differs from the x86_64 build's ($GOT, x86_64 $WANT)"
             cat "$RUNNER_TEMP/fx.csv"
           fi
+
+      - name: Package
+        # The same names as the x86_64 files, with the architecture in place
+        # of x86_64; the LGPL kit is this build's own archives, as section 6
+        # requires of the binary it ships beside.
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          VERSION="${TAG#v}"
+          VERSION="${VERSION:-dev}"
+          mkdir -p dist
+          cp target/release/vid-fp "dist/vid-fp-${VERSION}-aarch64-linux-gnu"
+          cp target/release/vid-fp dist/vid-fp-aarch64-linux-gnu
+          scripts/package-relink-kit.sh "$VERSION" "vid-fp-${VERSION}-aarch64-ffmpeg-static-libs"
+          cd dist
+          for f in *; do [ -f "$f" ] && sha256sum "$f" > "$f.sha256"; done
+          ls -la
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: vid-fp-aarch64
+          path: dist/*
+          retention-days: ${{ inputs.tag && 30 || 7 }}
+          if-no-files-found: error
