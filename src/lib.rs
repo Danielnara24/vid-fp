@@ -51,7 +51,7 @@ include!(concat!(env!("OUT_DIR"), "/static_ffmpeg_version_check.rs"));
 /// re-encoded, re-muxed, or scanned with different sampling settings replaces
 /// its own entry instead of growing a second one beside it.
 const CACHE_TABLE: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("fingerprints_dct_ct_ff8_pts");
+    TableDefinition::new("fingerprints_dct_ct_ff8_cscale");
 
 /// Files this build looked at and refused before opening: see `NotMedia`.
 ///
@@ -66,7 +66,7 @@ const CACHE_TABLE: TableDefinition<&str, &[u8]> =
 /// A refusal is worth half a millisecond, so it can be discarded on the merest
 /// suspicion -- and it has to be, because it depends on things `Stamp`
 /// deliberately does not record: the vendored FFmpeg's demuxer set (`ff8`) and
-/// this tool's own gate (`probe5` = `FIRST_PROBE_BYTES`/`SECOND_PROBE_BYTES`/
+/// this tool's own gate (`probe6` = `FIRST_PROBE_BYTES`/`SECOND_PROBE_BYTES`/
 /// `NO_EVIDENCE`, and what a `NotMedia` counts). A `Refusal::Said` widens that
 /// list to everything the DECODE can decide, since it stores the sentence a run
 /// printed: which decoder answers fail a file, and the words they fail it in,
@@ -79,7 +79,7 @@ const CACHE_TABLE: TableDefinition<&str, &[u8]> =
 /// in `SUPERSEDED_TABLES` would tell a user with a large library to expect a
 /// re-decode that is not coming.
 const REFUSED_TABLE: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("refused_ff8_probe5");
+    TableDefinition::new("refused_ff8_probe6");
 
 /// What each fingerprinted path held: absolute path -> bincode'd
 /// `content::Identity`.
@@ -183,7 +183,15 @@ const IDENTITY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("ident
 ///   are right -- but no field of an entry says which libavcodec wrote it, so
 ///   the whole table goes. Same fields, same units, values moved between
 ///   samples, invisible to the `Stamp`.
-const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 9] = [
+/// - `fingerprints_dct_ct_ff8_pts` holds hashes of pictures shrunk by whatever
+///   code libswscale picked for the processor that wrote them. Its fast
+///   bilinear scaler rounds differently in x86 SIMD than in C, which is what
+///   aarch64 runs, so the same file hashed differently on the two and about
+///   one link in eight of the local corpus's report moved between them. The
+///   scaler is now always built from the C code (`portable_scaler`); on x86
+///   that moves the hashes of most files, and nothing in an entry says which
+///   code made it.
+const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 10] = [
     TableDefinition::new("fingerprints"),
     TableDefinition::new("fingerprints_by_path"),
     TableDefinition::new("fingerprints_dct"),
@@ -193,6 +201,7 @@ const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 9] = [
     TableDefinition::new("fingerprints_dct_ct_ff8_splice"),
     TableDefinition::new("fingerprints_dct_ct_ff8_rescale"),
     TableDefinition::new("fingerprints_dct_ct_ff8_kffloor"),
+    TableDefinition::new("fingerprints_dct_ct_ff8_pts"),
 ];
 
 /// Refusal tables earlier builds wrote. Kept apart from the list above because
@@ -235,11 +244,18 @@ const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 9] = [
 /// the entry that stops a later run ever opening the file again. The verdict is
 /// wrong now, nothing about the file changed, and no `Stamp` can tell: the
 /// entries have to go by name or those videos stay invisible for ever.
-const SUPERSEDED_REFUSAL_TABLES: [TableDefinition<&str, &[u8]>; 4] = [
+///
+/// `refused_ff8_probe5` went with `fingerprints_dct_ct_ff8_pts`. One of the
+/// sentences a `Refusal::Said` replays is that every sampled frame was
+/// featureless, and that is a judgement on the scaled pictures, which the
+/// portable scaler changed: a file refused under the old one may fingerprint
+/// now.
+const SUPERSEDED_REFUSAL_TABLES: [TableDefinition<&str, &[u8]>; 5] = [
     TableDefinition::new("refused_ff8_probe1"),
     TableDefinition::new("refused_ff8_probe2"),
     TableDefinition::new("refused_ff8_probe3"),
     TableDefinition::new("refused_ff8_probe4"),
+    TableDefinition::new("refused_ff8_probe5"),
 ];
 
 /// Hard ceiling on the cache's page cache.

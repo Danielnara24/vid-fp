@@ -55,19 +55,60 @@ const KEEP: usize = 8;
 const MIN_AC_ENERGY: f32 = 8.0;
 
 /// How every keyframe is shrunk to the 64x64 greyscale the hash is taken from.
+/// Only ever used through [`portable_scaler`], which is what makes it the same
+/// picture on every processor.
+const SCALE_FLAGS: ffmpeg_next::software::scaling::flag::Flags =
+    ffmpeg_next::software::scaling::flag::Flags::FAST_BILINEAR;
+
+/// Held while FFmpeg's CPU flags are forced off, and while a decoder is opened.
 ///
-/// `BITEXACT | ACCURATE_RND` is what makes a fingerprint a property of the file
-/// rather than of the processor that read it. Without them libswscale picks
-/// per-architecture code with its own rounding: the aarch64 build computed
-/// different hashes from the x86_64 one for the same files (2 of 61 samples of
-/// one file dropped as featureless on one side and kept on the other), and
-/// about one link in eight of the local corpus's report differed between them.
-/// libswscale promises identical output on every CPU only with `BITEXACT`, so
-/// anything that touches this constant is a `CACHE_TABLE` rename.
-pub(crate) const SCALE_FLAGS: ffmpeg_next::software::scaling::flag::Flags =
-    ffmpeg_next::software::scaling::flag::Flags::FAST_BILINEAR
-        .union(ffmpeg_next::software::scaling::flag::Flags::BITEXACT)
-        .union(ffmpeg_next::software::scaling::flag::Flags::ACCURATE_RND);
+/// The flags are one process-wide value, read when a scaler or a decoder is
+/// set up. Holding this around both means a decoder never opens inside the
+/// window [`portable_scaler`] makes, where it would pick its plain C code for
+/// the whole file: the same pictures (FFmpeg's decoders are bit-exact whatever
+/// code they run), several times slower.
+static CPU_FLAGS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The scaler every keyframe goes through, built with FFmpeg's plain C code.
+///
+/// A fingerprint has to be a property of the file, not of the processor that
+/// read it, and libswscale's fast bilinear scaler is not: its x86 SIMD code
+/// rounds differently from its C code, which is what aarch64 runs. The same
+/// files hashed differently on the two (one file kept 59 samples on aarch64 of
+/// the 61 it kept on x86_64), about one link in eight of the local corpus's
+/// report differed, and there is nothing to say two x86 processors with
+/// different SIMD would agree either. `SWS_BITEXACT` does not reach this path
+/// -- it was tried, and moved the x86 output without matching the C output --
+/// and `BILINEAR` or `AREA` with it, which are bit-exact, cost four points of
+/// recall at the default `-d` on the labeled corpus. So the scaler stays fast
+/// bilinear and is built with every CPU flag forced off: libswscale picks its
+/// code when the context is made, so the flags are restored at once, and the
+/// decoders, which are the cost of a run, keep their SIMD.
+///
+/// Anything that changes what this produces -- the flags, the size, how the
+/// code is chosen -- moves every fingerprint, and is a `CACHE_TABLE` rename.
+pub(crate) fn portable_scaler(
+    format: ffmpeg_next::format::Pixel,
+    width: u32,
+    height: u32,
+) -> Result<ffmpeg_next::software::scaling::context::Context, ffmpeg_next::Error> {
+    let _held = CPU_FLAGS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // SAFETY: two plain calls on a global int; the lock keeps every reader this
+    // program controls out of the window.
+    let saved = unsafe { ffmpeg_next::ffi::av_get_cpu_flags() };
+    unsafe { ffmpeg_next::ffi::av_force_cpu_flags(0) };
+    let made = ffmpeg_next::software::scaling::context::Context::get(
+        format,
+        width,
+        height,
+        ffmpeg_next::format::Pixel::GRAY8,
+        64,
+        64,
+        SCALE_FLAGS,
+    );
+    unsafe { ffmpeg_next::ffi::av_force_cpu_flags(saved) };
+    made
+}
 
 /// How many times in a row the demuxer may fail before the file is treated as
 /// finished.
@@ -1696,8 +1737,12 @@ pub fn fingerprint_video(
         (*ctx).skip_frame = ffmpeg_next::ffi::AVDiscard::AVDISCARD_NONKEY;
     }
 
-    let mut decoder = context_decoder.decoder().video()
-        .context("Failed to initialize video decoder")?;
+    let mut decoder = {
+        // Not inside a `portable_scaler` window; see `CPU_FLAGS`.
+        let _held = CPU_FLAGS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        context_decoder.decoder().video()
+    }
+    .context("Failed to initialize video decoder")?;
 
     // Built from the first frame the decoder produces rather than from the
     // header. Without the probe the container never reports a pixel format --
@@ -1784,15 +1829,7 @@ pub fn fingerprint_video(
             }
         };
         if rebuild {
-            scaler = Some(ffmpeg_next::software::scaling::context::Context::get(
-                dec.format(),
-                dec.width(),
-                dec.height(),
-                ffmpeg_next::format::Pixel::GRAY8,
-                64,
-                64,
-                SCALE_FLAGS,
-            )?);
+            scaler = Some(portable_scaler(dec.format(), dec.width(), dec.height())?);
             frame_dims.get_or_insert((dec.width(), dec.height()));
         }
         let scaler = scaler.as_mut().unwrap();
@@ -2794,16 +2831,7 @@ mod tests {
                 dec.send_eof().unwrap();
                 dec.receive_frame(&mut frame).unwrap();
             }
-            let mut scaler = ffmpeg_next::software::scaling::context::Context::get(
-                frame.format(),
-                frame.width(),
-                frame.height(),
-                ffmpeg_next::format::Pixel::GRAY8,
-                64,
-                64,
-                SCALE_FLAGS,
-            )
-            .unwrap();
+            let mut scaler = portable_scaler(frame.format(), frame.width(), frame.height()).unwrap();
             let mut gray = ffmpeg_next::frame::Video::empty();
             scaler.run(&frame, &mut gray).unwrap();
             for y in 0..64 {

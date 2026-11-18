@@ -84,13 +84,13 @@ jobs:
 
       - name: The fixtures' report against the x86_64 build
         # Every figure in a report of the fixtures (samples, matched seconds,
-        # coverage, the groups and labels) comes out of the decoded pictures,
-        # so a checksum of it says whether this build sees what the x86_64
-        # release sees. The decoders are bit-exact by specification, but
-        # libswscale's scaling runs per-architecture code and floating point
-        # may round otherwise, so a difference is a warning to look into
-        # rather than a failure. The expected sum is the x86_64 static
-        # build's; refresh it when the fixtures or the report layout change.
+        # coverage, the groups and labels) comes out of the decoded and scaled
+        # pictures, so a checksum of it says whether this build fingerprints
+        # exactly as the x86_64 release does. It has to: FFmpeg's decoders are
+        # bit-exact on every processor and the scaler is built from its C code
+        # (fingerprint::portable_scaler), so any difference is a bug. The same
+        # sum is checked in release.yml's x86_64 job; refresh both when the
+        # fixtures or the report layout change.
         #
         # Exit 2 is expected: one fixture is featureless on purpose and cannot
         # be fingerprinted.
@@ -100,21 +100,12 @@ jobs:
             --cache "$RUNNER_TEMP/fx.redb" -o "$RUNNER_TEMP/fx.csv" || rc=$?
           if [ "$rc" -gt 2 ]; then echo "::error::vid-fp exited $rc"; exit 1; fi
           GOT="$(sed "s|$PWD/||g" "$RUNNER_TEMP/fx.csv" | sha256sum | cut -c1-16)"
-          WANT="170a8d9e994782b1"
-          # The first ARM run's report, reviewed: it differs from x86_64 in
-          # one cell, capture.ts's matched seconds against rescaled.ts (19.00
-          # against 17.00). That fixture changes resolution mid-file, so it is
-          # the one most exposed to libswscale's per-architecture code; groups
-          # and labels are the same.
-          KNOWN_ARM="fc069cfa18f8b928"
-          if [ "$GOT" = "$WANT" ]; then
-            echo "matches x86_64: $GOT"
-          elif [ "$GOT" = "$KNOWN_ARM" ]; then
-            echo "matches the reviewed aarch64 report: $GOT (one figure off x86_64's, see above)"
-          else
-            echo "::warning::the fixtures' report differs from the x86_64 build's ($GOT, x86_64 $WANT)"
+          if [ "$GOT" != "fc069cfa18f8b928" ]; then
+            echo "::error::the fixtures' report is $GOT, not the x86_64 build's fc069cfa18f8b928"
             cat "$RUNNER_TEMP/fx.csv"
+            exit 1
           fi
+          echo "matches x86_64: $GOT"
 
       - name: Package
         # The same names as the x86_64 files, with the architecture in place

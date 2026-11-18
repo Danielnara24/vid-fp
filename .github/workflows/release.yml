@@ -135,6 +135,23 @@ jobs:
             exit 1
           fi
 
+      - name: The fixtures' report is the one every processor makes
+        # The same checksum aarch64.yml demands of the ARM build: the scaler
+        # is built from FFmpeg's C code (fingerprint::portable_scaler) so that
+        # every processor fingerprints a file alike. Refresh both together.
+        # Exit 2 is expected: one fixture is featureless on purpose.
+        run: |
+          rc=0
+          ./target/release/vid-fp "$PWD/tests/fixtures" -d 10 -q \
+            --cache "$RUNNER_TEMP/fx.redb" -o "$RUNNER_TEMP/fx.csv" || rc=$?
+          if [ "$rc" -gt 2 ]; then echo "::error::vid-fp exited $rc"; exit 1; fi
+          GOT="$(sed "s|$PWD/||g" "$RUNNER_TEMP/fx.csv" | sha256sum | cut -c1-16)"
+          if [ "$GOT" != "fc069cfa18f8b928" ]; then
+            echo "::error::the fixtures' report is $GOT, not fc069cfa18f8b928"
+            cat "$RUNNER_TEMP/fx.csv"
+            exit 1
+          fi
+
       - name: Package artifacts
         run: |
           VERSION="${GITHUB_REF_NAME#v}"

@@ -55,9 +55,8 @@ chmod +x vid-fp
 sudo install -m 755 vid-fp /usr/local/bin/vid-fp
 ```
 
-On 64-bit ARM, download `vid-fp-aarch64-linux-gnu` instead. Its matches can
-differ from the x86_64 binary's by a second or so on a few files, because
-FFmpeg scales pictures with code written for each processor.
+On 64-bit ARM, download `vid-fp-aarch64-linux-gnu` instead. It fingerprints
+exactly as the x86_64 binary does, so both find the same duplicates.
 
 That URL always points at the newest version. Prefer not to use `sudo`? Install
 into `~/.local/bin` instead and make sure that directory is on your `PATH`.
