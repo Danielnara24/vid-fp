@@ -82,14 +82,18 @@ jobs:
           cp "$RUNNER_TEMP/av1/a.mkv" "$RUNNER_TEMP/av1/b.mkv"
           ./target/release/vid-fp "$RUNNER_TEMP/av1" -q --cache "$RUNNER_TEMP/av1.redb"
 
-      - name: The fixtures' report against the x86_64 build
+      - name: The fixtures' report is the reviewed aarch64 one
         # Every figure in a report of the fixtures (samples, matched seconds,
         # coverage, the groups and labels) comes out of the decoded and scaled
-        # pictures, so a checksum of it says whether this build fingerprints
-        # exactly as the x86_64 release does. It has to: FFmpeg's decoders are
-        # bit-exact on every processor and the scaler is built from its C code
-        # (fingerprint::portable_scaler), so any difference is a bug. The same
-        # sum is checked in release.yml's x86_64 job; refresh both when the
+        # pictures, so a checksum of it says whether this build still
+        # fingerprints as it did when its report was reviewed. It is its own
+        # sum, not x86_64's: libswscale's fast bilinear scaler rounds
+        # differently in x86 SIMD than in the C code ARM runs, which moves one
+        # figure here (test_video_capture.ts matched 19.00 s of
+        # test_video_rescaled.ts, 17.00 s on x86_64) and about one link in
+        # eight on a real library, at the same accuracy. That is why the two
+        # keep separate cache tables (lib.rs, CACHE_TABLE). x86_64's sum,
+        # 170a8d9e994782b1, is checked in release.yml. Refresh both when the
         # fixtures or the report layout change.
         #
         # Exit 2 is expected: one fixture is featureless on purpose and cannot
@@ -101,11 +105,11 @@ jobs:
           if [ "$rc" -gt 2 ]; then echo "::error::vid-fp exited $rc"; exit 1; fi
           GOT="$(sed "s|$PWD/||g" "$RUNNER_TEMP/fx.csv" | sha256sum | cut -c1-16)"
           if [ "$GOT" != "fc069cfa18f8b928" ]; then
-            echo "::error::the fixtures' report is $GOT, not the x86_64 build's fc069cfa18f8b928"
+            echo "::error::the fixtures' report is $GOT, not the reviewed aarch64 fc069cfa18f8b928"
             cat "$RUNNER_TEMP/fx.csv"
             exit 1
           fi
-          echo "matches x86_64: $GOT"
+          echo "matches the reviewed aarch64 report: $GOT"
 
       - name: Package
         # The same names as the x86_64 files, with the architecture in place

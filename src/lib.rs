@@ -50,8 +50,20 @@ include!(concat!(env!("OUT_DIR"), "/static_ffmpeg_version_check.rs"));
 /// scanned rather than by the number of times they have changed: a file that is
 /// re-encoded, re-muxed, or scanned with different sampling settings replaces
 /// its own entry instead of growing a second one beside it.
+///
+/// Per architecture, through the suffix `build.rs` supplies (empty on x86_64,
+/// `_aarch64` on ARM). The keyframes are shrunk by libswscale's fast bilinear
+/// scaler, and its x86 SIMD code rounds differently from the C code ARM runs:
+/// the same file hashes slightly differently on the two, and about one link in
+/// eight of the local corpus's report differs between them, at the same
+/// accuracy against the labeled pairs. So a cache two architectures share
+/// keeps a table each rather than handing one's fingerprints to the other.
+/// Every x86 instruction level from SSE2 to AVX2 gives the same pictures, so
+/// x86 machines do share one. Making all of them agree (the scaler built from
+/// the C code everywhere) was measured and declined: it cost every x86 user a
+/// re-decode and 2-6% of a cold scan for agreement no x86 user needs.
 const CACHE_TABLE: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("fingerprints_dct_ct_ff8_cscale");
+    TableDefinition::new(concat!("fingerprints_dct_ct_ff8_pts", env!("VID_FP_ARCH_TABLE_SUFFIX")));
 
 /// Files this build looked at and refused before opening: see `NotMedia`.
 ///
@@ -66,7 +78,7 @@ const CACHE_TABLE: TableDefinition<&str, &[u8]> =
 /// A refusal is worth half a millisecond, so it can be discarded on the merest
 /// suspicion -- and it has to be, because it depends on things `Stamp`
 /// deliberately does not record: the vendored FFmpeg's demuxer set (`ff8`) and
-/// this tool's own gate (`probe6` = `FIRST_PROBE_BYTES`/`SECOND_PROBE_BYTES`/
+/// this tool's own gate (`probe5` = `FIRST_PROBE_BYTES`/`SECOND_PROBE_BYTES`/
 /// `NO_EVIDENCE`, and what a `NotMedia` counts). A `Refusal::Said` widens that
 /// list to everything the DECODE can decide, since it stores the sentence a run
 /// printed: which decoder answers fail a file, and the words they fail it in,
@@ -78,8 +90,11 @@ const CACHE_TABLE: TableDefinition<&str, &[u8]> =
 /// fingerprint table costs, and the run says so in different words. Putting it
 /// in `SUPERSEDED_TABLES` would tell a user with a large library to expect a
 /// re-decode that is not coming.
+///
+/// Per architecture like `CACHE_TABLE`, because one verdict it remembers --
+/// every sampled frame featureless -- is a judgement on the scaled pictures.
 const REFUSED_TABLE: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("refused_ff8_probe6");
+    TableDefinition::new(concat!("refused_ff8_probe5", env!("VID_FP_ARCH_TABLE_SUFFIX")));
 
 /// What each fingerprinted path held: absolute path -> bincode'd
 /// `content::Identity`.
@@ -183,15 +198,7 @@ const IDENTITY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("ident
 ///   are right -- but no field of an entry says which libavcodec wrote it, so
 ///   the whole table goes. Same fields, same units, values moved between
 ///   samples, invisible to the `Stamp`.
-/// - `fingerprints_dct_ct_ff8_pts` holds hashes of pictures shrunk by whatever
-///   code libswscale picked for the processor that wrote them. Its fast
-///   bilinear scaler rounds differently in x86 SIMD than in C, which is what
-///   aarch64 runs, so the same file hashed differently on the two and about
-///   one link in eight of the local corpus's report moved between them. The
-///   scaler is now always built from the C code (`portable_scaler`); on x86
-///   that moves the hashes of most files, and nothing in an entry says which
-///   code made it.
-const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 10] = [
+const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 9] = [
     TableDefinition::new("fingerprints"),
     TableDefinition::new("fingerprints_by_path"),
     TableDefinition::new("fingerprints_dct"),
@@ -201,7 +208,6 @@ const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 10] = [
     TableDefinition::new("fingerprints_dct_ct_ff8_splice"),
     TableDefinition::new("fingerprints_dct_ct_ff8_rescale"),
     TableDefinition::new("fingerprints_dct_ct_ff8_kffloor"),
-    TableDefinition::new("fingerprints_dct_ct_ff8_pts"),
 ];
 
 /// Refusal tables earlier builds wrote. Kept apart from the list above because
@@ -244,18 +250,11 @@ const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 10] = [
 /// the entry that stops a later run ever opening the file again. The verdict is
 /// wrong now, nothing about the file changed, and no `Stamp` can tell: the
 /// entries have to go by name or those videos stay invisible for ever.
-///
-/// `refused_ff8_probe5` went with `fingerprints_dct_ct_ff8_pts`. One of the
-/// sentences a `Refusal::Said` replays is that every sampled frame was
-/// featureless, and that is a judgement on the scaled pictures, which the
-/// portable scaler changed: a file refused under the old one may fingerprint
-/// now.
-const SUPERSEDED_REFUSAL_TABLES: [TableDefinition<&str, &[u8]>; 5] = [
+const SUPERSEDED_REFUSAL_TABLES: [TableDefinition<&str, &[u8]>; 4] = [
     TableDefinition::new("refused_ff8_probe1"),
     TableDefinition::new("refused_ff8_probe2"),
     TableDefinition::new("refused_ff8_probe3"),
     TableDefinition::new("refused_ff8_probe4"),
-    TableDefinition::new("refused_ff8_probe5"),
 ];
 
 /// Hard ceiling on the cache's page cache.
@@ -1696,11 +1695,17 @@ fn ensure_cache_table(db: &Database) -> Result<()> {
 /// every page is live, the file is already dense (the inserts reused the very
 /// pages the clear freed), and the compaction rewrites the entire library's
 /// fingerprints to reclaim nothing.
+///
+/// Every table in the file goes, not only this build's: a cache shared with a
+/// machine of another architecture holds that machine's fingerprint tables
+/// too (`CACHE_TABLE`), and "clear the cache" leaving them behind would be a
+/// cache that is not clear.
 fn clear_cache(db: &mut Database) -> Result<()> {
     let txn = db.begin_write().context("Failed to start a cache transaction")?;
-    txn.delete_table(CACHE_TABLE).context("Failed to clear cache database")?;
-    txn.delete_table(REFUSED_TABLE).context("Failed to clear the refusals table")?;
-    txn.delete_table(IDENTITY_TABLE).context("Failed to clear the identity table")?;
+    let tables: Vec<_> = txn.list_tables().context("Failed to list the cache's tables")?.collect();
+    for table in tables {
+        txn.delete_table(table).context("Failed to clear the cache")?;
+    }
     txn.commit().context("Failed to commit the cache clear")?;
 
     // Dropping the table dropped its definition too; every later lookup needs
@@ -6718,6 +6723,24 @@ mod tests {
             cache_lookup(&db, path, &s).is_some(),
             "and the table is ready for the scan that follows"
         );
+    }
+
+    #[test]
+    fn test_clearing_the_cache_clears_another_architecture_s_tables_too() {
+        // A cache on a share an ARM and an x86 machine both scan holds a
+        // fingerprint table for each; --clear-cache from either empties both.
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = temp_db(&dir);
+        let other: TableDefinition<&str, &[u8]> = TableDefinition::new("fingerprints_dct_ct_ff8_pts_riscv64");
+        let txn = db.begin_write().unwrap();
+        txn.open_table(other).unwrap().insert("/videos/a.mkv", &b"x"[..]).unwrap();
+        txn.commit().unwrap();
+
+        clear_cache(&mut db).unwrap();
+
+        let names: Vec<String> =
+            db.begin_read().unwrap().list_tables().unwrap().map(|t| redb::TableHandle::name(&t).to_string()).collect();
+        assert!(!names.iter().any(|n| n.ends_with("_riscv64")), "{names:?}");
     }
 
     #[test]
