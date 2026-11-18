@@ -288,7 +288,10 @@ mod tests {
     /// sizes checked first), or its terminal's own switches. `--priority`
     /// is not passed either: the scan labels every ranking at once
     /// (`found::Verdict`), and the results page's *Rank by* picks one.
-    const NOT_SHOWN: [&str; 9] = ["from_file", "null", "priority", "delete", "permanent", "move_to", "from_report", "yes", "quiet"];
+    /// `--against` and its `--list` are another kind of run, which `run`
+    /// refuses from the window.
+    const NOT_SHOWN: [&str; 11] =
+        ["from_file", "null", "priority", "delete", "permanent", "move_to", "from_report", "yes", "quiet", "against", "list"];
 
     /// Each of vid-fp's options is the window's to show, its to pass by
     /// hand, or not its to pass, and only one of these: an option added to
