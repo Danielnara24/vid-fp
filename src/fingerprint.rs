@@ -54,6 +54,21 @@ const KEEP: usize = 8;
 /// at risk of being dropped.
 const MIN_AC_ENERGY: f32 = 8.0;
 
+/// How every keyframe is shrunk to the 64x64 greyscale the hash is taken from.
+///
+/// `BITEXACT | ACCURATE_RND` is what makes a fingerprint a property of the file
+/// rather than of the processor that read it. Without them libswscale picks
+/// per-architecture code with its own rounding: the aarch64 build computed
+/// different hashes from the x86_64 one for the same files (2 of 61 samples of
+/// one file dropped as featureless on one side and kept on the other), and
+/// about one link in eight of the local corpus's report differed between them.
+/// libswscale promises identical output on every CPU only with `BITEXACT`, so
+/// anything that touches this constant is a `CACHE_TABLE` rename.
+pub(crate) const SCALE_FLAGS: ffmpeg_next::software::scaling::flag::Flags =
+    ffmpeg_next::software::scaling::flag::Flags::FAST_BILINEAR
+        .union(ffmpeg_next::software::scaling::flag::Flags::BITEXACT)
+        .union(ffmpeg_next::software::scaling::flag::Flags::ACCURATE_RND);
+
 /// How many times in a row the demuxer may fail before the file is treated as
 /// finished.
 ///
@@ -1776,7 +1791,7 @@ pub fn fingerprint_video(
                 ffmpeg_next::format::Pixel::GRAY8,
                 64,
                 64,
-                ffmpeg_next::software::scaling::flag::Flags::FAST_BILINEAR,
+                SCALE_FLAGS,
             )?);
             frame_dims.get_or_insert((dec.width(), dec.height()));
         }
@@ -2786,7 +2801,7 @@ mod tests {
                 ffmpeg_next::format::Pixel::GRAY8,
                 64,
                 64,
-                ffmpeg_next::software::scaling::flag::Flags::FAST_BILINEAR,
+                SCALE_FLAGS,
             )
             .unwrap();
             let mut gray = ffmpeg_next::frame::Video::empty();
