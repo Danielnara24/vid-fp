@@ -63,7 +63,7 @@ include!(concat!(env!("OUT_DIR"), "/static_ffmpeg_version_check.rs"));
 /// the C code everywhere) was measured and declined: it cost every x86 user a
 /// re-decode and 2-6% of a cold scan for agreement no x86 user needs.
 const CACHE_TABLE: TableDefinition<&str, &[u8]> =
-    TableDefinition::new(concat!("fingerprints_dct_ct_ff8_framecrop", env!("VID_FP_ARCH_TABLE_SUFFIX")));
+    TableDefinition::new(concat!("fingerprints_dct_ct_ff8_detail", env!("VID_FP_ARCH_TABLE_SUFFIX")));
 
 /// Files this build looked at and refused before opening: see `NotMedia`.
 ///
@@ -206,7 +206,12 @@ const IDENTITY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("ident
 ///   by its own flat edges (`frame_crop`), so every value of `valid_hashes`
 ///   can move. The entries also lack `mirrored_hashes`, which on its own would
 ///   only have made them fail to load.
-const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 10] = [
+/// - `fingerprints_dct_ct_ff8_framecrop` kept frames whose AC energy was
+///   between the old featureless floor (8) and the new one (50): dark,
+///   low-contrast frames whose hash is mostly the position of one bright patch,
+///   which matched unrelated dark frames. Which samples a fingerprint holds
+///   changed, and the entries lack the detail and reframed hashes.
+const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 11] = [
     TableDefinition::new("fingerprints"),
     TableDefinition::new("fingerprints_by_path"),
     TableDefinition::new("fingerprints_dct"),
@@ -217,6 +222,7 @@ const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 10] = [
     TableDefinition::new("fingerprints_dct_ct_ff8_rescale"),
     TableDefinition::new("fingerprints_dct_ct_ff8_kffloor"),
     TableDefinition::new(concat!("fingerprints_dct_ct_ff8_pts", env!("VID_FP_ARCH_TABLE_SUFFIX"))),
+    TableDefinition::new(concat!("fingerprints_dct_ct_ff8_framecrop", env!("VID_FP_ARCH_TABLE_SUFFIX"))),
 ];
 
 /// Refusal tables earlier builds wrote. Kept apart from the list above because
@@ -593,12 +599,14 @@ struct Args {
     /// Frame-match tolerance, in bits out of 64; higher is looser
     ///
     /// Two unrelated frames sit about 32 bits apart, so the useful range is
-    /// roughly 2 to 12. Only even values do anything, since every hash has 32
-    /// of its 64 bits set. A lone frame match must be within this; one that
-    /// another match agrees with about the time offset may reach 6 bits
-    /// further, and past 12 bits more agreeing matches are needed: two at 14,
-    /// three at 16, four at 20. Values above 32 are refused.
-    #[arg(short = 'd', long = "hamming-distance", value_name = "N", default_value_t = 4)]
+    /// roughly 2 to 8. Each frame carries a second, finer hash, and two frames
+    /// are compared on both together: -d sets how far below chance that
+    /// combined distance must be, the same distance below chance as -d bits are
+    /// on one hash. A lone frame match must be within it; one that another
+    /// match agrees with about the time offset may reach 1.5 standard
+    /// deviations further, and further still needs more agreeing matches.
+    /// Values above 32 are refused.
+    #[arg(short = 'd', long = "hamming-distance", value_name = "N", default_value_t = 6)]
     hamming_distance: u32,
 
     /// Minimum percentage of a video that must match, from 0 to 100
@@ -3370,7 +3378,7 @@ fn identify(
     // from a former holder of its bytes, or decoded.
     enum Fate {
         Decode,
-        Adopt(VideoFingerprint),
+        Adopt(Box<VideoFingerprint>),
         Follow(usize),
     }
     // A former holder of the bytes first, for every queued file: a copy of
@@ -3379,7 +3387,7 @@ fn identify(
         .map(|t| {
             identities[n_hits + t]
                 .and_then(|id| index.adoptable(&id, kf_interval, min_kf_samples))
-                .map_or(Fate::Decode, Fate::Adopt)
+                .map_or(Fate::Decode, |fp| Fate::Adopt(Box::new(fp)))
         })
         .collect();
     // Then the copies among this run's own files. A set takes its fingerprint
@@ -3392,7 +3400,7 @@ fn identify(
                 Some(hits[i].clone())
             } else {
                 match &fates[i - n_hits] {
-                    Fate::Adopt(fp) => Some(fp.clone()),
+                    Fate::Adopt(fp) => Some((**fp).clone()),
                     _ => None,
                 }
             }
@@ -3401,7 +3409,7 @@ fn identify(
         match known {
             Some(fp) => {
                 for &t in &queued {
-                    fates[t] = Fate::Adopt(fp.clone());
+                    fates[t] = Fate::Adopt(Box::new(fp.clone()));
                 }
             }
             None => {
@@ -3420,7 +3428,8 @@ fn identify(
     for (job, fate) in todo.into_iter().zip(fates) {
         match fate {
             Fate::Decode => kept.push(Some(job)),
-            Fate::Adopt(mut fp) => {
+            Fate::Adopt(fp) => {
+                let mut fp = *fp;
                 fp.path = job.path.clone();
                 adopted.push((job.path, job.stamp, fp));
                 kept.push(None);
@@ -5333,6 +5342,9 @@ mod tests {
             codec: "h264".to_string(),
             frame_rate: 30.0,
             mirrored_hashes: Vec::new(),
+            detail_hashes: Vec::new(),
+            mirrored_detail_hashes: Vec::new(),
+            reframed: Vec::new(),
         }
     }
 
@@ -6741,7 +6753,7 @@ mod tests {
         // fingerprint table for each; --clear-cache from either empties both.
         let dir = tempfile::tempdir().unwrap();
         let mut db = temp_db(&dir);
-        let other: TableDefinition<&str, &[u8]> = TableDefinition::new("fingerprints_dct_ct_ff8_framecrop_riscv64");
+        let other: TableDefinition<&str, &[u8]> = TableDefinition::new("fingerprints_dct_ct_ff8_detail_riscv64");
         let txn = db.begin_write().unwrap();
         txn.open_table(other).unwrap().insert("/videos/a.mkv", &b"x"[..]).unwrap();
         txn.commit().unwrap();

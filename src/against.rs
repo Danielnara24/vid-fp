@@ -159,11 +159,14 @@ mod tests {
             codec: codec.to_string(),
             frame_rate: 30.0,
             mirrored_hashes: Vec::new(),
+            detail_hashes: Vec::new(),
+            mirrored_detail_hashes: Vec::new(),
+            reframed: Vec::new(),
         }
     }
 
     fn link(a: usize, b: usize, coverage_a: f32, coverage_b: f32) -> Match {
-        Match { a, b, coverage_a, coverage_b, span_a: None, span_b: None, mirrored: false }
+        Match { a, b, coverage_a, coverage_b, span_a: None, span_b: None, mirrored: false, reframed: None }
     }
 
     fn answers_of(fps: &[VideoFingerprint], matches: &[Match], library: &[bool]) -> Vec<Answer> {

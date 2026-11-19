@@ -168,6 +168,9 @@ mod tests {
             codec: "h264".to_string(),
             frame_rate: 30.0,
             mirrored_hashes: Vec::new(),
+            detail_hashes: Vec::new(),
+            mirrored_detail_hashes: Vec::new(),
+            reframed: Vec::new(),
         }
     }
 

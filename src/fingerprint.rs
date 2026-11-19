@@ -52,7 +52,7 @@ const KEEP: usize = 8;
 /// content sits two orders of magnitude above this floor (the 1st percentile of
 /// a full episode's keyframes is around 60), so nothing with a picture in it is
 /// at risk of being dropped.
-const MIN_AC_ENERGY: f32 = 8.0;
+const MIN_AC_ENERGY: f32 = 50.0;
 
 /// How many times in a row the demuxer may fail before the file is treated as
 /// finished.
@@ -126,6 +126,27 @@ pub struct VideoFingerprint {
     /// this is computed from the same coefficients, with no second decode.
     /// Comparison measures each pair both ways round (see `compare`).
     pub mirrored_hashes: Vec<u64>,
+    /// A second hash of each sample, from the frequencies just above the ones
+    /// `valid_hashes` reads (a 32x32 thumbnail, see `detail_coefficients`),
+    /// plain and mirrored. Two different frames that share a coarse layout --
+    /// two lines of white text on black, two road scenes -- agree in the low
+    /// frequencies and not in these, while two encodes of one frame agree in
+    /// both, so comparison reads it to confirm a match. Empty in a fixture,
+    /// which then confirms nothing on it.
+    pub detail_hashes: Vec<u64>,
+    pub mirrored_detail_hashes: Vec<u64>,
+    /// Each sample hashed again inside a smaller part of the picture, one entry
+    /// per `REFRAMINGS`, so a copy cut down to that part can be found.
+    pub reframed: Vec<Reframed>,
+}
+
+/// The samples of a fingerprint that a reframing applies to, and their hashes
+/// under it: main, mirrored, detail, mirrored detail.
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct Reframed {
+    /// Indices into `valid_hashes`, ascending.
+    pub samples: Vec<u32>,
+    pub hashes: Vec<[u64; 4]>,
 }
 
 impl VideoFingerprint {
@@ -254,8 +275,13 @@ fn sample_times(times: &[Option<u32>], duration_sec: f64) -> (Vec<u32>, u32) {
 /// this is an upscale and each output sample reads one source pixel. The tap
 /// list is never empty either way.
 fn box_weights(offset: usize, len: usize) -> Vec<Vec<(usize, f32)>> {
-    let scale = len as f32 / THUMB as f32;
-    (0..THUMB)
+    box_weights_to(offset, len, THUMB)
+}
+
+/// `box_weights` down to `out` samples rather than `THUMB`.
+fn box_weights_to(offset: usize, len: usize, out: usize) -> Vec<Vec<(usize, f32)>> {
+    let scale = len as f32 / out as f32;
+    (0..out)
         .map(|o| {
             let start = o as f32 * scale;
             let end = start + scale;
@@ -1544,36 +1570,246 @@ fn hash_frames(u_frames: &[u8]) -> (Vec<u64>, Vec<bool>) {
     (hashes, flat)
 }
 
-/// `hash_frames`, plus the hash of each frame mirrored left to right.
-fn hash_frames_both_ways(u_frames: &[u8]) -> (Vec<u64>, Vec<u64>, Vec<bool>) {
-    let n_unique = u_frames.len() / FRAME_STRIDE;
-    let mut mirrored = Vec::with_capacity(n_unique);
-    let basis = dct_basis();
-    // The resampling weights depend only on the rectangle, and a video has a
-    // handful of distinct ones, so they are built once per rectangle.
-    type Taps = Vec<Vec<(usize, f32)>>;
-    let mut weights: std::collections::HashMap<(usize, usize, usize, usize), (Taps, Taps)> =
-        std::collections::HashMap::new();
+/// Everything hashed out of one video's frames, index for index with them.
+pub(crate) struct Hashed {
+    pub hashes: Vec<u64>,
+    pub mirrored: Vec<u64>,
+    pub flat: Vec<bool>,
+    pub detail: Vec<u64>,
+    pub mirrored_detail: Vec<u64>,
+    /// One per `Reframing`, in `REFRAMINGS` order: each frame's hashes inside
+    /// that sub-rectangle, or `None` where the reframing does not apply.
+    pub reframed: Vec<Vec<Option<[u64; 4]>>>,
+}
 
-    let mut hashes = Vec::with_capacity(n_unique);
-    let mut flat = Vec::with_capacity(n_unique);
-    let mut thumb = [0.0f32; THUMB * THUMB];
-    let mut band = [0.0f32; 64 * THUMB];
+/// A sub-rectangle of each frame's own crop that a re-upload is often cut down
+/// to, hashed alongside the whole frame so that copy can still be found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reframing {
+    /// A portrait frame holding a 16:9 picture in its middle rows: the blurred
+    /// or coloured "fill" a vertical re-upload pads a landscape video with.
+    Band,
+    /// The middle 1/1.12 of the frame: a light zoom, crop or tilt-to-fill.
+    Zoom,
+}
+
+/// The reframings every sample is also hashed under, in storage order.
+pub const REFRAMINGS: [Reframing; 2] = [Reframing::Band, Reframing::Zoom];
+
+const ZOOM: f64 = 1.12;
+const BAND_ASPECT: f64 = 16.0 / 9.0;
+
+/// The thumbnail the detail hash is taken from, and the side of the transform
+/// block its coefficients are chosen out of.
+const DETAIL_THUMB: usize = 32;
+const DETAIL_KEEP: usize = 16;
+
+/// The 64 coefficients of the detail hash: every third of the 16x16 block
+/// with the 8x8 corner the main hash reads taken out, so the two hashes share
+/// no coefficient.
+fn detail_coefficients() -> [(usize, usize); 64] {
+    let mut out = [(0, 0); 64];
+    let mut n = 0;
+    let mut seen = 0;
+    for k in 0..DETAIL_KEEP {
+        for l in 0..DETAIL_KEEP {
+            if k < KEEP && l < KEEP {
+                continue;
+            }
+            if seen % 3 == 0 && n < 64 {
+                out[n] = (k, l);
+                n += 1;
+            }
+            seen += 1;
+        }
+    }
+    out
+}
+
+/// Fractions of a crop rectangle to a smaller integer rectangle, or `None` when
+/// it would be under 8 pixels a side.
+fn sub_rect(
+    (y1, y2, x1, x2): (usize, usize, usize, usize),
+    (fy0, fy1, fx0, fx1): (f64, f64, f64, f64),
+) -> Option<(usize, usize, usize, usize)> {
+    let h = (y2 - y1 + 1) as f64;
+    let w = (x2 - x1 + 1) as f64;
+    let ny1 = y1 as i64 + (h * fy0).round_ties_even() as i64;
+    let ny2 = y1 as i64 + (h * fy1).round_ties_even() as i64 - 1;
+    let nx1 = x1 as i64 + (w * fx0).round_ties_even() as i64;
+    let nx2 = x1 as i64 + (w * fx1).round_ties_even() as i64 - 1;
+    if ny2 - ny1 + 1 < 8 || nx2 - nx1 + 1 < 8 || ny1 < 0 || nx1 < 0 || ny2 > 63 || nx2 > 63 {
+        return None;
+    }
+    Some((ny1 as usize, ny2 as usize, nx1 as usize, nx2 as usize))
+}
+
+impl Reframing {
+    /// The part of a frame's crop this reframing keeps, given the decoded
+    /// picture's width and height.
+    fn rect(self, crop: (usize, usize, usize, usize), (width, height): (u32, u32)) -> Option<(usize, usize, usize, usize)> {
+        match self {
+            Reframing::Band => {
+                if !(height > width && width > 0) {
+                    return None;
+                }
+                let f = (width as f64 / height as f64) / BAND_ASPECT;
+                sub_rect(crop, ((1.0 - f) / 2.0, (1.0 + f) / 2.0, 0.0, 1.0))
+            }
+            Reframing::Zoom => {
+                let m = (1.0 - 1.0 / ZOOM) / 2.0;
+                sub_rect(crop, (m, 1.0 - m, m, 1.0 - m))
+            }
+        }
+    }
+}
+
+/// Weights per rectangle, built once each: a video has a handful of them.
+type Taps = Vec<Vec<(usize, f32)>>;
+
+struct Hasher {
+    basis: [[f32; THUMB]; KEEP],
+    detail_basis: Vec<[f32; DETAIL_THUMB]>,
+    detail_pick: [(usize, usize); 64],
+    weights: std::collections::HashMap<(usize, usize, usize, usize), (Taps, Taps)>,
+    detail_weights: std::collections::HashMap<(usize, usize, usize, usize), (Taps, Taps)>,
+    thumb: [f32; THUMB * THUMB],
+    band: [f32; 64 * THUMB],
+    dthumb: Vec<f32>,
+    dband: Vec<f32>,
+}
+
+impl Hasher {
+    fn new() -> Self {
+        let detail_basis = (0..DETAIL_KEEP)
+            .map(|k| {
+                let mut row = [0.0f32; DETAIL_THUMB];
+                for (x, cell) in row.iter_mut().enumerate() {
+                    *cell = (std::f32::consts::PI * (2.0 * x as f32 + 1.0) * k as f32
+                        / (2.0 * DETAIL_THUMB as f32))
+                        .cos();
+                }
+                row
+            })
+            .collect();
+        Hasher {
+            basis: dct_basis(),
+            detail_basis,
+            detail_pick: detail_coefficients(),
+            weights: Default::default(),
+            detail_weights: Default::default(),
+            thumb: [0.0; THUMB * THUMB],
+            band: [0.0; 64 * THUMB],
+            dthumb: vec![0.0; DETAIL_THUMB * DETAIL_THUMB],
+            dband: vec![0.0; 64 * DETAIL_THUMB],
+        }
+    }
+
+    /// The low-frequency block of `frame` inside `rect`.
+    fn coefficients(&mut self, frame: &[u8], rect: (usize, usize, usize, usize)) -> [f32; KEEP * KEEP] {
+        let (y1, y2, x1, x2) = rect;
+        let (rows, cols) = self
+            .weights
+            .entry(rect)
+            .or_insert_with(|| (box_weights(y1, y2 - y1 + 1), box_weights(x1, x2 - x1 + 1)));
+        resample(frame, rows, cols, &mut self.band, &mut self.thumb);
+        low_frequency_block(&self.thumb, &self.basis)
+    }
+
+    /// The detail hash of `frame` inside `rect`, plain and mirrored.
+    fn detail(&mut self, frame: &[u8], rect: (usize, usize, usize, usize)) -> (u64, u64) {
+        let (y1, y2, x1, x2) = rect;
+        let (rows, cols) = self.detail_weights.entry(rect).or_insert_with(|| {
+            (box_weights_to(y1, y2 - y1 + 1, DETAIL_THUMB), box_weights_to(x1, x2 - x1 + 1, DETAIL_THUMB))
+        });
+        let n = DETAIL_THUMB;
+        for (oy, taps) in rows.iter().enumerate() {
+            let dst = &mut self.dband[oy * 64..oy * 64 + 64];
+            dst.fill(0.0);
+            for &(sy, w) in taps {
+                for (d, &p) in dst.iter_mut().zip(&frame[sy * 64..sy * 64 + 64]) {
+                    *d += p as f32 * w;
+                }
+            }
+        }
+        for oy in 0..n {
+            let src = &self.dband[oy * 64..oy * 64 + 64];
+            for (ox, taps) in cols.iter().enumerate() {
+                let mut acc = 0.0;
+                for &(sx, w) in taps {
+                    acc += src[sx] * w;
+                }
+                self.dthumb[oy * n + ox] = acc;
+            }
+        }
+        // rows of the transform first, for every k any picked coefficient needs
+        let mut partial = [[0.0f32; DETAIL_THUMB]; DETAIL_KEEP];
+        for (k, prow) in partial.iter_mut().enumerate() {
+            for (y, &b) in self.detail_basis[k].iter().enumerate() {
+                let src = &self.dthumb[y * n..y * n + n];
+                for (p, &s) in prow.iter_mut().zip(src) {
+                    *p += b * s;
+                }
+            }
+        }
+        let mut c = [0.0f32; 64];
+        for (q, &(k, l)) in self.detail_pick.iter().enumerate() {
+            c[q] = partial[k].iter().zip(&self.detail_basis[l]).map(|(p, b)| p * b).sum();
+        }
+        let mut m = c;
+        for (q, &(_, l)) in self.detail_pick.iter().enumerate() {
+            if l % 2 == 1 {
+                m[q] = -m[q];
+            }
+        }
+        (hash_of(&c), hash_of(&m))
+    }
+}
+
+/// `hash_frames`, plus each frame mirrored left to right, its detail hash, and
+/// its hashes under every reframing (`dims` is the decoded picture's size,
+/// which says whether a reframing applies).
+#[cfg(test)]
+fn hash_frames_both_ways(u_frames: &[u8]) -> (Vec<u64>, Vec<u64>, Vec<bool>) {
+    let h = hash_frames_fully(u_frames, (0, 0));
+    (h.hashes, h.mirrored, h.flat)
+}
+
+pub(crate) fn hash_frames_fully(u_frames: &[u8], dims: (u32, u32)) -> Hashed {
+    let n_unique = u_frames.len() / FRAME_STRIDE;
+    let mut hasher = Hasher::new();
+    let mut out = Hashed {
+        hashes: Vec::with_capacity(n_unique),
+        mirrored: Vec::with_capacity(n_unique),
+        flat: Vec::with_capacity(n_unique),
+        detail: Vec::with_capacity(n_unique),
+        mirrored_detail: Vec::with_capacity(n_unique),
+        reframed: vec![Vec::with_capacity(n_unique); REFRAMINGS.len()],
+    };
 
     for frame in u_frames.chunks_exact(FRAME_STRIDE) {
         let rect = frame_crop(frame);
-        let (y1, y2, x1, x2) = rect;
-        let (rows, cols) = weights
-            .entry(rect)
-            .or_insert_with(|| (box_weights(y1, y2 - y1 + 1), box_weights(x1, x2 - x1 + 1)));
-        resample(frame, rows, cols, &mut band, &mut thumb);
-        let coefficients = low_frequency_block(&thumb, &basis);
-        hashes.push(hash_of(&coefficients));
-        mirrored.push(hash_of(&mirror_coefficients(&coefficients)));
-        flat.push(is_featureless(&coefficients));
+        let coefficients = hasher.coefficients(frame, rect);
+        out.hashes.push(hash_of(&coefficients));
+        out.mirrored.push(hash_of(&mirror_coefficients(&coefficients)));
+        out.flat.push(is_featureless(&coefficients));
+        let (d, md) = hasher.detail(frame, rect);
+        out.detail.push(d);
+        out.mirrored_detail.push(md);
+        for (v, reframing) in REFRAMINGS.iter().enumerate() {
+            let hashed = reframing.rect(rect, dims).and_then(|r| {
+                let c = hasher.coefficients(frame, r);
+                if is_featureless(&c) {
+                    return None;
+                }
+                let (d, md) = hasher.detail(frame, r);
+                Some([hash_of(&c), hash_of(&mirror_coefficients(&c)), d, md])
+            });
+            out.reframed[v].push(hashed);
+        }
     }
 
-    (hashes, mirrored, flat)
+    out
 }
 
 /// The coefficients of the same picture mirrored left to right. The basis
@@ -2355,7 +2591,8 @@ pub fn fingerprint_video(
     // u_frames holds n_unique * FRAME_STRIDE bytes; the frame count is the time list.
     let n_unique = unique_frame_times.len();
 
-    let (hashes, mirrored, flat) = hash_frames_both_ways(&u_frames);
+    let hashed = hash_frames_fully(&u_frames, (width, height));
+    let (hashes, mirrored, flat) = (&hashed.hashes, &hashed.mirrored, &hashed.flat);
 
     // Frame pixels are no longer needed; release the large buffer (munmap) now
     // rather than at end of scope, trimming the peak during the cheap tail work.
@@ -2394,6 +2631,7 @@ pub fn fingerprint_video(
     order.sort_by_key(|&i| times[i]);
 
     let mut changes_hashes = Vec::new();
+    let mut changes_frame = Vec::new();
     let mut changes_mirrored = Vec::new();
     let mut changes_t_start = Vec::new();
     let mut changes_valid = Vec::new();
@@ -2409,6 +2647,7 @@ pub fn fingerprint_video(
 
         if should_push {
             changes_hashes.push(h);
+            changes_frame.push(i);
             changes_mirrored.push(mirrored[i]);
             changes_t_start.push(times[i]);
             changes_valid.push(valid);
@@ -2419,9 +2658,21 @@ pub fn fingerprint_video(
     let mut final_mirrored = Vec::with_capacity(changes_hashes.len());
     let mut final_t_start = Vec::with_capacity(changes_hashes.len());
     let mut final_t_end = Vec::with_capacity(changes_hashes.len());
+    let mut final_detail = Vec::with_capacity(changes_hashes.len());
+    let mut final_mirrored_detail = Vec::with_capacity(changes_hashes.len());
+    let mut reframed: Vec<Reframed> = vec![Reframed::default(); REFRAMINGS.len()];
 
     for i in 0..changes_hashes.len() {
         if changes_valid[i] {
+            let frame = changes_frame[i];
+            for (v, r) in reframed.iter_mut().enumerate() {
+                if let Some(h) = hashed.reframed[v][frame] {
+                    r.samples.push(final_hashes.len() as u32);
+                    r.hashes.push(h);
+                }
+            }
+            final_detail.push(hashed.detail[frame]);
+            final_mirrored_detail.push(hashed.mirrored_detail[frame]);
             final_hashes.push(changes_hashes[i]);
             final_mirrored.push(changes_mirrored[i]);
             final_t_start.push(changes_t_start[i]);
@@ -2469,6 +2720,9 @@ pub fn fingerprint_video(
         codec,
         frame_rate,
         mirrored_hashes: final_mirrored,
+        detail_hashes: final_detail,
+        mirrored_detail_hashes: final_mirrored_detail,
+        reframed,
     }))
 }
 
@@ -2590,6 +2844,9 @@ mod tests {
             codec: "h264".to_string(),
             frame_rate,
             mirrored_hashes: Vec::new(),
+            detail_hashes: Vec::new(),
+            mirrored_detail_hashes: Vec::new(),
+            reframed: Vec::new(),
         }
     }
 

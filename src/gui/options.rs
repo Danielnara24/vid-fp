@@ -110,11 +110,11 @@ const fn number(min: f64, max: fn() -> f64, step: f64, digits: u32) -> Kind {
 pub static TOLERANCE: Opt = Opt {
     tip: Some(
         "How far apart two frames may be and still count as the same picture, in bits of a 64-bit fingerprint. Two unrelated \
-         frames are about 32 apart. Only even values make a difference.",
+         frames are about 32 apart.",
     ),
-    hint: Some("Higher finds more re-encoded and degraded copies, and more videos that are not copies. 2 to 12 is useful."),
+    hint: Some("Higher finds more re-encoded and degraded copies, and more videos that are not copies. 2 to 8 is useful."),
     // Past 32 the scan refuses it: that is chance, where every frame matches.
-    ..plain("hamming_distance", Some("hamming_distance"), number(0.0, || 32.0, 2.0, 0), l::TOLERANCE)
+    ..plain("hamming_distance", Some("hamming_distance"), number(0.0, || 32.0, 1.0, 0), l::TOLERANCE)
 };
 pub static MATCH_PERCENT: Opt = Opt {
     tip: Some(
@@ -333,7 +333,7 @@ mod tests {
     /// left alone is `vid-fp -r` and finds what it finds.
     #[test]
     fn the_defaults_are_the_command_lines() {
-        assert_eq!(TOLERANCE.default_value(), Value::Number(4.0));
+        assert_eq!(TOLERANCE.default_value(), Value::Number(6.0));
         assert_eq!(MATCH_PERCENT.default_value(), Value::Number(20.0));
         assert_eq!(MIN_KEYFRAMES.default_value(), Value::Number(12.0));
         assert!(EXTENSIONS.default_value().text().split(',').any(|e| e == "mkv"));

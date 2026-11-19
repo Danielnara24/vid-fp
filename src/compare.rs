@@ -1,4 +1,4 @@
-use crate::fingerprint::VideoFingerprint;
+use crate::fingerprint::{Reframing, VideoFingerprint, REFRAMINGS};
 use crate::utils::shutdown_requested;
 use indicatif::{ProgressBar, ProgressStyle};
 use log::info;
@@ -61,8 +61,17 @@ const PAIR_COST: usize = 8;
 /// rescale themselves; the tuning that would otherwise be silently wrong is the
 /// tuning that never has to be redone.
 fn sigma() -> f64 {
-    (HASH_BITS as f64).sqrt() / 2.0
+    sigma_of(HASH_BITS)
 }
+
+/// `sigma` for a distance taken over `width` bits.
+fn sigma_of(width: u32) -> f64 {
+    (width as f64).sqrt() / 2.0
+}
+
+/// The width of the combined distance: the main hash and the detail hash
+/// (`VideoFingerprint::detail_hashes`) read together, 64 bits each.
+const WIDE_BITS: u32 = 2 * HASH_BITS;
 
 /// How much looser than `-d` a corroborated frame match may be, in sigma.
 ///
@@ -105,8 +114,12 @@ const CORROBORATION_BUDGET: f64 = 2.0;
 /// A distance expressed as sigma below the mean of the unrelated-pair
 /// distribution, rounded to a whole number of bits.
 fn sigma_below_chance(sigmas: f64) -> u32 {
-    let mean = HASH_BITS as f64 / 2.0;
-    (mean - sigmas * sigma()).round().max(0.0) as u32
+    sigma_below_chance_of(HASH_BITS, sigmas)
+}
+
+fn sigma_below_chance_of(width: u32, sigmas: f64) -> u32 {
+    let mean = width as f64 / 2.0;
+    (mean - sigmas * sigma_of(width)).round().max(0.0) as u32
 }
 
 /// How improbable a frame match at `distance` is by chance, as a base-10
@@ -121,14 +134,19 @@ fn sigma_below_chance(sigmas: f64) -> u32 {
 /// Computed rather than tabulated because `HASH_BITS` is the only input and a
 /// table would have to be re-derived by hand if the hash ever widened. It runs
 /// once per scan.
+#[cfg(test)]
 fn chance_orders_of_magnitude(distance: u32) -> f64 {
-    let mut term = 1.0f64; // C(HASH_BITS, 0)
+    chance_orders_of_magnitude_of(HASH_BITS, distance)
+}
+
+fn chance_orders_of_magnitude_of(width: u32, distance: u32) -> f64 {
+    let mut term = 1.0f64; // C(width, 0)
     let mut sum = 1.0f64;
-    for i in 1..=distance.min(HASH_BITS) {
-        term *= (HASH_BITS - i + 1) as f64 / i as f64;
+    for i in 1..=distance.min(width) {
+        term *= (width - i + 1) as f64 / i as f64;
         sum += term;
     }
-    HASH_BITS as f64 * std::f64::consts::LOG10_2 - sum.log10()
+    width as f64 * std::f64::consts::LOG10_2 - sum.log10()
 }
 
 /// How many witnesses a frame match at each distance needs, indexed by that
@@ -147,11 +165,20 @@ fn chance_orders_of_magnitude(distance: u32) -> f64 {
 /// distance past ~30 bits: unrelated frames sit around 32 bits apart, so a match
 /// out there is not evidence of anything at any cluster size.
 fn witness_schedule() -> [u32; HASH_BITS as usize + 1] {
-    let anchor = sigma_below_chance(EVIDENCE_ANCHOR_SIGMA);
-    let budget = CORROBORATION_BUDGET * chance_orders_of_magnitude(anchor);
     let mut schedule = [u32::MAX; HASH_BITS as usize + 1];
+    schedule.copy_from_slice(&witness_schedule_of(HASH_BITS));
+    schedule
+}
+
+/// `witness_schedule` for a distance taken over `width` bits: the same anchor
+/// and budget, in sigma, so a witness count stands for the same improbability
+/// at either width.
+fn witness_schedule_of(width: u32) -> Vec<u32> {
+    let anchor = sigma_below_chance_of(width, EVIDENCE_ANCHOR_SIGMA);
+    let budget = CORROBORATION_BUDGET * chance_orders_of_magnitude_of(width, anchor);
+    let mut schedule = vec![u32::MAX; width as usize + 1];
     for (distance, needed) in schedule.iter_mut().enumerate() {
-        let each = chance_orders_of_magnitude(distance as u32);
+        let each = chance_orders_of_magnitude_of(width, distance as u32);
         // Multiply rather than divide: at exactly the anchor distance the two
         // sides are equal, and a division would land on 2.0000000001 as often
         // as on 2.0 and quietly demand a second witness there.
@@ -238,6 +265,11 @@ const EVERY_OFFSET: (i64, i64) = (i64::MIN, i64::MAX);
 struct Tolerance {
     strict: u32,
     loose: u32,
+    /// `Some` for a tolerance over `WIDE_BITS`: the distance is the main hash's
+    /// plus the detail hash's, and the main hash alone has to be within this
+    /// many bits -- what phase 1's index, which holds main hashes only, can be
+    /// exhaustive to.
+    cap: Option<u32>,
 }
 
 impl Tolerance {
@@ -254,13 +286,35 @@ impl Tolerance {
             // depend on `run` having already refused everything above it, and a
             // tolerance wider than the hash accepts every pair anyway.
             loose: max_hamming_dist.saturating_add(slack).min(HASH_BITS),
+            cap: None,
         }
+    }
+
+    /// The tolerance `-d` stands for, over the main hash and the detail hash
+    /// read together (`WIDE_BITS`).
+    ///
+    /// `-d` keeps its meaning in sigma: `-d 4` is 7 sigma below chance on 64
+    /// bits, so the strict side here is 7 sigma below chance on 128, and the
+    /// corroborated side the same 1.5 sigma above it. Read that way, the pair of
+    /// hashes is a sharper test of the same claim: two frames whose coarse
+    /// layout agrees by accident -- two lines of text on black, two road scenes
+    /// -- disagree in the detail half and stay far apart, while two encodes of
+    /// one frame agree in both.
+    ///
+    /// The main hash is held to half the corroborated distance on its own,
+    /// which is what makes the index exhaustive for this rule.
+    fn wide(max_hamming_dist: u32) -> Self {
+        let below = (HASH_BITS as f64 / 2.0 - max_hamming_dist as f64) / sigma();
+        let strict = sigma_below_chance_of(WIDE_BITS, below);
+        let slack = (CORROBORATION_SLACK_SIGMA * sigma_of(WIDE_BITS)).round() as u32;
+        let loose = strict.saturating_add(slack).min(WIDE_BITS);
+        Tolerance { strict, loose, cap: Some((loose / 2).min(HASH_BITS)) }
     }
 
     /// The widest distance any frame match can be admitted at -- what phase 1
     /// has to be exhaustive to, and what the probe radius is derived from.
     fn widest(&self) -> u32 {
-        self.loose
+        self.cap.unwrap_or(self.loose)
     }
 }
 
@@ -274,7 +328,52 @@ impl Tolerance {
 #[derive(Clone, Copy)]
 struct Rule<'a> {
     tol: Tolerance,
-    schedule: &'a [u32; HASH_BITS as usize + 1],
+    schedule: &'a [u32],
+}
+
+/// The two rules a run judges pairs by: over the main hash alone, and over the
+/// main and detail hashes together. A pair is read the wide way whenever both
+/// fingerprints carry detail hashes, which every decoded fingerprint does.
+#[derive(Clone, Copy)]
+struct Rules<'a> {
+    narrow: Rule<'a>,
+    wide: Rule<'a>,
+}
+
+impl<'a> Rules<'a> {
+    fn for_pair(&self, fp_a: &VideoFingerprint, fp_b: &VideoFingerprint) -> Rule<'a> {
+        if has_detail(fp_a) && has_detail(fp_b) { self.wide } else { self.narrow }
+    }
+
+    /// The widest main-hash distance either rule admits.
+    fn widest(&self) -> u32 {
+        self.narrow.tol.widest().max(self.wide.tol.widest())
+    }
+}
+
+fn has_detail(fp: &VideoFingerprint) -> bool {
+    !fp.valid_hashes.is_empty() && fp.detail_hashes.len() == fp.valid_hashes.len()
+}
+
+/// How far apart two matches' time offsets may be and still stand witness for
+/// each other.
+///
+/// Each sample is a keyframe, and two encodes place their keyframes where
+/// their own encoders chose, so the offset between a matched pair of samples
+/// is the true offset plus up to one sample gap of either file. The window is
+/// the larger of the two files' typical (median) gap, and never under
+/// `ALIGNMENT_TOLERANCE_MS`.
+fn alignment_window(fp_a: &VideoFingerprint, fp_b: &VideoFingerprint) -> i64 {
+    fn median_gap(fp: &VideoFingerprint) -> i64 {
+        let mut gaps: Vec<u32> =
+            fp.valid_t_start.iter().zip(&fp.valid_t_end).map(|(s, e)| e.saturating_sub(*s)).collect();
+        if gaps.is_empty() {
+            return 0;
+        }
+        let mid = gaps.len() / 2;
+        *gaps.select_nth_unstable(mid).1 as i64
+    }
+    ALIGNMENT_TOLERANCE_MS.max(median_gap(fp_a)).max(median_gap(fp_b))
 }
 
 /// The `k`th 16-bit block of a hash, most significant first.
@@ -493,6 +592,9 @@ pub struct Match {
     /// The pair matched with `a` mirrored left to right: one is a mirrored copy
     /// of the other. Every figure above was measured that way round.
     pub mirrored: bool,
+    /// The pair matched with one file's pictures read inside a smaller part of
+    /// them (`Reframing`): one is a reframed copy of the other.
+    pub reframed: Option<Reframing>,
 }
 
 impl Match {
@@ -501,7 +603,20 @@ impl Match {
     /// the same pass that measures the overlap already knows where it is.
     #[cfg(test)]
     pub fn new(a: usize, b: usize, coverage_a: f32, coverage_b: f32) -> Self {
-        Match { a, b, coverage_a, coverage_b, span_a: None, span_b: None, mirrored: false }
+        Match { a, b, coverage_a, coverage_b, span_a: None, span_b: None, mirrored: false, reframed: None }
+    }
+
+    /// The same match with its two files the other way round.
+    fn swapped(self) -> Self {
+        Match {
+            a: self.b,
+            b: self.a,
+            coverage_a: self.coverage_b,
+            coverage_b: self.coverage_a,
+            span_a: self.span_b,
+            span_b: self.span_a,
+            ..self
+        }
     }
 
     /// The same, positioned. Milliseconds, `(start, end)` per side.
@@ -824,22 +939,110 @@ pub struct GroupLink {
 /// The cost is that a pair found in several blocks is emitted several times,
 /// which a sort and a dedup at the end of each pass settles -- candidate pairs
 /// are orders of magnitude scarcer than the hashes they were found from.
+#[cfg(test)]
 fn candidate_pairs(
     fingerprints: &[VideoFingerprint],
     masks: &[u16],
     max_hamming_dist: u32,
 ) -> Vec<(usize, usize)> {
-    candidate_pairs_probing(fingerprints, fingerprints, masks, max_hamming_dist)
+    candidate_pairs_probing(fingerprints, fingerprints, masks, max_hamming_dist, false)
 }
 
 /// `candidate_pairs`, with each lower-numbered file `a` probing the index with
 /// the hashes of `probes[a]` instead of its own -- the mirrored fingerprints,
 /// to propose the pairs that match only with `a` mirrored.
+/// Phase 1 without an index: every probe file's hashes against every other
+/// file's, stopping at the first frame the pair's rule could admit at all.
+/// Proposes a subset of what `candidate_pairs_probing` does, and drops only
+/// pairs that measure to nothing; which route runs is purely a question of
+/// speed (`index_is_cheaper`).
+fn candidate_pairs_scanning(
+    fingerprints: &[VideoFingerprint],
+    probes: &[VideoFingerprint],
+    rules: Rules,
+    both_ways: bool,
+    wanted: &(impl Fn(usize, usize) -> bool + Sync),
+) -> Vec<(usize, usize)> {
+    let n = fingerprints.len();
+    // A frame can only be admitted inside the rule's own widest reach, which
+    // for a pair read the wide way is the combined distance as well as the
+    // main hash's cap -- so that is what is asked here, of whichever rule the
+    // pair will be measured by.
+    let any_frame = |a: &VideoFingerprint, b: &VideoFingerprint| -> bool {
+        let tol = rules.for_pair(a, b).tol;
+        match tol.cap {
+            None => any_within(&a.valid_hashes, None, &b.valid_hashes, None, tol.loose, tol.loose),
+            Some(cap) => any_within(
+                &a.valid_hashes,
+                Some(&a.detail_hashes),
+                &b.valid_hashes,
+                Some(&b.detail_hashes),
+                cap,
+                tol.loose,
+            ),
+        }
+    };
+    (0..n)
+        .into_par_iter()
+        .flat_map_iter(|q| {
+            let probe = &probes[q].valid_hashes;
+            let first = if both_ways { 0 } else { q + 1 };
+            (first..n).filter(move |&t| {
+                t != q
+                    && !probe.is_empty()
+                    && !shutdown_requested()
+                    && wanted(q.min(t), q.max(t))
+                    && any_frame(&probes[q], &fingerprints[t])
+            })
+            .map(move |t| (q, t))
+        })
+        .collect()
+}
+
+/// Whether any frame of `a` is within `cap` of a frame of `b` on the main hash
+/// and within `loose` of it on main plus detail (main alone when either side
+/// has no detail hashes).
+///
+/// The innermost loop of phase 1's scan, so it is compiled a second time with
+/// the POPCNT instruction and that copy taken when the processor has it: the
+/// release binary targets baseline x86-64, where `count_ones` is a dozen
+/// instructions of bit arithmetic. Both copies are the same source and give
+/// the same answer.
+fn any_within(a: &[u64], a_detail: Option<&[u64]>, b: &[u64], b_detail: Option<&[u64]>, cap: u32, loose: u32) -> bool {
+    #[inline(always)]
+    fn body(a: &[u64], a_detail: Option<&[u64]>, b: &[u64], b_detail: Option<&[u64]>, cap: u32, loose: u32) -> bool {
+        match (a_detail, b_detail) {
+            (Some(da), Some(db)) => a.iter().zip(da).any(|(&h_a, &d_a)| {
+                b.iter().zip(db).any(|(&h_b, &d_b)| {
+                    let main = (h_a ^ h_b).count_ones();
+                    main <= cap && main + (d_a ^ d_b).count_ones() <= loose
+                })
+            }),
+            _ => a.iter().any(|&h_a| b.iter().any(|&h_b| (h_a ^ h_b).count_ones() <= cap.min(loose))),
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // `unsafe` rather than a safe `#[target_feature]` fn, which needs Rust
+        // 1.86 and the declared MSRV is 1.85.
+        #[target_feature(enable = "popcnt")]
+        unsafe fn with_popcnt(a: &[u64], da: Option<&[u64]>, b: &[u64], db: Option<&[u64]>, cap: u32, loose: u32) -> bool {
+            body(a, da, b, db, cap, loose)
+        }
+        if std::arch::is_x86_feature_detected!("popcnt") {
+            // SAFETY: the feature was detected on this processor just above.
+            return unsafe { with_popcnt(a, a_detail, b, b_detail, cap, loose) };
+        }
+    }
+    body(a, a_detail, b, b_detail, cap, loose)
+}
+
 fn candidate_pairs_probing(
     fingerprints: &[VideoFingerprint],
     probes: &[VideoFingerprint],
     masks: &[u16],
     max_hamming_dist: u32,
+    both_ways: bool,
 ) -> Vec<(usize, usize)> {
     let n = fingerprints.len();
 
@@ -895,11 +1098,14 @@ fn candidate_pairs_probing(
                             // Entries are built in video order, so a binary
                             // search skips every already-processed video in one
                             // step.
-                            let start = videos.partition_point(|&v| (v as usize) <= v_a);
+                            // Unless the orientation is one-sided, when
+                            // every other video is a candidate either way.
+                            let start =
+                                if both_ways { 0 } else { videos.partition_point(|&v| (v as usize) <= v_a) };
 
                             for (&v_b, &h_b) in videos[start..].iter().zip(&hashes[start..]) {
                                 let v_b = v_b as usize;
-                                if seen[v_b] == mark {
+                                if seen[v_b] == mark || v_b == v_a {
                                     continue;
                                 }
                                 if (h_a ^ h_b).count_ones() <= max_hamming_dist {
@@ -1044,7 +1250,16 @@ fn for_each_frame_match<F: FnMut(Aligned)>(
 ) {
     for (i, &h_a) in fp_a.valid_hashes.iter().enumerate() {
         for (j, &h_b) in fp_b.valid_hashes.iter().enumerate() {
-            let distance = (h_a ^ h_b).count_ones();
+            let main = (h_a ^ h_b).count_ones();
+            let distance = match tol.cap {
+                None => main,
+                Some(cap) => {
+                    if main > cap {
+                        continue;
+                    }
+                    main + (fp_a.detail_hashes[i] ^ fp_b.detail_hashes[j]).count_ones()
+                }
+            };
             if distance <= tol.strict {
                 matched_a[i] = true;
                 matched_b[j] = true;
@@ -1103,6 +1318,7 @@ fn corroborate_pair_with<M: FnMut(u32, u32, u32)>(
     on_mark: &mut M,
 ) -> usize {
     let tol = rule.tol;
+    let window = alignment_window(fp_a, fp_b);
     let mut aligned: Vec<Aligned> = Vec::new();
     let mut total = 0usize;
     for_each_frame_match(fp_a, fp_b, tol, matched_a, matched_b, |entry| {
@@ -1114,7 +1330,7 @@ fn corroborate_pair_with<M: FnMut(u32, u32, u32)>(
 
     if total <= cap {
         let held = aligned.len();
-        corroborated_with(&mut aligned, rule.schedule, matched_a, matched_b, EVERY_OFFSET, witnesses, on_mark);
+        corroborated_with(&mut aligned, (rule.schedule, window), matched_a, matched_b, EVERY_OFFSET, witnesses, on_mark);
         return held;
     }
 
@@ -1122,7 +1338,7 @@ fn corroborate_pair_with<M: FnMut(u32, u32, u32)>(
     // no use for anything, since a band needs its own witnesses in full.
     aligned = Vec::new();
 
-    let bands = plan_bands(fp_a, fp_b, tol, matched_a, matched_b, cap);
+    let bands = plan_bands(fp_a, fp_b, tol, window, matched_a, matched_b, cap);
     log::debug!(
         "{} loose frame match(es) between {} and {}: corroborating in {} band(s)",
         total,
@@ -1138,14 +1354,13 @@ fn corroborate_pair_with<M: FnMut(u32, u32, u32)>(
             // Saturating so the widest band there is (`EVERY_OFFSET`, which
             // `plan_bands` falls back to for a pair with no samples at all)
             // cannot overflow the skirt off either end.
-            if entry.0 >= lo.saturating_sub(ALIGNMENT_TOLERANCE_MS)
-                && entry.0 <= hi.saturating_add(ALIGNMENT_TOLERANCE_MS)
+            if entry.0 >= lo.saturating_sub(window) && entry.0 <= hi.saturating_add(window)
             {
                 aligned.push(entry);
             }
         });
         held = held.max(aligned.len());
-        corroborated_with(&mut aligned, rule.schedule, matched_a, matched_b, (lo, hi), witnesses, on_mark);
+        corroborated_with(&mut aligned, (rule.schedule, window), matched_a, matched_b, (lo, hi), witnesses, on_mark);
     }
 
     held
@@ -1164,6 +1379,7 @@ fn plan_bands(
     fp_a: &VideoFingerprint,
     fp_b: &VideoFingerprint,
     tol: Tolerance,
+    window: i64,
     matched_a: &mut [bool],
     matched_b: &mut [bool],
     cap: usize,
@@ -1190,7 +1406,7 @@ fn plan_bands(
     // A day of runtime either side of zero is 350k buckets at 500 ms, so this
     // is a guard rather than a working part.
     const MAX_BUCKETS: i64 = 1 << 20;
-    let width = ALIGNMENT_TOLERANCE_MS.max(span / MAX_BUCKETS + 1);
+    let width = window.max(span / MAX_BUCKETS + 1);
     let buckets = (span / width + 1) as usize;
 
     let mut counts = vec![0usize; buckets];
@@ -1703,7 +1919,7 @@ fn augment(
 /// `evidence` listens.
 fn corroborated_with<M: FnMut(u32, u32, u32)>(
     aligned: &mut [Aligned],
-    schedule: &[u32; HASH_BITS as usize + 1],
+    (schedule, window): (&[u32], i64),
     matched_a: &mut [bool],
     matched_b: &mut [bool],
     targets: (i64, i64),
@@ -1732,10 +1948,10 @@ fn corroborated_with<M: FnMut(u32, u32, u32)>(
     let mut hi = 0usize;
     for k in 0..aligned.len() {
         let (offset, i, j, distance) = aligned[k];
-        while offset - aligned[lo].0 > ALIGNMENT_TOLERANCE_MS {
+        while offset - aligned[lo].0 > window {
             lo += 1;
         }
-        while hi < aligned.len() && aligned[hi].0 - offset <= ALIGNMENT_TOLERANCE_MS {
+        while hi < aligned.len() && aligned[hi].0 - offset <= window {
             hi += 1;
         }
         // Outside the band this call is responsible for: present as a witness
@@ -1748,7 +1964,7 @@ fn corroborated_with<M: FnMut(u32, u32, u32)>(
         if offset < targets.0 || offset >= targets.1 {
             continue;
         }
-        let needed = schedule[distance.min(HASH_BITS) as usize];
+        let needed = schedule[(distance as usize).min(schedule.len() - 1)];
         if needed == u32::MAX {
             continue;
         }
@@ -1812,28 +2028,47 @@ pub struct Evidence {
 
 /// `Evidence` for `fp_a` against `fp_b` at `-d max_hamming_dist`.
 pub fn evidence(fp_a: &VideoFingerprint, fp_b: &VideoFingerprint, max_hamming_dist: u32) -> Evidence {
-    // The pair was measured both ways round and kept the orientation that
+    // The pair was measured every way round and kept the orientation that
     // covered more (`better_orientation`), so the frames shown are taken the
-    // same way: plain, unless mirroring `a` matches more of either file.
-    let plain = evidence_as(fp_a, fp_b, max_hamming_dist);
-    if fp_a.mirrored_hashes.len() != fp_a.valid_hashes.len() || fp_a.valid_hashes.is_empty() {
-        return plain;
-    }
-    let mut mirrored_a = fp_a.clone();
-    mirrored_a.valid_hashes = fp_a.mirrored_hashes.clone();
-    let mirrored = evidence_as(&mirrored_a, fp_b, max_hamming_dist);
+    // same way: each orientation of `a` against `b`, and each one-sided
+    // orientation of `b` against `a` turned back round, the first best one
+    // winning, as in `find_matches_where`.
     let best = |e: &Evidence| {
         let ms = |st: &[(u32, u32)]| st.iter().map(|&(s, e)| (e - s) as u64).sum::<u64>();
         let pct = |ms: u64, total: u32| if total > 0 { ms as f64 / total as f64 } else { 0.0 };
         pct(ms(&e.stretches_a), fp_a.total_ms).max(pct(ms(&e.stretches_b), fp_b.total_ms))
     };
-    if best(&mirrored) > best(&plain) { mirrored } else { plain }
+    let mut chosen = evidence_as(fp_a, fp_b, max_hamming_dist);
+    for o in &Orientation::all()[1..] {
+        let mut candidates = vec![evidence_as(&o.apply(fp_a), fp_b, max_hamming_dist)];
+        if !o.symmetric() {
+            let e = evidence_as(&o.apply(fp_b), fp_a, max_hamming_dist);
+            candidates.push(Evidence {
+                pairs: e.pairs.iter().map(|&(tb, ta, d)| (ta, tb, d)).collect(),
+                stretches_a: e.stretches_b,
+                stretches_b: e.stretches_a,
+            });
+        }
+        for e in candidates {
+            if best(&e) > best(&chosen) {
+                chosen = e;
+            }
+        }
+    }
+    let mut pairs = chosen.pairs;
+    pairs.sort_unstable();
+    Evidence { pairs, ..chosen }
 }
 
 fn evidence_as(fp_a: &VideoFingerprint, fp_b: &VideoFingerprint, max_hamming_dist: u32) -> Evidence {
-    let tol = Tolerance::for_distance(max_hamming_dist);
-    let schedule = witness_schedule();
-    let rule = Rule { tol, schedule: &schedule };
+    let narrow_schedule = witness_schedule();
+    let wide_schedule = witness_schedule_of(WIDE_BITS);
+    let rules = Rules {
+        narrow: Rule { tol: Tolerance::for_distance(max_hamming_dist), schedule: &narrow_schedule },
+        wide: Rule { tol: Tolerance::wide(max_hamming_dist), schedule: &wide_schedule },
+    };
+    let rule = rules.for_pair(fp_a, fp_b);
+    let tol = rule.tol;
     let mut matched_a = vec![false; fp_a.valid_hashes.len()];
     let mut matched_b = vec![false; fp_b.valid_hashes.len()];
     // The closest partner of each sample of `a`, of the matches admitted.
@@ -1854,14 +2089,12 @@ fn evidence_as(fp_a: &VideoFingerprint, fp_b: &VideoFingerprint, max_hamming_dis
     }
     // A strict match is admitted outright, so every one of them is a match;
     // `for_each_frame_match` flagged them without saying which they were.
-    for (i, &h_a) in fp_a.valid_hashes.iter().enumerate() {
-        for (j, &h_b) in fp_b.valid_hashes.iter().enumerate() {
-            let d = (h_a ^ h_b).count_ones();
-            if d <= tol.strict {
-                note(&mut best, i as u32, j as u32, d);
-            }
+    let (mut scratch_a, mut scratch_b) = (matched_a.clone(), matched_b.clone());
+    for_each_frame_match(fp_a, fp_b, tol, &mut scratch_a, &mut scratch_b, |(_, i, j, d)| {
+        if d <= tol.strict {
+            note(&mut best, i, j, d);
         }
-    }
+    });
     let pairs = best
         .iter()
         .enumerate()
@@ -1932,93 +2165,67 @@ fn find_matches_where(
     // at `-d`: a pair whose only matches are corroborated ones would otherwise
     // never be proposed, and the corroboration rule would be unreachable exactly
     // where it does the most good.
-    let tol = Tolerance::for_distance(max_hamming_dist);
-    let masks = probe_masks(probe_radius(tol.widest()));
-    // One table for the whole run: it depends on the hash width alone, and
-    // every pair reads the same answers out of it.
-    let schedule = witness_schedule();
-    let rule = Rule { tol, schedule: &schedule };
+    let narrow_schedule = witness_schedule();
+    let wide_schedule = witness_schedule_of(WIDE_BITS);
+    let rules = Rules {
+        narrow: Rule { tol: Tolerance::for_distance(max_hamming_dist), schedule: &narrow_schedule },
+        wide: Rule { tol: Tolerance::wide(max_hamming_dist), schedule: &wide_schedule },
+    };
+    let widest = rules.widest();
+    let masks = probe_masks(probe_radius(widest));
 
-    // The two arms differ only in where the pairs come from, and they agree on
-    // every pair: the index is exhaustive, and the direct route is what
-    // "exhaustive" means. Measuring one pair is the same work either way, so it
-    // lives in `measure_pair` and neither arm can drift from the other.
-    // Each file again with its mirrored hashes in place of its own: the pair
-    // (a, b) is also measured with `a` mirrored, which finds a mirrored copy.
-    // A fingerprint with no mirrored hashes (a test fixture) gets none here and
-    // simply never matches that way round.
-    let mirrors: Vec<VideoFingerprint> = fingerprints
+    // Every other way round a pair is measured: `a` mirrored, and `a` read
+    // inside each reframing, mirrored or not (see `Orientation`). The plain
+    // orientation is `fingerprints` itself.
+    let orientations = Orientation::all();
+    let views: Vec<Vec<VideoFingerprint>> = orientations[1..]
         .iter()
-        .map(|fp| {
-            let mut m = fp.clone();
-            if fp.mirrored_hashes.len() == fp.valid_hashes.len() {
-                m.valid_hashes = fp.mirrored_hashes.clone();
-            } else {
-                m.valid_hashes.clear();
-                m.valid_t_start.clear();
-                m.valid_t_end.clear();
-            }
-            m
-        })
+        .map(|o| fingerprints.iter().map(|fp| o.apply(fp)).collect())
         .collect();
-    let mirrors = &mirrors;
+    let side = |o: usize| -> &[VideoFingerprint] { if o == 0 { fingerprints } else { &views[o - 1] } };
 
-    let pairs: Vec<(usize, usize, bool)> = if index_is_cheaper(masks.len(), n, total_hashes) {
-        let mut candidates: Vec<(usize, usize, bool)> = candidate_pairs(fingerprints, &masks, tol.widest())
-            .into_iter()
-            .map(|(a, b)| (a, b, false))
-            .collect();
-        candidates.extend(
-            candidate_pairs_probing(fingerprints, mirrors, &masks, tol.widest())
-                .into_iter()
-                .map(|(a, b)| (a, b, true)),
-        );
+    // One orientation of one pair, `q` read that way round against `t` as it
+    // is, reported with the lower index as `a`.
+    let measure = |(q, t, o): (usize, usize, usize), witnesses: &mut Witnesses| -> Option<Match> {
+        let m = measure_pair(&side(o)[q], &fingerprints[t], (q, t), rules, min_match_percent, min_duration, witnesses)?;
+        let m = Match { mirrored: orientations[o].mirrored, reframed: orientations[o].reframed, ..m };
+        Some(if q < t { m } else { m.swapped() })
+    };
+
+    let route_t = std::time::Instant::now();
+    // Every orientation is the same comparison of one library against itself,
+    // so the two routes compare per orientation exactly as they do for one.
+    let pairs: Vec<(usize, usize, usize)> = if index_is_cheaper(masks.len(), n, total_hashes) {
+        let mut candidates: Vec<(usize, usize, usize)> = Vec::new();
+        for (o, orientation) in orientations.iter().enumerate() {
+            candidates.extend(
+                candidate_pairs_probing(fingerprints, side(o), &masks, widest, !orientation.symmetric())
+                    .into_iter()
+                    .map(|(q, t)| (q, t, o)),
+            );
+        }
         candidates.retain(|&(a, b, _)| wanted(a, b));
-        info!("Index scan produced {} candidate pair(s); verifying...", candidates.len());
+        info!("Index scan produced {} candidate pair(s) in {:.1?}; verifying...", candidates.len(), route_t.elapsed());
         candidates
     } else {
-        // Deliberately not materialised: at the tolerances that get here the
-        // pair list is the whole triangle, which is quadratic in the library
-        // size and would be the largest allocation in the program by far. The
-        // parallel range below yields it instead, and the inner range is
-        // parallel too because the outer one is lopsided -- video 0 pairs with
-        // everything and the last video with nothing.
-
-        // The count is the whole triangle even though the list of it is never
-        // built -- `n * (n - 1) / 2` is what the ranges below yield, and the bar
-        // needs a denominator rather than the pairs themselves. In u64 because
-        // this is the arm that runs on the libraries where it overflows a u32.
-        let total = match sides {
-            None => n as u64 * n.saturating_sub(1) as u64 / 2,
-            Some(s) => {
-                let held = s.iter().filter(|&&h| h).count() as u64;
-                held * (n as u64 - held)
-            }
-        };
-        let pb = verification_bar(total);
-
-        let matches = (0..n)
-            .into_par_iter()
-            .flat_map(|v_a| ((v_a + 1)..n).into_par_iter().map(move |v_b| (v_a, v_b)))
-            .filter(|&(a, b)| wanted(a, b))
-            .map_init(
-                || (Ticker::new(&pb), Witnesses::new()),
-                |(ticker, witnesses), pair| {
-                    ticker.tick();
-                    let normal = measure_pair_as(
-                        fingerprints, fingerprints, pair, rule, min_match_percent, min_duration, witnesses,
-                    );
-                    let mirrored = measure_pair_as(
-                        fingerprints, mirrors, pair, rule, min_match_percent, min_duration, witnesses,
-                    );
-                    better_orientation(normal, mirrored)
-                },
-            )
-            .flatten()
-            .collect();
-
-        pb.finish_and_clear();
-        return matches;
+        // Past the radius where probing pays, every pair's hashes are compared
+        // outright -- two contiguous runs of u64, which is far cheaper per
+        // comparison than a probe -- and only the pairs with some frame inside
+        // the widest tolerance go on to be measured, as from the index.
+        let mut candidates: Vec<(usize, usize, usize)> = Vec::new();
+        for (o, orientation) in orientations.iter().enumerate() {
+            candidates.extend(
+                candidate_pairs_scanning(fingerprints, side(o), rules, !orientation.symmetric(), &wanted)
+                    .into_iter()
+                    .map(|(q, t)| (q, t, o)),
+            );
+        }
+        info!(
+            "Pairwise scan produced {} candidate pair(s) in {:.1?}; verifying...",
+            candidates.len(),
+            route_t.elapsed()
+        );
+        candidates
     };
 
     if shutdown_requested() {
@@ -2027,25 +2234,24 @@ fn find_matches_where(
 
     let pb = verification_bar(pairs.len() as u64);
 
-    let matches = pairs
+    let mut matches = pairs
         .into_par_iter()
         .map_init(
             || (Ticker::new(&pb), Witnesses::new()),
-            |(ticker, witnesses), (a, b, mirrored)| {
+            |(ticker, witnesses), task| {
                 ticker.tick();
-                let side_a = if mirrored { mirrors } else { fingerprints };
-                measure_pair_as(fingerprints, side_a, (a, b), rule, min_match_percent, min_duration, witnesses)
+                measure(task, witnesses).map(|m| (task.2, m))
             },
         )
         .flatten()
-        .collect::<Vec<Match>>();
+        .collect::<Vec<(usize, Match)>>();
 
     pb.finish_and_clear();
-    // A pair proposed both ways round keeps the orientation that matched more.
-    let mut matches = matches;
-    matches.sort_by_key(|m| (m.a, m.b));
+    // A pair proposed several ways round keeps the orientation that matched
+    // most, the earliest in `Orientation::all` on a tie -- the plain one first.
+    matches.sort_by_key(|(o, m)| (m.a, m.b, *o));
     let mut out: Vec<Match> = Vec::with_capacity(matches.len());
-    for m in matches {
+    for (_, m) in matches {
         match out.last_mut() {
             Some(last) if (last.a, last.b) == (m.a, m.b) => {
                 *last = better_orientation(Some(*last), Some(m)).unwrap();
@@ -2054,6 +2260,94 @@ fn find_matches_where(
         }
     }
     out
+}
+
+/// One way round a pair can be measured: the first file's pictures as they
+/// are, mirrored, or read inside a reframing (`fingerprint::REFRAMINGS`), each
+/// against the second file as it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Orientation {
+    mirrored: bool,
+    reframed: Option<Reframing>,
+}
+
+impl Orientation {
+    /// Every orientation, plain first: that order is the tie-break.
+    fn all() -> Vec<Orientation> {
+        let mut out = vec![
+            Orientation { mirrored: false, reframed: None },
+            Orientation { mirrored: true, reframed: None },
+        ];
+        for r in REFRAMINGS {
+            for mirrored in [false, true] {
+                out.push(Orientation { mirrored, reframed: Some(r) });
+            }
+        }
+        out
+    }
+
+    /// Whether measuring `a` this way round against `b` is the same question
+    /// as measuring `b` this way round against `a`. Mirroring is its own
+    /// inverse, so a mirrored `a` against `b` is a mirrored `b` against `a`; a
+    /// reframing is not -- a zoomed `a` against `b` finds `b` cut down from
+    /// `a`, and the other way round finds the reverse.
+    fn symmetric(&self) -> bool {
+        self.reframed.is_none()
+    }
+
+    /// `fp` read this way round: its hashes replaced by the orientation's, and
+    /// its samples narrowed to those the reframing applies to. A fingerprint
+    /// that lacks them (a fixture, or a reframing that applies to none of its
+    /// samples) comes back with no samples and simply matches nothing.
+    fn apply(&self, fp: &VideoFingerprint) -> VideoFingerprint {
+        let mut o = VideoFingerprint {
+            valid_hashes: Vec::new(),
+            valid_t_start: Vec::new(),
+            valid_t_end: Vec::new(),
+            mirrored_hashes: Vec::new(),
+            detail_hashes: Vec::new(),
+            mirrored_detail_hashes: Vec::new(),
+            reframed: Vec::new(),
+            path: fp.path.clone(),
+            codec: String::new(),
+            ..*fp
+        };
+        let n = fp.valid_hashes.len();
+        match self.reframed {
+            None => {
+                let (hashes, detail) = if self.mirrored {
+                    (&fp.mirrored_hashes, &fp.mirrored_detail_hashes)
+                } else {
+                    (&fp.valid_hashes, &fp.detail_hashes)
+                };
+                if hashes.len() != n {
+                    return o;
+                }
+                o.valid_hashes = hashes.clone();
+                o.valid_t_start = fp.valid_t_start.clone();
+                o.valid_t_end = fp.valid_t_end.clone();
+                if detail.len() == n {
+                    o.detail_hashes = detail.clone();
+                }
+            }
+            Some(r) => {
+                let Some(v) = REFRAMINGS.iter().position(|&x| x == r) else { return o };
+                let Some(rf) = fp.reframed.get(v) else { return o };
+                let (h, d) = if self.mirrored { (1, 3) } else { (0, 2) };
+                for (&s, hs) in rf.samples.iter().zip(&rf.hashes) {
+                    let s = s as usize;
+                    if s >= n {
+                        continue;
+                    }
+                    o.valid_hashes.push(hs[h]);
+                    o.detail_hashes.push(hs[d]);
+                    o.valid_t_start.push(fp.valid_t_start[s]);
+                    o.valid_t_end.push(fp.valid_t_end[s]);
+                }
+            }
+        }
+        o
+    }
 }
 
 /// Of the two orientations of one pair, the one whose better side is better
@@ -2152,15 +2446,14 @@ impl Drop for Ticker<'_> {
 }
 
 /// Phase 2 for one pair: measure it exactly, then apply both gates. `None` when
-/// the pair fails either of them, or when the run is shutting down.
-/// One orientation of one pair: `a` as `side_a[a]` holds it, against `b` as
-/// it is. `side_a` is either `fingerprints` itself or the mirrored copies of
-/// them, and the match records which.
-fn measure_pair_as(
-    fingerprints: &[VideoFingerprint],
-    side_a: &[VideoFingerprint],
+/// the pair fails either of them, or when the run is shutting down. `fp_a` may
+/// be a re-oriented copy (`Orientation::apply`); the match is reported plain,
+/// and the caller records the orientation.
+fn measure_pair(
+    fp_a: &VideoFingerprint,
+    fp_b: &VideoFingerprint,
     (v_a, v_b): (usize, usize),
-    rule: Rule,
+    rules: Rules,
     min_match_percent: f32,
     min_duration: f64,
     witnesses: &mut Witnesses,
@@ -2168,10 +2461,7 @@ fn measure_pair_as(
     if shutdown_requested() {
         return None;
     }
-    let mirrored = !std::ptr::eq(side_a, fingerprints);
-    let fp_a = &side_a[v_a];
-    let fp_b = &fingerprints[v_b];
-
+    let rule = rules.for_pair(fp_a, fp_b);
     let (pct_a, pct_b, span_a, span_b) = match_overlap(fp_a, fp_b, rule, witnesses);
 
     // A pair that shares NOTHING is not a match at any setting, and that has to
@@ -2204,7 +2494,7 @@ fn measure_pair_as(
         }
     }
 
-    Some(Match { a: v_a, b: v_b, coverage_a: pct_a, coverage_b: pct_b, span_a, span_b, mirrored })
+    Some(Match { a: v_a, b: v_b, coverage_a: pct_a, coverage_b: pct_b, span_a, span_b, mirrored: false, reframed: None })
 }
 
 #[cfg(test)]
@@ -2233,6 +2523,9 @@ mod tests {
             codec: "h264".to_string(),
             frame_rate: 30.0,
             mirrored_hashes: Vec::new(),
+            detail_hashes: Vec::new(),
+            mirrored_detail_hashes: Vec::new(),
+            reframed: Vec::new(),
         }
     }
 
@@ -2306,7 +2599,7 @@ mod tests {
     /// apart; it is the phase-2 behaviour these tests are about, not the
     /// mapping from the flag.
     fn exactly(bits: u32) -> Tolerance {
-        Tolerance { strict: bits, loose: bits }
+        Tolerance { strict: bits, loose: bits, cap: None }
     }
 
     /// The same thing as a whole `Rule`, for the tests that call the pair-level
@@ -2458,7 +2751,7 @@ mod tests {
     fn test_the_tolerance_pair_moves_monotonically_with_the_flag() {
         // `-d` may only ever admit more as it rises, whichever side of the
         // corroboration rule a frame match falls on.
-        let mut previous = Tolerance { strict: 0, loose: 0 };
+        let mut previous = Tolerance { strict: 0, loose: 0, cap: None };
         for d in 0..=HASH_BITS {
             let tol = Tolerance::for_distance(d);
             assert!(tol.strict <= tol.loose, "-d {d}: strict must not exceed loose");
@@ -2468,14 +2761,14 @@ mod tests {
         }
         // Both sides move with every rung and neither ever saturates: the gap
         // is constant, so `-d 12` is not `-d 4` with extra steps.
-        assert_eq!(Tolerance::for_distance(0), Tolerance { strict: 0, loose: 6 });
-        assert_eq!(Tolerance::for_distance(4), Tolerance { strict: 4, loose: 10 });
-        assert_eq!(Tolerance::for_distance(12), Tolerance { strict: 12, loose: 18 });
-        assert_eq!(Tolerance::for_distance(20), Tolerance { strict: 20, loose: 26 });
+        assert_eq!(Tolerance::for_distance(0), Tolerance { strict: 0, loose: 6, cap: None });
+        assert_eq!(Tolerance::for_distance(4), Tolerance { strict: 4, loose: 10, cap: None });
+        assert_eq!(Tolerance::for_distance(12), Tolerance { strict: 12, loose: 18, cap: None });
+        assert_eq!(Tolerance::for_distance(20), Tolerance { strict: 20, loose: 26, cap: None });
         // ...except against the hash width, past which a tolerance means nothing.
         assert_eq!(
             Tolerance::for_distance(HASH_BITS),
-            Tolerance { strict: HASH_BITS, loose: HASH_BITS }
+            Tolerance { strict: HASH_BITS, loose: HASH_BITS, cap: None }
         );
     }
 
@@ -2636,10 +2929,12 @@ mod tests {
         let (banded_a, banded_b, held) = corroborate_with_cap(&a, &b, tol, cap);
         assert_eq!((banded_a, banded_b), (whole_a, whole_b), "banding changed the verdict");
         // A band stops one bucket short of the cap and carries a skirt of one
-        // bucket on each side; a bucket here is one time offset, which this
-        // pair has at most `n` matches at.
+        // alignment window on each side, edges included; a bucket here is one
+        // time offset, which this pair has at most `n` matches at, and the
+        // window is the 2 s the samples are spaced at, so the skirt reaches one
+        // offset below the band and two above it.
         assert!(
-            held <= cap + 2 * n,
+            held <= cap + 3 * n,
             "held {held} matches at once against a cap of {cap}"
         );
     }
@@ -3014,7 +3309,7 @@ mod tests {
 
     /// Which samples the corroboration pass marks, written the slow obvious
     /// way: every loose frame match judged on its own, against the window of
-    /// every match within `ALIGNMENT_TOLERANCE_MS` of it and the definition of
+    /// every match within the pair's `alignment_window` of it and the definition of
     /// a matching in `largest_matching`. Shares no code with `corroborated` --
     /// no sliding window, no scratch space, no order between the rows.
     fn marked_the_slow_way(
@@ -3049,7 +3344,7 @@ mod tests {
             let window: Vec<Aligned> = aligned
                 .iter()
                 .copied()
-                .filter(|&(o, _, _, _)| (o - offset).abs() <= ALIGNMENT_TOLERANCE_MS)
+                .filter(|&(o, _, _, _)| (o - offset).abs() <= alignment_window(fp_a, fp_b))
                 .collect();
             if largest_matching(&window, i, j) >= needed as usize {
                 marked_a[i as usize] = true;

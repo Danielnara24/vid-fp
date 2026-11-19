@@ -23,6 +23,8 @@ filename matching find none of that.
 - A trimmed clip, highlight or excerpt sitting inside a longer recording
 - A copy mirrored left to right
 - A copy with black bars added or removed (letterbox, pillarbox)
+- A landscape video re-uploaded as a vertical one, with a blurred or plain fill
+- A copy zoomed in slightly, cropped, or tilted to fill the frame
 - Copies under different names, in different folders, across several drives
 
 ## What it does about it
@@ -405,7 +407,7 @@ nothing.
 | `--follow-symlinks` | Descend into symlinked folders. Deletions act on the file the link leads to | off |
 | `-e`, `--exclude <PATH>` | Exclude a folder or a single file; repeat for several. Matched by whole path components, so a file must be named exactly, and resolved through symlinks | |
 | `-x`, `--extensions <EXT>` | Extensions a **folder walk** treats as videos, comma-separated or repeated. `-x '*'` (quoted) takes every file, including ones with no extension; an entry prefixed with `!` is an exception, so `-x '!flac'` takes every file but those | 18 extensions, listed below |
-| `-d`, `--hamming-distance <N>` | Frame-match tolerance, in bits out of 64; higher = less strict matching. Raise to find more duplicates, at the cost of false positives. See [Tuning](#tuning). Values above `32` are refused | `4` |
+| `-d`, `--hamming-distance <N>` | Frame-match tolerance, in bits out of 64; higher = less strict matching. Raise to find more duplicates, at the cost of false positives. See [Tuning](#tuning). Values above `32` are refused | `6` |
 | `-p`, `--match-percent <F>` | Min % of overlap to count as a duplicate, from `0` to `100`. Lower includes shorter matches, at the cost of false positives. `0` turns the gate off and reports every pair sharing any footage at all; a pair sharing none is never reported | `20.0` |
 | `--min-duration <SECS>` | Min shared clip length in seconds for a match. Videos shorter than this are skipped entirely. `0` = off | `0.0` |
 | `-k`, `--priority <P>` | Criteria for KEEPING files: `length`, `resolution`, `quality`, or `size`. The chosen one is compared first, the rest follow in the default order. See [Codecs and quality](#codecs-and-quality) | `length` |
@@ -444,27 +446,30 @@ frames may be) and `-p` (how much of a video must match). They trade off against
 each other, so change one at a time.
 
 `-d` counts differing bits of a 64-bit frame hash. Two unrelated frames sit
-about 32 bits apart, so the useful range is roughly 2 to 12: below that only a
-bit-identical re-encode matches, above it unrelated footage starts to.
+about 32 bits apart, so the useful range is roughly 2 to 8: below that only a
+near-identical re-encode matches, above it unrelated footage starts to.
 
-**Only even values of `-d` do anything.** Every hash has exactly 32 of its 64
-bits set, so any two of them differ in an even number of places. `-d 5` accepts
-exactly what `-d 4` accepts. Step in twos.
+**Each frame is hashed twice, and a match has to hold in both.** Besides the
+coarse hash, every frame gets a second 64-bit hash of finer detail. Two frames
+that only share a layout (two lines of text on black, two road scenes) agree on
+the first and not the second; two encodes of one frame agree on both. `-d` is
+applied to the two together: it sets how far below chance their combined
+distance must be, the same distance below chance as `-d` bits are on one hash.
+So every value of `-d` does something, odd ones included.
 
 **A frame match is judged on its distance and on whether anything backs it up.**
 Two encodes of the same footage place every frame they share at one constant
 time offset, so their matches corroborate each other; two videos that merely
-look alike produce matches scattered across unrelated moments. So `-d` sets two
-thresholds: a match with nothing behind it must be within `-d`, while a match
-that another frame match agrees with (a different frame of each video, landing
-within half a second of the same offset) may reach `-d + 6`. Past 12 bits one
-agreeing match stops being rare enough to mean anything, so more are required:
-two at 14 bits, three at 16, four at 20. No two of them may share a frame on
-either side, or one static shot would supply them all.
+look alike produce matches scattered across unrelated moments. A match with
+nothing behind it must be within `-d`; one that another frame match agrees with
+(a different frame of each video, at the same offset give or take one keyframe
+gap) may be somewhat further, and further still needs more agreeing matches. No
+two of them may share a frame on either side, or one static shot would supply
+them all.
 
-Both thresholds move with every rung of `-d`, so the flag stays a sensitivity
-control across its whole range. The default is deliberately conservative:
-raising it finds more, and starts admitting false positives past about `-d 10`.
+All of it moves with every rung of `-d`, so the flag stays a sensitivity
+control across its whole range. Raising it finds more, and starts admitting
+false positives past about `-d 8`.
 
 **Both knobs are monotone.** Raising `-d` or lowering `-p` only ever *adds*
 files to the report; lowering `-d` or raising `-p` only ever *removes* them. The
