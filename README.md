@@ -455,7 +455,8 @@ that only share a layout (two lines of text on black, two road scenes) agree on
 the first and not the second; two encodes of one frame agree on both. `-d` is
 applied to the two together: it sets how far below chance their combined
 distance must be, the same distance below chance as `-d` bits are on one hash.
-So every value of `-d` does something, odd ones included.
+The combined distance is always even, so two neighbouring values of `-d` can
+accept exactly the same matches (`-d 5` and `-d 6` do).
 
 **A frame match is judged on its distance and on whether anything backs it up.**
 Two encodes of the same footage place every frame they share at one constant
@@ -466,6 +467,11 @@ nothing behind it must be within `-d`; one that another frame match agrees with
 gap) may be somewhat further, and further still needs more agreeing matches. No
 two of them may share a frame on either side, or one static shot would supply
 them all.
+
+Once two matches agree on an offset, a frame between them only has to be close
+to the frames at that offset, not to every frame in the other video, so it may
+be one step further again. This is what recovers the middle of a clip whose
+keyframes fall between the source's.
 
 All of it moves with every rung of `-d`, so the flag stays a sensitivity
 control across its whole range. Raising it finds more, and starts admitting

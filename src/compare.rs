@@ -1170,7 +1170,6 @@ fn match_overlap(
     rule: Rule,
     witnesses: &mut Witnesses,
 ) -> (f32, f32, Option<Span>, Option<Span>) {
-    let tol = rule.tol;
     // Per pair, and deliberately left that way. `Witnesses` beside them is the
     // worker's, and moving these two (and `corroborate_pair`'s match list) in
     // with it was tried and reverted: it is correct, it is byte-identical, and
@@ -1178,22 +1177,7 @@ fn match_overlap(
     let mut matched_a = vec![false; fp_a.valid_hashes.len()];
     let mut matched_b = vec![false; fp_b.valid_hashes.len()];
 
-    if tol.loose > tol.strict {
-        corroborate_pair(
-            fp_a,
-            fp_b,
-            rule,
-            &mut matched_a,
-            &mut matched_b,
-            MAX_ALIGNED_MATCHES,
-            witnesses,
-        );
-    } else {
-        // Nothing to corroborate, so nothing is worth remembering: the strict
-        // pass marks everything this pair is going to get. Only `-d` at the
-        // width of the hash and the tests reach this.
-        for_each_frame_match(fp_a, fp_b, tol, &mut matched_a, &mut matched_b, |_| {});
-    }
+    admit(fp_a, fp_b, rule, &mut matched_a, &mut matched_b, witnesses, &mut |_, _, _| {});
 
     // Each stored hash stands in for the picture over [t_start, t_end), so the
     // matched footage is the sum of the spans of the hashes that matched --
@@ -1224,6 +1208,120 @@ fn match_overlap(
         Span::of(&matched_a, fp_a),
         Span::of(&matched_b, fp_b),
     )
+}
+
+/// Every frame match the rule admits for one pair, flagged in `matched_a` and
+/// `matched_b` and told to `on_mark` as `(i, j, distance)`: the strict ones,
+/// the corroborated ones, and then the ones an established alignment rescues.
+///
+/// ## Rescue along an alignment
+///
+/// Two accepted matches at one offset (within the pair's `alignment_window` of
+/// each other) say where `b` sits in `a`. A frame between them no longer has to
+/// stand against every frame of the other file, only against the few at that
+/// offset, so it is held to one more `CORROBORATION_SLACK_SIGMA` step than the
+/// corroborated tolerance -- the same step corroboration itself takes beyond
+/// strict -- and only inside the stretch both ends of the chain bound, on both
+/// sides. This is what recovers the middle of a clip whose keyframes the
+/// encoder placed between the source's: the ends anchor the offset, and the
+/// frames in between are near misses rather than chance.
+fn admit<M: FnMut(u32, u32, u32)>(
+    fp_a: &VideoFingerprint,
+    fp_b: &VideoFingerprint,
+    rule: Rule,
+    matched_a: &mut [bool],
+    matched_b: &mut [bool],
+    witnesses: &mut Witnesses,
+    on_mark: &mut M,
+) {
+    let tol = rule.tol;
+    if tol.loose > tol.strict {
+        corroborate_pair_with(fp_a, fp_b, rule, matched_a, matched_b, MAX_ALIGNED_MATCHES, witnesses, on_mark);
+    } else {
+        // Nothing to corroborate: the strict pass marks everything the rule
+        // itself admits. Only `-d` at the width of the hash and tests reach it.
+        for_each_frame_match(fp_a, fp_b, tol, matched_a, matched_b, |_| {});
+    }
+    if !matched_a.iter().any(|&m| m) {
+        return;
+    }
+    // The anchors of an alignment: every frame match within the rule's reach
+    // between two samples that are both matched. Not "the matches corroboration
+    // admitted", which is what it first was: corroboration skips a row whose
+    // two samples are already settled, so that list could SHRINK as `-d` rose
+    // and take a rescue with it. Both conditions here only ever grow with `-d`,
+    // so the anchors do, and so does everything rescued from them. The same
+    // sweep names the strict matches, which `for_each_frame_match` flagged
+    // without saying which pair they were.
+    let mut anchors: Vec<Aligned> = Vec::new();
+    let (mut scratch_a, mut scratch_b) = (matched_a.to_vec(), matched_b.to_vec());
+    for_each_frame_match(fp_a, fp_b, tol, &mut scratch_a, &mut scratch_b, |entry| {
+        if entry.3 <= tol.strict {
+            on_mark(entry.1, entry.2, entry.3);
+        }
+        if matched_a[entry.1 as usize] && matched_b[entry.2 as usize] {
+            anchors.push(entry);
+        }
+    });
+    rescue_along_alignments(fp_a, fp_b, tol, anchors, matched_a, matched_b, on_mark);
+}
+
+/// The rescue step of `admit`. `accepted` is its anchors.
+fn rescue_along_alignments<M: FnMut(u32, u32, u32)>(
+    fp_a: &VideoFingerprint,
+    fp_b: &VideoFingerprint,
+    tol: Tolerance,
+    mut accepted: Vec<Aligned>,
+    matched_a: &mut [bool],
+    matched_b: &mut [bool],
+    on_mark: &mut M,
+) {
+    if accepted.len() < 2 {
+        return;
+    }
+    let window = alignment_window(fp_a, fp_b);
+    accepted.sort_unstable();
+    // Each chain: its offset range with the window either side, then the
+    // stretch of a and the stretch of b it bounds.
+    type Chain = ((i64, i64), (u32, u32), (u32, u32));
+    let mut chains: Vec<Chain> = Vec::new();
+    let mut s = 0;
+    while s < accepted.len() {
+        let mut e = s + 1;
+        while e < accepted.len() && accepted[e].0 - accepted[e - 1].0 <= window {
+            e += 1;
+        }
+        if e - s >= 2 {
+            let chain = &accepted[s..e];
+            let ta = |&(_, i, _, _): &Aligned| fp_a.valid_t_start[i as usize];
+            let tb = |&(_, _, j, _): &Aligned| fp_b.valid_t_start[j as usize];
+            let a = (chain.iter().map(ta).min().unwrap_or(0), chain.iter().map(ta).max().unwrap_or(0));
+            let b = (chain.iter().map(tb).min().unwrap_or(0), chain.iter().map(tb).max().unwrap_or(0));
+            if a.1 > a.0 {
+                chains.push(((chain[0].0 - window, chain[e - s - 1].0 + window), a, b));
+            }
+        }
+        s = e;
+    }
+    if chains.is_empty() {
+        return;
+    }
+    let width = if tol.cap.is_some() { WIDE_BITS } else { HASH_BITS };
+    let slack = (CORROBORATION_SLACK_SIGMA * sigma_of(width)).round() as u32;
+    let reach = tol.loose.saturating_add(slack).min(width);
+    let wider = Tolerance { strict: reach, loose: reach, cap: tol.cap.map(|_| (reach / 2).min(HASH_BITS)) };
+    let (mut scratch_a, mut scratch_b) = (vec![false; matched_a.len()], vec![false; matched_b.len()]);
+    for_each_frame_match(fp_a, fp_b, wider, &mut scratch_a, &mut scratch_b, |(off, i, j, d)| {
+        let (ta, tb) = (fp_a.valid_t_start[i as usize], fp_b.valid_t_start[j as usize]);
+        let inside = chains.iter().any(|&((olo, ohi), (alo, ahi), (blo, bhi))| {
+            off >= olo && off <= ohi && ta >= alo && ta <= ahi && tb >= blo && tb <= bhi
+        });
+        if inside && !(matched_a[i as usize] && matched_b[j as usize]) {
+            matched_a[i as usize] = true;
+            matched_b[j as usize] = true;
+            on_mark(i, j, d);
+        }
+    });
 }
 
 /// Every frame pair of A against every frame pair of B, marking the strict
@@ -1291,6 +1389,7 @@ fn for_each_frame_match<F: FnMut(Aligned)>(
 ///
 /// Returns the largest number of entries it held at once, which is what the
 /// tests measure the working set by.
+#[cfg(test)]
 fn corroborate_pair(
     fp_a: &VideoFingerprint,
     fp_b: &VideoFingerprint,
@@ -2068,7 +2167,6 @@ fn evidence_as(fp_a: &VideoFingerprint, fp_b: &VideoFingerprint, max_hamming_dis
         wide: Rule { tol: Tolerance::wide(max_hamming_dist), schedule: &wide_schedule },
     };
     let rule = rules.for_pair(fp_a, fp_b);
-    let tol = rule.tol;
     let mut matched_a = vec![false; fp_a.valid_hashes.len()];
     let mut matched_b = vec![false; fp_b.valid_hashes.len()];
     // The closest partner of each sample of `a`, of the matches admitted.
@@ -2079,21 +2177,9 @@ fn evidence_as(fp_a: &VideoFingerprint, fp_b: &VideoFingerprint, max_hamming_dis
             *slot = Some((j, d));
         }
     };
-    if tol.loose > tol.strict {
-        let mut witnesses = Witnesses::new();
-        corroborate_pair_with(fp_a, fp_b, rule, &mut matched_a, &mut matched_b, MAX_ALIGNED_MATCHES, &mut witnesses, &mut |i, j, d| {
-            note(&mut best, i, j, d)
-        });
-    } else {
-        for_each_frame_match(fp_a, fp_b, tol, &mut matched_a, &mut matched_b, |_| {});
-    }
-    // A strict match is admitted outright, so every one of them is a match;
-    // `for_each_frame_match` flagged them without saying which they were.
-    let (mut scratch_a, mut scratch_b) = (matched_a.clone(), matched_b.clone());
-    for_each_frame_match(fp_a, fp_b, tol, &mut scratch_a, &mut scratch_b, |(_, i, j, d)| {
-        if d <= tol.strict {
-            note(&mut best, i, j, d);
-        }
+    let mut witnesses = Witnesses::new();
+    admit(fp_a, fp_b, rule, &mut matched_a, &mut matched_b, &mut witnesses, &mut |i, j, d| {
+        note(&mut best, i, j, d)
     });
     let pairs = best
         .iter()
@@ -3113,16 +3199,44 @@ mod tests {
                 assert_eq!(envelope(&ev.stretches_a), span_a, "case {case} -d {d}");
                 assert_eq!(envelope(&ev.stretches_b), span_b, "case {case} -d {d}");
                 // Every matched sample of a is listed, with a partner inside b's
-                // matched footage, within the loose tolerance.
+                // matched footage, within the loose tolerance or, for a sample an
+                // alignment rescued, one slack step past it.
+                let reach = rule.tol.loose + (CORROBORATION_SLACK_SIGMA * sigma()).round() as u32;
                 let flagged_a = fp_a.valid_t_start.iter().zip(&fp_a.valid_t_end).filter(|(s, e)| ev.stretches_a.iter().any(|st| st.0 <= **s && **e <= st.1)).count();
                 assert_eq!(ev.pairs.len(), flagged_a, "case {case} -d {d}: one pair per matched sample of a");
                 for &(ta, tb, dist) in &ev.pairs {
-                    assert!(dist <= rule.tol.loose);
+                    assert!(dist <= reach);
                     assert!(ev.stretches_a.iter().any(|st| st.0 <= ta && ta < st.1));
                     assert!(ev.stretches_b.iter().any(|st| st.0 <= tb && tb < st.1), "case {case} -d {d}: {tb} is not matched footage of b");
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_a_near_miss_between_two_aligned_matches_is_rescued_and_one_alone_is_not() {
+        // a: five frames a second apart. b: the same five at a 3 s offset, the
+        // two ends exact and the middle three 12 bits off -- past -d 4's loose
+        // 10, inside one slack step (6) of it. The ends anchor the offset, so
+        // the middle is rescued; with only one exact end there is no chain.
+        let hashes: Vec<u64> = (0..5u64).map(distinct_hash).collect();
+        let times: Vec<u32> = (0..5u32).map(|i| 10_000 + i * 1000).collect();
+        let off = |h: u64, i: u64| if i == 0 || i == 4 { h } else { h ^ 0xFFF };
+        let a = mock_fp_at(hashes.clone(), times.clone());
+        let b = mock_fp_at(
+            hashes.iter().enumerate().map(|(i, &h)| off(h, i as u64)).collect(),
+            times.iter().map(|t| t + 3000).collect(),
+        );
+        let rule = Rule { tol: Tolerance::for_distance(4), schedule: &witness_schedule() };
+        // Each sample stands for one second of a 15 s runtime.
+        let seconds = |cov: f32| (cov * a.total_ms as f32 / 1000.0).round() as u32;
+        let (cov_a, _, _, _) = match_overlap(&a, &b, rule, &mut Witnesses::new());
+        assert_eq!(seconds(cov_a), 5, "the middle three should be rescued");
+
+        let mut one_end = b.clone();
+        one_end.valid_hashes[4] ^= 0xFFFF_FFFF;
+        let (cov_a, _, _, _) = match_overlap(&a, &one_end, rule, &mut Witnesses::new());
+        assert_eq!(seconds(cov_a), 1, "one anchor is no alignment");
     }
 
     #[test]
