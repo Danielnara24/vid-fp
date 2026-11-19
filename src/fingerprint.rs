@@ -119,6 +119,13 @@ pub struct VideoFingerprint {
     pub codec: String,
     /// Average frames per second, or 0.0 when the container never said.
     pub frame_rate: f64,
+    /// The hash each sample would have had if the picture were mirrored left to
+    /// right, index for index with `valid_hashes`. A mirrored copy is the most
+    /// common re-upload trick there is, and a DCT hash is not mirror-invariant:
+    /// mirroring negates every coefficient with an odd horizontal frequency, so
+    /// this is computed from the same coefficients, with no second decode.
+    /// Comparison measures each pair both ways round (see `compare`).
+    pub mirrored_hashes: Vec<u64>,
 }
 
 impl VideoFingerprint {
@@ -1463,94 +1470,125 @@ fn send_and_take(
     }
 }
 
-/// The hash of each 64x64 GRAY8 frame in `u_frames` (packed back to back),
-/// and whether it is featureless, after cropping away the border every frame
-/// of the video shares: a letterbox or a pillarbox is a property of the
-/// encode, not of the picture, and would otherwise weigh on every hash.
+/// How far a pixel of a bar may stray from the bar's own level, at most and on
+/// average, in grey levels of the 64x64 frame. A bar an encoder adds is flat to
+/// within compression noise; an edge of the picture itself almost never is.
+const BAR_MAX_DEVIATION: i32 = 4;
+const BAR_MEAN_DEVIATION: i32 = 1;
+
+/// The rows or columns at the start of `lines` that form one flat bar: each
+/// within the bar limits of the level of the first one. 0 when the first line
+/// is not flat itself.
+fn bar_depth<'a>(lines: impl Iterator<Item = &'a [u8]> + Clone) -> usize {
+    let mut it = lines.clone();
+    let Some(first) = it.next() else { return 0 };
+    let level = first.iter().map(|&p| p as i32).sum::<i32>() / first.len() as i32;
+    let flat = |line: &[u8]| {
+        let (mut max, mut sum) = (0, 0);
+        for &p in line {
+            let d = (p as i32 - level).abs();
+            max = max.max(d);
+            sum += d;
+        }
+        max <= BAR_MAX_DEVIATION && sum <= BAR_MEAN_DEVIATION * line.len() as i32
+    };
+    lines.take_while(|l| flat(l)).count()
+}
+
+/// The part of one 64x64 frame inside any flat bars along its edges, as
+/// (top, bottom, left, right) inclusive. Each bar is peeled along with the row
+/// or column next to it, which the scaler blends half into the bar.
 ///
-/// The crop is found from all of the frames together, so this is asked of a
-/// whole video at once.
+/// A function of the frame alone, and that is the point of it. The crop used to
+/// be found from the variance of every sampled frame of the video together, so
+/// a clip, which samples a different set of frames from its source, could get a
+/// different rectangle -- and a different rectangle reframes every hash: two
+/// pixel-identical frames came out 22 bits apart that way. Asked of one frame,
+/// the same picture gets the same crop in every copy of it, letterboxed or not:
+/// a bar the copy added is peeled, and a flat edge the picture itself has is
+/// peeled in both.
+fn frame_crop(frame: &[u8]) -> (usize, usize, usize, usize) {
+    const WHOLE: (usize, usize, usize, usize) = (0, 63, 0, 63);
+    let row = |y: usize| &frame[y * 64..y * 64 + 64];
+    let top = bar_depth((0..64).map(row));
+    let bottom = bar_depth((0..64).rev().map(row));
+    let (y1, y2) = (top + (top > 0) as usize, 63usize.saturating_sub(bottom + (bottom > 0) as usize));
+    if y2 < y1 || y2 - y1 + 1 < 16 {
+        return WHOLE;
+    }
+    // Columns are read inside the rows that survived, so a letterbox does not
+    // hide a pillarbox and vice versa.
+    let mut cols = vec![[0u8; 64]; 64];
+    let h = y2 - y1 + 1;
+    for (x, col) in cols.iter_mut().enumerate() {
+        for y in 0..h {
+            col[y] = frame[(y1 + y) * 64 + x];
+        }
+    }
+    let left = bar_depth(cols.iter().map(|c| &c[..h]));
+    let right = bar_depth(cols.iter().rev().map(|c| &c[..h]));
+    let (x1, x2) = (left + (left > 0) as usize, 63usize.saturating_sub(right + (right > 0) as usize));
+    if x2 < x1 || x2 - x1 + 1 < 16 {
+        return WHOLE;
+    }
+    (y1, y2, x1, x2)
+}
+
+/// The hash of each 64x64 GRAY8 frame in `u_frames` (packed back to back),
+/// and whether it is featureless, each taken inside that frame's own crop
+/// (`frame_crop`): a letterbox or a pillarbox is a property of the encode, not
+/// of the picture, and would otherwise weigh on every hash.
+#[cfg(test)]
 fn hash_frames(u_frames: &[u8]) -> (Vec<u64>, Vec<bool>) {
+    let (hashes, _, flat) = hash_frames_both_ways(u_frames);
+    (hashes, flat)
+}
+
+/// `hash_frames`, plus the hash of each frame mirrored left to right.
+fn hash_frames_both_ways(u_frames: &[u8]) -> (Vec<u64>, Vec<u64>, Vec<bool>) {
     let n_unique = u_frames.len() / FRAME_STRIDE;
-    let n_f32 = n_unique as f32;
-    let mut sum = vec![0u64; FRAME_STRIDE];
-    let mut sum_sq = vec![0u64; FRAME_STRIDE];
-    for frame in u_frames.chunks_exact(FRAME_STRIDE) {
-        for (i, &val) in frame.iter().enumerate() {
-            let v = val as u64;
-            sum[i] += v;
-            sum_sq[i] += v * v;
-        }
-    }
-
-    // Variance & Auto-Crop Algebra (Untouched - accurate)
-    let mut row_max_var = [0.0f32; 64];
-    let mut col_max_var = [0.0f32; 64];
-
-    // Indexed rather than iterated on purpose, and clippy's needless_range_loop
-    // is wrong about it: each cell reads two flat 64x64 buffers and updates two
-    // 64-entry projections, so the iterator form is a zip of chunks_exact(64)
-    // over sum and sum_sq nested inside a zip against row_max_var -- and
-    // col_max_var is walked afresh on every row rather than consumed once.
-    // y and x are coordinates here, not stand-ins for a cursor.
-    #[allow(clippy::needless_range_loop)]
-    for y in 0..64 {
-        for x in 0..64 {
-            let i = y * 64 + x;
-            let mean = sum[i] as f32 / n_f32;
-            let mean_sq = sum_sq[i] as f32 / n_f32;
-            let variance = mean_sq - (mean * mean);
-
-            if variance > row_max_var[y] { row_max_var[y] = variance; }
-            if variance > col_max_var[x] { col_max_var[x] = variance; }
-        }
-    }
-
-    let var_threshold = 2.0;
-    let valid_rows: Vec<usize> = (0..64).filter(|&i| row_max_var[i] > var_threshold).collect();
-    let valid_cols: Vec<usize> = (0..64).filter(|&i| col_max_var[i] > var_threshold).collect();
-
-    let mut y1 = 0; let mut y2 = 63;
-    let mut x1 = 0; let mut x2 = 63;
-
-    if !valid_rows.is_empty() && !valid_cols.is_empty() {
-        let temp_y1 = *valid_rows.first().unwrap();
-        let temp_y2 = *valid_rows.last().unwrap();
-        let temp_x1 = *valid_cols.first().unwrap();
-        let temp_x2 = *valid_cols.last().unwrap();
-
-        if (temp_y2 - temp_y1 + 1) >= 16 && (temp_x2 - temp_x1 + 1) >= 16 {
-            y1 = if temp_y1 > 0 { temp_y1 + 1 } else { temp_y1 };
-            y2 = if temp_y2 < 63 { temp_y2 - 1 } else { temp_y2 };
-            x1 = if temp_x1 > 0 { temp_x1 + 1 } else { temp_x1 };
-            x2 = if temp_x2 < 63 { temp_x2 - 1 } else { temp_x2 };
-        }
-    }
-
-    let crop_h = y2 - y1 + 1;
-    let crop_w = x2 - x1 + 1;
-
-    // The crop rectangle is fixed for the whole video, so the resampler and the
-    // transform basis are built once here and reused for every frame.
-    let rows = box_weights(y1, crop_h);
-    let cols = box_weights(x1, crop_w);
+    let mut mirrored = Vec::with_capacity(n_unique);
     let basis = dct_basis();
+    // The resampling weights depend only on the rectangle, and a video has a
+    // handful of distinct ones, so they are built once per rectangle.
+    type Taps = Vec<Vec<(usize, f32)>>;
+    let mut weights: std::collections::HashMap<(usize, usize, usize, usize), (Taps, Taps)> =
+        std::collections::HashMap::new();
 
     let mut hashes = Vec::with_capacity(n_unique);
     let mut flat = Vec::with_capacity(n_unique);
     let mut thumb = [0.0f32; THUMB * THUMB];
     let mut band = [0.0f32; 64 * THUMB];
 
-    // Iterate the flat buffer in FRAME_STRIDE-sized windows; each `frame` is a
-    // &[u8] of length 4096.
     for frame in u_frames.chunks_exact(FRAME_STRIDE) {
-        resample(frame, &rows, &cols, &mut band, &mut thumb);
+        let rect = frame_crop(frame);
+        let (y1, y2, x1, x2) = rect;
+        let (rows, cols) = weights
+            .entry(rect)
+            .or_insert_with(|| (box_weights(y1, y2 - y1 + 1), box_weights(x1, x2 - x1 + 1)));
+        resample(frame, rows, cols, &mut band, &mut thumb);
         let coefficients = low_frequency_block(&thumb, &basis);
         hashes.push(hash_of(&coefficients));
+        mirrored.push(hash_of(&mirror_coefficients(&coefficients)));
         flat.push(is_featureless(&coefficients));
     }
 
-    (hashes, flat)
+    (hashes, mirrored, flat)
+}
+
+/// The coefficients of the same picture mirrored left to right. The basis
+/// function of horizontal frequency `l` is symmetric about the centre for even
+/// `l` and antisymmetric for odd `l`, so mirroring negates exactly the odd
+/// columns. `frame_crop` peels each side on its own, so the mirrored frame
+/// gets the mirrored rectangle and this is exact, not an approximation.
+fn mirror_coefficients(c: &[f32; KEEP * KEEP]) -> [f32; KEEP * KEEP] {
+    let mut m = *c;
+    for k in 0..KEEP {
+        for l in (1..KEEP).step_by(2) {
+            m[k * KEEP + l] = -m[k * KEEP + l];
+        }
+    }
+    m
 }
 
 /// Fingerprint one video.
@@ -2317,7 +2355,7 @@ pub fn fingerprint_video(
     // u_frames holds n_unique * FRAME_STRIDE bytes; the frame count is the time list.
     let n_unique = unique_frame_times.len();
 
-    let (hashes, flat) = hash_frames(&u_frames);
+    let (hashes, mirrored, flat) = hash_frames_both_ways(&u_frames);
 
     // Frame pixels are no longer needed; release the large buffer (munmap) now
     // rather than at end of scope, trimming the peak during the cheap tail work.
@@ -2356,6 +2394,7 @@ pub fn fingerprint_video(
     order.sort_by_key(|&i| times[i]);
 
     let mut changes_hashes = Vec::new();
+    let mut changes_mirrored = Vec::new();
     let mut changes_t_start = Vec::new();
     let mut changes_valid = Vec::new();
 
@@ -2370,18 +2409,21 @@ pub fn fingerprint_video(
 
         if should_push {
             changes_hashes.push(h);
+            changes_mirrored.push(mirrored[i]);
             changes_t_start.push(times[i]);
             changes_valid.push(valid);
         }
     }
 
     let mut final_hashes = Vec::with_capacity(changes_hashes.len());
+    let mut final_mirrored = Vec::with_capacity(changes_hashes.len());
     let mut final_t_start = Vec::with_capacity(changes_hashes.len());
     let mut final_t_end = Vec::with_capacity(changes_hashes.len());
 
     for i in 0..changes_hashes.len() {
         if changes_valid[i] {
             final_hashes.push(changes_hashes[i]);
+            final_mirrored.push(changes_mirrored[i]);
             final_t_start.push(changes_t_start[i]);
 
             if i + 1 < changes_hashes.len() {
@@ -2426,12 +2468,63 @@ pub fn fingerprint_video(
         file_size,
         codec,
         frame_rate,
+        mirrored_hashes: final_mirrored,
     }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 64x64 frame with structure everywhere and no flat edge: no two
+    /// neighbouring pixels agree, so nothing about it reads as a bar.
+    fn busy_frame(seed: u32) -> Vec<u8> {
+        let mut x = seed.wrapping_mul(2654435761).max(1);
+        (0..64 * 64)
+            .map(|i| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                let (r, c) = (i / 64, i % 64);
+                ((r * 3 + c * 5) as u32 % 128 + (x % 96)) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_a_mirrored_frame_hashes_to_the_mirrored_hash() {
+        // The mirrored hash is derived from the coefficients rather than from a
+        // second pass over flipped pixels; it has to be the same answer.
+        for seed in 1..20 {
+            let frame = busy_frame(seed);
+            let flipped: Vec<u8> = frame.chunks_exact(64).flat_map(|row| row.iter().rev().copied()).collect();
+            let mut both = frame.clone();
+            both.extend_from_slice(&flipped);
+            let (hashes, mirrored, _) = hash_frames_both_ways(&both);
+            assert!((mirrored[0] ^ hashes[1]).count_ones() <= 1, "seed {seed}: {:016x} vs {:016x}", mirrored[0], hashes[1]);
+            assert!((mirrored[1] ^ hashes[0]).count_ones() <= 1, "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn test_each_frame_is_cropped_by_its_own_flat_edges() {
+        let frame = busy_frame(7);
+        assert_eq!(frame_crop(&frame), (0, 63, 0, 63), "a picture with no flat edge is not cropped");
+
+        // A letterbox (8 rows) and a pillarbox (5 columns) of different levels.
+        let mut boxed = frame.clone();
+        for y in 0..64 {
+            for x in 0..64 {
+                if !(8..56).contains(&y) {
+                    boxed[y * 64 + x] = 16;
+                } else if !(5..59).contains(&x) {
+                    boxed[y * 64 + x] = 40;
+                }
+            }
+        }
+        // Each bar is peeled with the line beside it, which a real scaler blends.
+        assert_eq!(frame_crop(&boxed), (9, 54, 6, 57));
+    }
     use std::path::PathBuf;
     use std::sync::Once;
 
@@ -2496,6 +2589,7 @@ mod tests {
             file_size: size,
             codec: "h264".to_string(),
             frame_rate,
+            mirrored_hashes: Vec::new(),
         }
     }
 

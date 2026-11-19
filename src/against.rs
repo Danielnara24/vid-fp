@@ -158,11 +158,12 @@ mod tests {
             file_size: (duration * 131_072.0) as u64 * height as u64 / 720,
             codec: codec.to_string(),
             frame_rate: 30.0,
+            mirrored_hashes: Vec::new(),
         }
     }
 
     fn link(a: usize, b: usize, coverage_a: f32, coverage_b: f32) -> Match {
-        Match { a, b, coverage_a, coverage_b, span_a: None, span_b: None }
+        Match { a, b, coverage_a, coverage_b, span_a: None, span_b: None, mirrored: false }
     }
 
     fn answers_of(fps: &[VideoFingerprint], matches: &[Match], library: &[bool]) -> Vec<Answer> {

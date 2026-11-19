@@ -599,6 +599,7 @@ mod tests {
             file_size: size,
             codec: codec.to_string(),
             frame_rate,
+            mirrored_hashes: Vec::new(),
         }
     }
 

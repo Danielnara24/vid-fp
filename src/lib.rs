@@ -63,7 +63,7 @@ include!(concat!(env!("OUT_DIR"), "/static_ffmpeg_version_check.rs"));
 /// the C code everywhere) was measured and declined: it cost every x86 user a
 /// re-decode and 2-6% of a cold scan for agreement no x86 user needs.
 const CACHE_TABLE: TableDefinition<&str, &[u8]> =
-    TableDefinition::new(concat!("fingerprints_dct_ct_ff8_pts", env!("VID_FP_ARCH_TABLE_SUFFIX")));
+    TableDefinition::new(concat!("fingerprints_dct_ct_ff8_framecrop", env!("VID_FP_ARCH_TABLE_SUFFIX")));
 
 /// Files this build looked at and refused before opening: see `NotMedia`.
 ///
@@ -198,7 +198,15 @@ const IDENTITY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("ident
 ///   are right -- but no field of an entry says which libavcodec wrote it, so
 ///   the whole table goes. Same fields, same units, values moved between
 ///   samples, invisible to the `Stamp`.
-const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 9] = [
+/// - `fingerprints_dct_ct_ff8_pts` holds hashes taken inside ONE crop
+///   rectangle per file, found from the variance of every sampled frame of
+///   that file together. A clip samples a different set of frames from its
+///   source and could get a different rectangle, which reframes every hash:
+///   pixel-identical frames came out 22 bits apart. Each frame is now cropped
+///   by its own flat edges (`frame_crop`), so every value of `valid_hashes`
+///   can move. The entries also lack `mirrored_hashes`, which on its own would
+///   only have made them fail to load.
+const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 10] = [
     TableDefinition::new("fingerprints"),
     TableDefinition::new("fingerprints_by_path"),
     TableDefinition::new("fingerprints_dct"),
@@ -208,6 +216,7 @@ const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 9] = [
     TableDefinition::new("fingerprints_dct_ct_ff8_splice"),
     TableDefinition::new("fingerprints_dct_ct_ff8_rescale"),
     TableDefinition::new("fingerprints_dct_ct_ff8_kffloor"),
+    TableDefinition::new(concat!("fingerprints_dct_ct_ff8_pts", env!("VID_FP_ARCH_TABLE_SUFFIX"))),
 ];
 
 /// Refusal tables earlier builds wrote. Kept apart from the list above because
@@ -5323,6 +5332,7 @@ mod tests {
             file_size: 12_345,
             codec: "h264".to_string(),
             frame_rate: 30.0,
+            mirrored_hashes: Vec::new(),
         }
     }
 
@@ -6731,7 +6741,7 @@ mod tests {
         // fingerprint table for each; --clear-cache from either empties both.
         let dir = tempfile::tempdir().unwrap();
         let mut db = temp_db(&dir);
-        let other: TableDefinition<&str, &[u8]> = TableDefinition::new("fingerprints_dct_ct_ff8_pts_riscv64");
+        let other: TableDefinition<&str, &[u8]> = TableDefinition::new("fingerprints_dct_ct_ff8_framecrop_riscv64");
         let txn = db.begin_write().unwrap();
         txn.open_table(other).unwrap().insert("/videos/a.mkv", &b"x"[..]).unwrap();
         txn.commit().unwrap();

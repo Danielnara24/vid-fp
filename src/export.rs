@@ -2175,6 +2175,7 @@ matched_from_seconds;matched_to_seconds";
             valid_hashes: vec![], valid_t_start: vec![], valid_t_end: vec![],
             total_ms: 100_000, width: 1920, height: 1080, duration: 60.0, file_size: 1048576,
             codec: "h264".to_string(), frame_rate: 30.0,
+            mirrored_hashes: Vec::new(),
         }
     }
 

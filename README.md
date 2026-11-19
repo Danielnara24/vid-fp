@@ -21,6 +21,8 @@ filename matching find none of that.
 - The same video re-encoded at a different resolution, bitrate or quality
 - The same video in a different container: MP4, MKV, AVI, MOV, WebM, TS, etc.
 - A trimmed clip, highlight or excerpt sitting inside a longer recording
+- A copy mirrored left to right
+- A copy with black bars added or removed (letterbox, pillarbox)
 - Copies under different names, in different folders, across several drives
 
 ## What it does about it

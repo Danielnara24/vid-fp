@@ -490,6 +490,9 @@ pub struct Match {
     pub span_a: Option<Span>,
     /// Where the matched footage lies in `b`'s own runtime.
     pub span_b: Option<Span>,
+    /// The pair matched with `a` mirrored left to right: one is a mirrored copy
+    /// of the other. Every figure above was measured that way round.
+    pub mirrored: bool,
 }
 
 impl Match {
@@ -498,7 +501,7 @@ impl Match {
     /// the same pass that measures the overlap already knows where it is.
     #[cfg(test)]
     pub fn new(a: usize, b: usize, coverage_a: f32, coverage_b: f32) -> Self {
-        Match { a, b, coverage_a, coverage_b, span_a: None, span_b: None }
+        Match { a, b, coverage_a, coverage_b, span_a: None, span_b: None, mirrored: false }
     }
 
     /// The same, positioned. Milliseconds, `(start, end)` per side.
@@ -826,6 +829,18 @@ fn candidate_pairs(
     masks: &[u16],
     max_hamming_dist: u32,
 ) -> Vec<(usize, usize)> {
+    candidate_pairs_probing(fingerprints, fingerprints, masks, max_hamming_dist)
+}
+
+/// `candidate_pairs`, with each lower-numbered file `a` probing the index with
+/// the hashes of `probes[a]` instead of its own -- the mirrored fingerprints,
+/// to propose the pairs that match only with `a` mirrored.
+fn candidate_pairs_probing(
+    fingerprints: &[VideoFingerprint],
+    probes: &[VideoFingerprint],
+    masks: &[u16],
+    max_hamming_dist: u32,
+) -> Vec<(usize, usize)> {
     let n = fingerprints.len();
 
     log::debug!(
@@ -864,7 +879,7 @@ fn candidate_pairs(
                     if shutdown_requested() {
                         return Vec::new();
                     }
-                    let fp_a = &fingerprints[v_a];
+                    let fp_a = &probes[v_a];
                     let mark = v_a as u32 + 1;
                     let mut local: Vec<(usize, usize)> = Vec::new();
 
@@ -1797,6 +1812,25 @@ pub struct Evidence {
 
 /// `Evidence` for `fp_a` against `fp_b` at `-d max_hamming_dist`.
 pub fn evidence(fp_a: &VideoFingerprint, fp_b: &VideoFingerprint, max_hamming_dist: u32) -> Evidence {
+    // The pair was measured both ways round and kept the orientation that
+    // covered more (`better_orientation`), so the frames shown are taken the
+    // same way: plain, unless mirroring `a` matches more of either file.
+    let plain = evidence_as(fp_a, fp_b, max_hamming_dist);
+    if fp_a.mirrored_hashes.len() != fp_a.valid_hashes.len() || fp_a.valid_hashes.is_empty() {
+        return plain;
+    }
+    let mut mirrored_a = fp_a.clone();
+    mirrored_a.valid_hashes = fp_a.mirrored_hashes.clone();
+    let mirrored = evidence_as(&mirrored_a, fp_b, max_hamming_dist);
+    let best = |e: &Evidence| {
+        let ms = |st: &[(u32, u32)]| st.iter().map(|&(s, e)| (e - s) as u64).sum::<u64>();
+        let pct = |ms: u64, total: u32| if total > 0 { ms as f64 / total as f64 } else { 0.0 };
+        pct(ms(&e.stretches_a), fp_a.total_ms).max(pct(ms(&e.stretches_b), fp_b.total_ms))
+    };
+    if best(&mirrored) > best(&plain) { mirrored } else { plain }
+}
+
+fn evidence_as(fp_a: &VideoFingerprint, fp_b: &VideoFingerprint, max_hamming_dist: u32) -> Evidence {
     let tol = Tolerance::for_distance(max_hamming_dist);
     let schedule = witness_schedule();
     let rule = Rule { tol, schedule: &schedule };
@@ -1909,9 +1943,37 @@ fn find_matches_where(
     // every pair: the index is exhaustive, and the direct route is what
     // "exhaustive" means. Measuring one pair is the same work either way, so it
     // lives in `measure_pair` and neither arm can drift from the other.
-    let pairs: Vec<(usize, usize)> = if index_is_cheaper(masks.len(), n, total_hashes) {
-        let mut candidates = candidate_pairs(fingerprints, &masks, tol.widest());
-        candidates.retain(|&(a, b)| wanted(a, b));
+    // Each file again with its mirrored hashes in place of its own: the pair
+    // (a, b) is also measured with `a` mirrored, which finds a mirrored copy.
+    // A fingerprint with no mirrored hashes (a test fixture) gets none here and
+    // simply never matches that way round.
+    let mirrors: Vec<VideoFingerprint> = fingerprints
+        .iter()
+        .map(|fp| {
+            let mut m = fp.clone();
+            if fp.mirrored_hashes.len() == fp.valid_hashes.len() {
+                m.valid_hashes = fp.mirrored_hashes.clone();
+            } else {
+                m.valid_hashes.clear();
+                m.valid_t_start.clear();
+                m.valid_t_end.clear();
+            }
+            m
+        })
+        .collect();
+    let mirrors = &mirrors;
+
+    let pairs: Vec<(usize, usize, bool)> = if index_is_cheaper(masks.len(), n, total_hashes) {
+        let mut candidates: Vec<(usize, usize, bool)> = candidate_pairs(fingerprints, &masks, tol.widest())
+            .into_iter()
+            .map(|(a, b)| (a, b, false))
+            .collect();
+        candidates.extend(
+            candidate_pairs_probing(fingerprints, mirrors, &masks, tol.widest())
+                .into_iter()
+                .map(|(a, b)| (a, b, true)),
+        );
+        candidates.retain(|&(a, b, _)| wanted(a, b));
         info!("Index scan produced {} candidate pair(s); verifying...", candidates.len());
         candidates
     } else {
@@ -1943,14 +2005,13 @@ fn find_matches_where(
                 || (Ticker::new(&pb), Witnesses::new()),
                 |(ticker, witnesses), pair| {
                     ticker.tick();
-                    measure_pair(
-                        fingerprints,
-                        pair,
-                        rule,
-                        min_match_percent,
-                        min_duration,
-                        witnesses,
-                    )
+                    let normal = measure_pair_as(
+                        fingerprints, fingerprints, pair, rule, min_match_percent, min_duration, witnesses,
+                    );
+                    let mirrored = measure_pair_as(
+                        fingerprints, mirrors, pair, rule, min_match_percent, min_duration, witnesses,
+                    );
+                    better_orientation(normal, mirrored)
                 },
             )
             .flatten()
@@ -1970,16 +2031,41 @@ fn find_matches_where(
         .into_par_iter()
         .map_init(
             || (Ticker::new(&pb), Witnesses::new()),
-            |(ticker, witnesses), pair| {
+            |(ticker, witnesses), (a, b, mirrored)| {
                 ticker.tick();
-                measure_pair(fingerprints, pair, rule, min_match_percent, min_duration, witnesses)
+                let side_a = if mirrored { mirrors } else { fingerprints };
+                measure_pair_as(fingerprints, side_a, (a, b), rule, min_match_percent, min_duration, witnesses)
             },
         )
         .flatten()
-        .collect();
+        .collect::<Vec<Match>>();
 
     pb.finish_and_clear();
-    matches
+    // A pair proposed both ways round keeps the orientation that matched more.
+    let mut matches = matches;
+    matches.sort_by_key(|m| (m.a, m.b));
+    let mut out: Vec<Match> = Vec::with_capacity(matches.len());
+    for m in matches {
+        match out.last_mut() {
+            Some(last) if (last.a, last.b) == (m.a, m.b) => {
+                *last = better_orientation(Some(*last), Some(m)).unwrap();
+            }
+            _ => out.push(m),
+        }
+    }
+    out
+}
+
+/// Of the two orientations of one pair, the one whose better side is better
+/// covered; the plain one on a tie, so a pair that matches both ways (a
+/// symmetric picture) is never reported as mirrored for nothing.
+fn better_orientation(normal: Option<Match>, mirrored: Option<Match>) -> Option<Match> {
+    match (normal, mirrored) {
+        (Some(n), Some(m)) => {
+            if m.coverage_a.max(m.coverage_b) > n.coverage_a.max(n.coverage_b) { Some(m) } else { Some(n) }
+        }
+        (n, m) => n.or(m),
+    }
 }
 
 /// The bar phase 2 runs under.
@@ -2067,8 +2153,12 @@ impl Drop for Ticker<'_> {
 
 /// Phase 2 for one pair: measure it exactly, then apply both gates. `None` when
 /// the pair fails either of them, or when the run is shutting down.
-fn measure_pair(
+/// One orientation of one pair: `a` as `side_a[a]` holds it, against `b` as
+/// it is. `side_a` is either `fingerprints` itself or the mirrored copies of
+/// them, and the match records which.
+fn measure_pair_as(
     fingerprints: &[VideoFingerprint],
+    side_a: &[VideoFingerprint],
     (v_a, v_b): (usize, usize),
     rule: Rule,
     min_match_percent: f32,
@@ -2078,7 +2168,8 @@ fn measure_pair(
     if shutdown_requested() {
         return None;
     }
-    let fp_a = &fingerprints[v_a];
+    let mirrored = !std::ptr::eq(side_a, fingerprints);
+    let fp_a = &side_a[v_a];
     let fp_b = &fingerprints[v_b];
 
     let (pct_a, pct_b, span_a, span_b) = match_overlap(fp_a, fp_b, rule, witnesses);
@@ -2113,7 +2204,7 @@ fn measure_pair(
         }
     }
 
-    Some(Match { a: v_a, b: v_b, coverage_a: pct_a, coverage_b: pct_b, span_a, span_b })
+    Some(Match { a: v_a, b: v_b, coverage_a: pct_a, coverage_b: pct_b, span_a, span_b, mirrored })
 }
 
 #[cfg(test)]
@@ -2141,6 +2232,7 @@ mod tests {
             file_size: 1024,
             codec: "h264".to_string(),
             frame_rate: 30.0,
+            mirrored_hashes: Vec::new(),
         }
     }
 
