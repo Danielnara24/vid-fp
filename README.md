@@ -22,8 +22,11 @@ filename matching find none of that.
 - The same video in a different container: MP4, MKV, AVI, MOV, WebM, TS, etc.
 - A trimmed clip, highlight or excerpt sitting inside a longer recording
 - A copy mirrored left to right
-- A copy with black bars added or removed (letterbox, pillarbox)
-- A landscape video re-uploaded as a vertical one, with a blurred or plain fill
+- A copy with black bars added or removed (letterbox, pillarbox), including bars
+  carrying a channel logo or subtitles
+- A landscape video re-uploaded as a vertical one, with a blurred or plain fill,
+  or cut down to a vertical strip of itself
+- A widescreen video cut down to 4:3 (pan and scan, an SD broadcast or VHS copy)
 - A copy zoomed in slightly, cropped, or tilted to fill the frame
 - A video shown inside another: picture-in-picture, a reaction layout, a screen
   recording of a player
@@ -409,7 +412,7 @@ nothing.
 | `--follow-symlinks` | Descend into symlinked folders. Deletions act on the file the link leads to | off |
 | `-e`, `--exclude <PATH>` | Exclude a folder or a single file; repeat for several. Matched by whole path components, so a file must be named exactly, and resolved through symlinks | |
 | `-x`, `--extensions <EXT>` | Extensions a **folder walk** treats as videos, comma-separated or repeated. `-x '*'` (quoted) takes every file, including ones with no extension; an entry prefixed with `!` is an exception, so `-x '!flac'` takes every file but those | 18 extensions, listed below |
-| `-d`, `--hamming-distance <N>` | Frame-match tolerance, in bits out of 64; higher = less strict matching. Raise to find more duplicates, at the cost of false positives. See [Tuning](#tuning). Values above `32` are refused | `6` |
+| `-d`, `--hamming-distance <N>` | Frame-match tolerance, in bits out of 64; higher = less strict matching. Raise to find more duplicates, at the cost of false positives. See [Tuning](#tuning). Values above `32` are refused | `7` |
 | `-p`, `--match-percent <F>` | Min % of overlap to count as a duplicate, from `0` to `100`. Lower includes shorter matches, at the cost of false positives. `0` turns the gate off and reports every pair sharing any footage at all; a pair sharing none is never reported | `20.0` |
 | `--min-duration <SECS>` | Min shared clip length in seconds for a match. Videos shorter than this are skipped entirely. `0` = off | `0.0` |
 | `-k`, `--priority <P>` | Criteria for KEEPING files: `length`, `resolution`, `quality`, or `size`. The chosen one is compared first, the rest follow in the default order. See [Codecs and quality](#codecs-and-quality) | `length` |
@@ -494,8 +497,10 @@ shared even though the files are identical end to end.
 
 **Getting false positives?** Lower `-d` first, it's the blunter of the two. Dark
 scenes, fades, and letterboxed content look alike to any perceptual hash.
-(Frames with no structure at all are dropped rather than hashed, so black frames
-and plain title cards can't link anything on their own.)
+(Frames with no structure at all are dropped rather than hashed, and so are
+frames whose picture is a small patch on black, such as a line of lyrics, so
+black frames and title cards can't link anything on their own. A video made of
+nothing else is reported as having no usable frames.)
 
 `--min-duration` is an absolute floor, in seconds, on how much footage two files
 must share. Both gates apply, so `-p 5 --min-duration 60` means "at least 5%

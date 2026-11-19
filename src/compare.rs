@@ -991,7 +991,7 @@ fn candidate_pairs_scanning(
                 t != q
                     && !probe.is_empty()
                     && !shutdown_requested()
-                    && wanted(q.min(t), q.max(t))
+                    && wanted(q, t)
                     && any_frame(&probes[q], &fingerprints[t])
             })
             .map(move |t| (q, t))
@@ -1264,6 +1264,89 @@ fn admit<M: FnMut(u32, u32, u32)>(
         }
     });
     rescue_along_alignments(fp_a, fp_b, tol, anchors, matched_a, matched_b, on_mark);
+    // What is credited is read the way the anchors are, after the rescue: every
+    // frame match within the rule's reach between two samples both matched. A
+    // set that only grows with `-d`, where the marks reported along the way
+    // need not (corroboration skips a row already settled).
+    let mut settled: Vec<(u32, u32)> = Vec::new();
+    let (mut scratch_a, mut scratch_b) = (matched_a.to_vec(), matched_b.to_vec());
+    for_each_frame_match(fp_a, fp_b, tol, &mut scratch_a, &mut scratch_b, |(_, i, j, _)| {
+        if matched_a[i as usize] && matched_b[j as usize] {
+            settled.push((i, j));
+        }
+    });
+    credit_matched_spans(fp_a, fp_b, &mut settled, matched_a, matched_b);
+}
+
+/// Whether two of `group` differ on both sides. Asked of every pair rather
+/// than against one of them, so that adding a match can never make it false.
+/// If none differs from the first on both sides, every match shares its `i` or
+/// its `j`, and two apart exist exactly when one of each kind does.
+fn two_apart(group: &[(u32, u32)]) -> bool {
+    let Some(&(i0, j0)) = group.first() else { return false };
+    if group.iter().any(|&(i, j)| i != i0 && j != j0) {
+        return true;
+    }
+    group.iter().any(|&(i, j)| i == i0 && j != j0) && group.iter().any(|&(i, j)| j == j0 && i != i0)
+}
+
+/// The footage a matched hash stands for, credited on both sides.
+///
+/// Each hash stands for its picture until its file's next sample, which is how
+/// coverage has always been counted -- but only on the side the hash belongs
+/// to. Two files sampled at different densities then disagree about how much
+/// they share: a long source sampled every few seconds is credited a few
+/// seconds for one match, while the short clip it matched, sampled every half
+/// second, is credited half a second for the same footage. A compilation of
+/// four such clips read under a 20% gate on its own side. So a match also
+/// credits the other side's samples that fall inside the matched sample's own
+/// span, read from the matched sample on: the same assumption, made of the
+/// same match, from both ends.
+///
+/// Only for matches that agree on an offset with at least one other match of
+/// different samples (the chains `rescue_along_alignments` builds on): a lone
+/// coincidence is not allowed to stand for anything beyond itself, which is
+/// what kept the near-miss sets out (credited from every match, `-d 7` took 31
+/// false links where this takes none).
+fn credit_matched_spans(
+    fp_a: &VideoFingerprint,
+    fp_b: &VideoFingerprint,
+    marked: &mut Vec<(u32, u32)>,
+    matched_a: &mut [bool],
+    matched_b: &mut [bool],
+) {
+    if marked.len() < 2 {
+        return;
+    }
+    let window = alignment_window(fp_a, fp_b);
+    let off = |&(i, j): &(u32, u32)| fp_b.valid_t_start[j as usize] as i64 - fp_a.valid_t_start[i as usize] as i64;
+    marked.sort_unstable_by_key(|m| (off(m), *m));
+    marked.dedup();
+    let credit = |from: &VideoFingerprint, k: usize, onto: &VideoFingerprint, at: usize, m: &mut [bool]| {
+        let lo = onto.valid_t_start[at];
+        let hi = lo.saturating_add(from.valid_t_end[k].saturating_sub(from.valid_t_start[k]));
+        let first = onto.valid_t_start.partition_point(|&t| t < lo);
+        for (x, &t) in onto.valid_t_start.iter().enumerate().skip(first) {
+            if t >= hi {
+                break;
+            }
+            m[x] = true;
+        }
+    };
+    let mut s = 0;
+    while s < marked.len() {
+        let mut e = s + 1;
+        while e < marked.len() && off(&marked[e]) - off(&marked[e - 1]) <= window {
+            e += 1;
+        }
+        if two_apart(&marked[s..e]) {
+            for &(i, j) in &marked[s..e] {
+                credit(fp_b, j as usize, fp_a, i as usize, matched_a);
+                credit(fp_a, i as usize, fp_b, j as usize, matched_b);
+            }
+        }
+        s = e;
+    }
 }
 
 /// The rescue step of `admit`. `accepted` is its anchors.
@@ -2139,8 +2222,11 @@ pub fn evidence(fp_a: &VideoFingerprint, fp_b: &VideoFingerprint, max_hamming_di
     };
     let mut chosen = evidence_as(fp_a, fp_b, max_hamming_dist);
     for o in &Orientation::all()[1..] {
-        let mut candidates = vec![evidence_as(&o.apply(fp_a), fp_b, max_hamming_dist)];
-        if !o.symmetric() {
+        let mut candidates = Vec::new();
+        if o.fits(fp_a, fp_b) {
+            candidates.push(evidence_as(&o.apply(fp_a), fp_b, max_hamming_dist));
+        }
+        if !o.symmetric() && o.fits(fp_b, fp_a) {
             let e = evidence_as(&o.apply(fp_b), fp_a, max_hamming_dist);
             candidates.push(Evidence {
                 pairs: e.pairs.iter().map(|&(tb, ta, d)| (ta, tb, d)).collect(),
@@ -2245,6 +2331,9 @@ fn find_matches_where(
     min_duration: f64,
 ) -> Vec<Match> {
     let wanted = |a: usize, b: usize| sides.is_none_or(|s| s[a] != s[b]);
+    let orientations = Orientation::all();
+    let wanted_as =
+        |o: usize, q: usize, t: usize| wanted(q.min(t), q.max(t)) && orientations[o].fits(&fingerprints[q], &fingerprints[t]);
     let n = fingerprints.len();
     let total_hashes: usize = fingerprints.iter().map(|fp| fp.valid_hashes.len()).sum();
     // Phase 1 has to be exhaustive at the WIDEST distance phase 2 can admit, not
@@ -2263,7 +2352,6 @@ fn find_matches_where(
     // Every other way round a pair is measured: `a` mirrored, and `a` read
     // inside each reframing, mirrored or not (see `Orientation`). The plain
     // orientation is `fingerprints` itself.
-    let orientations = Orientation::all();
     let views: Vec<Vec<VideoFingerprint>> = orientations[1..]
         .iter()
         .map(|o| fingerprints.iter().map(|fp| o.apply(fp)).collect())
@@ -2290,7 +2378,7 @@ fn find_matches_where(
                     .map(|(q, t)| (q, t, o)),
             );
         }
-        candidates.retain(|&(a, b, _)| wanted(a, b));
+        candidates.retain(|&(q, t, o)| wanted_as(o, q, t));
         info!("Index scan produced {} candidate pair(s) in {:.1?}; verifying...", candidates.len(), route_t.elapsed());
         candidates
     } else {
@@ -2301,7 +2389,7 @@ fn find_matches_where(
         let mut candidates: Vec<(usize, usize, usize)> = Vec::new();
         for (o, orientation) in orientations.iter().enumerate() {
             candidates.extend(
-                candidate_pairs_scanning(fingerprints, side(o), rules, !orientation.symmetric(), &wanted)
+                candidate_pairs_scanning(fingerprints, side(o), rules, !orientation.symmetric(), &|q, t| wanted_as(o, q, t))
                     .into_iter()
                     .map(|(q, t)| (q, t, o)),
             );
@@ -2379,6 +2467,24 @@ impl Orientation {
     /// `a`, and the other way round finds the reverse.
     fn symmetric(&self) -> bool {
         self.reframed.is_none()
+    }
+
+    /// Whether `t` could be `q` read this way round at all. A reframing that
+    /// cuts a landscape picture down to another shape is only measured against
+    /// a file of that shape: a 9:16 strip against a portrait file, a 4:3 cut
+    /// against a landscape file nearer 4:3 than the source's own shape (on a
+    /// log scale, so 720x576 and 720x480 storage both count). Measured against
+    /// everything, a cut is one more chance for a look-alike and nothing else.
+    fn fits(&self, q: &VideoFingerprint, t: &VideoFingerprint) -> bool {
+        let aspect = |fp: &VideoFingerprint| fp.width as f64 / fp.height.max(1) as f64;
+        match self.reframed {
+            Some(Reframing::Strip(_)) => t.height > t.width,
+            Some(Reframing::Cut43) => {
+                let (at, aq) = (aspect(t), aspect(q));
+                at > 1.0 && (at / (4.0 / 3.0)).ln().abs() < (at / aq).ln().abs()
+            }
+            _ => true,
+        }
     }
 
     /// `fp` read this way round: its hashes replaced by the orientation's, and
@@ -3198,12 +3304,14 @@ mod tests {
                 let envelope = |st: &[(u32, u32)]| st.first().map(|f| Span { start_ms: f.0, end_ms: st.last().unwrap().1 });
                 assert_eq!(envelope(&ev.stretches_a), span_a, "case {case} -d {d}");
                 assert_eq!(envelope(&ev.stretches_b), span_b, "case {case} -d {d}");
-                // Every matched sample of a is listed, with a partner inside b's
-                // matched footage, within the loose tolerance or, for a sample an
-                // alignment rescued, one slack step past it.
+                // Every listed pair is a matched sample of a with a partner inside
+                // b's matched footage, within the loose tolerance or, for a sample
+                // an alignment rescued, one slack step past it. A sample can be
+                // matched with no pair of its own: footage credited from the other
+                // side's matched sample (`credit_matched_spans`).
                 let reach = rule.tol.loose + (CORROBORATION_SLACK_SIGMA * sigma()).round() as u32;
                 let flagged_a = fp_a.valid_t_start.iter().zip(&fp_a.valid_t_end).filter(|(s, e)| ev.stretches_a.iter().any(|st| st.0 <= **s && **e <= st.1)).count();
-                assert_eq!(ev.pairs.len(), flagged_a, "case {case} -d {d}: one pair per matched sample of a");
+                assert!(ev.pairs.len() <= flagged_a, "case {case} -d {d}: at most one pair per matched sample of a");
                 for &(ta, tb, dist) in &ev.pairs {
                     assert!(dist <= reach);
                     assert!(ev.stretches_a.iter().any(|st| st.0 <= ta && ta < st.1));
@@ -3211,6 +3319,59 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_a_match_stands_for_the_sparser_side_s_span_on_both_sides() {
+        // a is sampled every half second, b every five seconds, over the same
+        // footage at offset 0: each of b's samples is one of a's frames. One
+        // b hash stands for five seconds of b, and the a frames inside those
+        // five seconds are the same footage, so a is covered as fully as b.
+        let a_times: Vec<u32> = (0..21u32).map(|k| k * 500).collect();
+        let a_hashes: Vec<u64> = (0..21u64).map(distinct_hash).collect();
+        let a = mock_fp_at(a_hashes.clone(), a_times.clone());
+        let b = mock_fp_at(vec![a_hashes[0], a_hashes[10], a_hashes[20]], vec![a_times[0], a_times[10], a_times[20]]);
+        let rule = Rule { tol: Tolerance::for_distance(4), schedule: &witness_schedule() };
+        let (cov_a, cov_b, _, _) = match_overlap(&a, &b, rule, &mut Witnesses::new());
+        assert_eq!(cov_b, 1.0);
+        assert!(cov_a > 0.99, "a is credited b's spans: {cov_a}");
+
+        // One match alone stands for nothing beyond its own sample.
+        let lone = mock_fp_at(vec![a_hashes[10]], vec![a_times[10]]);
+        let (cov_a, _, _, _) = match_overlap(&a, &lone, rule, &mut Witnesses::new());
+        assert!((cov_a - 500.0 / a.total_ms as f32).abs() < 1e-6, "{cov_a}");
+    }
+
+    #[test]
+    fn test_two_apart_does_not_depend_on_which_match_comes_first() {
+        assert!(two_apart(&[(1, 2), (3, 4)]));
+        // (1, 4) shares a sample with each of the others, and they still differ.
+        assert!(two_apart(&[(1, 4), (1, 2), (3, 4)]));
+        assert!(!two_apart(&[(1, 2), (1, 3), (1, 4)]), "one sample of a against three of b");
+        assert!(!two_apart(&[(1, 2)]));
+    }
+
+    #[test]
+    fn test_a_cut_reframing_is_measured_only_against_a_file_of_its_shape() {
+        let shaped = |w: u32, h: u32| {
+            let mut fp = mock_fp_at(vec![distinct_hash(1)], vec![0]);
+            fp.width = w;
+            fp.height = h;
+            fp
+        };
+        let (wide, portrait, sd, pal, ntsc, hd) =
+            (shaped(1920, 1080), shaped(1080, 1920), shaped(640, 480), shaped(720, 576), shaped(720, 480), shaped(854, 480));
+        let strip = Orientation { mirrored: false, reframed: Some(Reframing::Strip(3)) };
+        assert!(strip.fits(&wide, &portrait));
+        assert!(!strip.fits(&wide, &hd), "a strip of a landscape picture is portrait");
+        let cut = Orientation { mirrored: false, reframed: Some(Reframing::Cut43) };
+        for t in [&sd, &pal, &ntsc] {
+            assert!(cut.fits(&wide, t), "{}x{}", t.width, t.height);
+        }
+        assert!(!cut.fits(&wide, &hd), "a 16:9 file rounding a pixel narrower is not a 4:3 cut");
+        assert!(!cut.fits(&wide, &portrait));
+        let zoom = Orientation { mirrored: false, reframed: Some(Reframing::Zoom) };
+        assert!(zoom.fits(&wide, &hd));
     }
 
     #[test]

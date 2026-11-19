@@ -63,7 +63,7 @@ include!(concat!(env!("OUT_DIR"), "/static_ffmpeg_version_check.rs"));
 /// the C code everywhere) was measured and declined: it cost every x86 user a
 /// re-decode and 2-6% of a cold scan for agreement no x86 user needs.
 const CACHE_TABLE: TableDefinition<&str, &[u8]> =
-    TableDefinition::new(concat!("fingerprints_dct_ct_ff8_inset", env!("VID_FP_ARCH_TABLE_SUFFIX")));
+    TableDefinition::new(concat!("fingerprints_dct_ct_ff8_s128", env!("VID_FP_ARCH_TABLE_SUFFIX")));
 
 /// Files this build looked at and refused before opening: see `NotMedia`.
 ///
@@ -214,7 +214,12 @@ const IDENTITY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("ident
 /// - `fingerprints_dct_ct_ff8_detail` holds two reframings per sample, not
 ///   three: no `Inset`, so a picture-in-picture copy of a file cached there
 ///   would never be found, and nothing in an entry says so.
-const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 12] = [
+/// - `fingerprints_dct_ct_ff8_inset` holds hashes read from a 64x64 working
+///   frame where they are now read from 128x128 (`fingerprint::SIDE`), so every
+///   value moved; frames whose picture is under a quarter of the frame kept as
+///   usable; bars carrying a caption left unpeeled; and no `Strip` or `Cut43`
+///   reframing, which an entry would load without and then never match under.
+const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 13] = [
     TableDefinition::new("fingerprints"),
     TableDefinition::new("fingerprints_by_path"),
     TableDefinition::new("fingerprints_dct"),
@@ -227,6 +232,7 @@ const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 12] = [
     TableDefinition::new(concat!("fingerprints_dct_ct_ff8_pts", env!("VID_FP_ARCH_TABLE_SUFFIX"))),
     TableDefinition::new(concat!("fingerprints_dct_ct_ff8_framecrop", env!("VID_FP_ARCH_TABLE_SUFFIX"))),
     TableDefinition::new(concat!("fingerprints_dct_ct_ff8_detail", env!("VID_FP_ARCH_TABLE_SUFFIX"))),
+    TableDefinition::new(concat!("fingerprints_dct_ct_ff8_inset", env!("VID_FP_ARCH_TABLE_SUFFIX"))),
 ];
 
 /// Refusal tables earlier builds wrote. Kept apart from the list above because
@@ -610,7 +616,7 @@ struct Args {
     /// match agrees with about the time offset may reach 1.5 standard
     /// deviations further, and further still needs more agreeing matches.
     /// Values above 32 are refused.
-    #[arg(short = 'd', long = "hamming-distance", value_name = "N", default_value_t = 6)]
+    #[arg(short = 'd', long = "hamming-distance", value_name = "N", default_value_t = 7)]
     hamming_distance: u32,
 
     /// Minimum percentage of a video that must match, from 0 to 100
@@ -6757,7 +6763,7 @@ mod tests {
         // fingerprint table for each; --clear-cache from either empties both.
         let dir = tempfile::tempdir().unwrap();
         let mut db = temp_db(&dir);
-        let other: TableDefinition<&str, &[u8]> = TableDefinition::new("fingerprints_dct_ct_ff8_inset_riscv64");
+        let other: TableDefinition<&str, &[u8]> = TableDefinition::new("fingerprints_dct_ct_ff8_s128_riscv64");
         let txn = db.begin_write().unwrap();
         txn.open_table(other).unwrap().insert("/videos/a.mkv", &b"x"[..]).unwrap();
         txn.commit().unwrap();

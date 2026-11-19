@@ -90,10 +90,10 @@ jobs:
         # sum, not x86_64's: libswscale's fast bilinear scaler rounds
         # differently in x86 SIMD than in the C code ARM runs, which moves one
         # figure here (test_video_capture.ts matched 19.00 s of
-        # test_video_rescaled.ts, 17.00 s on x86_64) and about one link in
+        # test_video_rescaled.ts, 27.00 s on x86_64 since the 128 working frame; the aarch64 sum below predates it and needs refreshing from this job's output) and about one link in
         # eight on a real library, at the same accuracy. That is why the two
         # keep separate cache tables (lib.rs, CACHE_TABLE). x86_64's sum,
-        # 170a8d9e994782b1, is checked in release.yml. Refresh both when the
+        # 445c2b370e95668d, is checked in release.yml. Refresh both when the
         # fixtures or the report layout change.
         #
         # Exit 2 is expected: one fixture is featureless on purpose and cannot
