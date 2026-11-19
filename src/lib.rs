@@ -63,7 +63,7 @@ include!(concat!(env!("OUT_DIR"), "/static_ffmpeg_version_check.rs"));
 /// the C code everywhere) was measured and declined: it cost every x86 user a
 /// re-decode and 2-6% of a cold scan for agreement no x86 user needs.
 const CACHE_TABLE: TableDefinition<&str, &[u8]> =
-    TableDefinition::new(concat!("fingerprints_dct_ct_ff8_detail", env!("VID_FP_ARCH_TABLE_SUFFIX")));
+    TableDefinition::new(concat!("fingerprints_dct_ct_ff8_inset", env!("VID_FP_ARCH_TABLE_SUFFIX")));
 
 /// Files this build looked at and refused before opening: see `NotMedia`.
 ///
@@ -211,7 +211,10 @@ const IDENTITY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("ident
 ///   low-contrast frames whose hash is mostly the position of one bright patch,
 ///   which matched unrelated dark frames. Which samples a fingerprint holds
 ///   changed, and the entries lack the detail and reframed hashes.
-const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 11] = [
+/// - `fingerprints_dct_ct_ff8_detail` holds two reframings per sample, not
+///   three: no `Inset`, so a picture-in-picture copy of a file cached there
+///   would never be found, and nothing in an entry says so.
+const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 12] = [
     TableDefinition::new("fingerprints"),
     TableDefinition::new("fingerprints_by_path"),
     TableDefinition::new("fingerprints_dct"),
@@ -223,6 +226,7 @@ const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 11] = [
     TableDefinition::new("fingerprints_dct_ct_ff8_kffloor"),
     TableDefinition::new(concat!("fingerprints_dct_ct_ff8_pts", env!("VID_FP_ARCH_TABLE_SUFFIX"))),
     TableDefinition::new(concat!("fingerprints_dct_ct_ff8_framecrop", env!("VID_FP_ARCH_TABLE_SUFFIX"))),
+    TableDefinition::new(concat!("fingerprints_dct_ct_ff8_detail", env!("VID_FP_ARCH_TABLE_SUFFIX"))),
 ];
 
 /// Refusal tables earlier builds wrote. Kept apart from the list above because
@@ -6753,7 +6757,7 @@ mod tests {
         // fingerprint table for each; --clear-cache from either empties both.
         let dir = tempfile::tempdir().unwrap();
         let mut db = temp_db(&dir);
-        let other: TableDefinition<&str, &[u8]> = TableDefinition::new("fingerprints_dct_ct_ff8_detail_riscv64");
+        let other: TableDefinition<&str, &[u8]> = TableDefinition::new("fingerprints_dct_ct_ff8_inset_riscv64");
         let txn = db.begin_write().unwrap();
         txn.open_table(other).unwrap().insert("/videos/a.mkv", &b"x"[..]).unwrap();
         txn.commit().unwrap();

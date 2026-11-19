@@ -25,6 +25,8 @@ filename matching find none of that.
 - A copy with black bars added or removed (letterbox, pillarbox)
 - A landscape video re-uploaded as a vertical one, with a blurred or plain fill
 - A copy zoomed in slightly, cropped, or tilted to fill the frame
+- A video shown inside another: picture-in-picture, a reaction layout, a screen
+  recording of a player
 - Copies under different names, in different folders, across several drives
 
 ## What it does about it

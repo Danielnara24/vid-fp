@@ -1591,10 +1591,92 @@ pub enum Reframing {
     Band,
     /// The middle 1/1.12 of the frame: a light zoom, crop or tilt-to-fill.
     Zoom,
+    /// The largest rectangle with a sharp edge along all four sides: a picture
+    /// pasted onto a background of its own -- picture-in-picture, a reaction
+    /// layout, a screen recording of a player (`inset_rect`).
+    Inset,
 }
 
 /// The reframings every sample is also hashed under, in storage order.
-pub const REFRAMINGS: [Reframing; 2] = [Reframing::Band, Reframing::Zoom];
+pub const REFRAMINGS: [Reframing; 3] = [Reframing::Band, Reframing::Zoom, Reframing::Inset];
+
+/// A step between neighbouring pixels this large (grey levels) is an edge, for
+/// `inset_rect`: three times what `frame_crop` still calls flat.
+const INSET_STEP: i32 = 3 * BAR_MAX_DEVIATION;
+/// Share of each side of an inset that must be such an edge; the rest may be
+/// blended into a background of the same shade.
+const INSET_COVER: f64 = 0.8;
+/// An inset larger than this share of the frame is the frame itself, cropped,
+/// which `frame_crop` and `Zoom` already read.
+const INSET_MAX_AREA: f64 = 0.7;
+
+/// The largest rectangle of `frame` bounded by edges on all four sides, as
+/// (top, bottom, left, right) inclusive, at least `THUMB` a side -- anything
+/// smaller would be hashed from fewer pixels than the thumbnail has.
+///
+/// For each pair of rows, the candidate sides are the columns whose edge runs
+/// the height between them, which is a short list, so this is O(64^3) at worst
+/// and ~0.2 ms a frame in practice.
+fn inset_rect(frame: &[u8]) -> Option<(usize, usize, usize, usize)> {
+    let px = |y: usize, x: usize| frame[y * 64 + x] as i32;
+    // hp[y][x]: edges along the boundary above row y, over columns 0..x.
+    // vp[x][y]: edges along the boundary left of column x, over rows 0..y.
+    let mut hp = [[0u16; 65]; 64];
+    let mut vp = [[0u16; 65]; 64];
+    for (y, line) in hp.iter_mut().enumerate().skip(1) {
+        let mut edges = 0;
+        for (x, cell) in line.iter_mut().skip(1).enumerate() {
+            edges += ((px(y, x) - px(y - 1, x)).abs() >= INSET_STEP) as u16;
+            *cell = edges;
+        }
+    }
+    for (x, line) in vp.iter_mut().enumerate().skip(1) {
+        let mut edges = 0;
+        for (y, cell) in line.iter_mut().skip(1).enumerate() {
+            edges += ((px(y, x) - px(y, x - 1)).abs() >= INSET_STEP) as u16;
+            *cell = edges;
+        }
+    }
+    let covers = |n: u16, len: usize| n as f64 >= INSET_COVER * len as f64;
+    let mut best = 0usize;
+    let mut found = None;
+    let mut cols = [0usize; 64];
+    for y1 in 1..64 {
+        for y2 in (y1 + THUMB)..64 {
+            let h = y2 - y1;
+            if h * 63 <= best {
+                continue;
+            }
+            let mut n = 0;
+            for (x, line) in vp.iter().enumerate().skip(1) {
+                if covers(line[y2] - line[y1], h) {
+                    cols[n] = x;
+                    n += 1;
+                }
+            }
+            for p in 0..n {
+                let x1 = cols[p];
+                for q in (p + 1..n).rev() {
+                    let x2 = cols[q];
+                    let w = x2 - x1;
+                    if w < THUMB || w * h <= best {
+                        break;
+                    }
+                    if (w * h) as f64 > INSET_MAX_AREA * 4096.0 {
+                        continue;
+                    }
+                    if !covers(hp[y1][x2] - hp[y1][x1], w) || !covers(hp[y2][x2] - hp[y2][x1], w) {
+                        continue;
+                    }
+                    best = w * h;
+                    found = Some((y1, y2 - 1, x1, x2 - 1));
+                    break;
+                }
+            }
+        }
+    }
+    found
+}
 
 const ZOOM: f64 = 1.12;
 const BAND_ASPECT: f64 = 16.0 / 9.0;
@@ -1647,8 +1729,14 @@ fn sub_rect(
 impl Reframing {
     /// The part of a frame's crop this reframing keeps, given the decoded
     /// picture's width and height.
-    fn rect(self, crop: (usize, usize, usize, usize), (width, height): (u32, u32)) -> Option<(usize, usize, usize, usize)> {
+    fn rect(
+        self,
+        frame: &[u8],
+        crop: (usize, usize, usize, usize),
+        (width, height): (u32, u32),
+    ) -> Option<(usize, usize, usize, usize)> {
         match self {
+            Reframing::Inset => inset_rect(frame),
             Reframing::Band => {
                 if !(height > width && width > 0) {
                     return None;
@@ -1797,7 +1885,7 @@ pub(crate) fn hash_frames_fully(u_frames: &[u8], dims: (u32, u32)) -> Hashed {
         out.detail.push(d);
         out.mirrored_detail.push(md);
         for (v, reframing) in REFRAMINGS.iter().enumerate() {
-            let hashed = reframing.rect(rect, dims).and_then(|r| {
+            let hashed = reframing.rect(frame, rect, dims).and_then(|r| {
                 let c = hasher.coefficients(frame, r);
                 if is_featureless(&c) {
                     return None;
@@ -2758,6 +2846,35 @@ mod tests {
             assert!((mirrored[0] ^ hashes[1]).count_ones() <= 1, "seed {seed}: {:016x} vs {:016x}", mirrored[0], hashes[1]);
             assert!((mirrored[1] ^ hashes[0]).count_ones() <= 1, "seed {seed}");
         }
+    }
+
+    #[test]
+    fn test_a_picture_pasted_onto_a_background_is_found_and_a_plain_frame_has_none() {
+        // A diagonal gradient, the kind of animated backdrop a reaction or
+        // picture-in-picture layout sits on, with a textured 24x20 picture at
+        // (rows 8..32, columns 30..50). The gradient's own steps are a grey
+        // level or two, far under an edge.
+        let mut frame = vec![0u8; FRAME_STRIDE];
+        for y in 0..64 {
+            for x in 0..64 {
+                frame[y * 64 + x] = (60 + y + x) as u8;
+            }
+        }
+        assert_eq!(inset_rect(&frame), None, "a gradient has no inset");
+        for y in 8..32 {
+            for x in 30..50 {
+                frame[y * 64 + x] = if (x / 3 + y / 4) % 2 == 0 { 230 } else { 20 };
+            }
+        }
+        assert_eq!(inset_rect(&frame), Some((8, 31, 30, 49)));
+        // Too small to hash from: under THUMB on a side.
+        let mut small = vec![100u8; FRAME_STRIDE];
+        for y in 10..20 {
+            for x in 10..40 {
+                small[y * 64 + x] = 250;
+            }
+        }
+        assert_eq!(inset_rect(&small), None);
     }
 
     #[test]
