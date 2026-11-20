@@ -20,9 +20,31 @@ use crate::utils::shutdown_requested;
 /// detail hash of a reframed picture was mostly interpolation. The detail hash
 /// of a whole frame sharpens too, and that is what separates look-alikes.
 /// Generated corpus, `-d 6 -p 20`: R 0.839 -> 0.864 with false links 18 -> 3.
-/// 256 bought little more for a 450 s cold scan and 1.5 GB of peak memory.
-pub(crate) const SIDE: usize = 128;
-const FRAME_STRIDE: usize = SIDE * SIDE;
+/// 256 is offered as an opt-in (`--frame-size 256`, `FINE_SIDE`) for its own
+/// trade, not as the default: see the README's tuning section for the figures.
+pub const DEFAULT_SIDE: usize = 128;
+/// The opt-in finer working frame.
+pub const FINE_SIDE: usize = 256;
+
+static FRAME_SIDE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(DEFAULT_SIDE);
+
+/// Set the working frame's side for this run. A property of the run, not of a
+/// file: set once before any decode, and the cache keeps a table per side.
+pub fn set_frame_side(side: usize) {
+    FRAME_SIDE.store(side, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The working frame's side this run hashes at.
+pub fn frame_side() -> usize {
+    FRAME_SIDE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The side of a square working frame, from its length.
+fn side_of(frame: &[u8]) -> usize {
+    let side = (frame.len() as f64).sqrt().round() as usize;
+    debug_assert_eq!(side * side, frame.len(), "a working frame is square");
+    side
+}
 
 /// `FF_THREAD_FRAME` and `FF_THREAD_SLICE` from libavcodec. Spelled out rather
 /// than taken from the bindings because they are plain `#define`s, and the name
@@ -350,11 +372,12 @@ fn resample(
     band: &mut [f32],
     out: &mut [f32],
 ) {
+    let side = side_of(frame);
     for (oy, taps) in rows.iter().enumerate() {
-        let dst = &mut band[oy * SIDE..oy * SIDE + SIDE];
+        let dst = &mut band[oy * side..oy * side + side];
         dst.fill(0.0);
         for &(sy, w) in taps {
-            let src = &frame[sy * SIDE..sy * SIDE + SIDE];
+            let src = &frame[sy * side..sy * side + side];
             for (d, &s) in dst.iter_mut().zip(src) {
                 *d += s as f32 * w;
             }
@@ -362,7 +385,7 @@ fn resample(
     }
 
     for oy in 0..THUMB {
-        let src = &band[oy * SIDE..oy * SIDE + SIDE];
+        let src = &band[oy * side..oy * side + side];
         for (ox, taps) in cols.iter().enumerate() {
             let mut acc = 0.0;
             for &(sx, w) in taps {
@@ -1601,27 +1624,28 @@ fn frame_crop(frame: &[u8]) -> (usize, usize, usize, usize) {
 /// nothing else then has no usable frames and is reported as such, like an
 /// all-black one.
 fn frame_crop_or_tiny(frame: &[u8]) -> ((usize, usize, usize, usize), bool) {
-    const WHOLE: (usize, usize, usize, usize) = (0, SIDE - 1, 0, SIDE - 1);
-    const MIN_SPAN: usize = SIDE / 4;
-    let row = |y: usize| &frame[y * SIDE..y * SIDE + SIDE];
-    let (top, bottom) = paired_bars((0..SIDE).map(row), (0..SIDE).rev().map(row));
-    let (y1, y2) = (top + (top > 0) as usize, (SIDE - 1).saturating_sub(bottom + (bottom > 0) as usize));
-    if y2 < y1 || y2 - y1 + 1 < MIN_SPAN {
-        return (WHOLE, true);
+    let side = side_of(frame);
+    let whole = (0, side - 1, 0, side - 1);
+    let min_span = side / 4;
+    let row = |y: usize| &frame[y * side..y * side + side];
+    let (top, bottom) = paired_bars((0..side).map(row), (0..side).rev().map(row));
+    let (y1, y2) = (top + (top > 0) as usize, (side - 1).saturating_sub(bottom + (bottom > 0) as usize));
+    if y2 < y1 || y2 - y1 + 1 < min_span {
+        return (whole, true);
     }
     // Columns are read inside the rows that survived, so a letterbox does not
     // hide a pillarbox and vice versa.
-    let mut cols = vec![[0u8; SIDE]; SIDE];
+    let mut cols = vec![vec![0u8; side]; side];
     let h = y2 - y1 + 1;
     for (x, col) in cols.iter_mut().enumerate() {
         for y in 0..h {
-            col[y] = frame[(y1 + y) * SIDE + x];
+            col[y] = frame[(y1 + y) * side + x];
         }
     }
     let (left, right) = paired_bars(cols.iter().map(|c| &c[..h]), cols.iter().rev().map(|c| &c[..h]));
-    let (x1, x2) = (left + (left > 0) as usize, (SIDE - 1).saturating_sub(right + (right > 0) as usize));
-    if x2 < x1 || x2 - x1 + 1 < MIN_SPAN {
-        return (WHOLE, true);
+    let (x1, x2) = (left + (left > 0) as usize, (side - 1).saturating_sub(right + (right > 0) as usize));
+    if x2 < x1 || x2 - x1 + 1 < min_span {
+        return (whole, true);
     }
     ((y1, y2, x1, x2), false)
 }
@@ -1705,31 +1729,31 @@ const INSET_COVER: f64 = 0.8;
 /// which `frame_crop` and `Zoom` already read.
 const INSET_MAX_AREA: f64 = 0.7;
 
-/// How many working-frame pixels one pixel of the 64x64 reading `inset_rect`
-/// works on spans.
-const F: usize = SIDE / 64;
-
 /// The frame averaged down to 64x64, the resolution `inset_rect`'s edge step
 /// was measured at and the one that keeps its O(n^3) search cheap.
 fn coarse(full: &[u8]) -> [u8; 4096] {
+    let side = side_of(full);
+    // How many working-frame pixels one pixel of the 64x64 reading spans.
+    let f = side / 64;
     let mut frame = [0u8; 4096];
     for y in 0..64 {
         for x in 0..64 {
             let mut acc = 0u32;
-            for dy in 0..F {
-                for dx in 0..F {
-                    acc += full[(y * F + dy) * SIDE + x * F + dx] as u32;
+            for dy in 0..f {
+                for dx in 0..f {
+                    acc += full[(y * f + dy) * side + x * f + dx] as u32;
                 }
             }
-            frame[y * 64 + x] = ((acc + (F * F / 2) as u32) / (F * F) as u32) as u8;
+            frame[y * 64 + x] = ((acc + (f * f / 2) as u32) / (f * f) as u32) as u8;
         }
     }
     frame
 }
 
-/// A rectangle of the 64x64 reading, in working-frame pixels.
-fn widen((y1, y2, x1, x2): (usize, usize, usize, usize)) -> (usize, usize, usize, usize) {
-    (y1 * F, y2 * F + F - 1, x1 * F, x2 * F + F - 1)
+/// A rectangle of the 64x64 reading, in pixels of a working frame `f` times
+/// its side.
+fn widen((y1, y2, x1, x2): (usize, usize, usize, usize), f: usize) -> (usize, usize, usize, usize) {
+    (y1 * f, y2 * f + f - 1, x1 * f, x2 * f + f - 1)
 }
 
 /// The largest rectangle of `frame` bounded by edges on all four sides, as
@@ -1741,7 +1765,8 @@ fn widen((y1, y2, x1, x2): (usize, usize, usize, usize)) -> (usize, usize, usize
 /// and ~0.2 ms a frame in practice. It is searched on the 64x64 average of
 /// the working frame (`coarse`) and widened back.
 fn inset_rect(full: &[u8]) -> Option<(usize, usize, usize, usize)> {
-    inset_rect_64(&coarse(full)).map(widen)
+    let f = side_of(full) / 64;
+    inset_rect_64(&coarse(full)).map(|r| widen(r, f))
 }
 
 fn inset_rect_64(frame: &[u8]) -> Option<(usize, usize, usize, usize)> {
@@ -1840,6 +1865,7 @@ fn detail_coefficients() -> [(usize, usize); 64] {
 fn sub_rect(
     (y1, y2, x1, x2): (usize, usize, usize, usize),
     (fy0, fy1, fx0, fx1): (f64, f64, f64, f64),
+    side: usize,
 ) -> Option<(usize, usize, usize, usize)> {
     let h = (y2 - y1 + 1) as f64;
     let w = (x2 - x1 + 1) as f64;
@@ -1847,8 +1873,8 @@ fn sub_rect(
     let ny2 = y1 as i64 + (h * fy1).round_ties_even() as i64 - 1;
     let nx1 = x1 as i64 + (w * fx0).round_ties_even() as i64;
     let nx2 = x1 as i64 + (w * fx1).round_ties_even() as i64 - 1;
-    let min = (SIDE / 8) as i64;
-    let last = (SIDE - 1) as i64;
+    let min = (side / 8) as i64;
+    let last = (side - 1) as i64;
     if ny2 - ny1 + 1 < min || nx2 - nx1 + 1 < min || ny1 < 0 || nx1 < 0 || ny2 > last || nx2 > last {
         return None;
     }
@@ -1871,18 +1897,18 @@ impl Reframing {
                     return None;
                 }
                 let f = (width as f64 / height as f64) / BAND_ASPECT;
-                sub_rect(crop, ((1.0 - f) / 2.0, (1.0 + f) / 2.0, 0.0, 1.0))
+                sub_rect(crop, ((1.0 - f) / 2.0, (1.0 + f) / 2.0, 0.0, 1.0), side_of(frame))
             }
             Reframing::Zoom => {
                 let m = (1.0 - 1.0 / ZOOM) / 2.0;
-                sub_rect(crop, (m, 1.0 - m, m, 1.0 - m))
+                sub_rect(crop, (m, 1.0 - m, m, 1.0 - m), side_of(frame))
             }
             Reframing::Cut43 => {
                 if !(height > 0 && width as f64 > height as f64 * 4.0 / 3.0 * 1.05) {
                     return None;
                 }
                 let f = (4.0 / 3.0) / (width as f64 / height as f64);
-                sub_rect(crop, (0.0, 1.0, (1.0 - f) / 2.0, (1.0 + f) / 2.0))
+                sub_rect(crop, (0.0, 1.0, (1.0 - f) / 2.0, (1.0 + f) / 2.0), side_of(frame))
             }
             Reframing::Strip(k) => {
                 if !(width > height && height > 0) {
@@ -1890,7 +1916,7 @@ impl Reframing {
                 }
                 let f = (height as f64 / width as f64) / BAND_ASPECT;
                 let c = f / 2.0 + k as f64 * (1.0 - f) / (STRIPS - 1) as f64;
-                sub_rect(crop, (0.0, 1.0, c - f / 2.0, c + f / 2.0))
+                sub_rect(crop, (0.0, 1.0, c - f / 2.0, c + f / 2.0), side_of(frame))
             }
         }
     }
@@ -1906,13 +1932,14 @@ struct Hasher {
     weights: std::collections::HashMap<(usize, usize, usize, usize), (Taps, Taps)>,
     detail_weights: std::collections::HashMap<(usize, usize, usize, usize), (Taps, Taps)>,
     thumb: [f32; THUMB * THUMB],
-    band: [f32; SIDE * THUMB],
+    side: usize,
+    band: Vec<f32>,
     dthumb: Vec<f32>,
     dband: Vec<f32>,
 }
 
 impl Hasher {
-    fn new() -> Self {
+    fn new(side: usize) -> Self {
         let detail_basis = (0..DETAIL_KEEP)
             .map(|k| {
                 let mut row = [0.0f32; DETAIL_THUMB];
@@ -1931,9 +1958,10 @@ impl Hasher {
             weights: Default::default(),
             detail_weights: Default::default(),
             thumb: [0.0; THUMB * THUMB],
-            band: [0.0; SIDE * THUMB],
+            side,
+            band: vec![0.0; side * THUMB],
             dthumb: vec![0.0; DETAIL_THUMB * DETAIL_THUMB],
-            dband: vec![0.0; SIDE * DETAIL_THUMB],
+            dband: vec![0.0; side * DETAIL_THUMB],
         }
     }
 
@@ -1956,16 +1984,17 @@ impl Hasher {
         });
         let n = DETAIL_THUMB;
         for (oy, taps) in rows.iter().enumerate() {
-            let dst = &mut self.dband[oy * SIDE..oy * SIDE + SIDE];
+            let side = self.side;
+            let dst = &mut self.dband[oy * side..oy * side + side];
             dst.fill(0.0);
             for &(sy, w) in taps {
-                for (d, &p) in dst.iter_mut().zip(&frame[sy * SIDE..sy * SIDE + SIDE]) {
+                for (d, &p) in dst.iter_mut().zip(&frame[sy * side..sy * side + side]) {
                     *d += p as f32 * w;
                 }
             }
         }
         for oy in 0..n {
-            let src = &self.dband[oy * SIDE..oy * SIDE + SIDE];
+            let src = &self.dband[oy * self.side..oy * self.side + self.side];
             for (ox, taps) in cols.iter().enumerate() {
                 let mut acc = 0.0;
                 for &(sx, w) in taps {
@@ -2003,13 +2032,14 @@ impl Hasher {
 /// which says whether a reframing applies).
 #[cfg(test)]
 fn hash_frames_both_ways(u_frames: &[u8]) -> (Vec<u64>, Vec<u64>, Vec<bool>) {
-    let h = hash_frames_fully(u_frames, (0, 0));
+    let h = hash_frames_fully(u_frames, (0, 0), DEFAULT_SIDE);
     (h.hashes, h.mirrored, h.flat)
 }
 
-pub(crate) fn hash_frames_fully(u_frames: &[u8], dims: (u32, u32)) -> Hashed {
-    let n_unique = u_frames.len() / FRAME_STRIDE;
-    let mut hasher = Hasher::new();
+pub(crate) fn hash_frames_fully(u_frames: &[u8], dims: (u32, u32), side: usize) -> Hashed {
+    let n_unique = u_frames.len() / (side * side);
+    let mut hasher = Hasher::new(side);
+    let stride = side * side;
     let mut out = Hashed {
         hashes: Vec::with_capacity(n_unique),
         mirrored: Vec::with_capacity(n_unique),
@@ -2019,7 +2049,7 @@ pub(crate) fn hash_frames_fully(u_frames: &[u8], dims: (u32, u32)) -> Hashed {
         reframed: vec![Vec::with_capacity(n_unique); REFRAMINGS.len()],
     };
 
-    for frame in u_frames.chunks_exact(FRAME_STRIDE) {
+    for frame in u_frames.chunks_exact(stride) {
         let (rect, tiny) = frame_crop_or_tiny(frame);
         let coefficients = hasher.coefficients(frame, rect);
         out.hashes.push(hash_of(&coefficients));
@@ -2222,7 +2252,10 @@ pub fn fingerprint_video(
     // All unique frames packed back-to-back, FRAME_STRIDE bytes each. One growable
     // allocation instead of N tiny ones -> no heap fragmentation/retention, and the
     // whole thing is released to the OS when this function returns.
-    let mut u_frames: Vec<u8> = Vec::with_capacity(FRAME_STRIDE * 64);
+    // The working frame's side, read once: a run hashes every file at one size.
+    let side = frame_side();
+    let frame_stride = side * side;
+    let mut u_frames: Vec<u8> = Vec::with_capacity(frame_stride * 64);
     // When each kept frame is shown, in milliseconds. `None` for a frame the
     // container gave no timestamp for; a video with any of those falls back to
     // spacing its samples evenly (see `sample_times`).
@@ -2240,7 +2273,7 @@ pub fn fingerprint_video(
     };
 
     let mut frame_idx = 0;
-    let mut prev_frame = vec![0u8; FRAME_STRIDE];
+    let mut prev_frame = vec![0u8; frame_stride];
     let mut is_first = true;
 
     // By hoisting `decoded`, `scaled`, and `current_frame` outside the loop,
@@ -2248,7 +2281,7 @@ pub fn fingerprint_video(
     // FFmpeg's zero-copy buffer pool is now properly utilized.
     let mut decoded = ffmpeg_next::frame::Video::empty();
     let mut scaled = ffmpeg_next::frame::Video::empty();
-    let mut current_frame = vec![0u8; FRAME_STRIDE];
+    let mut current_frame = vec![0u8; frame_stride];
 
     // Rebuilt whenever the decoder's output changes shape, not merely built once.
     // A stream is allowed to change resolution or pixel format mid-file -- a
@@ -2280,8 +2313,8 @@ pub fn fingerprint_video(
                 dec.width(),
                 dec.height(),
                 ffmpeg_next::format::Pixel::GRAY8,
-                SIDE as u32,
-                SIDE as u32,
+                side as u32,
+                side as u32,
                 ffmpeg_next::software::scaling::flag::Flags::FAST_BILINEAR,
             )?);
             frame_dims.get_or_insert((dec.width(), dec.height()));
@@ -2293,10 +2326,10 @@ pub fn fingerprint_video(
         let data = scaled.data(0);
         let stride = scaled.stride(0);
 
-        for y in 0..SIDE {
+        for y in 0..side {
             let src_idx = y * stride;
-            let dst_idx = y * SIDE;
-            current_frame[dst_idx..dst_idx + SIDE].copy_from_slice(&data[src_idx..src_idx + SIDE]);
+            let dst_idx = y * side;
+            current_frame[dst_idx..dst_idx + side].copy_from_slice(&data[src_idx..src_idx + side]);
         }
 
         if is_first || current_frame != prev_frame {
@@ -2823,7 +2856,7 @@ pub fn fingerprint_video(
     // u_frames holds n_unique * FRAME_STRIDE bytes; the frame count is the time list.
     let n_unique = unique_frame_times.len();
 
-    let hashed = hash_frames_fully(&u_frames, (width, height));
+    let hashed = hash_frames_fully(&u_frames, (width, height), side);
     let (hashes, mirrored, flat) = (&hashed.hashes, &hashed.mirrored, &hashed.flat);
 
     // Frame pixels are no longer needed; release the large buffer (munmap) now
@@ -2962,6 +2995,12 @@ pub fn fingerprint_video(
 mod tests {
     use super::*;
 
+    /// The tests build frames at the default size.
+    const SIDE: usize = DEFAULT_SIDE;
+    const FRAME_STRIDE: usize = SIDE * SIDE;
+    /// Working-frame pixels per pixel of a 64-unit frame.
+    const F: usize = SIDE / 64;
+
     /// A working frame with structure everywhere and no flat edge: no two
     /// neighbouring pixels agree, so nothing about it reads as a bar.
     fn busy_frame(seed: u32) -> Vec<u8> {
@@ -3019,6 +3058,39 @@ mod tests {
             }
         }
         assert_eq!(inset_rect(&small), None);
+    }
+
+    #[test]
+    fn test_a_frame_with_no_finer_detail_hashes_alike_at_either_working_size() {
+        // A 128 frame doubled pixel for pixel to 256 holds nothing more, so
+        // every hash -- crop, detail and each reframing -- has to come out the
+        // same: what proves the side is threaded through everything.
+        // Smooth content and no bars: rectangles land on whole pixels at either
+        // size, so the larger one can sit half a 128-pixel off, which is
+        // nothing to a picture and everything to pixel noise.
+        let frame: Vec<u8> = (0..FRAME_STRIDE)
+            .map(|i| {
+                let (y, x) = ((i / SIDE) as f32, (i % SIDE) as f32);
+                (128.0 + 60.0 * (x / 9.0 + y / 13.0).sin() + 40.0 * (x / 17.0 - y / 7.0).cos()) as u8
+            })
+            .collect();
+        let doubled: Vec<u8> =
+            (0..FINE_SIDE * FINE_SIDE).map(|i| frame[(i / FINE_SIDE / 2) * SIDE + (i % FINE_SIDE) / 2]).collect();
+        let dims = (1920, 1080);
+        let (a, b) = (hash_frames_fully(&frame, dims, SIDE), hash_frames_fully(&doubled, dims, FINE_SIDE));
+        // Within 2 sigma of a 64-bit hash: a 9:16 strip is ~40 pixels wide,
+        // where half a pixel is the noise of a re-encode. A side mishandled
+        // anywhere lands at chance, ~32 bits.
+        let near = |x: u64, y: u64| (x ^ y).count_ones() <= 8;
+        assert!(near(a.hashes[0], b.hashes[0]));
+        assert!(near(a.detail[0], b.detail[0]));
+        assert_eq!(a.flat, b.flat);
+        for (ra, rb) in a.reframed.iter().zip(&b.reframed) {
+            assert_eq!(ra[0].is_some(), rb[0].is_some());
+            if let (Some(x), Some(y)) = (ra[0], rb[0]) {
+                assert!(near(x[0], y[0]) && near(x[2], y[2]));
+            }
+        }
     }
 
     #[test]

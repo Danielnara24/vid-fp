@@ -62,8 +62,21 @@ include!(concat!(env!("OUT_DIR"), "/static_ffmpeg_version_check.rs"));
 /// x86 machines do share one. Making all of them agree (the scaler built from
 /// the C code everywhere) was measured and declined: it cost every x86 user a
 /// re-decode and 2-6% of a cold scan for agreement no x86 user needs.
-const CACHE_TABLE: TableDefinition<&str, &[u8]> =
+const CACHE_TABLE_128: TableDefinition<&str, &[u8]> =
     TableDefinition::new(concat!("fingerprints_dct_ct_ff8_s128", env!("VID_FP_ARCH_TABLE_SUFFIX")));
+/// `--frame-size 256`'s fingerprints: every hash differs from 128's, and a
+/// table each lets a user switch between the two without losing either.
+const CACHE_TABLE_256: TableDefinition<&str, &[u8]> =
+    TableDefinition::new(concat!("fingerprints_dct_ct_ff8_s256", env!("VID_FP_ARCH_TABLE_SUFFIX")));
+
+/// The fingerprint table for this run's working-frame size.
+fn cache_table() -> TableDefinition<'static, &'static str, &'static [u8]> {
+    if fingerprint::frame_side() == fingerprint::FINE_SIDE {
+        CACHE_TABLE_256
+    } else {
+        CACHE_TABLE_128
+    }
+}
 
 /// Files this build looked at and refused before opening: see `NotMedia`.
 ///
@@ -618,6 +631,16 @@ struct Args {
     /// Values above 32 are refused.
     #[arg(short = 'd', long = "hamming-distance", value_name = "N", default_value_t = 7)]
     hamming_distance: u32,
+
+    /// Side of the working frame each keyframe is hashed from: 128 or 256
+    ///
+    /// 256 hashes from four times the pixels: it matches a little more at a
+    /// given -d, at a little less precision, for a ~13% longer cold scan and
+    /// ~3.5x the peak memory. Each size keeps its own fingerprints in the
+    /// cache, so switching re-decodes once.
+    #[arg(long = "frame-size", value_name = "PX", default_value_t = 128,
+          value_parser = clap::builder::TypedValueParser::map(clap::builder::PossibleValuesParser::new(["128", "256"]), |v: String| v.parse::<usize>().unwrap()))]
+    frame_size: usize,
 
     /// Minimum percentage of a video that must match, from 0 to 100
     ///
@@ -1701,7 +1724,7 @@ fn install_signal_handler() -> Result<()> {
 /// otherwise turn every lookup on a new machine into an error path.
 fn ensure_cache_table(db: &Database) -> Result<()> {
     let txn = db.begin_write().context("Failed to start a cache transaction")?;
-    txn.open_table(CACHE_TABLE).context("Failed to create the cache table")?;
+    txn.open_table(cache_table()).context("Failed to create the cache table")?;
     txn.open_table(REFUSED_TABLE).context("Failed to create the refusals table")?;
     txn.open_table(IDENTITY_TABLE).context("Failed to create the identity table")?;
     txn.commit().context("Failed to commit the cache table")?;
@@ -1819,7 +1842,7 @@ impl CacheView {
             return Self { fingerprints: None, refusals: None };
         };
         Self {
-            fingerprints: read.open_table(CACHE_TABLE).ok(),
+            fingerprints: read.open_table(cache_table()).ok(),
             refusals: read.open_table(REFUSED_TABLE).ok(),
         }
     }
@@ -2039,7 +2062,7 @@ fn refusals_store(db: &Database, refused: &[(String, Stamp, Refusal)]) -> Result
         // fingerprinted, so this is a b-tree descent against a table a
         // `-x '*'` run barely uses.
         let mut cached =
-            txn.open_table(CACHE_TABLE).context("Failed to open the cache table")?;
+            txn.open_table(cache_table()).context("Failed to open the cache table")?;
         for (path, stamp, verdict) in refused {
             let encoded = bincode::serialize(&(stamp, verdict))
                 .context("Failed to serialize a refusal")?;
@@ -2100,7 +2123,7 @@ fn cache_store(db: &Database, path: &str, stamp: Stamp, fp: &VideoFingerprint) -
 
     let txn = db.begin_write().context("Failed to start a cache transaction")?;
     {
-        let mut table = txn.open_table(CACHE_TABLE).context("Failed to open the cache table")?;
+        let mut table = txn.open_table(cache_table()).context("Failed to open the cache table")?;
         table
             .insert(path, encoded.as_slice())
             .context("Failed to insert the fingerprint")?;
@@ -2145,7 +2168,7 @@ fn cache_forget(db: &Database, paths: &[String]) -> Result<usize> {
 
     let txn = db.begin_write().context("Failed to start a cache transaction")?;
     {
-        let mut table = txn.open_table(CACHE_TABLE).context("Failed to open the cache table")?;
+        let mut table = txn.open_table(cache_table()).context("Failed to open the cache table")?;
         // Both tables: a file that was trashed or moved is no longer at this
         // path whichever of the two had something to say about it, and a
         // refusal left behind would outlive the bytes it was about exactly the
@@ -2215,7 +2238,7 @@ fn prune_cache(db: &Database, valid_files: &HashSet<&str>, stats: &RunStats) -> 
     {
         let read = db.begin_read().context("Failed to open the cache for reading")?;
         let table = read
-            .open_table(CACHE_TABLE)
+            .open_table(cache_table())
             .context("Failed to open the cache table")?;
 
         for entry in table.iter().context("Failed to iterate the cache")? {
@@ -2270,7 +2293,7 @@ fn prune_cache(db: &Database, valid_files: &HashSet<&str>, stats: &RunStats) -> 
         let txn = db.begin_write().context("Failed to start a cache transaction")?;
         {
             let mut table = txn
-                .open_table(CACHE_TABLE)
+                .open_table(cache_table())
                 .context("Failed to open the cache table")?;
             for key in &stale {
                 table
@@ -2627,6 +2650,9 @@ Interrupted with Ctrl-C.
         std::io::stdout().write_all(&buf)?;
         return Ok(());
     }
+
+    // Before anything opens the cache: the side decides which table is read.
+    fingerprint::set_frame_side(args.frame_size);
 
     // 1. Initialize custom CLI Logger
     let Verbosity { console: console_level, filter: log_level } =
@@ -3191,7 +3217,7 @@ impl IdentityIndex {
         let mut index =
             Self { current: HashMap::new(), former: HashMap::new(), fingerprints: None };
         let Ok(read) = db.begin_read() else { return index };
-        index.fingerprints = read.open_table(CACHE_TABLE).ok();
+        index.fingerprints = read.open_table(cache_table()).ok();
         let Ok(table) = read.open_table(IDENTITY_TABLE) else { return index };
         let Ok(iter) = table.iter() else { return index };
         for entry in iter.flatten() {
@@ -3517,7 +3543,7 @@ fn identities_store(
             let encoded = bincode::serialize(identity).context("Failed to serialize an identity")?;
             ids.insert(*path, encoded.as_slice()).context("Failed to record an identity")?;
         }
-        let mut table = txn.open_table(CACHE_TABLE).context("Failed to open the cache table")?;
+        let mut table = txn.open_table(cache_table()).context("Failed to open the cache table")?;
         let mut refused =
             txn.open_table(REFUSED_TABLE).context("Failed to open the refusals table")?;
         for (path, stamp, fp) in adopted {
@@ -5435,7 +5461,7 @@ mod tests {
         assert!(cache_lookup(&db, path, &old).is_none(), "the superseded stamp cannot");
 
         let read = db.begin_read().unwrap();
-        let table = read.open_table(CACHE_TABLE).unwrap();
+        let table = read.open_table(cache_table()).unwrap();
         assert_eq!(table.len().unwrap(), 1, "one file, one entry, however often it changes");
     }
 
@@ -5612,7 +5638,7 @@ mod tests {
 
     fn cached_paths(db: &Database) -> Vec<String> {
         let read = db.begin_read().unwrap();
-        let table = read.open_table(CACHE_TABLE).unwrap();
+        let table = read.open_table(cache_table()).unwrap();
         table
             .iter()
             .unwrap()
@@ -6903,7 +6929,7 @@ mod tests {
 
     fn cached(db: &Database, path: &Path) -> Option<VideoFingerprint> {
         let read = db.begin_read().unwrap();
-        let table = read.open_table(CACHE_TABLE).unwrap();
+        let table = read.open_table(cache_table()).unwrap();
         let stored = table.get(path.to_string_lossy().as_ref()).unwrap()?;
         Some(bincode::deserialize::<CacheEntry>(stored.value()).unwrap().1)
     }
