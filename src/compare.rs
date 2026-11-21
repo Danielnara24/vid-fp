@@ -355,6 +355,78 @@ fn has_detail(fp: &VideoFingerprint) -> bool {
     !fp.valid_hashes.is_empty() && fp.detail_hashes.len() == fp.valid_hashes.len()
 }
 
+/// Thin `fp`'s samples to at most one per `ALIGNMENT_TOLERANCE_MS`, in place.
+///
+/// A sample that starts sooner than that after the last one kept is folded into
+/// it: dropped, its span added to the kept one's, so coverage still counts the
+/// same footage. The comparison cannot place a match more finely than that
+/// window (`alignment_window` never goes under it), so samples denser than it
+/// carry no timing. What they do carry is more draws of each picture's hash
+/// noise, and every draw is one more chance to land near some frame of an
+/// unrelated file. A file sampled at every frame (an all-intra encode, which a
+/// keyframe-only decode reads frame by frame) had twenty-five times the chances
+/// of the same footage sampled at ordinary keyframes, and on the second
+/// generated corpus one such file stood in 130 of the 227 false links between
+/// unrelated videos at `-d 10`.
+///
+/// A file whose samples are already at least that far apart is untouched,
+/// which is nearly every ordinary encode. Applied to every fingerprint just
+/// before comparison, so the report's sample count and the window's evidence
+/// read the samples the comparison measured. Decoding and the cache are not
+/// involved: an entry keeps every sample, and changing this costs no rename.
+pub(crate) fn thin_samples(fp: &mut VideoFingerprint) {
+    let n = fp.valid_hashes.len();
+    let step = ALIGNMENT_TOLERANCE_MS as u32;
+    if fp.valid_t_start.windows(2).all(|w| w[1] >= w[0] + step) {
+        return;
+    }
+    // The new index of each sample kept, `u32::MAX` for one folded away.
+    let mut new_of = vec![u32::MAX; n];
+    let mut kept = 0usize;
+    let mut last_start = 0u32;
+    for i in 0..n {
+        let start = fp.valid_t_start[i];
+        if kept > 0 && start < last_start + step {
+            let end = fp.valid_t_end[i];
+            let k = kept - 1;
+            fp.valid_t_end[k] = fp.valid_t_end[k].max(end);
+            continue;
+        }
+        new_of[i] = kept as u32;
+        fp.valid_hashes[kept] = fp.valid_hashes[i];
+        fp.valid_t_start[kept] = start;
+        fp.valid_t_end[kept] = fp.valid_t_end[i];
+        for v in [&mut fp.mirrored_hashes, &mut fp.detail_hashes, &mut fp.mirrored_detail_hashes] {
+            if v.len() == n {
+                v[kept] = v[i];
+            }
+        }
+        last_start = start;
+        kept += 1;
+    }
+    fp.valid_hashes.truncate(kept);
+    fp.valid_t_start.truncate(kept);
+    fp.valid_t_end.truncate(kept);
+    for v in [&mut fp.mirrored_hashes, &mut fp.detail_hashes, &mut fp.mirrored_detail_hashes] {
+        if v.len() == n {
+            v.truncate(kept);
+        }
+    }
+    for r in &mut fp.reframed {
+        let mut w = 0;
+        for j in 0..r.samples.len() {
+            let ni = new_of.get(r.samples[j] as usize).copied().unwrap_or(u32::MAX);
+            if ni != u32::MAX {
+                r.samples[w] = ni;
+                r.hashes[w] = r.hashes[j];
+                w += 1;
+            }
+        }
+        r.samples.truncate(w);
+        r.hashes.truncate(w);
+    }
+}
+
 /// How far apart two matches' time offsets may be and still stand witness for
 /// each other.
 ///
@@ -3020,6 +3092,59 @@ mod tests {
         fp.valid_t_end = ends;
         fp.duration = total as f64 / 1000.0;
         fp
+    }
+
+    #[test]
+    fn test_samples_closer_than_the_alignment_window_are_folded_into_one() {
+        let hashes: Vec<u64> = (0..6).map(distinct_hash).collect();
+        let mut fp = mock_fp_at(hashes.clone(), vec![0, 100, 200, 600, 1200, 1250]);
+        fp.detail_hashes = hashes.iter().map(|h| !h).collect();
+        fp.mirrored_hashes = hashes.iter().map(|h| h.rotate_left(1)).collect();
+        fp.reframed = vec![crate::fingerprint::Reframed { samples: vec![1, 3, 5], hashes: vec![[1; 4], [3; 4], [5; 4]] }];
+        let footage: u32 = fp.valid_t_start.iter().zip(&fp.valid_t_end).map(|(s, e)| e - s).sum();
+
+        thin_samples(&mut fp);
+
+        assert_eq!(fp.valid_t_start, vec![0, 600, 1200]);
+        assert_eq!(fp.valid_t_end, vec![600, 1200, 2250], "a kept sample stands for what it absorbed");
+        assert_eq!(fp.valid_hashes, vec![hashes[0], hashes[3], hashes[4]]);
+        assert_eq!(fp.detail_hashes, vec![!hashes[0], !hashes[3], !hashes[4]]);
+        assert_eq!(fp.mirrored_hashes, vec![hashes[0].rotate_left(1), hashes[3].rotate_left(1), hashes[4].rotate_left(1)]);
+        // A reframed sample keeps its hashes under its new index; one folded away goes.
+        assert_eq!(fp.reframed[0].samples, vec![1]);
+        assert_eq!(fp.reframed[0].hashes, vec![[3; 4]]);
+        let after: u32 = fp.valid_t_start.iter().zip(&fp.valid_t_end).map(|(s, e)| e - s).sum();
+        assert_eq!(after, footage, "no footage is lost from coverage");
+    }
+
+    #[test]
+    fn test_a_file_sampled_no_faster_than_the_window_is_untouched() {
+        let hashes: Vec<u64> = (0..5).map(distinct_hash).collect();
+        let step = ALIGNMENT_TOLERANCE_MS as u32;
+        let mut fp = mock_fp_sampled(hashes.clone(), step);
+        fp.reframed = vec![crate::fingerprint::Reframed { samples: vec![0, 4], hashes: vec![[7; 4], [8; 4]] }];
+        thin_samples(&mut fp);
+        assert_eq!(fp.valid_hashes, hashes);
+        assert_eq!(fp.valid_t_start, (0..5).map(|i| i * step).collect::<Vec<_>>());
+        assert_eq!(fp.reframed[0].samples, vec![0, 4]);
+    }
+
+    #[test]
+    fn test_a_copy_sampled_at_every_frame_still_covers_its_source_once_thinned() {
+        // The source keyframes every 2 s; the copy is the same footage with a
+        // sample every 40 ms (an all-intra encode), each carrying the picture
+        // of the 2 s stretch it falls in.
+        let pictures: Vec<u64> = (0..10).map(distinct_hash).collect();
+        let source = mock_fp_sampled(pictures.clone(), 2000);
+        let dense_hashes: Vec<u64> = (0..500).map(|i| pictures[i * 40 / 2000]).collect();
+        let mut dense = mock_fp_sampled(dense_hashes, 40);
+        thin_samples(&mut dense);
+        let step = ALIGNMENT_TOLERANCE_MS as u32;
+        assert!(dense.valid_t_start.windows(2).all(|w| w[1] - w[0] >= step && w[1] - w[0] < step + 40));
+        assert_eq!(dense.valid_t_end.last(), Some(&20_000), "the last sample still reaches the end");
+        let m = find_all_matches(&[source, dense], 4, 0.2, 0.0);
+        assert_eq!(m.len(), 1);
+        assert!(m[0].coverage_a > 0.99 && m[0].coverage_b > 0.99, "{} {}", m[0].coverage_a, m[0].coverage_b);
     }
 
     /// What the corroboration pass makes of one pair, and how many matches it

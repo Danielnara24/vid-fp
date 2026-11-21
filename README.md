@@ -587,7 +587,9 @@ disagree, one file was found almost entirely inside the other while the other
 was barely covered back, which is usually a sampling artifact.
 
 **The `samples` column is how many frame hashes the file's fingerprint holds**,
-after featureless frames have been dropped. A file with few samples has each one
+after featureless frames have been dropped and samples less than half a second
+apart have been merged into one (an all-intra file has a keyframe at every frame,
+and those extra samples only add chances of a false match). A file with few samples has each one
 standing for a long stretch of runtime, so its matched footage comes out coarse.
 At the limit, a file with one sample has that sample standing for its entire
 runtime, so any match at all covers 100% of it and no `--match-percent` can gate

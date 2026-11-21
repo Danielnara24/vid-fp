@@ -4520,6 +4520,10 @@ fn run(
     info!("\nFingerprinting complete. Cross-analyzing {} videos...", n);
     progress::stage("Comparing videos");
 
+    // Samples closer together than the comparison can tell apart are folded
+    // into one before anything is measured (see `compare::thin_samples`).
+    fingerprints.iter_mut().for_each(compare::thin_samples);
+
     // Which fingerprints are the library's, by their place in the list.
     let library_side: Vec<bool> = fingerprints.iter().map(|f| held_paths.contains(&f.path)).collect();
 
