@@ -2064,19 +2064,23 @@ fn refusals_store(db: &Database, refused: &[(String, Stamp, Refusal)]) -> Result
 /// Removing it here rather than where the fall-through happens is what makes
 /// the invariant true by construction: a path with a fingerprint has no refusal
 /// beside it because writing the fingerprint is what takes the refusal away.
-fn cache_store(db: &Database, path: &str, stamp: Stamp, fp: &VideoFingerprint) -> Result<()> {
+///
+/// Several files go in one transaction when they come from ONE decode: a file
+/// and the byte-identical copies that share it. They exist at the same moment,
+/// so one commit loses nothing the per-video rule protects, and a folder of N
+/// copies pays one fsync rather than N.
+fn cache_store(db: &Database, entries: &[(&str, Stamp, &VideoFingerprint)]) -> Result<()> {
     // `&(stamp, fp)` rather than an owned pair: serde follows the reference, so
     // this writes the exact bytes `CacheEntry` reads back without copying the
     // hash vectors to get there.
-    let encoded = bincode::serialize(&(stamp, fp)).context("Failed to serialize fingerprint")?;
+    let encoded = entries
+        .iter()
+        .map(|(_, stamp, fp)| bincode::serialize(&(stamp, fp)).context("Failed to serialize fingerprint"))
+        .collect::<Result<Vec<_>>>()?;
 
     let txn = db.begin_write().context("Failed to start a cache transaction")?;
     {
         let mut table = txn.open_table(CACHE_TABLE).context("Failed to open the cache table")?;
-        table
-            .insert(path, encoded.as_slice())
-            .context("Failed to insert the fingerprint")?;
-
         // Unconditional, and cheap because it is a b-tree descent that normally
         // finds nothing: the common case is a first decode with no refusal to
         // take away. In the same transaction as the insert, so the two tables
@@ -2084,11 +2088,22 @@ fn cache_store(db: &Database, path: &str, stamp: Stamp, fp: &VideoFingerprint) -
         // them.
         let mut refused =
             txn.open_table(REFUSED_TABLE).context("Failed to open the refusals table")?;
-        refused.remove(path).context("Failed to drop a superseded refusal")?;
+        for ((path, _, _), encoded) in entries.iter().zip(&encoded) {
+            table
+                .insert(*path, encoded.as_slice())
+                .context("Failed to insert the fingerprint")?;
+            refused.remove(*path).context("Failed to drop a superseded refusal")?;
+        }
     }
     txn.commit().context("Failed to commit the fingerprint")?;
 
     Ok(())
+}
+
+/// `cache_store` for one file, as most tests write one.
+#[cfg(test)]
+fn cache_store_one(db: &Database, path: &str, stamp: Stamp, fp: &VideoFingerprint) -> Result<()> {
+    cache_store(db, &[(path, stamp, fp)])
 }
 
 /// Forget the fingerprints of files that are no longer where they were.
@@ -4359,14 +4374,16 @@ fn run(
                             .iter()
                             .map(|f| VideoFingerprint { path: f.path.clone(), ..fp.clone() })
                             .collect();
-                        for (member, made) in
-                            std::iter::once(job).chain(&job.followers).zip(std::iter::once(fp).chain(copies))
-                        {
-                            match cache_store(db, &member.path, member.stamp, &made) {
-                                Ok(()) => {
-                                    newly_cached.fetch_add(1, Ordering::Relaxed);
-                                }
-                                Err(e) => {
+                        let made: Vec<VideoFingerprint> = std::iter::once(fp).chain(copies).collect();
+                        let members: Vec<&Job> = std::iter::once(job).chain(&job.followers).collect();
+                        let entries: Vec<(&str, Stamp, &VideoFingerprint)> =
+                            members.iter().zip(&made).map(|(m, f)| (m.path.as_str(), m.stamp, f)).collect();
+                        match cache_store(db, &entries) {
+                            Ok(()) => {
+                                newly_cached.fetch_add(entries.len(), Ordering::Relaxed);
+                            }
+                            Err(e) => {
+                                for member in &members {
                                     log::error!(
                                         target: stats::COUNTED,
                                         "Failed to cache fingerprint for {}: {:#}",
@@ -4378,8 +4395,9 @@ fn run(
                                         .record(format!("{}: {:#}", member.path, e));
                                 }
                             }
-                            local.push((idx, made));
                         }
+                        drop(entries);
+                        local.extend(made.into_iter().map(|f| (idx, f)));
 
                         finish(idx, job, charged_work());
                     }
@@ -5310,7 +5328,7 @@ mod tests {
         let written = stamp(1_700_000_000, 12_345);
         let fp = mock_fp("/videos/some_show_s01e01.mkv");
 
-        cache_store(&db, &fp.path, written, &fp).unwrap();
+        cache_store_one(&db, &fp.path, written, &fp).unwrap();
 
         let hit = cache_lookup(&db, &fp.path, &written).expect("an untouched file must hit");
         assert_eq!(hit.valid_hashes, fp.valid_hashes);
@@ -5337,7 +5355,7 @@ mod tests {
         empty.valid_hashes.clear();
         empty.valid_t_start.clear();
         empty.valid_t_end.clear();
-        cache_store(&db, path, s, &empty).unwrap();
+        cache_store_one(&db, path, s, &empty).unwrap();
 
         assert!(
             cache_lookup(&db, path, &s).is_none(),
@@ -5347,7 +5365,7 @@ mod tests {
         // And the check is about the hashes rather than about the path: an
         // ordinary entry under the same stamp still hits.
         let good = mock_fp(path);
-        cache_store(&db, path, s, &good).unwrap();
+        cache_store_one(&db, path, s, &good).unwrap();
         assert!(cache_lookup(&db, path, &s).is_some());
     }
 
@@ -5363,8 +5381,8 @@ mod tests {
         let old = stamp(1_700_000_000, 12_345);
         let new = stamp(1_700_009_999, 6_000);
 
-        cache_store(&db, path, old, &mock_fp(path)).unwrap();
-        cache_store(&db, path, new, &mock_fp(path)).unwrap();
+        cache_store_one(&db, path, old, &mock_fp(path)).unwrap();
+        cache_store_one(&db, path, new, &mock_fp(path)).unwrap();
 
         assert!(cache_lookup(&db, path, &new).is_some(), "the file as it stands now hits");
         assert!(cache_lookup(&db, path, &old).is_none(), "the superseded stamp cannot");
@@ -5386,8 +5404,8 @@ mod tests {
         let gone = "/videos/duplicate.mkv";
         let s = stamp(1_700_000_000, 12_345);
 
-        cache_store(&db, kept, s, &mock_fp(kept)).unwrap();
-        cache_store(&db, gone, s, &mock_fp(gone)).unwrap();
+        cache_store_one(&db, kept, s, &mock_fp(kept)).unwrap();
+        cache_store_one(&db, gone, s, &mock_fp(gone)).unwrap();
 
         let forgotten = cache_forget(&db, &[gone.to_string()]).unwrap();
 
@@ -5455,7 +5473,7 @@ mod tests {
         let (doomed, report) = armed_report(&dir);
 
         let s = stamp(1_700_000_000, 12_345);
-        cache_store(&db, &doomed, s, &mock_fp(&doomed)).unwrap();
+        cache_store_one(&db, &doomed, s, &mock_fp(&doomed)).unwrap();
         assert!(cache_lookup(&db, &doomed, &s).is_some(), "precondition");
 
         let args = Args::parse_from([
@@ -5541,7 +5559,7 @@ mod tests {
 
     fn cache_with_an_orphan(dir: &tempfile::TempDir) -> Database {
         let db = temp_db(dir);
-        cache_store(&db, ORPHAN, stamp(1_700_000_000, 12_345), &mock_fp(ORPHAN)).unwrap();
+        cache_store_one(&db, ORPHAN, stamp(1_700_000_000, 12_345), &mock_fp(ORPHAN)).unwrap();
         db
     }
 
@@ -5769,7 +5787,7 @@ mod tests {
         // the file falls through, decodes, and is stored.
         let mut fp = mock_fp(path);
         fp.duration = 8.84;
-        cache_store(&db, path, written, &fp).unwrap();
+        cache_store_one(&db, path, written, &fp).unwrap();
 
         assert!(
             cache_lookup(&db, path, &written).is_some(),
@@ -5879,7 +5897,7 @@ mod tests {
         // produce. Nothing here is verdict-specific, and this is what says so.
         let elsewhere = "/videos/was-a-video.mkv";
         let written = stamp(1_700_000_000, 12_345);
-        cache_store(&db, elsewhere, written, &mock_fp(elsewhere)).unwrap();
+        cache_store_one(&db, elsewhere, written, &mock_fp(elsewhere)).unwrap();
         refusals_store(
             &db,
             &[(
@@ -6680,12 +6698,12 @@ mod tests {
         let path = "/videos/some_show_s01e01.mkv";
         let s = stamp(1_700_000_000, 12_345);
 
-        cache_store(&db, path, s, &mock_fp(path)).unwrap();
+        cache_store_one(&db, path, s, &mock_fp(path)).unwrap();
         clear_cache(&mut db).unwrap();
 
         assert!(cache_lookup(&db, path, &s).is_none(), "nothing survives a clear");
 
-        cache_store(&db, path, s, &mock_fp(path)).unwrap();
+        cache_store_one(&db, path, s, &mock_fp(path)).unwrap();
         assert!(
             cache_lookup(&db, path, &s).is_some(),
             "and the table is ready for the scan that follows"
@@ -6926,7 +6944,7 @@ mod tests {
 
         let mut other = job_for(&scanned(&before), 0.0).stamp;
         other.mtime += 1;
-        cache_store(&db, &before.to_string_lossy(), other, &mock_fp(&before.to_string_lossy()))
+        cache_store_one(&db, &before.to_string_lossy(), other, &mock_fp(&before.to_string_lossy()))
             .unwrap();
 
         let after = dir.path().join("b.mp4");
@@ -7068,7 +7086,7 @@ mod tests {
         // the identity still vouches for it: a run that decodes the moved file
         // instead of adopting it ends up holding the real hashes, not these.
         let marker = mock_fp(&before.to_string_lossy());
-        cache_store(&db, &before.to_string_lossy(), job_for(&scanned(&before), 0.0).stamp, &marker)
+        cache_store_one(&db, &before.to_string_lossy(), job_for(&scanned(&before), 0.0).stamp, &marker)
             .unwrap();
 
         let after = library.join("renamed.mp4");

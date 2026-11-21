@@ -16,7 +16,6 @@
 //! A file whose runtime is unknown is read from its start.
 
 use crate::fingerprint::{clock_may_restart, duration_seconds, header_is_complete, open_video, probe_streams};
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Context, Result};
 use ffmpeg_next::format::Pixel;
@@ -196,19 +195,45 @@ type RestartIndex = Arc<Vec<(u32, i64)>>;
 /// A file as it stood when its index was read: path, length, modification
 /// time. A file that changed is read again.
 type FileStamp = (String, u64, std::time::SystemTime);
-static RESTART_INDEXES: Mutex<Option<HashMap<FileStamp, RestartIndex>>> = Mutex::new(None);
+/// The keyframe indexes read so far, most recently used last, and held to
+/// `KEPT_INDEXES` files: a Compare window asks of two files at a time, and the
+/// window lives as long as the session, so an unbounded map grew by one index for every `.ts` ever compared, and
+/// kept the old one beside the new whenever a file changed.
+static RESTART_INDEXES: Mutex<Vec<(FileStamp, RestartIndex)>> = Mutex::new(Vec::new());
+
+/// How many files' keyframe indexes are kept.
+const KEPT_INDEXES: usize = 8;
+
+/// The index kept for `key`, moved to the most recently used end.
+fn kept_index(key: &FileStamp) -> Option<RestartIndex> {
+    let mut kept = RESTART_INDEXES.lock().unwrap_or_else(|e| e.into_inner());
+    let at = kept.iter().position(|(k, _)| k == key)?;
+    let entry = kept.remove(at);
+    let index = entry.1.clone();
+    kept.push(entry);
+    Some(index)
+}
+
+/// Keep `index` for `key`, in place of any index of an older state of the same
+/// file, and let the least recently used go past `KEPT_INDEXES`.
+fn keep_index(key: FileStamp, index: RestartIndex) {
+    let mut kept = RESTART_INDEXES.lock().unwrap_or_else(|e| e.into_inner());
+    kept.retain(|(k, _)| k.0 != key.0);
+    kept.push((key, index));
+    let over = kept.len().saturating_sub(KEPT_INDEXES);
+    kept.drain(..over);
+}
 
 /// The keyframe the scan sampled at `at_ms` in a file whose clock may restart,
 /// found through `restart_index` and read from its byte position.
 fn by_restart_index(path: &str, ictx: &mut ffmpeg_next::format::context::Input, index: usize, tb: f64, at_ms: u32) -> Result<ffmpeg_next::Packet> {
     let md = std::fs::metadata(path).context("The video could not be looked at")?;
     let key = (path.to_string(), md.len(), md.modified().unwrap_or(std::time::UNIX_EPOCH));
-    let kept = RESTART_INDEXES.lock().unwrap().get_or_insert_with(HashMap::new).get(&key).cloned();
-    let keyframes = match kept {
+    let keyframes = match kept_index(&key) {
         Some(k) => k,
         None => {
             let built = Arc::new(restart_index(ictx, index, tb));
-            RESTART_INDEXES.lock().unwrap().get_or_insert_with(HashMap::new).insert(key, built.clone());
+            keep_index(key, built.clone());
             built
         }
     };
@@ -355,6 +380,25 @@ mod tests {
 
     /// A frame of a real video, at the size asked for and the video's shape,
     /// with picture in it rather than black.
+    /// The indexes kept stay few, the last used survives, and a file that
+    /// changed replaces its old index rather than sitting beside it.
+    #[test]
+    fn only_a_few_keyframe_indexes_are_kept_and_one_per_file() {
+        let t = std::time::UNIX_EPOCH;
+        let key = |n: usize, len: u64| (format!("/test-only/{n}.ts"), len, t);
+        for n in 0..KEPT_INDEXES + 5 {
+            keep_index(key(n, 1), Arc::new(vec![(n as u32, 0)]));
+        }
+        assert!(kept_index(&key(0, 1)).is_none(), "the oldest went");
+        let last = KEPT_INDEXES + 4;
+        assert_eq!(kept_index(&key(last, 1)).unwrap()[0].0, last as u32);
+        keep_index(key(last, 2), Arc::new(vec![(7, 0)]));
+        assert!(kept_index(&key(last, 1)).is_none(), "a changed file's old index is let go");
+        let held = RESTART_INDEXES.lock().unwrap();
+        assert!(held.len() <= KEPT_INDEXES);
+        assert_eq!(held.iter().filter(|(k, _)| k.0 == key(last, 1).0).count(), 1);
+    }
+
     #[test]
     fn a_still_is_a_frame_of_the_video_at_its_shape() {
         init().unwrap();

@@ -266,7 +266,8 @@ impl Model {
     /// group shown, is where it lands once the emptied groups before it go.
     /// Whether any mark was taken off.
     pub fn drop_gone(&mut self, gone: &HashSet<PathBuf>, current: &mut usize) -> bool {
-        let ids: Vec<usize> = (0..self.n()).filter(|&id| gone.contains(self.path(id))).collect();
+        // A set, not a list: it is asked of every member of every group.
+        let ids: HashSet<usize> = (0..self.n()).filter(|&id| gone.contains(self.path(id))).collect();
         let mut unmarked = false;
         for &id in &ids {
             unmarked |= self.set_mark(id, false);

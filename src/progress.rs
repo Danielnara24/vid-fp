@@ -243,10 +243,11 @@ impl Stage {
             // 6-360 k, the less the more links there are to spread its
             // start-up over.
             Stage::Grouping => 10_000.0,
-            // 220-390 a hash pair of `evidence_cost`, on VIDS and parts of
-            // VIDS and VIDS2: the frames behind each link
-            // (`compare::evidence`), and the result written after them.
-            Stage::Saving => 270.0,
+            // 37-48 a hash pair of `evidence_cost` on VIDS and VIDS2: the
+            // frames behind each link (`compare::evidence_matched`, in the
+            // one orientation the scan recorded), and the result written
+            // after them. It was 220-390 while every orientation was swept.
+            Stage::Saving => 40.0,
         }
     }
 }

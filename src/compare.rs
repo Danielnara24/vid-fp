@@ -706,6 +706,10 @@ impl Match {
 pub struct Link {
     pub coverage: f32,
     pub span: Option<Span>,
+    /// Which way round the pair matched (`Match::mirrored`, `Match::reframed`),
+    /// so the window's evidence is measured the way the scan measured it.
+    pub mirrored: bool,
+    pub reframed: Option<Reframing>,
 }
 
 /// Match figures made lookup-friendly, keyed by (subject, other).
@@ -735,8 +739,9 @@ impl MatchIndex {
         let mut links = HashMap::with_capacity(matches.len() * 2);
 
         for m in matches {
-            links.insert((m.a, m.b), Link { coverage: m.coverage_a, span: m.span_a });
-            links.insert((m.b, m.a), Link { coverage: m.coverage_b, span: m.span_b });
+            let (mirrored, reframed) = (m.mirrored, m.reframed);
+            links.insert((m.a, m.b), Link { coverage: m.coverage_a, span: m.span_a, mirrored, reframed });
+            links.insert((m.b, m.a), Link { coverage: m.coverage_b, span: m.span_b, mirrored, reframed });
         }
 
         Self { links, same_bytes: Vec::new() }
@@ -768,6 +773,12 @@ impl MatchIndex {
     /// How much of `subject` is contained in `other`, if the two were compared.
     pub fn coverage(&self, subject: usize, other: usize) -> Option<f32> {
         self.links.get(&(subject, other)).map(|l| l.coverage)
+    }
+
+    /// Which way round `subject` and `other` matched, if they did: mirrored,
+    /// and read inside which reframing (of whichever file it applies to).
+    pub fn orientation(&self, subject: usize, other: usize) -> Option<(bool, Option<Reframing>)> {
+        self.links.get(&(subject, other)).map(|l| (l.mirrored, l.reframed))
     }
 
     /// Where the footage `subject` shares with `other` sits in `subject`'s own
@@ -2321,8 +2332,47 @@ pub struct Evidence {
     pub stretches_b: Vec<(u32, u32)>,
 }
 
-/// `Evidence` for `fp_a` against `fp_b` at `-d max_hamming_dist`.
+/// `Evidence` for `fp_a` against `fp_b` at `-d max_hamming_dist`, measured
+/// every way round the scan measures a pair, keeping the best covered.
+///
+/// For a pair the scan matched, `evidence_matched` is the same answer for a
+/// fraction of the cost: the scan has already chosen the orientation.
 pub fn evidence(fp_a: &VideoFingerprint, fp_b: &VideoFingerprint, max_hamming_dist: u32) -> Evidence {
+    evidence_among(fp_a, fp_b, max_hamming_dist, &Orientation::all(), true)
+}
+
+/// `evidence`, measured the way the scan measured the pair: in the
+/// orientation it recorded (`MatchIndex::orientation`), and with a symmetric
+/// one read from the file the scan read it from, the lower-numbered of the two
+/// (`a_is_lower`).
+///
+/// The full sweep measures every orientation of both files -- each strip, each
+/// cut, mirrored or not -- to rediscover an orientation the comparison already
+/// recorded on the `Match`. It also measured a mirrored pair from `a`'s side
+/// whichever file that was, where the scan mirrors the lower-numbered file;
+/// a mirrored hash is not an exact inverse (mirroring moves the median each
+/// bit is set against), so from the other side the window could show frames
+/// the scan never matched, or none at all, and the sweep then picked some
+/// other orientation that happened to cover more. A one-sided orientation is
+/// measured both ways round, as the scan measures it, since `Match` does not
+/// say which file the reframing was read from.
+pub fn evidence_matched(
+    fp_a: &VideoFingerprint,
+    fp_b: &VideoFingerprint,
+    max_hamming_dist: u32,
+    (mirrored, reframed): (bool, Option<Reframing>),
+    a_is_lower: bool,
+) -> Evidence {
+    evidence_among(fp_a, fp_b, max_hamming_dist, &[Orientation { mirrored, reframed }], a_is_lower)
+}
+
+fn evidence_among(
+    fp_a: &VideoFingerprint,
+    fp_b: &VideoFingerprint,
+    max_hamming_dist: u32,
+    orientations: &[Orientation],
+    a_is_lower: bool,
+) -> Evidence {
     // The pair was measured every way round and kept the orientation that
     // covered more (`better_orientation`), so the frames shown are taken the
     // same way: each orientation of `a` against `b`, and each one-sided
@@ -2333,26 +2383,36 @@ pub fn evidence(fp_a: &VideoFingerprint, fp_b: &VideoFingerprint, max_hamming_di
         let pct = |ms: u64, total: u32| if total > 0 { ms as f64 / total as f64 } else { 0.0 };
         pct(ms(&e.stretches_a), fp_a.total_ms).max(pct(ms(&e.stretches_b), fp_b.total_ms))
     };
-    let mut chosen = evidence_as(fp_a, fp_b, max_hamming_dist);
-    for o in &Orientation::all()[1..] {
+    let turned_back = |e: Evidence| Evidence {
+        pairs: e.pairs.iter().map(|&(tb, ta, d)| (ta, tb, d)).collect(),
+        stretches_a: e.stretches_b,
+        stretches_b: e.stretches_a,
+    };
+    let mut chosen: Option<Evidence> = None;
+    for o in orientations {
+        // Which file the orientation is read from: both for a one-sided one,
+        // and for a symmetric one the file the scan read it from.
+        let (from_a, from_b) = if o.symmetric() { (a_is_lower, !a_is_lower) } else { (true, true) };
         let mut candidates = Vec::new();
-        if o.fits(fp_a, fp_b) {
-            candidates.push(evidence_as(&o.apply(fp_a), fp_b, max_hamming_dist));
-        }
-        if !o.symmetric() && o.fits(fp_b, fp_a) {
-            let e = evidence_as(&o.apply(fp_b), fp_a, max_hamming_dist);
-            candidates.push(Evidence {
-                pairs: e.pairs.iter().map(|&(tb, ta, d)| (ta, tb, d)).collect(),
-                stretches_a: e.stretches_b,
-                stretches_b: e.stretches_a,
-            });
+        if *o == Orientation::PLAIN {
+            // No copy to make: plain is the fingerprint as it is, and the same
+            // question from either side.
+            candidates.push(evidence_as(fp_a, fp_b, max_hamming_dist));
+        } else {
+            if from_a && o.fits(fp_a, fp_b) {
+                candidates.push(evidence_as(&o.apply(fp_a), fp_b, max_hamming_dist));
+            }
+            if from_b && o.fits(fp_b, fp_a) {
+                candidates.push(turned_back(evidence_as(&o.apply(fp_b), fp_a, max_hamming_dist)));
+            }
         }
         for e in candidates {
-            if best(&e) > best(&chosen) {
-                chosen = e;
+            if chosen.as_ref().is_none_or(|c| best(&e) > best(c)) {
+                chosen = Some(e);
             }
         }
     }
+    let chosen = chosen.unwrap_or_default();
     let mut pairs = chosen.pairs;
     pairs.sort_unstable();
     Evidence { pairs, ..chosen }
@@ -2597,6 +2657,8 @@ struct Orientation {
 }
 
 impl Orientation {
+    const PLAIN: Orientation = Orientation { mirrored: false, reframed: None };
+
     /// Every orientation, plain first: that order is the tie-break.
     fn all() -> Vec<Orientation> {
         let mut out = vec![
@@ -3419,6 +3481,7 @@ mod tests {
                 let rule = Rule { tol: Tolerance::for_distance(d), schedule: &witness_schedule() };
                 let (cov_a, cov_b, span_a, span_b) = match_overlap(&fp_a, &fp_b, rule, &mut Witnesses::new());
                 let ev = evidence(&fp_a, &fp_b, d);
+                assert_eq!(evidence_matched(&fp_a, &fp_b, d, (false, None), true), ev, "case {case} -d {d}: the orientation the scan chose");
                 let pct = |ms: u64, fp: &VideoFingerprint| (ms as f32 / fp.total_ms as f32).min(1.0);
                 assert_eq!(pct(covered(&ev.stretches_a), &fp_a), cov_a, "case {case} -d {d}: a's footage");
                 assert_eq!(pct(covered(&ev.stretches_b), &fp_b), cov_b, "case {case} -d {d}: b's footage");
@@ -3438,6 +3501,49 @@ mod tests {
                     assert!(ev.stretches_a.iter().any(|st| st.0 <= ta && ta < st.1));
                     assert!(ev.stretches_b.iter().any(|st| st.0 <= tb && tb < st.1), "case {case} -d {d}: {tb} is not matched footage of b");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn test_the_evidence_shown_covers_what_the_scan_measured_in_every_orientation() {
+        // A file, its mirrored copy, a copy cut down to its zoom, a plain copy
+        // and a stranger. The copy's own mirrored hashes are unrelated to the
+        // file, as two real mirrored hashes are not exact inverses: the scan
+        // mirrors the lower-numbered file, and the window has to measure the
+        // same side or it shows a match the scan never made -- or none.
+        let times: Vec<u32> = (0..6u32).map(|i| 10_000 + i * 1000).collect();
+        let hashes = |base: u64| -> Vec<u64> { (0..6u64).map(|i| distinct_hash(base + i)).collect() };
+        let mut a = mock_fp_at(hashes(0), times.clone());
+        a.mirrored_hashes = hashes(100);
+        let zoom = REFRAMINGS.iter().position(|&r| r == Reframing::Zoom).unwrap();
+        a.reframed = vec![crate::fingerprint::Reframed::default(); REFRAMINGS.len()];
+        a.reframed[zoom] = crate::fingerprint::Reframed {
+            samples: (0..6).collect(),
+            hashes: hashes(200).iter().map(|&h| [h, h.rotate_left(7), 0, 0]).collect(),
+        };
+        let mut mirrored = mock_fp_at(hashes(100), times.clone());
+        mirrored.mirrored_hashes = hashes(500);
+        let fps = vec![
+            a,
+            mirrored,
+            mock_fp_at(hashes(200), times.clone()),
+            mock_fp_at(hashes(0), times.clone()),
+            mock_fp_at(hashes(400), times.clone()),
+        ];
+        let matches = find_all_matches(&fps, 4, 0.2, 0.0);
+        assert!(matches.iter().any(|m| (m.a, m.b, m.mirrored) == (0, 1, true)), "the mirrored copy is found mirrored");
+        assert!(matches.iter().any(|m| m.reframed == Some(Reframing::Zoom)), "the cut-down copy is found zoomed");
+        assert!(matches.iter().all(|m| m.a != 4 && m.b != 4), "the stranger matches nothing");
+        let index = MatchIndex::new(matches.clone());
+        let covered = |st: &[(u32, u32)], fp: &VideoFingerprint| {
+            (st.iter().map(|&(s, e)| (e - s) as u64).sum::<u64>() as f32 / fp.total_ms as f32).min(1.0)
+        };
+        for m in &matches {
+            for (x, y) in [(m.a, m.b), (m.b, m.a)] {
+                let ev = evidence_matched(&fps[x], &fps[y], 4, index.orientation(x, y).unwrap(), x < y);
+                assert_eq!(covered(&ev.stretches_a, &fps[x]), index.coverage(x, y).unwrap(), "{x} against {y}");
+                assert_eq!(covered(&ev.stretches_b, &fps[y]), index.coverage(y, x).unwrap(), "{x} against {y}");
             }
         }
     }

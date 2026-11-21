@@ -264,27 +264,45 @@ impl Found {
         let cost = |a: usize, b: usize| {
             crate::progress::evidence_cost(fingerprints[a].valid_hashes.len(), fingerprints[b].valid_hashes.len())
         };
-        let total: u64 = rows.iter().flatten().flat_map(|(idx, _, partners)| partners.iter().map(|&o| cost(*idx, o))).sum();
+        // Each comparison once. Groups overlap, so one member's best link and
+        // its link to a representative recur in every group it is in; the
+        // evidence is a function of the ordered pair alone, so it is measured
+        // once and handed to each.
+        let mut wanted: Vec<(usize, usize)> =
+            rows.iter().flatten().flat_map(|(idx, _, partners)| partners.iter().map(move |&o| (*idx, o))).collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let total: u64 = wanted.iter().map(|&(a, b)| cost(a, b)).sum();
         crate::progress::learn(|k| k.evidence = Some(total as f64));
-        let done = crate::progress::begin_counted(
-            crate::progress::Stage::Saving,
-            total,
-            rows.iter().map(|r| r.len() as u64).sum(),
-        );
-        let groups = rows
+        let done = crate::progress::begin_counted(crate::progress::Stage::Saving, total, wanted.len() as u64);
+        let measured: HashMap<(usize, usize), crate::compare::Evidence> = wanted
             .into_par_iter()
+            .map(|(a, b)| {
+                // Measured the way round the scan matched them. Every partner is
+                // a file the member matched (its best link, or the representative
+                // of a star it is in), so the orientation is always known; the
+                // full sweep is only a fallback for a caller that says otherwise.
+                let (fa, fb) = (&fingerprints[a], &fingerprints[b]);
+                let evidence = match matches.orientation(a, b) {
+                    Some(way) => crate::compare::evidence_matched(fa, fb, tolerance, way, a < b),
+                    None => crate::compare::evidence(fa, fb, tolerance),
+                };
+                done.add(1, cost(a, b));
+                ((a, b), evidence)
+            })
+            .collect();
+        let groups = rows
+            .into_iter()
             .map(|members| Group {
                 members: members
                     .into_iter()
                     .map(|(idx, best, partners)| {
                         // Its seconds blank where the runtime is.
                         let seconds_known = fingerprints[idx].duration > 0.0;
-                        let weight: u64 = partners.iter().map(|&o| cost(idx, o)).sum();
                         let compared = partners
                             .into_iter()
-                            .map(|o| Comparison::of(crate::compare::evidence(&fingerprints[idx], &fingerprints[o], tolerance), number[&o], tolerance))
+                            .map(|o| Comparison::of(measured[&(idx, o)].clone(), number[&o], tolerance))
                             .collect();
-                        done.add(1, weight);
                         Member {
                             file: number[&idx],
                             compared,

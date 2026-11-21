@@ -59,7 +59,8 @@ one differs, it is said below.
   user chose matched frames over side-by-side playback. Each `Member` carries
   `compared`: against its best link (first) and the group's reference, the
   matched frame pairs (thinned to `found::MOST_PAIRS`), and each side's
-  matched stretches, made by `compare::evidence`. The window decodes each
+  matched stretches, made by `compare::evidence_matched` in the orientation
+  the scan recorded for the link. The window decodes each
   frame with `thumbnail::frame_at` through `Thumbs` (`Size::at(ms)`), draws a
   chart (`Chart`: bar, link band, bar, on ONE time scale, the shorter slid
   to the offset most pairs agree on, `alignment`, so a real copy draws
@@ -75,7 +76,8 @@ one differs, it is said below.
   is found by the scan's own clock: the first keyframe is the anchor, and in a
   container whose clock may restart (TS/PS) a keyframe index replaying that
   clock is read once per file and the frame found by byte position, since one
-  timestamp can occur in each `cat`ted segment.
+  timestamp can occur in each `cat`ted segment. The last few files' indexes
+  are kept (`thumbnail::KEPT_INDEXES`), not every file's for the session.
 - Strip of groups and the tree view by folder (`folders.rs`) as in img-fp; a
   group's face is its KEEP file. Marks are on the file (by number in
   `Found::files`), so a mark shows in every group the file is in.
