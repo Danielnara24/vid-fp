@@ -380,8 +380,8 @@ Trash. Folders given on its command line are the ones to scan
   and KEEP, DELETE or REVIEW exactly as the report would say it.
 - *Rank by* picks which copy is kept, as `-k` does. Every ranking is worked
   out during the scan, so switching scans nothing again.
-- *Compare…* (or C) shows the frames the scan matched between a video and
-  its best match, side by side with their times. A chart above draws both
+- The compare button beside each video (or C) shows the frames the scan
+  matched between a video and its best match, side by side with their times. A chart above draws both
   videos on one time scale with a line per pair: when the pairs agree on
   where one video sits in the other, it is drawn there and the lines run
   straight down; crossing lines are frames that only look alike. The zoom

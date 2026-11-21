@@ -909,7 +909,7 @@ impl Results {
         }
         let pill = gtk::Label::builder().css_classes(["suggest"]).valign(gtk::Align::Center).build();
         let compare = gtk::Button::builder()
-            .label("Compare…")
+            .icon_name("view-dual-symbolic")
             .valign(gtk::Align::Center)
             .focusable(false)
             .tooltip_text("Compare it with what it matched, frame by frame (C)")
