@@ -90,6 +90,11 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.41.1" date="2026-11-20">
+      <description>
+        <p>The Flatpak is available again. Nothing else changed from 0.41.0.</p>
+      </description>
+    </release>
     <release version="0.41.0" date="2026-11-20">
       <description>
         <p>Many more kinds of copies are found: mirrored videos, vertical and zoomed re-uploads, a video shown inside another, 4:3 and letterboxed broadcasts with captions in the bars, and clips whose frames fall between the source's keyframes. Each frame is compared on a second, finer hash, which keeps unrelated look-alikes apart. Videos sampled at every frame no longer match unrelated footage by chance, and comparing is faster. Every video is fingerprinted again once after the update.</p>
