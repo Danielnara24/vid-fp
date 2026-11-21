@@ -416,8 +416,8 @@ nothing.
 | `-p`, `--match-percent <F>` | Min % of overlap to count as a duplicate, from `0` to `100`. Lower includes shorter matches, at the cost of false positives. `0` turns the gate off and reports every pair sharing any footage at all; a pair sharing none is never reported | `20.0` |
 | `--min-duration <SECS>` | Min shared clip length in seconds for a match. Videos shorter than this are skipped entirely. `0` = off | `0.0` |
 | `-k`, `--priority <P>` | Criteria for KEEPING files: `length`, `resolution`, `quality`, or `size`. The chosen one is compared first, the rest follow in the default order. See [Codecs and quality](#codecs-and-quality) | `length` |
-| `--keyframe-interval <F>` | Seconds between sampled keyframes (`0` = every keyframe). Higher is faster, but makes short matches harder to find | `0.0` |
-| `--min-keyframes <F>` | Min keyframes kept for short videos (only relevant when keyframe-interval > 0; `0` = no floor). Raising it is not monotonic — see [Tuning](#tuning) | `12.0` |
+| `--keyframe-interval <F>` | Seconds between sampled keyframes (`0` = every keyframe). Only reaches videos longer than interval × `--min-keyframes`. Higher is faster, but makes short matches harder to find | `0.0` |
+| `--min-keyframes <F>` | Min keyframes kept for short videos (only relevant when keyframe-interval > 0; `0` = no floor). Higher finds more and costs time on short videos. See [Tuning](#tuning) | `64.0` |
 | `-o`, `--output <FILE>` | Optional path to save the report: `.txt`, `.csv`, or `.json`. `-` writes it to stdout | |
 | `--format <FORMAT>` | Write the report as `txt`, `csv`, or `json`, whatever `--output` is called | from the extension |
 | `--delete` | Move files marked DELETE to the trash | off |
@@ -521,14 +521,23 @@ costs recall, since a moment neither file sampled cannot match.
 `--min-keyframes` stops that from gutting short videos: when
 `duration / --min-keyframes` is finer than the interval, that finer spacing is
 used instead, so every video keeps at least that many samples. `0` removes the
-floor and leaves the interval to apply at every length. Moving `--min-keyframes`
-is nearly free on a library of long videos, and is most of the cost on a library of short clips.
+floor and leaves the interval to apply at every length.
 
-**Raising `--min-keyframes` is not monotone**, unlike `-d` and `-p`. Coverage is
-the span each hash stands for, so a denser sample makes every hash stand for
-less. Extra samples that match nothing dilute a pair's coverage and can push it
-under `-p`, taking the pair out of the report. If you change either flag, check 
-that the groups you expect are still there.
+So the interval only reaches videos longer than interval × `--min-keyframes`
+seconds. At the default of 64 and an interval of 30, that is videos over 32
+minutes; everything shorter is sampled 64 times. On two test libraries
+(1,201 and 612 files), raising `--min-keyframes` found more matches at every
+interval up to the highest value tried (80), and was the better trade than a
+shorter interval: an interval of 29 at the default floor scanned in 30-50% of
+the time of every keyframe for 1-5 points less F1, at half the memory. Past an
+interval of about 30 the scan barely gets faster, because the long videos it
+thins out are a small part of the work.
+
+Raising `--min-keyframes` is not strictly monotone, unlike `-d` and `-p`.
+Coverage is the span each hash stands for, so a denser sample makes every hash
+stand for less. Extra samples that match nothing can dilute a pair's coverage
+under `-p` and take the pair out of the report. If you change either flag,
+check that the groups you expect are still there.
 
 ## Codecs and quality
 

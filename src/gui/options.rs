@@ -141,7 +141,7 @@ pub static KF_INTERVAL: Opt = Opt {
     ..plain("kf_interval", Some("kf_interval"), number(0.0, || 3600.0, 1.0, 1), l::KF_INTERVAL)
 };
 pub static MIN_KEYFRAMES: Opt = Opt {
-    hint: Some("With an interval, a short video still keeps this many keyframes. 4, 12, 20 and 28 work well; 8 and 16 miss some."),
+    hint: Some("With an interval, a short video still keeps this many keyframes. Higher finds more matches and takes longer on short videos."),
     ..plain("min_kf_samples", Some("min_kf_samples"), number(0.0, || 1000.0, 1.0, 0), l::MIN_KEYFRAMES)
 };
 
@@ -335,7 +335,7 @@ mod tests {
     fn the_defaults_are_the_command_lines() {
         assert_eq!(TOLERANCE.default_value(), Value::Number(6.0));
         assert_eq!(MATCH_PERCENT.default_value(), Value::Number(20.0));
-        assert_eq!(MIN_KEYFRAMES.default_value(), Value::Number(12.0));
+        assert_eq!(MIN_KEYFRAMES.default_value(), Value::Number(64.0));
         assert!(EXTENSIONS.default_value().text().split(',').any(|e| e == "mkv"));
         assert!(RECURSIVE.default_value().on() && !SYMLINKS.default_value().on());
     }

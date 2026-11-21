@@ -636,19 +636,22 @@ struct Args {
     /// Seconds between sampled keyframes (0 = decode every keyframe)
     ///
     /// Long videos sample at this interval; short ones use a finer spacing so
-    /// they keep at least --min-keyframes samples. Higher is faster, but makes
-    /// short matches harder to find. Negative and non-finite values are refused.
+    /// they keep at least --min-keyframes samples, so the interval only reaches
+    /// videos longer than interval x --min-keyframes seconds. Higher is faster
+    /// on those, but makes short matches in them harder to find. Negative and
+    /// non-finite values are refused.
     #[arg(long = "keyframe-interval", value_name = "F", default_value_t = 0.0)]
     kf_interval: f64,
 
     /// Minimum keyframes to keep for short videos
     ///
     /// Only used when --keyframe-interval is above 0; 0 removes the floor.
-    /// Raising it is NOT monotonic: denser sampling makes each hash stand for a
-    /// shorter span, so frames that match nothing dilute a pair's coverage and
-    /// can push it under --match-percent. 4, 12, 20 and 28 measure well; 8 and
-    /// 16 lose pairs. Negative and non-finite values are refused.
-    #[arg(long = "min-keyframes", value_name = "F", default_value_t = 12.0)]
+    /// Higher finds more matches and costs decode time, mostly on libraries of
+    /// short videos. It is not strictly monotonic: denser sampling makes each
+    /// hash stand for a shorter span, so frames that match nothing can dilute a
+    /// pair's coverage under --match-percent. Negative and non-finite values
+    /// are refused.
+    #[arg(long = "min-keyframes", value_name = "F", default_value_t = 64.0)]
     min_kf_samples: f64,
 
     /// Property that decides which file to KEEP
