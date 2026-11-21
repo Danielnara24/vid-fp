@@ -368,6 +368,19 @@ jobs:
             exit 1
           fi
 
+      - name: Take the image's Flatpak installation off its lower layer
+        # The image ships the runtimes preinstalled in a lower layer of its
+        # overlay filesystem, and on runners whose overlayfs cannot redirect a
+        # directory rename out of one, updating them fails with EXDEV
+        # ("Invalid cross-device link"), which flatpak-builder then reports as
+        # exit 139. A copy lives wholly in the writable layer, where renames
+        # work. 0.41.0's first run failed exactly so.
+        run: |
+          for d in $(flatpak --installations) "$HOME/.local/share/flatpak"; do
+            [ -d "$d" ] || continue
+            cp -a "$d" "$d.copy" && rm -rf "$d" && mv "$d.copy" "$d"
+          done
+
       - name: Build
         uses: flatpak/flatpak-github-actions/flatpak-builder@v6
         with:
