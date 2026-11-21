@@ -90,6 +90,11 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.42.1" date="2026-11-21">
+      <description>
+        <p>The Compare button beside each video is now an icon.</p>
+      </description>
+    </release>
     <release version="0.42.0" date="2026-11-21">
       <description>
         <p>With a keyframe interval set, short videos now keep at least 64 keyframes instead of 12, which finds noticeably more matches.</p>
