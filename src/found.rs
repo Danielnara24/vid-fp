@@ -185,6 +185,10 @@ impl Default for Found {
     }
 }
 
+/// One member of a group before its comparisons are made: the file, its
+/// strongest link inside the group, and the files it is to be compared with.
+type Row = (usize, Option<crate::compare::GroupLink>, Vec<usize>);
+
 impl Found {
     /// The scan's groups, labelled as the report labels them under each
     /// ranking.
@@ -233,26 +237,54 @@ impl Found {
                 }
             })
             .collect();
-        let groups = groups
+        // Each member's row and the files it is compared with, first, so the
+        // run's bar can be told what the comparisons weigh before they run: a
+        // comparison is a frame-by-frame measurement, about the product of the
+        // two sample counts, and on a library of long videos it is seconds.
+        let rows: Vec<Vec<Row>> = groups
             .par_iter()
-            .map(|group| Group {
-                members: group
+            .map(|group| {
+                group
                     .iter()
                     .map(|&idx| {
                         // The report's row: the strongest link inside this
-                        // group, its seconds blank where the runtime is.
+                        // group.
                         let best = matches.links_of(idx, group, fingerprints).into_iter().next();
-                        let seconds_known = fingerprints[idx].duration > 0.0;
                         // Against its best link and the representative, each
                         // once, never itself.
                         let mut partners: Vec<usize> = best.as_ref().map(|l| l.other).into_iter().collect();
                         if group[0] != idx && !partners.contains(&group[0]) {
                             partners.push(group[0]);
                         }
+                        (idx, best, partners)
+                    })
+                    .collect()
+            })
+            .collect();
+        let cost = |a: usize, b: usize| {
+            crate::progress::evidence_cost(fingerprints[a].valid_hashes.len(), fingerprints[b].valid_hashes.len())
+        };
+        let total: u64 = rows.iter().flatten().flat_map(|(idx, _, partners)| partners.iter().map(|&o| cost(*idx, o))).sum();
+        crate::progress::learn(|k| k.evidence = Some(total as f64));
+        let done = crate::progress::begin_counted(
+            crate::progress::Stage::Saving,
+            total,
+            rows.iter().map(|r| r.len() as u64).sum(),
+        );
+        let groups = rows
+            .into_par_iter()
+            .map(|members| Group {
+                members: members
+                    .into_iter()
+                    .map(|(idx, best, partners)| {
+                        // Its seconds blank where the runtime is.
+                        let seconds_known = fingerprints[idx].duration > 0.0;
+                        let weight: u64 = partners.iter().map(|&o| cost(idx, o)).sum();
                         let compared = partners
                             .into_iter()
                             .map(|o| Comparison::of(crate::compare::evidence(&fingerprints[idx], &fingerprints[o], tolerance), number[&o], tolerance))
                             .collect();
+                        done.add(1, weight);
                         Member {
                             file: number[&idx],
                             compared,

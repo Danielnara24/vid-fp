@@ -20,7 +20,6 @@ use clap_complete::Shell;
 use compare::{find_all_matches, max_hamming_distance, MatchIndex, HASH_BITS};
 use export::{Disposal, Format, ReportTarget, Sink};
 use fingerprint::{fingerprint_video, VideoFingerprint, MAX_DECODE_THREADS};
-use indicatif::{ProgressBar, ProgressState, ProgressStyle};
 use log::info;
 use rayon::prelude::*;
 use redb::{Database, DatabaseError, ReadableTable, StorageError, TableDefinition};
@@ -1306,6 +1305,9 @@ struct Job {
     path: String,
     stamp: Stamp,
     weight: u64,
+    /// Keyframes the decode will hash, as the weighing pass counted them; 0
+    /// before it has, or when it could not. Only the progress bar reads it.
+    keyframes: u64,
     size: u64,
     /// Byte-identical copies of this file that are waiting too. Not decoded:
     /// each takes this file's fingerprint under its own path, or its failure,
@@ -1337,7 +1339,7 @@ struct Job {
 /// the whole range from a stalled thread to a workstation spans one character.
 /// The file name to the right does shift by that character, which is the price of
 /// the tighter spacing and the reason the digits are held to three.
-fn work_rate(per_sec: f64) -> String {
+pub(crate) fn work_rate(per_sec: f64) -> String {
     // The dash is "no reading", and it is also where anything unusable lands:
     // the rate is a division by an elapsed time that starts at zero, so the
     // first tick of a run can hand this an absurdity, and a bar is the wrong
@@ -1368,39 +1370,6 @@ fn work_rate(per_sec: f64) -> String {
         return unmeasurable();
     }
     format!("{} {}/s", number, unit)
-}
-
-/// The bar for the weighing pass, which counts FILES.
-///
-/// The decode bar measures work, and cannot be imitated here for the reason this
-/// pass exists at all: nothing has measured any work yet. A count is honest
-/// about that, and the two bars are visibly different jobs rather than one bar
-/// that appears to restart.
-///
-/// It exists because this pass is silent and, on the run it was written for, was
-/// most of the wall clock: 229k files under `-x '*'`, an `avformat_open_input`
-/// each, and the only thing on screen was a "Found 229112 files. Fingerprinting"
-/// printed minutes before any fingerprinting started. On an ordinary library it
-/// is over in well under a second and the bar is a flicker, which is the right
-/// trade in the direction that matters -- the case it explains is the slow one.
-fn weighing_bar(files: usize, quiet: bool) -> ProgressBar {
-    // Under the desktop app the bar is the window's (`progress`).
-    if let Some(pb) = progress::spoken(files as u64, progress::Stage::Weighing) {
-        return pb;
-    }
-    if quiet {
-        return ProgressBar::hidden();
-    }
-
-    let pb = ProgressBar::new(files as u64);
-    pb.set_style(
-        ProgressStyle::with_template(
-            "{elapsed_precise} \u{2502} [{bar:28.cyan/blue}] \u{2502} {percent}% \u{2502} {pos}/{len} \u{2502} measuring decode cost",
-        )
-        .unwrap()
-        .progress_chars("=>-"),
-    );
-    pb
 }
 
 /// How wide the run actually gets to be, given what `--threads` asked for and
@@ -1682,10 +1651,10 @@ fn install_signal_handler() -> Result<()> {
             utils::request_shutdown();
             // Straight to stderr, not through the logger, so it still shows
             // under --quiet. The user pressed a key; they get an answer now.
-            eprintln!(
-                "\nInterrupt received — saving finished fingerprints to cache."
-            );
+            // Above the bar, which goes on drawing while the run winds down.
+            progress::println("\nInterrupt received — saving finished fingerprints to cache.");
         } else {
+            progress::clear_for_exit();
             eprintln!("\nSecond interrupt — quitting now.");
             std::process::exit(130);
         }
@@ -2715,7 +2684,10 @@ Interrupted with Ctrl-C.
                 return Ok(());
             }
 
-            writeln!(buf, "{}", line)
+            // Above the progress bar rather than through it.
+            let _ = buf;
+            progress::println(&line);
+            Ok(())
         })
         .init();
 
@@ -3148,25 +3120,6 @@ fn unpack_lookups(
     pass
 }
 
-/// A bar over a count of `len`, drawn in the style of the weighing bar, or the
-/// window's when the window is listening.
-fn content_bar(len: u64, stage: progress::Stage, unit: &str, quiet: bool) -> ProgressBar {
-    if let Some(pb) = progress::spoken(len, stage) {
-        return pb;
-    }
-    if quiet {
-        return ProgressBar::hidden();
-    }
-    let template = if unit == "bytes" {
-        "{elapsed_precise} \u{2502} [{bar:28.cyan/blue}] \u{2502} {percent}% \u{2502} {bytes}/{total_bytes} \u{2502} checking for identical copies"
-    } else {
-        "{elapsed_precise} \u{2502} [{bar:28.cyan/blue}] \u{2502} {percent}% \u{2502} {pos}/{len} \u{2502} identifying files"
-    };
-    let pb = ProgressBar::new(len);
-    pb.set_style(ProgressStyle::with_template(template).unwrap().progress_chars("=>-"));
-    pb
-}
-
 /// The identities the cache holds, sorted by what they can be used for.
 ///
 /// `current` are the records still describing a walked file as it is now: that
@@ -3281,7 +3234,6 @@ struct Identified {
 /// already fingerprinted are still reported as identical. See `content`.
 ///
 /// `Ok(None)` is an interrupt.
-#[allow(clippy::too_many_arguments)]
 fn identify(
     db: &Database,
     files: &HashMap<&str, &sources::ScannedFile>,
@@ -3289,7 +3241,6 @@ fn identify(
     todo: Vec<Job>,
     kf_interval: f64,
     min_kf_samples: f64,
-    quiet: bool,
 ) -> Result<Option<Identified>> {
     let index = IdentityIndex::open(db, files);
 
@@ -3306,8 +3257,8 @@ fn identify(
     // 1. Sample whatever has no identity yet.
     let unsampled: Vec<usize> = (0..paths.len()).filter(|&i| identities[i].is_none()).collect();
     if !unsampled.is_empty() {
-        progress::stage("Identifying files");
-        let bar = content_bar(unsampled.len() as u64, progress::Stage::Identifying, "files", quiet);
+        let n = unsampled.len() as u64;
+        let bar = progress::begin_counted(progress::Stage::Identifying, n, n);
         let sampled: Vec<(usize, Option<content::Identity>)> = unsampled
             .par_iter()
             .map(|&i| {
@@ -3325,11 +3276,10 @@ fn identify(
                         }
                     }
                 };
-                bar.inc(1);
+                bar.tick();
                 (i, found)
             })
             .collect();
-        bar.finish_and_clear();
         if shutdown_requested() {
             return Ok(None);
         }
@@ -3350,24 +3300,25 @@ fn identify(
         .filter(|&i| identities[i].is_some_and(|id| id.full.is_none()))
         .collect();
     if !to_read.is_empty() {
-        progress::stage("Checking for identical copies");
         let total: u64 = to_read.iter().map(|&i| files[paths[i].as_str()].size).sum();
-        let bar = content_bar(total, progress::Stage::Hashing, "bytes", quiet);
+        progress::learn(|k| k.hashing = Some(total));
+        let bar = progress::begin_counted(progress::Stage::Hashing, total, to_read.len() as u64);
         let read: Vec<(usize, Option<content::Digest>)> = to_read
             .par_iter()
             .map(|&i| {
                 let file = files[paths[i].as_str()];
-                let tick = |n: u64| bar.inc(n);
-                match content::digest(&file.path, file.size, &tick) {
+                let tick = |n: u64| bar.add(0, n);
+                let read = match content::digest(&file.path, file.size, &tick) {
                     Ok(d) => (i, d),
                     Err(e) => {
                         log::debug!("Could not read {} whole: {}", file.path, e);
                         (i, None)
                     }
-                }
+                };
+                bar.add(1, 0);
+                read
             })
             .collect();
-        bar.finish_and_clear();
         if shutdown_requested() {
             return Ok(None);
         }
@@ -3608,7 +3559,9 @@ fn run(
     // the thread budget's weights and the prune all read from this list. On a
     // network mount that is the difference between three round trips per file
     // and one.
-    progress::stage("Looking for videos");
+    // One bar for the whole run (`progress`), up until the report's listing.
+    let _bar = progress::start(active_threads);
+    progress::learn(|k| k.window = args.window_result.is_some());
     let mut library = match sources::collect(
         &sources::Sources {
             include: &args.include,
@@ -3786,6 +3739,10 @@ fn run(
     video_files.sort_by_key(|f| std::cmp::Reverse(f.size));
 
     let total_videos = video_files.len();
+    progress::learn(|k| {
+        k.files = total_videos;
+        k.bytes = video_files.iter().map(|f| f.size).sum();
+    });
 
     let kf_interval = args.kf_interval;
     let min_kf_samples = args.min_kf_samples;
@@ -3811,12 +3768,13 @@ fn run(
     // One snapshot for the whole pass rather than two transactions per file;
     // see `CacheView`. Nothing writes to either table between here and the
     // decode, so every worker reads the same cache the first one would have.
-    progress::stage("Reading the cache");
+    let read = progress::begin_counted(progress::Stage::CacheRead, total_videos as u64, total_videos as u64);
     let cache = CacheView::open(db);
 
     let lookups: Vec<Lookup> = video_files
         .par_iter()
         .map(|file| {
+            read.tick();
             // Thread count is deliberately NOT part of the stamp. Threading
             // changes only how fast frames arrive, never which ones, so a
             // fingerprint made with 8 threads is byte-identical to one made with
@@ -3863,6 +3821,7 @@ fn run(
                     // a placeholder, and the only thing that reads it before
                     // then is the `sort_by_key` that put this list in order.
                     weight: file.size,
+                    keyframes: 0,
                     size: file.size,
                     followers: Vec::new(),
                 }),
@@ -3888,6 +3847,11 @@ fn run(
     } = unpack_lookups(lookups, min_duration, total_videos, stats);
 
     let todo_count = todo.len();
+    progress::learn(|k| {
+        k.misses = Some((todo_count, todo.iter().map(|job| job.size).sum()));
+        k.cached_hashes =
+            (fingerprints.len(), fingerprints.iter().map(|fp| fp.valid_hashes.len() as u64).sum());
+    });
 
     let remembered = remembered_clause(remembered_not_media, remembered_failures);
     let remembered_refusals = remembered_not_media + remembered_failures;
@@ -3951,7 +3915,7 @@ fn run(
     // decode bar. It counts files rather than work: nothing here has measured
     // anything yet, which is the whole reason the pass exists.
     if !todo.is_empty() {
-        let wb = weighing_bar(todo.len(), args.quiet);
+        let wb = progress::begin_counted(progress::Stage::Weighing, todo.len() as u64, todo.len() as u64);
 
         let weighed: Vec<fingerprint::Weighed> = todo
             .par_iter()
@@ -3962,7 +3926,7 @@ fn run(
                 // running. Weighing a file this run will not decode costs
                 // nothing to say so.
                 let weighed = if shutdown_requested() {
-                    fingerprint::Weighed::Work(job.size)
+                    fingerprint::Weighed::Work(job.size, 0)
                 } else {
                     fingerprint::weigh_decode(
                         &job.path,
@@ -3972,18 +3936,18 @@ fn run(
                         job.size,
                     )
                 };
-                wb.inc(1);
+                wb.tick();
                 weighed
             })
             .collect();
-        wb.finish_and_clear();
 
         let mut kept: Vec<Job> = Vec::with_capacity(todo.len());
         let mut refused: Vec<(String, Stamp, Refusal)> = Vec::new();
         for (mut job, weighed) in std::mem::take(&mut todo).into_iter().zip(weighed) {
             match weighed {
-                fingerprint::Weighed::Work(weight) => {
+                fingerprint::Weighed::Work(weight, keyframes) => {
                     job.weight = weight;
+                    job.keyframes = keyframes;
                     kept.push(job);
                 }
                 // Worded, counted and exit-coded exactly as the decode would
@@ -4032,6 +3996,10 @@ fn run(
         // barely at all in the direction size predicts.
         todo.sort_by_key(|job| std::cmp::Reverse(job.weight));
     }
+    progress::learn(|k| {
+        k.misses = Some((todo.len(), todo.iter().map(|job| job.size).sum()));
+        k.decode_work = Some(todo.iter().map(|job| progress::decode_cost(job.weight, job.keyframes)).sum());
+    });
 
     if shutdown_requested() {
         return Ok(Outcome::Interrupted);
@@ -4053,7 +4021,6 @@ fn run(
             std::mem::take(&mut todo),
             kf_interval,
             min_kf_samples,
-            args.quiet,
         )?
         else {
             return Ok(Outcome::Interrupted);
@@ -4122,15 +4089,11 @@ fn run(
         // once when they have all joined -- see `refusals_store`.
         let refused_here: Mutex<Vec<(String, Stamp, Refusal)>> = Mutex::new(Vec::new());
 
-        // Files finished. The bar's own position is decode work, so it cannot
-        // answer "how many videos is that?" -- and that is the number a user
-        // quotes back. It rides in `{prefix}` rather than sharing `{msg}`
-        // with the file name because the two change on different events: the
-        // name when a decode STARTS, the count when one ENDS. Formatting both at
-        // claim time pinned the count at 0/6 for an entire six-file run -- every
-        // worker had claimed before anything finished, so the only reads of the
-        // counter all happened while it was still zero.
-        let files_done = AtomicUsize::new(0);
+        // The bar's own position is decode work, so it cannot answer "how
+        // many videos is that?" -- the counter's item count does, and it is
+        // moved when a decode ENDS while the file name moves when one STARTS.
+        // Formatting both at claim time once pinned the count at 0/6 for an
+        // entire six-file run.
 
         // The decodes running right now, keyed by their index in `todo`. The bar
         // has one line for a file name and up to `--threads` files in flight, so
@@ -4147,78 +4110,27 @@ fn run(
         // lock is taken twice per video, against decodes measured in seconds.
         let in_flight: Mutex<BTreeMap<usize, String>> = Mutex::new(BTreeMap::new());
 
-        // The bar measures WORK, not files and no longer bytes. Its denominator
-        // is the same `total_weight` the thread budget is apportioned against, so
-        // the bar and the scheduler agree about what half-done means; counting
-        // files did not, and with inputs spanning three orders of magnitude a
-        // count is close to meaningless -- a run can sit at 90% for most of its
-        // wall time. Counting bytes agreed with the scheduler but was wrong in
-        // the same place the scheduler was, and being consistently wrong is what
-        // let a bar cross 50% a quarter of the way through a mixed-codec folder.
-        //
-        // What is on screen changed with it. The position itself is a count of
-        // decoded keyframe-pixels, which nobody wants the raw value of, so it
-        // shows as a percentage; the byte pair that used to stand next to it is
-        // gone, because "3.2GB of 54GB" describes something the bar is no longer
-        // measuring and the two would disagree in front of the user.
-        //
-        // The RATE survives, and is the one field here worth the plumbing. It is
-        // the same speedometer the old {bytes_per_sec} was -- indicatif's own
-        // windowed estimate, so it reads current speed rather than the run's
-        // average -- but denominated in the work, which is what makes it steady:
-        // megabytes a second swung by a factor of five between a high-bitrate
-        // remux and a well-compressed encode of identical footage, while the
-        // pixel rate is a property of the machine and barely moves.
-        //
-        // Still no ETA. The weight is a much better predictor than the size was,
-        // but it predicts DECODE cost, and the tail of a run is threads going
-        // idle rather than work being done -- a rate extrapolated across that
-        // reads high for most of a scan and then stalls.
-        let pb = if let Some(pb) =
-            progress::spoken(total_weight.min(u64::MAX as u128) as u64, progress::Stage::Fingerprinting)
-        {
-            // The window's bar (`progress`): it reads the same prefix and
-            // message the terminal's would show.
-            pb.set_prefix(format!("0/{}", todo_count));
-            pb
-        } else if args.quiet {
-            ProgressBar::hidden()
-        } else {
-            let pb = ProgressBar::new(total_weight.min(u64::MAX as u128) as u64);
-            pb.set_style(
-                ProgressStyle::with_template(
-                    "{elapsed_precise} \u{2502} [{bar:28.cyan/blue}] \u{2502} {percent}% \u{2502} {work_rate} \u{2502} {prefix} \u{2502} {msg}",
-                )
-                .unwrap()
-                .with_key("work_rate", |state: &ProgressState, w: &mut dyn std::fmt::Write| {
-                    let _ = w.write_str(&work_rate(state.per_sec()));
-                })
-                .progress_chars("=>-"),
-            );
-            // Five fields of digits with only spaces between them read as one
-            // long number at a glance, so they are ruled apart. A box-drawing
-            // bar rather than an ASCII pipe: it cannot be confused with the `|`
-            // that shows up in file names, and the run already prints text that
-            // assumes a UTF-8 terminal.
-            //
-            // The bar is narrower than the 40 it used to be, because the size
-            // pair, the rate and the rules all have to fit on the same line as
-            // the file name -- a line that wraps redraws as two and flickers.
-            // `{wide_msg}` looked like the tidier answer, since it truncates the
-            // name to the space left instead of wrapping, but it renders the
-            // message empty once the bar has any colour in it and the name
-            // simply vanished a second into every run.
-            pb.set_prefix(format!("0/{}", todo_count));
-            pb
-        };
+        // The run's bar (`progress`) measures this stage in WORK, not files and
+        // not bytes: the weighing pass's keyframe-pixels, plus the fixed cost of
+        // hashing each keyframe (`progress::decode_cost`). Counting files is
+        // close to meaningless with inputs spanning three orders of magnitude,
+        // and counting bytes let a bar cross 50% a quarter of the way through a
+        // mixed-codec folder. The files finished are its count, the file it is
+        // waiting on comes after, and the rate between them is decode work a
+        // second over the last few seconds, which is a property of the machine
+        // and barely moves where megabytes a second swung fivefold.
+        let pb = progress::begin_counted(
+            progress::Stage::Fingerprinting,
+            todo.iter().map(|job| progress::decode_cost(job.weight, job.keyframes)).sum(),
+            todo_count as u64,
+        );
 
         let workers = active_threads.min(todo_count).max(1);
         let todo = &todo;
         let budget = &budget;
         let cursor = &cursor;
         let collected = &collected;
-        let pb = &pb;
-        let files_done = &files_done;
+        let pb = &*pb;
         let in_flight = &in_flight;
         let newly_cached = &newly_cached;
         let refused_here = &refused_here;
@@ -4245,9 +4157,7 @@ fn run(
                     // the queue and a bar that ended short of full would be the
                     // lie the old per-file `inc` was already avoiding.
                     let finish = |idx: usize, job: &Job, charged: u64| {
-                        let done = files_done.fetch_add(1, Ordering::Relaxed) + 1;
-                        pb.set_prefix(format!("{}/{}", done, todo_count));
-                        pb.inc(job.weight.saturating_sub(charged));
+                        pb.add(1, progress::decode_cost(job.weight, job.keyframes).saturating_sub(charged));
 
                         let mut open = in_flight.lock().unwrap_or_else(|e| e.into_inner());
                         open.remove(&idx);
@@ -4261,10 +4171,7 @@ fn run(
                         // between every pair of decodes, and every ending that
                         // leaves the bar up -- an interrupt, a decode that
                         // outlives its neighbours -- ends with it stale.
-                        match open.iter().next() {
-                            Some((_, name)) => pb.set_message(name.clone()),
-                            None => pb.set_message(String::new()),
-                        }
+                        progress::detail(open.iter().next().map(|(_, name)| name.clone()).unwrap_or_default());
                     };
 
                     loop {
@@ -4300,52 +4207,62 @@ fn run(
                                 in_flight.lock().unwrap_or_else(|e| e.into_inner());
                             open.insert(idx, file_name);
                             if let Some((_, name)) = open.iter().next() {
-                                pb.set_message(name.clone());
+                                progress::detail(name.clone());
                             }
                         }
 
-                        // How far into this file the demuxer has got, and how much
+                        // How far into this file the decode has got, and how much
                         // of the file's weight that has already been credited to
-                        // the bar. `fingerprint_video` reports a byte offset per
-                        // packet, which on a linearly scanned container is
-                        // thousands of times a second and far more often than the
-                        // bar can redraw; PROGRESS_STEP_BYTES is what turns that
-                        // firehose into a bounded number of increments.
+                        // the bar. Two parts, because the decode does two things
+                        // one after the other: it reads and decodes, which
+                        // `fingerprint_video` reports as a byte offset per
+                        // packet, and then it hashes the frames it kept, which it
+                        // reports frame by frame (`Step`). The first is charged
+                        // the file's keyframe-pixels by its byte fraction, the
+                        // second its keyframes' hashing by the frames hashed
+                        // (`progress::decode_cost`). Charged by bytes alone, a
+                        // ProRes file reached the end of its bytes at 3.8 s of
+                        // an 8 s decode and the bar then sat still.
                         //
-                        // The two are in different units, which is why there are
-                        // two of them: the demuxer can only say where it is in
-                        // BYTES, and the bar is measured in decode work. The
-                        // conversion is the file's own byte fraction, i.e. it
-                        // assumes this file's keyframes are spread evenly through
-                        // it -- true enough to move a bar with, and it does not
-                        // accumulate error, because the offsets are absolute and
+                        // A byte offset per packet is thousands a second on a
+                        // linearly scanned container; PROGRESS_STEP_BYTES turns
+                        // that firehose into a bounded number of increments. The
+                        // offsets are absolute, so nothing accumulates error, and
                         // `finish` pays whatever rounding left owing.
                         //
                         // `Cell`s because the hook has to stay `Fn` and the
                         // totals have to outlive it -- this closure is built
                         // fresh per video and never leaves this thread.
                         let charged_bytes = Cell::new(0u64);
-                        let charged_work = Cell::new(0u64);
-                        let advance = |pos: u64| {
-                            // Clamped, never a delta from the raw offset: a seek
-                            // that lands short walks the offset BACKWARDS, and an
-                            // offset past the size we stat'ed (a file being
-                            // appended to as we read it) would overrun the bar.
-                            // Only forward movement inside the file counts.
-                            let reached = pos.min(job.size);
-                            if reached.saturating_sub(charged_bytes.get()) < PROGRESS_STEP_BYTES {
-                                return;
+                        let charged_read = Cell::new(0u64);
+                        let charged_hashing = Cell::new(0u64);
+                        let hashing = progress::decode_cost(job.weight, job.keyframes) - job.weight;
+                        let charged_work = || charged_read.get() + charged_hashing.get();
+                        let advance = |step: fingerprint::Step| match step {
+                            fingerprint::Step::Read(pos) => {
+                                // Clamped, never a delta from the raw offset: a
+                                // seek that lands short walks the offset
+                                // BACKWARDS, and an offset past the size we
+                                // stat'ed (a file being appended to as we read
+                                // it) would overrun the bar. Only forward
+                                // movement inside the file counts.
+                                let reached = pos.min(job.size);
+                                if reached.saturating_sub(charged_bytes.get()) < PROGRESS_STEP_BYTES || job.size == 0 {
+                                    return;
+                                }
+                                charged_bytes.set(reached);
+                                let work = (job.weight as u128 * reached as u128 / job.size as u128) as u64;
+                                pb.add(0, work.saturating_sub(charged_read.get()));
+                                charged_read.set(work.max(charged_read.get()));
                             }
-                            charged_bytes.set(reached);
-
-                            if job.size == 0 {
-                                return;
+                            fingerprint::Step::Hashed(done, of) => {
+                                if of == 0 {
+                                    return;
+                                }
+                                let work = (hashing as u128 * done.min(of) as u128 / of as u128) as u64;
+                                pb.add(0, work.saturating_sub(charged_hashing.get()));
+                                charged_hashing.set(work.max(charged_hashing.get()));
                             }
-                            let work =
-                                (job.weight as u128 * reached as u128 / job.size as u128) as u64;
-                            let delta = work.saturating_sub(charged_work.get());
-                            charged_work.set(work);
-                            pb.inc(delta);
                         };
 
                         let decoded = fingerprint_video(
@@ -4377,7 +4294,7 @@ fn run(
                                 for _ in std::iter::once(job).chain(&job.followers) {
                                     stats.skipped_short.bump();
                                 }
-                                finish(idx, job, charged_work.get());
+                                finish(idx, job, charged_work());
                                 continue;
                             }
                             Err(e) => {
@@ -4420,7 +4337,7 @@ fn run(
                                         }
                                     }
                                 }
-                                finish(idx, job, charged_work.get()); // Work attempted
+                                finish(idx, job, charged_work()); // Work attempted
                                 continue;
                             }
                         };
@@ -4461,7 +4378,7 @@ fn run(
                             local.push((idx, made));
                         }
 
-                        finish(idx, job, charged_work.get());
+                        finish(idx, job, charged_work());
                     }
 
                     collected
@@ -4472,7 +4389,7 @@ fn run(
             }
         });
 
-        pb.finish_and_clear();
+        progress::detail(String::new());
 
         let remember = refused_here.lock().unwrap_or_else(|e| e.into_inner()).split_off(0);
         if let Err(e) = refusals_store(db, &remember) {
@@ -4518,7 +4435,6 @@ fn run(
     }
 
     info!("\nFingerprinting complete. Cross-analyzing {} videos...", n);
-    progress::stage("Comparing videos");
 
     // Samples closer together than the comparison can tell apart are folded
     // into one before anything is measured (see `compare::thin_samples`).
@@ -4526,6 +4442,16 @@ fn run(
 
     // Which fingerprints are the library's, by their place in the list.
     let library_side: Vec<bool> = fingerprints.iter().map(|f| held_paths.contains(&f.path)).collect();
+
+    // What the comparison is in hash pairs: every pair of the run's hashes,
+    // or under `--against` the product of the two sides'.
+    progress::learn(|k| {
+        let (mut held, mut scanned) = (0.0, 0.0);
+        for (fp, &lib) in fingerprints.iter().zip(&library_side) {
+            *(if lib { &mut held } else { &mut scanned }) += fp.valid_hashes.len() as f64;
+        }
+        k.hash_pairs = Some(if answering { held * scanned } else { scanned * scanned / 2.0 });
+    });
 
     let matches = if answering {
         compare::find_matches_across(&fingerprints, &library_side, max_hamming, min_match_pct, min_duration)
@@ -4542,7 +4468,8 @@ fn run(
     } else {
         info!("Grouping duplicate clusters...");
     }
-    progress::stage("Grouping duplicates");
+    progress::learn(|k| k.matches = Some(matches.len()));
+    progress::begin(progress::Stage::Grouping);
 
     // Clustering only needs to know which pairs matched -- it decides membership
     // and nothing else. The coverage figures travel separately to the report,
@@ -4618,7 +4545,6 @@ fn run(
     }
 
     if let Some(path) = &args.window_result {
-        progress::stage("Saving the results");
         found::Found::of(&final_groups, &fingerprints, &matches, total_videos, max_hamming).save(path)?;
     }
 
@@ -4983,6 +4909,7 @@ mod tests {
                 path: String::new(),
                 stamp: stamp(0, 0),
                 weight,
+                keyframes: 0,
                 size: 0,
                 followers: Vec::new(),
             })
@@ -5288,6 +5215,7 @@ mod tests {
                 path: "/videos/new.mkv".to_string(),
                 stamp: stamp(1_700_000_000, 12_345),
                 weight: 12_345,
+                keyframes: 0,
                 size: 12_345,
                 followers: Vec::new(),
             })
@@ -6871,6 +6799,7 @@ mod tests {
                 min_kf_samples: 12.0,
             },
             weight: file.size,
+            keyframes: 0,
             size: file.size,
             followers: Vec::new(),
         }
@@ -6892,7 +6821,7 @@ mod tests {
         let by_path: HashMap<&str, &sources::ScannedFile> =
             files.iter().map(|f| (f.path.as_str(), f)).collect();
         let todo = files[hits.len()..].iter().map(|f| job_for(f, kf_interval)).collect();
-        identify(db, &by_path, hits, todo, kf_interval, 12.0, true).unwrap().unwrap()
+        identify(db, &by_path, hits, todo, kf_interval, 12.0).unwrap().unwrap()
     }
 
     /// Fingerprint everything under `dir` the ordinary way, so the cache holds

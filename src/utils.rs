@@ -45,9 +45,8 @@ pub fn shutdown_requested() -> bool {
 /// rightly so -- the file wants it -- but the terminal is still meant to be
 /// silent. Anything drawing on stderr at Info level has to ask this as well.
 ///
-/// A flag rather than a parameter because the one caller is inside `compare`,
-/// which would otherwise thread a bool through `find_all_matches` and every one
-/// of its twenty-odd test call sites to reach a progress bar. Relaxed for the
+/// A flag rather than a parameter because the caller is `progress::start`,
+/// which every stage reaches through a global rather than a threaded bool. Relaxed for the
 /// same reason `SHUTDOWN` is: it is a hint about pixels, not a data handoff.
 static CONSOLE_QUIET: AtomicBool = AtomicBool::new(false);
 

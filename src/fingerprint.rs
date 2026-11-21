@@ -1022,7 +1022,7 @@ const ASSUMED_KEYFRAME_SECONDS: f64 = 2.0;
 /// proxy, rescaled so a file nothing is known about lands among the ones that
 /// were measured instead of swamping them or vanishing beside them: the same 753
 /// files average 3.8 keyframe-pixels per byte.
-const WORK_PER_BYTE: f64 = 3.8;
+pub(crate) const WORK_PER_BYTE: f64 = 3.8;
 
 /// How much decoding this file is going to cost, in keyframe-pixels.
 ///
@@ -1071,7 +1071,7 @@ pub fn weigh_decode(
 
     match weigh_from_container(filepath, kf_interval, min_kf_samples, min_duration) {
         Ok(Some(weighed)) => weighed,
-        Ok(None) => Weighed::Work(from_bytes()),
+        Ok(None) => Weighed::Work(from_bytes(), 0),
         Err(e) => Weighed::Undecodable(e),
     }
 }
@@ -1089,8 +1089,11 @@ pub fn weigh_decode(
 /// file opened twice, and a progress bar denominated in the bytes of files that
 /// finish the instant they are looked at.
 pub enum Weighed {
-    /// Estimated decode cost, in keyframe-pixels.
-    Work(u64),
+    /// Estimated decode cost, in keyframe-pixels, and the keyframes that
+    /// counted (0 when the cost came from the file's bytes). The thread budget
+    /// reads the cost; the progress bar also charges each keyframe the fixed
+    /// cost of hashing it (`progress::KEYFRAME_PIXELS`).
+    Work(u64, u64),
     /// No decode is going to happen, and this is the error it would have raised.
     /// The caller reports it now and never opens the file again.
     Undecodable(anyhow::Error),
@@ -1296,6 +1299,7 @@ fn weigh_from_container(
 
     Ok(Some(Weighed::Work(
         ((keyframes as f64) * (pixels as f64) * cost).max(1.0) as u64,
+        keyframes.max(0) as u64,
     )))
 }
 
@@ -2003,11 +2007,21 @@ impl Hasher {
 /// which says whether a reframing applies).
 #[cfg(test)]
 fn hash_frames_both_ways(u_frames: &[u8]) -> (Vec<u64>, Vec<u64>, Vec<bool>) {
-    let h = hash_frames_fully(u_frames, (0, 0));
+    let h = hash_frames_fully(u_frames, (0, 0), &|_| {});
     (h.hashes, h.mirrored, h.flat)
 }
 
-pub(crate) fn hash_frames_fully(u_frames: &[u8], dims: (u32, u32)) -> Hashed {
+/// What `fingerprint_video` tells its caller as it goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// The demuxer has reached this byte offset of the video stream.
+    Read(u64),
+    /// This many of the sampled frames are hashed, of so many.
+    Hashed(usize, usize),
+}
+
+/// `on_frame` is told how many frames are hashed so far, as each next one starts.
+pub(crate) fn hash_frames_fully(u_frames: &[u8], dims: (u32, u32), on_frame: &dyn Fn(usize)) -> Hashed {
     let n_unique = u_frames.len() / FRAME_STRIDE;
     let mut hasher = Hasher::new();
     let mut out = Hashed {
@@ -2019,7 +2033,10 @@ pub(crate) fn hash_frames_fully(u_frames: &[u8], dims: (u32, u32)) -> Hashed {
         reframed: vec![Vec::with_capacity(n_unique); REFRAMINGS.len()],
     };
 
-    for frame in u_frames.chunks_exact(FRAME_STRIDE) {
+    for (i, frame) in u_frames.chunks_exact(FRAME_STRIDE).enumerate() {
+        if i > 0 {
+            on_frame(i);
+        }
         let (rect, tiny) = frame_crop_or_tiny(frame);
         let coefficients = hasher.coefficients(frame, rect);
         out.hashes.push(hash_of(&coefficients));
@@ -2094,6 +2111,12 @@ fn mirror_coefficients(c: &[f32; KEEP * KEEP]) -> [f32; KEEP * KEEP] {
 /// bar once at the end. Rate-limiting is the caller's job -- this fires per
 /// packet, and on a linear-scanning container that is thousands of times a
 /// second.
+///
+/// Then, once the file is read, it is handed `Step::Hashed` for each sampled
+/// frame hashed: the frames are kept as they are decoded and hashed after the
+/// last one, and that is a stretch of its own. On a ProRes file (every frame a
+/// keyframe) the read ended at 3.8 s of an 8 s decode, and a bar that moved by
+/// bytes alone then sat still for the other four.
 pub fn fingerprint_video(
     filepath: &str,
     kf_interval: f64,
@@ -2101,7 +2124,7 @@ pub fn fingerprint_video(
     decode_threads: usize,
     min_duration: f64,
     file_size: u64,
-    progress: &dyn Fn(u64),
+    progress: &dyn Fn(Step),
 ) -> Result<Option<VideoFingerprint>> {
     // 1. Native Zero-Copy Extraction (No Subprocess Overhead)
     let mut ictx = open_video(filepath)?;
@@ -2553,7 +2576,7 @@ pub fn fingerprint_video(
         // the same thing to a smaller degree.
         let pos = packet.position();
         if pos >= 0 {
-            progress(pos as u64);
+            progress(Step::Read(pos as u64));
         }
 
         if !packet.is_key() {
@@ -2823,7 +2846,7 @@ pub fn fingerprint_video(
     // u_frames holds n_unique * FRAME_STRIDE bytes; the frame count is the time list.
     let n_unique = unique_frame_times.len();
 
-    let hashed = hash_frames_fully(&u_frames, (width, height));
+    let hashed = hash_frames_fully(&u_frames, (width, height), &|done| progress(Step::Hashed(done, n_unique)));
     let (hashes, mirrored, flat) = (&hashed.hashes, &hashed.mirrored, &hashed.flat);
 
     // Frame pixels are no longer needed; release the large buffer (munmap) now
@@ -3224,7 +3247,7 @@ mod tests {
 
         let under = duration - 0.01;
         assert!(
-            matches!(weigh_decode(&filepath, 0.0, 4.0, under, size), Weighed::Work(_)),
+            matches!(weigh_decode(&filepath, 0.0, 4.0, under, size), Weighed::Work(..)),
             "a floor under the runtime is not one this file falls under"
         );
         assert!(
@@ -3245,7 +3268,7 @@ mod tests {
         );
 
         assert!(
-            matches!(weigh_decode(&filepath, 0.0, 4.0, 0.0, size), Weighed::Work(_)),
+            matches!(weigh_decode(&filepath, 0.0, 4.0, 0.0, size), Weighed::Work(..)),
             "0 turns the flag off and nothing is short"
         );
     }
@@ -3267,8 +3290,10 @@ mod tests {
         let filepath = path.to_string_lossy().to_string();
 
         let offsets = std::cell::RefCell::new(Vec::new());
-        fingerprint_video(&filepath, 0.0, 4.0, 1, 0.0, size, &|pos| {
-            offsets.borrow_mut().push(pos)
+        fingerprint_video(&filepath, 0.0, 4.0, 1, 0.0, size, &|step| {
+            if let Step::Read(pos) = step {
+                offsets.borrow_mut().push(pos)
+            }
         })
         .unwrap()
         .expect("the fixture fingerprints");
@@ -3305,8 +3330,10 @@ mod tests {
         let filepath = path.to_string_lossy().to_string();
 
         let offsets = std::cell::RefCell::new(Vec::new());
-        fingerprint_video(&filepath, 0.0, 4.0, 1, 0.0, size, &|pos| {
-            offsets.borrow_mut().push(pos)
+        fingerprint_video(&filepath, 0.0, 4.0, 1, 0.0, size, &|step| {
+            if let Step::Read(pos) = step {
+                offsets.borrow_mut().push(pos)
+            }
         })
         .unwrap()
         .expect("the fixture fingerprints");
@@ -3793,7 +3820,7 @@ mod tests {
         let path = fixture_path();
         let size = std::fs::metadata(&path).unwrap().len();
         assert!(
-            matches!(weigh_decode(&path.to_string_lossy(), 0.0, 4.0, 0.0, size), Weighed::Work(_)),
+            matches!(weigh_decode(&path.to_string_lossy(), 0.0, 4.0, 0.0, size), Weighed::Work(..)),
             "the fixture is a real MP4 and scores 100 on its first 2 KB"
         );
     }
@@ -3804,7 +3831,7 @@ mod tests {
     /// asserting about a number, so the verdict is unwrapped in one place.
     fn work_of(weighed: Weighed) -> u64 {
         match weighed {
-            Weighed::Work(weight) => weight,
+            Weighed::Work(weight, _) => weight,
             Weighed::Undecodable(e) => panic!("expected a weight, got a verdict: {:#}", e),
             Weighed::TooShort(d) => panic!("expected a weight, got a {:.2}s skip", d),
         }

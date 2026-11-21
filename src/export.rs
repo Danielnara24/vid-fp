@@ -1277,6 +1277,9 @@ pub fn output_results(
     assume_yes: bool,
     stats: &RunStats,
 ) -> Result<Vec<String>> {
+    // The run's bar comes down before the listing and the confirmation prompt:
+    // a prompt under a redrawing bar is a prompt nobody can read.
+    crate::progress::finish();
 
     // --- Pass 1: resolve each file's fate across ALL groups ------------------
     // Groups overlap, so a file can appear in several groups with different

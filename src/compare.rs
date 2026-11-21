@@ -1,6 +1,6 @@
 use crate::fingerprint::{Reframing, VideoFingerprint, REFRAMINGS};
 use crate::utils::shutdown_requested;
-use indicatif::{ProgressBar, ProgressStyle};
+use crate::progress::{self, Batch, Counter};
 use log::info;
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -1017,7 +1017,7 @@ fn candidate_pairs(
     masks: &[u16],
     max_hamming_dist: u32,
 ) -> Vec<(usize, usize)> {
-    candidate_pairs_probing(fingerprints, fingerprints, masks, max_hamming_dist, false)
+    candidate_pairs_probing(fingerprints, fingerprints, masks, max_hamming_dist, false, &Counter::default())
 }
 
 /// `candidate_pairs`, with each lower-numbered file `a` probing the index with
@@ -1028,12 +1028,16 @@ fn candidate_pairs(
 /// Proposes a subset of what `candidate_pairs_probing` does, and drops only
 /// pairs that measure to nothing; which route runs is purely a question of
 /// speed (`index_is_cheaper`).
+///
+/// Each probe file's row is reported to `done` when it is finished, weighing
+/// `row_weights[q]` (`scan_row_weights`).
 fn candidate_pairs_scanning(
     fingerprints: &[VideoFingerprint],
     probes: &[VideoFingerprint],
     rules: Rules,
     both_ways: bool,
     wanted: &(impl Fn(usize, usize) -> bool + Sync),
+    (row_weights, done): (&[u64], &Counter),
 ) -> Vec<(usize, usize)> {
     let n = fingerprints.len();
     // A frame can only be admitted inside the rule's own widest reach, which
@@ -1059,14 +1063,46 @@ fn candidate_pairs_scanning(
         .flat_map_iter(|q| {
             let probe = &probes[q].valid_hashes;
             let first = if both_ways { 0 } else { q + 1 };
-            (first..n).filter(move |&t| {
-                t != q
-                    && !probe.is_empty()
-                    && !shutdown_requested()
-                    && wanted(q, t)
-                    && any_frame(&probes[q], &fingerprints[t])
-            })
-            .map(move |t| (q, t))
+            let row: Vec<(usize, usize)> = (first..n)
+                .filter(move |&t| {
+                    t != q
+                        && !probe.is_empty()
+                        && !shutdown_requested()
+                        && wanted(q, t)
+                        && any_frame(&probes[q], &fingerprints[t])
+                })
+                .map(move |t| (q, t))
+                .collect();
+            done.add(1, row_weights[q]);
+            row
+        })
+        .collect()
+}
+
+/// What each probe file's row of `candidate_pairs_scanning` costs, in hash
+/// pairs: its hashes times the hashes of every file it is compared with. The
+/// same filter the scan applies, so a reframing measured only against portrait
+/// files weighs only what it compares.
+fn scan_row_weights(
+    fingerprints: &[VideoFingerprint],
+    probes: &[VideoFingerprint],
+    both_ways: bool,
+    wanted: &(impl Fn(usize, usize) -> bool + Sync),
+) -> Vec<u64> {
+    let n = fingerprints.len();
+    (0..n)
+        .into_par_iter()
+        .map(|q| {
+            let hq = probes[q].valid_hashes.len() as u64;
+            if hq == 0 {
+                return 0;
+            }
+            let first = if both_ways { 0 } else { q + 1 };
+            let others: u64 = (first..n)
+                .filter(|&t| t != q && wanted(q, t))
+                .map(|t| fingerprints[t].valid_hashes.len() as u64)
+                .sum();
+            hq * others
         })
         .collect()
 }
@@ -1109,12 +1145,16 @@ fn any_within(a: &[u64], a_detail: Option<&[u64]>, b: &[u64], b_detail: Option<&
     body(a, a_detail, b, b_detail, cap, loose)
 }
 
+///
+/// Each probe file's pass over one block is reported to `done`, weighing its
+/// hash count.
 fn candidate_pairs_probing(
     fingerprints: &[VideoFingerprint],
     probes: &[VideoFingerprint],
     masks: &[u16],
     max_hamming_dist: u32,
     both_ways: bool,
+    done: &Counter,
 ) -> Vec<(usize, usize)> {
     let n = fingerprints.len();
 
@@ -1188,6 +1228,7 @@ fn candidate_pairs_probing(
                         }
                     }
 
+                    done.add(1, fp_a.valid_hashes.len() as u64);
                     local
                 },
             )
@@ -2441,11 +2482,21 @@ fn find_matches_where(
     let route_t = std::time::Instant::now();
     // Every orientation is the same comparison of one library against itself,
     // so the two routes compare per orientation exactly as they do for one.
+    // Phase 1 is counted on the run's bar like any other stage: it is most of
+    // a warm scan's comparison, and it used to run with nothing on screen.
     let pairs: Vec<(usize, usize, usize)> = if index_is_cheaper(masks.len(), n, total_hashes) {
+        let probed: u64 = (0..orientations.len())
+            .map(|o| side(o).iter().map(|fp| fp.valid_hashes.len() as u64).sum::<u64>())
+            .sum();
+        let done = progress::begin_counted(
+            progress::Stage::Candidates,
+            probed * BLOCKS as u64,
+            (orientations.len() * BLOCKS * n) as u64,
+        );
         let mut candidates: Vec<(usize, usize, usize)> = Vec::new();
         for (o, orientation) in orientations.iter().enumerate() {
             candidates.extend(
-                candidate_pairs_probing(fingerprints, side(o), &masks, widest, !orientation.symmetric())
+                candidate_pairs_probing(fingerprints, side(o), &masks, widest, !orientation.symmetric(), &done)
                     .into_iter()
                     .map(|(q, t)| (q, t, o)),
             );
@@ -2458,10 +2509,29 @@ fn find_matches_where(
         // outright -- two contiguous runs of u64, which is far cheaper per
         // comparison than a probe -- and only the pairs with some frame inside
         // the widest tolerance go on to be measured, as from the index.
+        let row_weights: Vec<Vec<u64>> = orientations
+            .iter()
+            .enumerate()
+            .map(|(o, orientation)| {
+                scan_row_weights(fingerprints, side(o), !orientation.symmetric(), &|q, t| wanted_as(o, q, t))
+            })
+            .collect();
+        let done = progress::begin_counted(
+            progress::Stage::Candidates,
+            row_weights.iter().flatten().sum(),
+            (orientations.len() * n) as u64,
+        );
         let mut candidates: Vec<(usize, usize, usize)> = Vec::new();
         for (o, orientation) in orientations.iter().enumerate() {
             candidates.extend(
-                candidate_pairs_scanning(fingerprints, side(o), rules, !orientation.symmetric(), &|q, t| wanted_as(o, q, t))
+                candidate_pairs_scanning(
+                    fingerprints,
+                    side(o),
+                    rules,
+                    !orientation.symmetric(),
+                    &|q, t| wanted_as(o, q, t),
+                    (&row_weights[o], &done),
+                )
                     .into_iter()
                     .map(|(q, t)| (q, t, o)),
             );
@@ -2478,21 +2548,30 @@ fn find_matches_where(
         return Vec::new();
     }
 
-    let pb = verification_bar(pairs.len() as u64);
+    // A pair costs the product of its two sample counts, so that is what it
+    // weighs on the bar; the count says pairs.
+    let cost = |&(q, t, o): &(usize, usize, usize)| {
+        (side(o)[q].valid_hashes.len() as u64 * fingerprints[t].valid_hashes.len() as u64).max(1)
+    };
+    let done = progress::begin_counted(
+        progress::Stage::Verifying,
+        pairs.iter().map(cost).sum(),
+        pairs.len() as u64,
+    );
 
     let mut matches = pairs
         .into_par_iter()
         .map_init(
-            || (Ticker::new(&pb), Witnesses::new()),
-            |(ticker, witnesses), task| {
-                ticker.tick();
-                measure(task, witnesses).map(|m| (task.2, m))
+            || (Batch::new(&done), Witnesses::new()),
+            |(batch, witnesses), task| {
+                let m = measure(task, witnesses).map(|m| (task.2, m));
+                batch.add(cost(&task));
+                m
             },
         )
         .flatten()
         .collect::<Vec<(usize, Match)>>();
 
-    pb.finish_and_clear();
     // A pair proposed several ways round keeps the orientation that matched
     // most, the earliest in `Orientation::all` on a tie -- the plain one first.
     matches.sort_by_key(|(o, m)| (m.a, m.b, *o));
@@ -2623,89 +2702,6 @@ fn better_orientation(normal: Option<Match>, mirrored: Option<Match>) -> Option<
             if m.coverage_a.max(m.coverage_b) > n.coverage_a.max(n.coverage_b) { Some(m) } else { Some(n) }
         }
         (n, m) => n.or(m),
-    }
-}
-
-/// The bar phase 2 runs under.
-///
-/// Phase 1 announces how many pairs it proposed and then, until this existed,
-/// went silent for the whole of the verification. At the defaults that is a
-/// fifth of a second and nobody notices; at a loose `-d` over a large library it
-/// is minutes of a program that looks hung, immediately after a decode stage
-/// that reported itself continuously.
-///
-/// Shown at the same level as that stage's own log lines, so `--quiet` silences
-/// both -- and indicatif draws nothing when stderr is not a terminal, so a
-/// redirected run is unaffected either way. Unit tests install no logger at all,
-/// which leaves the max level at `Off` and the bar hidden; nothing here has to
-/// be told it is a test. Both halves of that are `utils::console_is_verbose`,
-/// which is not the same question as `log_enabled!(Info)` any more: `--log-file`
-/// raises the filter for its own sake, so under `-q --log-file` an Info line is
-/// enabled and bound for the file while the terminal stays silent.
-///
-/// No ETA, for the same reason the decode bar has none: a pair costs the product
-/// of the two files' sample counts, which spans orders of magnitude across a
-/// mixed library, so a rate extrapolated from the pairs done so far predicts the
-/// remainder badly.
-fn verification_bar(pairs: u64) -> ProgressBar {
-    // Under the desktop app the bar is the window's (`progress`).
-    if let Some(pb) = crate::progress::spoken(pairs, crate::progress::Stage::Comparing) {
-        return pb;
-    }
-    if pairs == 0 || !crate::utils::console_is_verbose() {
-        return ProgressBar::hidden();
-    }
-
-    let pb = ProgressBar::new(pairs);
-    pb.set_style(
-        ProgressStyle::with_template(
-            "{elapsed_precise} \u{2502} [{bar:28.cyan/blue}] \u{2502} {percent}% \u{2502} {human_pos}/{human_len} pairs",
-        )
-        .unwrap()
-        .progress_chars("=>-"),
-    );
-    pb
-}
-
-/// How many pairs one worker gets through before it touches the bar.
-///
-/// A pair is measured in microseconds and the bar redraws twenty times a second
-/// at most, so reporting each one is an atomic add on a line every thread is
-/// fighting over, bought entirely for pixels that are never drawn -- the same
-/// reasoning as `PROGRESS_STEP_BYTES` in the decode stage. At 512 a run of a
-/// million pairs still moves the bar two thousand times.
-const PAIRS_PER_REPORT: u64 = 512;
-
-/// A worker's unreported pair count, flushed to the bar in batches.
-///
-/// The flush on drop is what makes the batching invisible rather than merely
-/// coarse: rayon drops the per-worker state when that worker's slice is done, so
-/// the last partial batch is always accounted for and the bar lands on full
-/// however the pairs happened to be split.
-struct Ticker<'a> {
-    bar: &'a ProgressBar,
-    pending: u64,
-}
-
-impl<'a> Ticker<'a> {
-    fn new(bar: &'a ProgressBar) -> Self {
-        Ticker { bar, pending: 0 }
-    }
-
-    fn tick(&mut self) {
-        self.pending += 1;
-        if self.pending >= PAIRS_PER_REPORT {
-            self.bar.inc(self.pending);
-            self.pending = 0;
-        }
-    }
-}
-
-impl Drop for Ticker<'_> {
-    fn drop(&mut self) {
-        if self.pending > 0 {
-            self.bar.inc(self.pending);
-        }
     }
 }
 
