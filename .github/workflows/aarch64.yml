@@ -89,8 +89,8 @@ jobs:
         # fingerprints as it did when its report was reviewed. It is its own
         # sum, not x86_64's: libswscale's fast bilinear scaler rounds
         # differently in x86 SIMD than in the C code ARM runs, which moves one
-        # figure here (test_video_capture.ts matched 19.00 s of
-        # test_video_rescaled.ts, 27.00 s on x86_64 since the 128 working frame; the aarch64 sum below predates it and needs refreshing from this job's output) and about one link in
+        # figure here (test_video_capture.ts matched 29.00 s of
+        # test_video_rescaled.ts, 27.00 s on x86_64) and about one link in
         # eight on a real library, at the same accuracy. That is why the two
         # keep separate cache tables (lib.rs, CACHE_TABLE). x86_64's sum,
         # 445c2b370e95668d, is checked in release.yml. Refresh both when the
@@ -104,8 +104,8 @@ jobs:
             --cache "$RUNNER_TEMP/fx.redb" -o "$RUNNER_TEMP/fx.csv" || rc=$?
           if [ "$rc" -gt 2 ]; then echo "::error::vid-fp exited $rc"; exit 1; fi
           GOT="$(sed "s|$PWD/||g" "$RUNNER_TEMP/fx.csv" | sha256sum | cut -c1-16)"
-          if [ "$GOT" != "fc069cfa18f8b928" ]; then
-            echo "::error::the fixtures' report is $GOT, not the reviewed aarch64 fc069cfa18f8b928"
+          if [ "$GOT" != "8ee3b8920cd64beb" ]; then
+            echo "::error::the fixtures' report is $GOT, not the reviewed aarch64 8ee3b8920cd64beb"
             cat "$RUNNER_TEMP/fx.csv"
             exit 1
           fi
