@@ -62,7 +62,7 @@ include!(concat!(env!("OUT_DIR"), "/static_ffmpeg_version_check.rs"));
 /// the C code everywhere) was measured and declined: it cost every x86 user a
 /// re-decode and 2-6% of a cold scan for agreement no x86 user needs.
 const CACHE_TABLE: TableDefinition<&str, &[u8]> =
-    TableDefinition::new(concat!("fingerprints_dct_ct_ff8_s128", env!("VID_FP_ARCH_TABLE_SUFFIX")));
+    TableDefinition::new(concat!("fingerprints_dct_ct_ff8_turned", env!("VID_FP_ARCH_TABLE_SUFFIX")));
 
 /// Files this build looked at and refused before opening: see `NotMedia`.
 ///
@@ -77,7 +77,7 @@ const CACHE_TABLE: TableDefinition<&str, &[u8]> =
 /// A refusal is worth half a millisecond, so it can be discarded on the merest
 /// suspicion -- and it has to be, because it depends on things `Stamp`
 /// deliberately does not record: the vendored FFmpeg's demuxer set (`ff8`) and
-/// this tool's own gate (`probe5` = `FIRST_PROBE_BYTES`/`SECOND_PROBE_BYTES`/
+/// this tool's own gate (`probe6` = `FIRST_PROBE_BYTES`/`SECOND_PROBE_BYTES`/
 /// `NO_EVIDENCE`, and what a `NotMedia` counts). A `Refusal::Said` widens that
 /// list to everything the DECODE can decide, since it stores the sentence a run
 /// printed: which decoder answers fail a file, and the words they fail it in,
@@ -93,7 +93,7 @@ const CACHE_TABLE: TableDefinition<&str, &[u8]> =
 /// Per architecture like `CACHE_TABLE`, because one verdict it remembers --
 /// every sampled frame featureless -- is a judgement on the scaled pictures.
 const REFUSED_TABLE: TableDefinition<&str, &[u8]> =
-    TableDefinition::new(concat!("refused_ff8_probe5", env!("VID_FP_ARCH_TABLE_SUFFIX")));
+    TableDefinition::new(concat!("refused_ff8_probe6", env!("VID_FP_ARCH_TABLE_SUFFIX")));
 
 /// What each fingerprinted path held: absolute path -> bincode'd
 /// `content::Identity`.
@@ -218,7 +218,15 @@ const IDENTITY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("ident
 ///   value moved; frames whose picture is under a quarter of the frame kept as
 ///   usable; bars carrying a caption left unpeeled; and no `Strip` or `Cut43`
 ///   reframing, which an entry would load without and then never match under.
-const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 13] = [
+/// - `fingerprints_dct_ct_ff8_s128` holds, for any file whose container asks
+///   for its pictures to be turned (a phone's display matrix), hashes of the
+///   pictures as stored rather than as seen, so the file never matched a copy
+///   with the turn baked into its pixels, and the width and height of the
+///   stored buffer. For a Matroska file it also holds a `duration` read from
+///   the segment, which spans the audio, where the video track's own
+///   `DURATION` tag is now read first (`fingerprint::duration_seconds`). Same
+///   fields, same units, values moved, invisible to the `Stamp`.
+const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 14] = [
     TableDefinition::new("fingerprints"),
     TableDefinition::new("fingerprints_by_path"),
     TableDefinition::new("fingerprints_dct"),
@@ -232,6 +240,7 @@ const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 13] = [
     TableDefinition::new(concat!("fingerprints_dct_ct_ff8_framecrop", env!("VID_FP_ARCH_TABLE_SUFFIX"))),
     TableDefinition::new(concat!("fingerprints_dct_ct_ff8_detail", env!("VID_FP_ARCH_TABLE_SUFFIX"))),
     TableDefinition::new(concat!("fingerprints_dct_ct_ff8_inset", env!("VID_FP_ARCH_TABLE_SUFFIX"))),
+    TableDefinition::new(concat!("fingerprints_dct_ct_ff8_s128", env!("VID_FP_ARCH_TABLE_SUFFIX"))),
 ];
 
 /// Refusal tables earlier builds wrote. Kept apart from the list above because
@@ -274,11 +283,17 @@ const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 13] = [
 /// the entry that stops a later run ever opening the file again. The verdict is
 /// wrong now, nothing about the file changed, and no `Stamp` can tell: the
 /// entries have to go by name or those videos stay invisible for ever.
-const SUPERSEDED_REFUSAL_TABLES: [TableDefinition<&str, &[u8]>; 4] = [
+///
+/// `refused_ff8_probe5` holds `Refusal::TooShort` runtimes read from a
+/// Matroska segment, which spans the audio, where the video track's own
+/// `DURATION` tag is now read first. A remembered runtime answers before the
+/// header is read again, so it has to be measured the way the decode measures.
+const SUPERSEDED_REFUSAL_TABLES: [TableDefinition<&str, &[u8]>; 5] = [
     TableDefinition::new("refused_ff8_probe1"),
     TableDefinition::new("refused_ff8_probe2"),
     TableDefinition::new("refused_ff8_probe3"),
     TableDefinition::new("refused_ff8_probe4"),
+    TableDefinition::new(concat!("refused_ff8_probe5", env!("VID_FP_ARCH_TABLE_SUFFIX"))),
 ];
 
 /// Hard ceiling on the cache's page cache.
@@ -519,9 +534,17 @@ type CacheEntry = (Stamp, VideoFingerprint);
 /// for anyone that bites.
 ///
 /// Not a substitute for `-x '*'`: no list can name a file that has no extension.
-const DEFAULT_EXTENSIONS: [&str; 18] = [
+///
+/// The second ten came in together, each something a camera or an archive
+/// writes and FFmpeg demuxes: `mxf` (broadcast and cinema cameras), `m2t`
+/// (HDV camcorders), `mod`/`tod` (JVC and Panasonic SD camcorders), `dv`,
+/// `m2v` (elementary MPEG-2, a DVD's video track), `f4v` (Flash-era MP4),
+/// `rm`/`rmvb` (RealMedia) and `ogm`. `mod` is also a tracker-music suffix,
+/// the same loud-and-localised cost `.ts` carries.
+const DEFAULT_EXTENSIONS: [&str; 28] = [
     "mp4", "m4v", "mkv", "webm", "avi", "mov", "flv", "wmv", "asf", "mpg", "mpeg", "m2ts", "mts",
-    "ts", "vob", "ogv", "3gp", "divx",
+    "ts", "vob", "ogv", "3gp", "divx", "mxf", "m2t", "mod", "tod", "dv", "m2v", "f4v", "rm",
+    "rmvb", "ogm",
 ];
 
 #[derive(Parser, Debug)]
@@ -664,7 +687,8 @@ struct Args {
     /// written as text) unless --format overrides it. On stdout the report
     /// replaces the terminal listing rather than repeating it, and progress,
     /// warnings and prompts stay on stderr. A file actually named - is
-    /// reachable as ./-
+    /// reachable as ./-. A file the scan reads, or an existing file named like
+    /// a video, is refused rather than written over.
     #[arg(short = 'o', long = "output", value_name = "FILE",
           value_hint = clap::ValueHint::FilePath)]
     output: Option<String>,
@@ -774,7 +798,8 @@ struct Args {
     /// the run works, so this is where the unabridged list goes when you want
     /// to grep it. --quiet narrows the terminal and not this file, so the two
     /// together give a silent run and a full account on disk. Truncated at the
-    /// start of each run.
+    /// start of each run; a file the scan reads, or an existing file named like
+    /// a video, is refused.
     #[arg(long = "log-file", value_name = "PATH",
           value_hint = clap::ValueHint::FilePath)]
     log_file: Option<String>,
@@ -826,6 +851,20 @@ struct Args {
 enum Outcome {
     Completed,
     Interrupted,
+}
+
+/// Whether the files this disposal removes take their cache entries with them.
+///
+/// Only a permanent delete. A file sent to the Trash or moved under `--move-to`
+/// still exists, keeps its modification time and size, and is one restore away
+/// from its old path -- where the entry left in place makes it a cache hit, and
+/// its identity lets the content pass recognise it anywhere else. Forgetting
+/// both meant a restored library was decoded all over again, which the copy
+/// fallback's own care to carry the mtime across (`copy_durably`) was there to
+/// prevent. An entry for a file that never comes back is what `--prune-cache`
+/// collects.
+fn forgets(disposal: &Disposal) -> bool {
+    matches!(disposal, Disposal::Permanent)
 }
 
 /// What, if anything, the run is armed to do with the files marked DELETE.
@@ -1047,6 +1086,69 @@ fn report_target_for(output: Option<&str>, format: Option<Format>) -> Result<Opt
     }))
 }
 
+/// Refuse a report or log destination that is one of the videos this run reads.
+///
+/// Both are written over whatever is there -- the log is truncated at start-up,
+/// the report renamed over its destination at the end -- and neither flag is a
+/// disposal flag, so a report-only run promised to touch no video and
+/// `vid-fp a.mp4 b.mkv -o b.mkv` replaced `b.mkv` with a 570-byte listing.
+/// Asked before anything is opened, of the two things knowable then: a file the
+/// command line names, and an existing file named like a video, by the default
+/// list or by `-x`. A file named like nothing in particular that turns out to be
+/// a video (only reachable under `-x '*'`) is caught for the report by
+/// `report_replaces_an_input` once the run knows what it fingerprinted; the log
+/// file is already open by then, which is the one gap left, and it needs a
+/// video with no video extension to be named as the log.
+fn refuse_to_overwrite_an_input(flag: &str, target: &str, args: &Args) -> Result<()> {
+    if target == "-" {
+        return Ok(());
+    }
+    let path = Path::new(target);
+    if !std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
+        return Ok(());
+    }
+    let canonical = std::fs::canonicalize(path).ok();
+    let named = args
+        .include
+        .iter()
+        .filter(|p| p.as_str() != "-")
+        .any(|p| canonical.is_some() && std::fs::canonicalize(p).ok() == canonical);
+    let extension = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
+    let video_named = extension.is_some_and(|ext| {
+        DEFAULT_EXTENSIONS.contains(&ext.as_str())
+            || args.extensions.iter().any(|x| {
+                let x = x.trim().to_ascii_lowercase();
+                let x = x.trim_start_matches("*.").trim_start_matches('.');
+                !x.starts_with('!') && x != "*" && x == ext
+            })
+    });
+    if named || video_named {
+        anyhow::bail!(
+            "{} {} is {}, and writing there would replace it. Choose another file name.",
+            flag,
+            target,
+            if named { "one of the files this run scans" } else { "an existing video file" }
+        );
+    }
+    Ok(())
+}
+
+/// Whether the report would be written over a file this run fingerprinted,
+/// which is then certainly a video. See `refuse_to_overwrite_an_input`.
+fn report_replaces_an_input(target: Option<&ReportTarget>, fingerprints: &[VideoFingerprint]) -> Result<()> {
+    let Some(ReportTarget { sink: Sink::File(path), .. }) = target else { return Ok(()) };
+    let Ok(canonical) = std::fs::canonicalize(path) else { return Ok(()) };
+    if let Some(fp) = fingerprints.iter().find(|f| Path::new(&f.path) == canonical) {
+        anyhow::bail!(
+            "--output {} is {}, a video this run fingerprinted, and writing the report there \
+             would replace it. Nothing was touched; choose another file name.",
+            path.display(),
+            fp.path
+        );
+    }
+    Ok(())
+}
+
 /// Prove the report can be written where it is going, without writing anything
 /// that is still there afterwards.
 ///
@@ -1238,7 +1340,7 @@ fn run_from_report(
     // them, and it leaves no more behind than a scan refused by the loop guard.
     conjured.keep();
 
-    if !deleted_paths.is_empty() {
+    if !deleted_paths.is_empty() && forgets(&disposal) {
         match db {
             Some(db) => match cache_forget(db, &deleted_paths) {
                 Ok(forgotten) => {
@@ -2623,6 +2725,14 @@ Interrupted with Ctrl-C.
     // says nothing about them. See `utils::console_is_verbose`.
     if args.quiet {
         utils::silence_console();
+    }
+
+    // Before the log file is opened, which truncates it: see the function.
+    if let Some(path) = &args.log_file {
+        refuse_to_overwrite_an_input("--log-file", path, &args)?;
+    }
+    if let Some(path) = &args.output {
+        refuse_to_overwrite_an_input("--output", path, &args)?;
     }
 
     // Opened before the logger exists, so a bad path is reported by the ordinary
@@ -4438,6 +4548,9 @@ fn run(
         return Ok(Outcome::Interrupted);
     }
 
+    // Before anything is written or disposed of, on either ending below.
+    report_replaces_an_input(report_target.as_ref(), &fingerprints)?;
+
     let n = fingerprints.len();
     if n < 2 && !answering {
         info!("Not enough valid videos to compare.");
@@ -4456,6 +4569,16 @@ fn run(
     }
 
     info!("\nFingerprinting complete. Cross-analyzing {} videos...", n);
+
+    // One order, whatever the cache held. The list arrives as cache hits in
+    // size order followed by fresh decodes in decode-weight order, so a cold
+    // scan and a warm rescan of the same unchanged library handed the
+    // comparison two different lists -- and the comparison is not indifferent
+    // to order: ties in the star cover go to the lower index, and a mirrored
+    // link is measured from the lower-numbered file's side. On the generated
+    // corpus the two runs wrote different reports, down to one file that was
+    // KEEP cold and DELETE warm. Sorted by path, they are byte-identical.
+    fingerprints.sort_by(|a, b| a.path.cmp(&b.path));
 
     // Samples closer together than the comparison can tell apart are folded
     // into one before anything is measured (see `compare::thin_samples`).
@@ -4596,12 +4719,12 @@ fn run(
         let _ = out.flush();
     }
 
-    // Those files are no longer where they were, so the fingerprints filed
-    // under their paths describe nothing at all. Deliberately BEFORE the
-    // interrupt check below: the removals have already happened, and stopping is
-    // no reason to leave the cache claiming otherwise. It is one small
-    // transaction either way.
-    if !deleted_paths.is_empty() {
+    // Those files are gone for good, so the fingerprints filed under their
+    // paths describe nothing at all (see `forgets` for why only for good).
+    // Deliberately BEFORE the interrupt check below: the removals have already
+    // happened, and stopping is no reason to leave the cache claiming
+    // otherwise. It is one small transaction either way.
+    if !deleted_paths.is_empty() && disposal.as_ref().is_some_and(forgets) {
         match cache_forget(db, &deleted_paths) {
             Ok(forgotten) => {
                 log::debug!("Dropped {} cache entry(ies) for removed file(s).", forgotten)
@@ -6144,6 +6267,84 @@ mod tests {
         }
 
         (library, dir.path().join("plan.csv"))
+    }
+
+    /// A report-only run touches no video, so neither the report nor the log
+    /// may be written over one. `vid-fp a.mp4 b.mkv -o b.mkv` replaced `b.mkv`
+    /// with the listing, and `--log-file` truncated its target at start-up.
+    #[test]
+    fn test_a_report_or_a_log_is_never_written_over_a_video() {
+        let dir = tempfile::tempdir().unwrap();
+        let (library, _) = library_with_a_pair(&dir);
+        let (a, b) = (library.join("a.mp4"), library.join("b.mp4"));
+        let (a, b) = (a.to_string_lossy().to_string(), b.to_string_lossy().to_string());
+        let size = std::fs::metadata(&b).unwrap().len();
+
+        // Named on the command line, by either flag.
+        let args = Args::parse_from(["vid-fp", &a, &b, "-o", &b]);
+        assert!(refuse_to_overwrite_an_input("--output", &b, &args).is_err());
+        assert!(refuse_to_overwrite_an_input("--log-file", &b, &args).is_err());
+
+        // Not scanned, but an existing file named like a video, by the default
+        // list or by -x.
+        let elsewhere = dir.path().join("keep.mkv");
+        std::fs::copy(&a, &elsewhere).unwrap();
+        let elsewhere = elsewhere.to_string_lossy().to_string();
+        assert!(refuse_to_overwrite_an_input("--output", &elsewhere, &args).is_err());
+        let odd = dir.path().join("clip.dat");
+        std::fs::copy(&a, &odd).unwrap();
+        let odd = odd.to_string_lossy().to_string();
+        let with_dat = Args::parse_from(["vid-fp", &a, "-x", "*.DAT,!mkv"]);
+        assert!(refuse_to_overwrite_an_input("--output", &odd, &with_dat).is_err());
+        assert!(refuse_to_overwrite_an_input("--output", &odd, &args).is_ok(), "not a video name without -x");
+
+        // The ordinary cases stay allowed: an earlier report, a new file, stdout.
+        let report = dir.path().join("report.csv");
+        std::fs::write(&report, "old").unwrap();
+        assert!(refuse_to_overwrite_an_input("--output", &report.to_string_lossy(), &args).is_ok());
+        let new = dir.path().join("new.mp4").to_string_lossy().to_string();
+        assert!(refuse_to_overwrite_an_input("--output", &new, &args).is_ok(), "nothing there to lose");
+        assert!(refuse_to_overwrite_an_input("--output", "-", &args).is_ok());
+
+        // A video with no video name, reached under -x '*': caught once the
+        // run knows what it fingerprinted, before anything is written.
+        let hidden = library.join("c.bin");
+        std::fs::copy(&a, &hidden).unwrap();
+        let db = temp_db(&dir);
+        let err = run_error(&dir, &db, &["-r", "-x", "*", "-o", &hidden.to_string_lossy()]);
+        assert!(err.contains("a video this run fingerprinted"), "{err}");
+        assert_eq!(std::fs::metadata(&hidden).unwrap().len(), size, "and it is intact");
+        assert_eq!(std::fs::metadata(&b).unwrap().len(), size);
+    }
+
+    /// A file sent to the Trash or moved aside keeps its cache entry, so
+    /// putting it back is a cache hit rather than a re-decode; only a
+    /// permanent delete forgets.
+    #[test]
+    fn test_a_file_moved_aside_keeps_its_fingerprint_and_a_deleted_one_does_not() {
+        for (flags, kept) in [(&["--move-to"][..], true), (&["--delete", "--permanent"][..], false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let (library, _) = library_with_a_pair(&dir);
+            let db = temp_db(&dir);
+            let dest = dir.path().join("aside");
+            let mut extra: Vec<String> = flags.iter().map(|s| s.to_string()).collect();
+            if kept {
+                extra.push(dest.to_string_lossy().to_string());
+            }
+            let root = library.to_string_lossy().to_string();
+            let mut argv = vec!["vid-fp".to_string(), root];
+            argv.extend(extra);
+            let stats = RunStats::default();
+            assert!(matches!(
+                run(&Args::parse_from(argv), Some(&db), Instant::now(), 1, &stats),
+                Ok(Outcome::Completed)
+            ));
+            let gone: Vec<PathBuf> = ["a.mp4", "b.mp4"].iter().map(|n| library.join(n)).filter(|p| !p.exists()).collect();
+            assert_eq!(gone.len(), 1, "one copy of the pair went ({flags:?})");
+            let path = std::fs::canonicalize(&library).unwrap().join(gone[0].file_name().unwrap());
+            let remembered = cached_paths(&db).contains(&path.to_string_lossy().to_string());
+            assert_eq!(remembered, kept, "{flags:?}");
+        }
     }
 
     #[test]

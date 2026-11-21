@@ -448,10 +448,49 @@ fn rational_f64(r: ffmpeg_next::Rational) -> f64 {
     r.numerator() as f64 / r.denominator() as f64
 }
 
+/// A Matroska track's own runtime, from the `DURATION` tag mkvmerge and FFmpeg
+/// write per track (`HH:MM:SS.nnnnnnnnn`), or `None` when there is none.
+///
+/// Matroska has no per-stream duration field, so libavformat leaves
+/// `stream.duration` unset and the only runtime it reports is the SEGMENT's --
+/// the longest track, which is very often the audio. A 60 s picture with 61.5 s
+/// of sound read as 61.5 s, a full second and a half past the MP4 copy of the
+/// same picture, and that was enough to win the length ranking for a 360p
+/// copy over a 1080p one. The tag is the video track's own figure.
+fn tagged_track_duration(stream: &ffmpeg_next::format::stream::Stream<'_>) -> Option<f64> {
+    let metadata = stream.metadata();
+    let value = metadata
+        .iter()
+        .find(|(k, _)| {
+            let k = k.to_ascii_uppercase();
+            k == "DURATION" || k.starts_with("DURATION-")
+        })
+        .map(|(_, v)| v.to_string())?;
+    parse_clock(&value)
+}
+
+/// `HH:MM:SS(.fraction)` as seconds, for `tagged_track_duration`.
+fn parse_clock(value: &str) -> Option<f64> {
+    let mut parts = value.trim().split(':');
+    let (h, m, s) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() {
+        return None;
+    }
+    let h: f64 = h.parse().ok()?;
+    let m: f64 = m.parse().ok()?;
+    let s: f64 = s.parse().ok()?;
+    let total = h * 3600.0 + m * 60.0 + s;
+    (total.is_finite() && total > 0.0 && h >= 0.0 && m >= 0.0 && s >= 0.0).then_some(total)
+}
+
 /// The runtime the container claims, in seconds, or <= 0 when it never said.
 ///
 /// Lifted out of `fingerprint_video` unchanged so the header-completeness check
 /// below can ask the same question and get the same answer.
+///
+/// The video stream's own figure first, then a Matroska track's `DURATION`
+/// tag (`tagged_track_duration`), and only then the container's, which spans
+/// every track and so includes an audio track that runs past the picture.
 pub(crate) fn duration_seconds(
     stream: &ffmpeg_next::format::stream::Stream<'_>,
     ictx: &ffmpeg_next::format::context::Input,
@@ -464,6 +503,12 @@ pub(crate) fn duration_seconds(
         if tb.denominator() > 0 {
             duration_sec =
                 stream_duration as f64 * (tb.numerator() as f64 / tb.denominator() as f64);
+        }
+    }
+
+    if duration_sec <= 0.0 {
+        if let Some(tagged) = tagged_track_duration(stream) {
+            duration_sec = tagged;
         }
     }
 
@@ -484,6 +529,86 @@ pub(crate) fn duration_seconds(
     }
 
     duration_sec
+}
+
+/// How many quarter turns CLOCKWISE the stream's pictures are to be turned to
+/// be seen as intended: 0 to 3, from the display matrix a phone writes
+/// beside its frames instead of turning the pixels.
+///
+/// A phone films portrait into a landscape-shaped buffer and says "turn this
+/// 90 degrees" in the container; every player obeys, and every re-encode,
+/// upload or messenger copy bakes the turn into the pixels. Read as stored, the
+/// original and every copy of it were two different pictures and never
+/// matched at any `-d`. Rounded to the nearest quarter turn, the only kind a
+/// camera writes; a mirror in the matrix is not read.
+pub(crate) fn display_turns(stream: &ffmpeg_next::format::stream::Stream<'_>) -> u8 {
+    let Some(data) = display_matrix(stream) else { return 0 };
+    if data.len() < 9 * 4 {
+        return 0;
+    }
+    // Copied out first because the side data is a byte buffer with no promise
+    // of alignment.
+    let mut matrix = [0i32; 9];
+    for (i, m) in matrix.iter_mut().enumerate() {
+        *m = i32::from_ne_bytes(data[i * 4..i * 4 + 4].try_into().unwrap());
+    }
+    // SAFETY: nine i32s, which is all the function reads.
+    let ccw = unsafe { ffmpeg_next::ffi::av_display_rotation_get(matrix.as_ptr()) };
+    if !ccw.is_finite() {
+        return 0;
+    }
+    // Counter-clockwise from the matrix, so clockwise is its negation.
+    ((-ccw / 90.0).round() as i64).rem_euclid(4) as u8
+}
+
+/// The stream's display matrix, as raw bytes, wherever this FFmpeg keeps it:
+/// in the codec parameters from 6.1 on, which the demuxer fills while reading
+/// the header, and in the stream's own list before that. See build.rs.
+fn display_matrix<'a>(stream: &'a ffmpeg_next::format::stream::Stream<'_>) -> Option<&'a [u8]> {
+    #[cfg(ffmpeg_coded_side_data)]
+    {
+        // SAFETY: the parameters belong to the open stream and outlive this
+        // borrow; the function only reads the array it is given.
+        unsafe {
+            let par = stream.parameters().as_ptr();
+            let side = ffmpeg_next::ffi::av_packet_side_data_get(
+                (*par).coded_side_data,
+                (*par).nb_coded_side_data,
+                ffmpeg_next::ffi::AVPacketSideDataType::AV_PKT_DATA_DISPLAYMATRIX,
+            );
+            if side.is_null() || (*side).data.is_null() {
+                return None;
+            }
+            Some(std::slice::from_raw_parts((*side).data, (*side).size))
+        }
+    }
+    #[cfg(not(ffmpeg_coded_side_data))]
+    {
+        stream
+            .side_data()
+            .find(|side| side.kind() == ffmpeg_next::codec::packet::side_data::Type::DisplayMatrix)
+            .map(|side| side.data())
+    }
+}
+
+/// `frame`, a `SIDE` x `SIDE` square, turned `turns` quarter turns clockwise.
+fn turn_square(frame: &mut [u8], turns: u8, scratch: &mut Vec<u8>) {
+    if turns % 4 == 0 {
+        return;
+    }
+    scratch.clear();
+    scratch.extend_from_slice(frame);
+    let src = |y: usize, x: usize| scratch[y * SIDE + x];
+    let last = SIDE - 1;
+    for y in 0..SIDE {
+        for x in 0..SIDE {
+            frame[y * SIDE + x] = match turns % 4 {
+                1 => src(last - x, y),
+                2 => src(last - y, last - x),
+                _ => src(x, last - y),
+            };
+        }
+    }
 }
 
 /// Average frames per second, or 0.0 when the container never said.
@@ -2179,6 +2304,12 @@ pub fn fingerprint_video(
 
     let frame_rate = frame_rate_of(&input, duration_sec);
 
+    // The turn the container asks for, applied to every working frame below so
+    // the hashes are of the picture as it is seen (`display_turns`), and the
+    // reported width and height are its shape as seen too.
+    let turns = display_turns(&input);
+    let shown = |w: u32, h: u32| if turns % 2 == 1 { (h, w) } else { (w, h) };
+
     let mut context_decoder = ffmpeg_next::codec::context::Context::from_parameters(input.parameters())
         .context("Failed to create codec context from parameters")?;
 
@@ -2272,6 +2403,7 @@ pub fn fingerprint_video(
     let mut decoded = ffmpeg_next::frame::Video::empty();
     let mut scaled = ffmpeg_next::frame::Video::empty();
     let mut current_frame = vec![0u8; FRAME_STRIDE];
+    let mut turn_scratch: Vec<u8> = Vec::with_capacity(if turns == 0 { 0 } else { FRAME_STRIDE });
 
     // Rebuilt whenever the decoder's output changes shape, not merely built once.
     // A stream is allowed to change resolution or pixel format mid-file -- a
@@ -2307,7 +2439,7 @@ pub fn fingerprint_video(
                 SIDE as u32,
                 ffmpeg_next::software::scaling::flag::Flags::FAST_BILINEAR,
             )?);
-            frame_dims.get_or_insert((dec.width(), dec.height()));
+            frame_dims.get_or_insert(shown(dec.width(), dec.height()));
         }
         let scaler = scaler.as_mut().unwrap();
 
@@ -2321,6 +2453,7 @@ pub fn fingerprint_video(
             let dst_idx = y * SIDE;
             current_frame[dst_idx..dst_idx + SIDE].copy_from_slice(&data[src_idx..src_idx + SIDE]);
         }
+        turn_square(&mut current_frame, turns, &mut turn_scratch);
 
         if is_first || current_frame != prev_frame {
             // Append into the single flat buffer instead of pushing a new Vec.
@@ -2841,7 +2974,7 @@ pub fn fingerprint_video(
     // probe used to leave in the stream parameters -- it copies the decoder's
     // view back into them -- and correct even where a header disagrees with its
     // own bitstream.
-    let (width, height) = frame_dims.unwrap_or((decoder.width(), decoder.height()));
+    let (width, height) = frame_dims.unwrap_or_else(|| shown(decoder.width(), decoder.height()));
 
     // u_frames holds n_unique * FRAME_STRIDE bytes; the frame count is the time list.
     let n_unique = unique_frame_times.len();
@@ -4152,6 +4285,62 @@ mod tests {
         assert_eq!(fp.bitrate(), 0);
         assert_eq!(fp.quality(), 0);
         assert!(!fp.valid_hashes.is_empty(), "the stream still fingerprints");
+    }
+
+    /// A phone's portrait video, stored landscape with a turn in its display
+    /// matrix, fingerprints as the picture it shows: the same as a copy with
+    /// the turn baked into its pixels, which is what every re-encode makes.
+    /// Read as stored, the two were unrelated at every `-d`.
+    #[test]
+    fn test_a_turn_the_container_asks_for_is_applied_before_hashing() {
+        init_ffmpeg_for_tests();
+        let flagged = fingerprint_path(&fixture_named("test_video_rotated.mp4"));
+        let baked = fingerprint_path(&fixture_named("test_video_turned.mp4"));
+
+        assert_eq!((flagged.width, flagged.height), (180, 320), "reported as shown, not as stored");
+        assert_eq!((baked.width, baked.height), (180, 320));
+        assert_eq!(flagged.valid_hashes.len(), baked.valid_hashes.len());
+        for (i, (a, b)) in flagged.valid_hashes.iter().zip(&baked.valid_hashes).enumerate() {
+            let d = (a ^ b).count_ones();
+            assert!(d <= 6, "sample {i} is {d} bits from its re-encode; unrelated frames sit near 32");
+        }
+    }
+
+    /// Each quarter turn moves a corner to the next corner clockwise, and four
+    /// of them are no turn at all.
+    #[test]
+    fn test_a_square_is_turned_clockwise() {
+        let mut frame = vec![0u8; FRAME_STRIDE];
+        frame[0] = 1; // top left
+        let mut scratch = Vec::new();
+        let corner = |f: &[u8]| f.iter().position(|&v| v == 1).unwrap();
+        turn_square(&mut frame, 1, &mut scratch);
+        assert_eq!(corner(&frame), SIDE - 1, "top right");
+        turn_square(&mut frame, 1, &mut scratch);
+        assert_eq!(corner(&frame), FRAME_STRIDE - 1, "bottom right");
+        turn_square(&mut frame, 1, &mut scratch);
+        assert_eq!(corner(&frame), (SIDE - 1) * SIDE, "bottom left");
+        turn_square(&mut frame, 3, &mut scratch);
+        assert_eq!(corner(&frame), FRAME_STRIDE - 1, "three turns are one turn back");
+        turn_square(&mut frame, 2, &mut scratch);
+        assert_eq!(corner(&frame), 0);
+    }
+
+    /// A Matroska file whose audio runs past its picture reports the video
+    /// track's own runtime, not the segment's. Read off the segment, a 360p MKV
+    /// with a long audio tail out-lasted the 1080p MP4 of the same footage and
+    /// won the length ranking.
+    #[test]
+    fn test_a_matroska_track_is_as_long_as_its_own_duration_tag() {
+        init_ffmpeg_for_tests();
+        let fp = fingerprint_path(&fixture_named("test_video_audio_tail.mkv"));
+        assert!((fp.duration - 2.0).abs() < 0.01, "the video track is 2 s, the audio 4.1 s: read {}", fp.duration);
+
+        assert_eq!(parse_clock("00:00:02.000000000"), Some(2.0));
+        assert_eq!(parse_clock("01:02:03.5"), Some(3723.5));
+        assert_eq!(parse_clock("00:00:00.000000000"), None, "no runtime is not a runtime");
+        assert_eq!(parse_clock("2.0"), None);
+        assert_eq!(parse_clock("a:b:c"), None);
     }
 
     /// A video with nothing in the picture fails rather than fingerprinting to

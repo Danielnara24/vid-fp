@@ -15,7 +15,7 @@
 //! a fade), a third and then half way, keeping the busiest of those looked at.
 //! A file whose runtime is unknown is read from its start.
 
-use crate::fingerprint::{clock_may_restart, duration_seconds, header_is_complete, open_video, probe_streams};
+use crate::fingerprint::{clock_may_restart, display_turns, duration_seconds, header_is_complete, open_video, probe_streams};
 use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Context, Result};
 use ffmpeg_next::format::Pixel;
@@ -49,9 +49,19 @@ pub fn still(path: &str, max_w: u32, max_h: u32, cover: bool) -> Result<(u32, u3
     if !header_is_complete(&ictx) {
         probe_streams(&mut ictx)?;
     }
-    let (index, duration, parameters) = {
+    let (index, duration, parameters, turns) = {
         let stream = ictx.streams().best(ffmpeg_next::media::Type::Video).ok_or_else(|| anyhow!("No video stream found"))?;
-        (stream.index(), duration_seconds(&stream, &ictx), stream.parameters())
+        (stream.index(), duration_seconds(&stream, &ictx), stream.parameters(), display_turns(&stream))
+    };
+    // Seek targets are on the container's clock, which starts where the file
+    // says it starts rather than at 0: a broadcast capture's clock routinely
+    // starts hours in, past the whole runtime, and a target counted from 0
+    // was before the first frame, so every try failed and the thumbnail was
+    // the first frame -- the one this function exists to avoid.
+    // SAFETY: the context is open; `start_time` is a plain field of it.
+    let start = match unsafe { (*ictx.as_ptr()).start_time } {
+        t if t != ffmpeg_next::ffi::AV_NOPTS_VALUE && t > 0 => t,
+        _ => 0,
     };
     let mut context = ffmpeg_next::codec::context::Context::from_parameters(parameters).context("Failed to create codec context")?;
     unsafe {
@@ -66,7 +76,7 @@ pub fn still(path: &str, max_w: u32, max_h: u32, cover: bool) -> Result<(u32, u3
     let tries: &[f64] = if duration > 0.0 { &TRIES } else { &[0.0] };
     for &share in tries {
         if share > 0.0 {
-            let at = (duration * share * 1_000_000.0) as i64;
+            let at = start.saturating_add((duration * share * 1_000_000.0) as i64);
             if ictx.seek(at, ..at).is_err() {
                 continue;
             }
@@ -83,12 +93,12 @@ pub fn still(path: &str, max_w: u32, max_h: u32, cover: bool) -> Result<(u32, u3
     }
     // Nothing found where it was looked for: the start, which any file that
     // decodes at all has.
-    if best.is_none() && duration > 0.0 && ictx.seek(0, ..0).is_ok() {
+    if best.is_none() && duration > 0.0 && ictx.seek(start, ..start.saturating_add(1)).is_ok() {
         decoder.flush();
         best = first_frame(&mut ictx, &mut decoder, index).map(|f| (0.0, f));
     }
     let (_, frame) = best.ok_or_else(|| anyhow!("No frame could be decoded"))?;
-    to_rgba(&frame, max_w, max_h, cover)
+    to_rgba(&frame, max_w, max_h, cover, turns)
 }
 
 /// The keyframe of `path` that the scan sampled at `at_ms`, as `still` gives
@@ -112,15 +122,15 @@ pub fn frame_at(path: &str, at_ms: u32, max_w: u32, max_h: u32) -> Result<(u32, 
     if !header_is_complete(&ictx) {
         probe_streams(&mut ictx)?;
     }
-    let (index, time_base, parameters) = {
+    let (index, time_base, parameters, turns) = {
         let stream = ictx.streams().best(ffmpeg_next::media::Type::Video).ok_or_else(|| anyhow!("No video stream found"))?;
-        (stream.index(), stream.time_base(), stream.parameters())
+        (stream.index(), stream.time_base(), stream.parameters(), display_turns(&stream))
     };
     let tb = if time_base.numerator() > 0 && time_base.denominator() > 0 { f64::from(time_base) } else { 1.0 / 90_000.0 };
     let stamp = |p: &ffmpeg_next::Packet| p.dts().or_else(|| p.pts());
     if clock_may_restart(&ictx) {
         let packet = by_restart_index(path, &mut ictx, index, tb, at_ms)?;
-        return decode_one(parameters, &packet, at_ms, max_w, max_h);
+        return decode_one(parameters, &packet, at_ms, max_w, max_h, turns);
     }
 
     // The anchor: the first keyframe, read as the scan read it.
@@ -167,11 +177,11 @@ pub fn frame_at(path: &str, at_ms: u32, max_w: u32, max_h: u32) -> Result<(u32, 
         }
     }
     let (_, packet) = nearest.ok_or_else(|| anyhow!("No keyframe near {at_ms} ms"))?;
-    decode_one(parameters, &packet, at_ms, max_w, max_h)
+    decode_one(parameters, &packet, at_ms, max_w, max_h, turns)
 }
 
 /// Decode `packet`, a keyframe, alone, and fit it inside `max_w` x `max_h`.
-fn decode_one(parameters: ffmpeg_next::codec::Parameters, packet: &ffmpeg_next::Packet, at_ms: u32, max_w: u32, max_h: u32) -> Result<(u32, u32, Vec<u8>)> {
+fn decode_one(parameters: ffmpeg_next::codec::Parameters, packet: &ffmpeg_next::Packet, at_ms: u32, max_w: u32, max_h: u32, turns: u8) -> Result<(u32, u32, Vec<u8>)> {
     let mut context = ffmpeg_next::codec::context::Context::from_parameters(parameters).context("Failed to create codec context")?;
     unsafe {
         // One thread: a single keyframe, wanted back at once rather than
@@ -185,7 +195,7 @@ fn decode_one(parameters: ffmpeg_next::codec::Parameters, packet: &ffmpeg_next::
         let _ = decoder.send_eof();
         decoder.receive_frame(&mut frame).map_err(|e| anyhow!("The keyframe near {at_ms} ms would not decode: {e}"))?;
     }
-    to_rgba(&frame, max_w, max_h, false)
+    to_rgba(&frame, max_w, max_h, false, turns)
 }
 
 /// Each keyframe of a file, as `(the scan's ms, its byte position)`, by path,
@@ -349,29 +359,63 @@ pub fn fitted((w, h): (f64, f64), max_w: u32, max_h: u32, cover: bool) -> (u32, 
     (((w * s).round() as u32).max(1), ((h * s).round() as u32).max(1))
 }
 
-/// `frame` as packed RGBA at the size it is shown (`fitted`), cut to the place
+/// `frame` as packed RGBA at the size it is shown (`fitted`), turned `turns`
+/// quarter turns clockwise (`fingerprint::display_turns`), cut to the place
 /// with `cover`.
-fn to_rgba(frame: &ffmpeg_next::frame::Video, max_w: u32, max_h: u32, cover: bool) -> Result<(u32, u32, Vec<u8>)> {
+fn to_rgba(frame: &ffmpeg_next::frame::Video, max_w: u32, max_h: u32, cover: bool, turns: u8) -> Result<(u32, u32, Vec<u8>)> {
     // The shape it is meant to be seen at: anamorphic DVD and broadcast video
     // stores 720 x 576 pixels for a 16:9 picture.
     let sar = frame.aspect_ratio();
     let par = if sar.numerator() > 0 && sar.denominator() > 0 { sar.numerator() as f64 / sar.denominator() as f64 } else { 1.0 };
-    let shape = (frame.width() as f64 * par, frame.height() as f64);
+    let stored = (frame.width() as f64 * par, frame.height() as f64);
+    let sideways = turns % 2 == 1;
+    let shape = if sideways { (stored.1, stored.0) } else { stored };
     let (w, h) = fitted(shape, max_w, max_h, cover);
-    let mut scaler = scaling::Context::get(frame.format(), frame.width(), frame.height(), Pixel::RGBA, w, h, scaling::Flags::AREA)
+    // Scaled in the orientation it is stored in, then turned.
+    let (sw, sh) = if sideways { (h, w) } else { (w, h) };
+    let mut scaler = scaling::Context::get(frame.format(), frame.width(), frame.height(), Pixel::RGBA, sw, sh, scaling::Flags::AREA)
         .context("Failed to set up the scaler")?;
     let mut rgba = ffmpeg_next::frame::Video::empty();
     scaler.run(frame, &mut rgba).context("Failed to scale the frame")?;
+    let (data, stride) = (rgba.data(0), rgba.stride(0));
+    let mut packed = Vec::with_capacity(sw as usize * sh as usize * 4);
+    for y in 0..sh as usize {
+        packed.extend_from_slice(&data[y * stride..y * stride + sw as usize * 4]);
+    }
+    let turned = turn_rgba(&packed, sw as usize, sh as usize, turns);
     // Cut to the place, from the middle.
     let (cw, ch) = if cover { (w.min(max_w), h.min(max_h)) } else { (w, h) };
     let (x0, y0) = (((w - cw) / 2) as usize, ((h - ch) / 2) as usize);
-    let (data, stride) = (rgba.data(0), rgba.stride(0));
     let mut out = Vec::with_capacity(cw as usize * ch as usize * 4);
     for y in y0..y0 + ch as usize {
-        let row = y * stride + x0 * 4;
-        out.extend_from_slice(&data[row..row + cw as usize * 4]);
+        let row = (y * w as usize + x0) * 4;
+        out.extend_from_slice(&turned[row..row + cw as usize * 4]);
     }
     Ok((cw, ch, out))
+}
+
+/// Packed RGBA `w` x `h`, turned `turns` quarter turns clockwise: the result
+/// is `h` x `w` for an odd number of turns.
+fn turn_rgba(px: &[u8], w: usize, h: usize, turns: u8) -> Vec<u8> {
+    let turns = turns % 4;
+    if turns == 0 {
+        return px.to_vec();
+    }
+    let (ow, oh) = if turns % 2 == 1 { (h, w) } else { (w, h) };
+    let mut out = vec![0u8; px.len()];
+    for y in 0..oh {
+        for x in 0..ow {
+            // Where the output pixel (x, y) comes from in the input.
+            let (sx, sy) = match turns {
+                1 => (y, h - 1 - x),
+                2 => (w - 1 - x, h - 1 - y),
+                _ => (w - 1 - y, x),
+            };
+            let (d, s) = ((y * ow + x) * 4, (sy * w + sx) * 4);
+            out[d..d + 4].copy_from_slice(&px[s..s + 4]);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -415,6 +459,48 @@ mod tests {
         assert_eq!((w, h, px.len()), (160, 90, 160 * 90 * 4));
     }
 
+    fn mean_brightness(px: &[u8]) -> f64 {
+        px.chunks(4).map(|p| (p[0] as f64 + p[1] as f64 + p[2] as f64) / 3.0).sum::<f64>() / (px.len() / 4) as f64
+    }
+
+    /// A capture whose clock starts thousands of seconds in, as a broadcast's
+    /// does, is still looked into rather than shown by its first frame. It
+    /// opens on two seconds of black; the seek used to count from 0, land
+    /// before the first frame, fail every try and fall back to that black.
+    #[test]
+    fn a_still_is_looked_for_on_the_files_own_clock() {
+        init().unwrap();
+        let (_, _, px) = still("tests/fixtures/test_video_late_clock.ts", 160, 90, false).unwrap();
+        assert!(mean_brightness(&px) > 30.0, "a picture, not the black opening: {}", mean_brightness(&px));
+    }
+
+    /// A video whose container asks for a turn is shown turned, the same shape
+    /// as a copy with the turn baked in.
+    #[test]
+    fn a_still_is_turned_as_the_container_asks() {
+        init().unwrap();
+        let (w, h, px) = still("tests/fixtures/test_video_rotated.mp4", 320, 320, false).unwrap();
+        assert!(h > w, "portrait, as shown: {w}x{h}");
+        let (bw, bh, baked) = still("tests/fixtures/test_video_turned.mp4", 320, 320, false).unwrap();
+        assert_eq!((w, h), (bw, bh));
+        // Same picture: close pixel for pixel, where an unturned one would not be.
+        let diff = px.iter().zip(&baked).map(|(a, b)| (*a as i32 - *b as i32).abs() as f64).sum::<f64>() / px.len() as f64;
+        assert!(diff < 20.0, "mean difference {diff}");
+
+        let (fw, fh, _) = frame_at("tests/fixtures/test_video_rotated.mp4", 0, 320, 320).unwrap();
+        assert_eq!((fw, fh), (w, h), "the Compare window's frames are turned too");
+    }
+
+    #[test]
+    fn a_picture_turns_a_quarter_at_a_time() {
+        // 2 x 1: red then green.
+        let px = [255, 0, 0, 255, 0, 255, 0, 255];
+        assert_eq!(turn_rgba(&px, 2, 1, 1), px.to_vec(), "a column, red on top");
+        assert_eq!(turn_rgba(&px, 2, 1, 2), [0, 255, 0, 255, 255, 0, 0, 255].to_vec());
+        assert_eq!(turn_rgba(&px, 2, 1, 3), [0, 255, 0, 255, 255, 0, 0, 255].to_vec(), "green on top");
+        assert_eq!(turn_rgba(&px, 2, 1, 0), px.to_vec());
+    }
+
     /// Every keyframe of `path` read in order from its start, each with its
     /// time in ms from the first keyframe and its picture as `frame_at` sizes
     /// it: an oracle that does no seeking at all.
@@ -448,7 +534,7 @@ mod tests {
                 let _ = dec.send_eof();
                 dec.receive_frame(&mut frame).unwrap();
             }
-            out.push((elapsed as f64 * tb * 1000.0, to_rgba(&frame, max, max, false).unwrap().2));
+            out.push((elapsed as f64 * tb * 1000.0, to_rgba(&frame, max, max, false, 0).unwrap().2));
         }
         out
     }

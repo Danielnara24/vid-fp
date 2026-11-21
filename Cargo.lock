@@ -1666,6 +1666,7 @@ dependencies = [
  "ctrlc",
  "env_logger",
  "ffmpeg-next",
+ "ffmpeg-sys-next",
  "gtk4",
  "indicatif",
  "libc",

@@ -1592,7 +1592,10 @@ mod tests {
         // that reports "No videos found" reads as a broken tool, not as a
         // narrow default.
         let dir = tempfile::tempdir().unwrap();
-        let mut expected: Vec<String> = ["clip.mts", "capture.ts", "rip.vob", "itunes.m4v"]
+        let mut expected: Vec<String> = [
+            "clip.mts", "capture.ts", "rip.vob", "itunes.m4v", "camera.mxf", "hdv.m2t", "jvc.mod",
+            "jvc.tod", "tape.dv", "track.m2v", "flash.f4v", "old.rm", "old.rmvb", "anime.ogm",
+        ]
             .iter()
             .map(|n| touch(dir.path(), n))
             .collect();

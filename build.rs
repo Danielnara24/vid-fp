@@ -73,6 +73,17 @@ fn main() {
     let suffix = if arch == "x86_64" { String::new() } else { format!("_{arch}") };
     println!("cargo:rustc-env=VID_FP_ARCH_TABLE_SUFFIX={suffix}");
 
+    // Whether the FFmpeg the bindings were generated from keeps a stream's
+    // side data in its codec parameters (6.1 on), as `ffmpeg-sys-next` reports
+    // it to its direct dependents. Before 6.1 it is the stream's own list; from
+    // 6.1 that list is filled only by a probe, which a complete header skips,
+    // so reading it there found no display matrix at all (`fingerprint::
+    // display_turns`).
+    println!("cargo:rustc-check-cfg=cfg(ffmpeg_coded_side_data)");
+    if std::env::var("DEP_FFMPEG_FFMPEG_6_1").is_ok_and(|v| v == "true") {
+        println!("cargo:rustc-cfg=ffmpeg_coded_side_data");
+    }
+
     if std::env::var_os("CARGO_FEATURE_STATIC_FFMPEG").is_none() {
         return;
     }

@@ -950,6 +950,23 @@ fn copy_durably(src: &Path, dest: &Path, meta: &std::fs::Metadata) -> Result<()>
     file.sync_all()
         .with_context(|| format!("Failed to flush {} to disk", dest.display()))?;
 
+    // And the folder's entry for it: fsync on a new file makes its bytes
+    // durable, not its name, so a power cut after the unlink could leave the
+    // bytes on the far disk under no name at all. Not every filesystem lets a
+    // folder be opened to be synced (some network ones refuse), and there it
+    // is the best that can be had; nor does every one support syncing a folder
+    // (EINVAL, ENOTSUP), which is the same answer. Any other failure is real.
+    if let Some(parent) = dest.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            if let Err(e) = dir.sync_all() {
+                let unsupported = matches!(e.raw_os_error(), Some(libc::EINVAL) | Some(libc::ENOTSUP) | Some(libc::EBADF));
+                if !unsupported {
+                    return Err(e).with_context(|| format!("Failed to flush {} to disk", parent.display()));
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 

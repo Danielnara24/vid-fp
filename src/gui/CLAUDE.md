@@ -53,8 +53,10 @@ one differs, it is said below.
   keeping the busiest; pixel aspect applied. The freedesktop thumbnail cache is
   used when current (`Thumb::MTime`, and `Thumb::Size` when written), read with
   gdk-pixbuf. Premultiplied BGRA at drawn size; two decoders for rows, one for
-  the strip; held to bytes (`Budget`). Rotation metadata (phone video) is not
-  applied.
+  the strip; held to bytes (`Budget`). Rotation metadata (phone video) is
+  applied (`thumbnail::to_rgba`), as the scan applies it. Seeks are counted from
+  the file's own `start_time`: a broadcast `.ts` whose clock starts past its
+  runtime used to fail every try and show its first frame.
 - **Compare (`matched.rs`) shows the scan's evidence, not a player.** The
   user chose matched frames over side-by-side playback. Each `Member` carries
   `compared`: against its best link (first) and the group's reference, the

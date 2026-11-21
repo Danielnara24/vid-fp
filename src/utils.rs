@@ -128,7 +128,19 @@ const DEFAULT_ORDER: [Priority; 4] = [
 
 /// Tolerance bands. Files inside the same band are treated as equal on that
 /// metric, so the decision falls through to the next one instead of being
-/// settled by noise. See the README for the reasoning behind each width.
+/// settled by noise.
+///
+/// Length is a band in seconds rather than a share of the runtime because the
+/// noise in a reported runtime is a fixed number of seconds, not a fraction of
+/// the file. Measured on the generated corpus (1,121 files whose footage the
+/// manifest states, read with each Matroska track's own `DURATION` tag): 1,077
+/// report a runtime within 0.1 s of the footage they hold, and every file
+/// further off is one whose stream opens with frames before its first keyframe
+/// (four seeds and their stream copies, 0.65 to 6.2 s). The smallest real
+/// difference the corpus makes on purpose, a trim of both ends, is 2.4 s. One
+/// second sits an order of magnitude above the noise and under every real trim;
+/// a share of the runtime would have to be 0.01% to stay under 2.4 s on a
+/// six-hour file and would then be below the noise on a short clip.
 pub const DURATION_TOLERANCE_SECS: f64 = 1.0;
 pub const RESOLUTION_TOLERANCE: f64 = 0.05;
 pub const QUALITY_TOLERANCE: f64 = 0.05;

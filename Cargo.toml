@@ -85,6 +85,12 @@ ffmpeg-next = { version = "8.1", default-features = false, features = [
     "format",
     "software-scaling",
 ] }
+# Named directly only so build.rs sees the FFmpeg version it was built against
+# (`DEP_FFMPEG_*`, which cargo hands only to a crate's direct dependents): a
+# stream's side data moved into its codec parameters in FFmpeg 6.1, and which
+# field holds a phone's display matrix depends on that. Same version as
+# ffmpeg-next pulls in, no features of its own, so nothing new is built.
+ffmpeg-sys-next = { version = "8.1", default-features = false }
 
 # Embedded key-value database for caching signatures
 redb = "2"
