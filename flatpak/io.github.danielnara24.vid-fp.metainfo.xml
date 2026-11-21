@@ -90,6 +90,11 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.43.0" date="2026-11-21">
+      <description>
+        <p>Phone videos that only carry a rotation flag now match their re-encodes, MKV files report their video's own length, broadcast captures get a real thumbnail, and camera formats such as MXF and HDV are found in folders. Fingerprints are rebuilt once.</p>
+      </description>
+    </release>
     <release version="0.42.2" date="2026-11-21">
       <description>
         <p>Compare now always shows the frames the scan actually matched, and a scan of a large folder finishes sooner.</p>
