@@ -90,6 +90,11 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.45.1" date="2026-11-22">
+      <description>
+        <p>Internal restructuring of how videos are read. Results are unchanged.</p>
+      </description>
+    </release>
     <release version="0.45.0" date="2026-11-21">
       <description>
         <p>The fingerprint cache is kept in a simpler layout. It is converted on the first run, without fingerprinting anything again.</p>
