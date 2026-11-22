@@ -275,7 +275,8 @@ vid-fp ~/Videos -r --delete --permanent
 ```
 
 Once the groups are resolved, an armed run stops and asks before touching
-anything. Return accepts. Answering `n` doesn't abort the run, it demotes it to
+anything. Return accepts, except before `--permanent`, which needs a typed `y`.
+Answering `n` doesn't abort the run, it demotes it to
 a report-only one, so you still get the full table and the reclaimable figure
 without re-scanning. Pass `-y`/`--yes` to skip the prompt.
 
@@ -332,14 +333,17 @@ vid-fp --from-report dupes.csv --delete
 `--from-report` disposes of every row whose `action` column reads `DELETE` and
 touches nothing else. Change `REVIEW`/`KEEP` cells to `DELETE` and they're acted
 on; change a `DELETE` to anything else and it isn't. If you mark every copy of
-something `DELETE`, every copy is deleted. The confirmation prompt still shows
-the count and the byte total first.
+something `DELETE`, every copy is deleted. A `DELETE` whose group still has
+rows you kept is left alone if every one of those files has since gone or
+changed, since it would then be the last copy. The confirmation prompt still
+shows the count and the byte total first.
 
 Every file is re-checked against the size the report recorded immediately before
 it's touched, and left alone if it has changed, so a report can sit for a week
 before you get to it. Columns are found by name, so a reordered report still
 works, and the format is read from the file rather than its name, so a report
-kept as `dupes.bak` replays. Only CSV and JSON reports are accepted; `.txt`
+kept as `dupes.bak` replays. A CSV re-saved by a spreadsheet with `,` or tab
+separators replays too. Only CSV and JSON reports are accepted; `.txt`
 reports refused.
 
 ### Checking new files against a library
@@ -413,7 +417,7 @@ nothing.
 | `-r`, `--recursive` | Include subfolders | off |
 | `--follow-symlinks` | Descend into symlinked folders. Deletions act on the file the link leads to | off |
 | `-e`, `--exclude <PATH>` | Exclude a folder or a single file; repeat for several. Matched by whole path components, so a file must be named exactly, and resolved through symlinks | |
-| `-x`, `--extensions <EXT>` | Extensions a **folder walk** treats as videos, comma-separated or repeated. `-x '*'` (quoted) takes every file, including ones with no extension; an entry prefixed with `!` is an exception, so `-x '!flac'` takes every file but those | 28 extensions, listed below |
+| `-x`, `--extensions <EXT>` | Extensions a **folder walk** treats as videos, comma-separated or repeated. `-x '*'` (quoted) takes every file, including ones with no extension; an entry prefixed with `!` is an exception, so `-x '!flac'` takes every file but those | 38 extensions, listed below |
 | `-d`, `--hamming-distance <N>` | Frame-match tolerance, in bits out of 64; higher = less strict matching. Raise to find more duplicates, at the cost of false positives. See [Tuning](#tuning). Values above `32` are refused | `6` |
 | `-p`, `--match-percent <F>` | Min % of overlap to count as a duplicate, from `0` to `100`. Lower includes shorter matches, at the cost of false positives. `0` turns the gate off and reports every pair sharing any footage at all; a pair sharing none is never reported | `20.0` |
 | `--min-duration <SECS>` | Min shared clip length in seconds for a match. Videos shorter than this are skipped entirely. `0` = off | `0.0` |
@@ -433,16 +437,16 @@ nothing.
 | `-q`, `--quiet` | Only print errors | off |
 | `--log-file <PATH>` | Write every log line to this file, including the failures the terminal never shows. Not affected by `--quiet`. Truncated at the start of each run | |
 | `--cache <PATH>` | Use this cache file instead of the default one. Needed to run multiple scans at once, since a run locks its cache for the whole scan | `$XDG_CACHE_HOME/vid-fp/fingerprints.redb` |
-| `--clear-cache` | Wipe ALL vid-fp cache before running | off |
+| `--clear-cache` | Wipe ALL vid-fp cache before running. A cache file that cannot be read is set aside as `<name>.damaged` and a new one started | off |
 | `--prune-cache` | Drop cached entries only for files not in this scan. Skipped when the scan was incomplete | off |
 | `--completions <SHELL>` | Print a completion script for `bash`, `zsh`, `fish`, `elvish`, or `powershell` and exit | |
 | `--man` | Print the man page (roff) and exit | |
 
-A folder walk treats these 28 extensions as video by default:
+A folder walk treats these 38 extensions as video by default:
 
 `mp4` `m4v` `mkv` `webm` `avi` `mov` `flv` `wmv` `asf` `mpg` `mpeg` `m2ts`
 `mts` `ts` `vob` `ogv` `3gp` `divx` `mxf` `m2t` `mod` `tod` `dv` `m2v` `f4v`
-`rm` `rmvb` `ogm`
+`rm` `rmvb` `ogm` `trp` `tp` `wtv` `3g2` `qt` `mk3d` `vro` `lrv` `mpe` `m1v`
 
 A positive `-x` list replaces that default rather than narrowing it, so `-x mp4`
 walks for `.mp4` alone.
@@ -548,6 +552,11 @@ These rules decide which copy is kept, not which files match. Matching itself is
 codec-blind, so an AV1 encode and an H.264 encode of the same footage land in
 the same group.
 
+**`resolution` counts the picture, not the bars.** A letterboxed or
+pillarboxed copy is ranked on the picture inside its black bars, so it ties
+with the same film stored without them rather than winning on the bars' area.
+The report still prints the stored width and height.
+
 **`quality` is bits per frame**, bitrate divided by the average frame rate.
 Ranking on raw bitrate would prefer whichever copy simply had more frames in it,
 since a 60 fps copy needs roughly twice the bitrate of a 30 fps one to look the
@@ -619,7 +628,8 @@ about.
 ### CSV and JSON
 
 The console and `.txt` report have one line per file; the machine-readable
-formats carry more data:
+formats carry more data. The CSV separates fields with `;`, not `,` (so
+`pandas.read_csv(f, sep=";")`, or `cut -d';'`):
 
 | Column | Meaning |
 | --- | --- |
@@ -684,7 +694,7 @@ the bytes are not, and no space was reclaimed.
 ### Errors
 
 Failures are reported once at the end in the summary: a count per kind and up
-to 10 examples of each. `--log-file <PATH>` records every one in full for
+to 10 examples of each, the first 10 by name. `--log-file <PATH>` records every one in full for
 grepping.
 
 ### Cache
@@ -747,8 +757,8 @@ still reaches files with no extension.
 - **You see the cost before you pay it.** A dry run prints how much the DELETE
   files would reclaim, computed from exactly the set `--delete` would act on.
 - **It asks first.** An armed run stops after the groups are resolved and shows
-  how many files, how many bytes, and the first ten by name. Return accepts, `n`
-  turns the run into a report. The prompt is interactive-only and `--yes` skips
+  how many files, how many bytes, and the first ten by name. Return accepts
+  (a permanent delete needs a typed `y`), `n` turns the run into a report. The prompt is interactive-only and `--yes` skips
   it, so nothing can hang unattended.
 - **Trash, not permanent.** `--delete` moves files to the system trash via the
   FreeDesktop.org spec, so they're recoverable, unless you add `--permanent`.
@@ -756,9 +766,9 @@ still reaches files with no extension.
   no decode.
 - **`--move-to` where the trash isn't.** Moving files under a folder of your
   choosing is recoverable in the same way and always available.
-- **Reports and logs never land on a video.** `-o` or `--log-file` naming a
-  file the scan reads, or an existing file with a video extension, is refused
-  before anything starts.
+- **Reports and logs never land on a video, or on each other.** `-o` or
+  `--log-file` naming a file the scan reads, an existing file with a video
+  extension, the cache, or each other is refused before anything starts.
 - **Do a dry run first.** Look at the output (or a saved `--output` report)
   before running with `--delete`.
 - **DELETE always rests on a measurement.** A file is marked DELETE only when it
@@ -776,13 +786,15 @@ still reaches files with no extension.
   when the scan reaches it by another route, such as a symlink.
 - **Nothing is acted on twice, or blind.** Every target is re-checked against
   its recorded size immediately before it's touched, and a file that changed
-  since the scan is left alone and reported.
+  since the scan is left alone and reported. So is one whose every copy it lost
+  to has gone or changed since, since removing it would remove the last copy.
 - **Mixed codecs are never guessed at.** When the only thing separating two
   copies is which encoder made them, both are flagged REVIEW.
 - **`--from-report` hands the judgement to you.** The rules above are applied by
   the run that *writes* a report. Replaying an edited one keeps the confirmation
-  prompt and the size check, but nothing else: the edited file is the decision,
-  and it is not checked for leaving a survivor in each group. A row it cannot
+  prompt, the size check and the last-copy check above, but nothing else: the
+  edited file is the decision, and a group you mark entirely `DELETE` is
+  emptied. A row it cannot
   understand is never guessed at; the file is left alone and the run exits `2`.
 
 ## License

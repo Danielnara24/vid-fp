@@ -142,9 +142,29 @@ const DEFAULT_ORDER: [Priority; 4] = [
 /// a share of the runtime would have to be 0.01% to stay under 2.4 s on a
 /// six-hour file and would then be below the noise on a short clip.
 pub const DURATION_TOLERANCE_SECS: f64 = 1.0;
-pub const RESOLUTION_TOLERANCE: f64 = 0.05;
-pub const QUALITY_TOLERANCE: f64 = 0.05;
-pub const SIZE_TOLERANCE: f64 = 0.05;
+/// The other three bands, measured the same way on both generated corpora
+/// (VIDS and VIDS2, 2026-11-21): each derived file against its seed, keeping
+/// only pairs that tie on length, since length is compared first.
+///
+/// Resolution (picture pixels, `resolution`): copies at the seed's stored size
+/// differ by at most 4.7% (369 pairs) -- six of `fingerprint::SIDE`'s 128
+/// lines, the scaler-blended row `frame_crop` peels beside a bar -- while the
+/// smallest deliberate change at the same length is 21% (a vertical reframe).
+///
+/// Quality and size: copies holding the seed's own video stream (exact
+/// copies, remuxes) differ by up to 8.0%, because a `.mov` remux transcodes the
+/// audio and both figures count it, while the smallest deliberate re-encode in
+/// the seed's codec is 11.5% (a lighting change), the next 22.6%. Size is only
+/// reached once quality ties, and at one length and frame rate the two are the
+/// same figure, so they share a band.
+///
+/// 10% clears every measured noise and sits under every deliberate change, for
+/// all three. The 5% these replaced was not measured: it decided 3-5% of
+/// remuxes on their audio and, once resolution counted the picture, would have
+/// split copies on the one blended line a bar leaves.
+pub const RESOLUTION_TOLERANCE: f64 = 0.10;
+pub const QUALITY_TOLERANCE: f64 = 0.10;
+pub const SIZE_TOLERANCE: f64 = 0.10;
 
 pub fn format_size(bytes: u64) -> String {
     let b = bytes as f64;
@@ -279,8 +299,18 @@ pub fn format_shared(seconds: Option<f64>) -> String {
     }
 }
 
+/// The pixels of picture a file holds: its stored width x height, times the
+/// share of the frame inside its bars where the scan measured one
+/// (`VideoFingerprint::picture`). Letterbox and pillarbox bars are not
+/// resolution, and ranked on stored pixels a letterboxed copy beat the same
+/// film cropped to its picture by the area of its bars.
 pub fn resolution(fp: &VideoFingerprint) -> u64 {
-    fp.width as u64 * fp.height as u64
+    let stored = fp.width as u64 * fp.height as u64;
+    if fp.picture > 0.0 && fp.picture <= 1.0 {
+        (stored as f64 * fp.picture as f64).round() as u64
+    } else {
+        stored
+    }
 }
 
 /// The best bit-based values seen for ONE codec within a duplicate group.
@@ -488,6 +518,19 @@ impl GroupMaxima {
         b: &VideoFingerprint,
         order: [Priority; 4],
     ) -> Ordering {
+        // Reversed so the alphabetically FIRST path wins, since max_by keeps
+        // the greater element.
+        self.rank_on_metrics(a, b, order).then_with(|| b.path.cmp(&a.path))
+    }
+
+    /// `rank` without its last-resort tiebreak on the path: `Equal` when the
+    /// two files are level on every metric.
+    pub fn rank_on_metrics(
+        &self,
+        a: &VideoFingerprint,
+        b: &VideoFingerprint,
+        order: [Priority; 4],
+    ) -> Ordering {
         let mut ord = Ordering::Equal;
 
         for m in order {
@@ -496,10 +539,7 @@ impl GroupMaxima {
         for m in order {
             ord = ord.then(self.compare(a, b, m));
         }
-
-        // Reversed so the alphabetically FIRST path wins, since max_by keeps
-        // the greater element.
-        ord.then_with(|| b.path.cmp(&a.path))
+        ord
     }
 }
 
@@ -583,6 +623,19 @@ pub fn outranks(
     maxima.rank(a, b, ordered_metrics(priority)) == Ordering::Greater
 }
 
+/// Whether `a` ranks above `b` on the metrics alone, a tie on all of them
+/// being no. `outranks` settles such a tie by path, which is right for
+/// electing one survivor of a group and wrong for `--against`, where a tie is
+/// the library's: two equal copies must not be told apart by folder names.
+pub fn outranks_on_metrics(
+    a: &VideoFingerprint,
+    b: &VideoFingerprint,
+    priority: Priority,
+    maxima: &GroupMaxima,
+) -> bool {
+    maxima.rank_on_metrics(a, b, ordered_metrics(priority)) == Ordering::Greater
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -614,6 +667,7 @@ mod tests {
             detail_hashes: Vec::new(),
             mirrored_detail_hashes: Vec::new(),
             reframed: Vec::new(),
+            picture: 0.0,
         }
     }
 

@@ -58,21 +58,27 @@ pub struct Tally {
 }
 
 impl Tally {
-    /// Count one occurrence, keeping `detail` as an example if there is room.
+    /// Count one occurrence, keeping `detail` as an example if it is among the
+    /// first `MAX_SAMPLES` in sorted order.
+    ///
+    /// Sorted rather than first-come: these are recorded from rayon workers,
+    /// so the first ten to ARRIVE differ from run to run, and two identical
+    /// scans named different files in their summaries. Keeping the ten that
+    /// sort first makes the summary a function of what failed, not of thread
+    /// timing. A detail that sorts after every one already kept is dropped
+    /// without being stored, so a flood of one failure costs a lock and a
+    /// string comparison each.
     pub fn record(&self, detail: impl Into<String>) {
-        // fetch_add returns the value from BEFORE the update, so this thread is
-        // the (prev + 1)th occurrence. Once MAX_SAMPLES have already been
-        // through there is nothing left to keep, and we skip the lock entirely
-        // -- which matters when the failure is something like "permission
-        // denied" repeated across fifty thousand files.
-        if self.count.fetch_add(1, Ordering::Relaxed) >= MAX_SAMPLES {
-            return;
-        }
+        self.count.fetch_add(1, Ordering::Relaxed);
+        let detail = detail.into();
 
         let mut samples = self.samples.lock().unwrap_or_else(|e| e.into_inner());
-        if samples.len() < MAX_SAMPLES {
-            samples.push(detail.into());
+        if samples.len() >= MAX_SAMPLES && samples.last().is_some_and(|last| detail >= *last) {
+            return;
         }
+        let at = samples.partition_point(|s| *s <= detail);
+        samples.insert(at, detail);
+        samples.truncate(MAX_SAMPLES);
     }
 
     /// Count one occurrence that has no detail worth showing.
@@ -104,6 +110,7 @@ pub struct RunStats {
     pub cache_purge_failed: Tally,
     pub cache_prune_skipped: Tally,
     pub delete_stale: Tally,
+    pub delete_unheld: Tally,
     pub delete_failed: Tally,
     pub report_unusable: Tally,
     pub report_write_failed: Tally,
@@ -128,7 +135,7 @@ pub struct RunStats {
 }
 
 impl RunStats {
-    fn problems(&self) -> [(&Tally, &'static str); 12] {
+    fn problems(&self) -> [(&Tally, &'static str); 13] {
         [
             // "path" rather than "folder": a scan target can now be a single
             // file, or a line piped in from another tool.
@@ -178,6 +185,15 @@ impl RunStats {
                 &self.delete_stale,
                 "file(s) marked DELETE changed on disk after they were scanned \
                  and were NOT removed",
+            ),
+            // The other half of what the window checks before it trashes
+            // anything (`Move::stays`): a DELETE rests on the copies it lost to,
+            // and when none of them is still there as it was measured, removing
+            // it would remove the last copy the run knows of.
+            (
+                &self.delete_unheld,
+                "file(s) marked DELETE were NOT removed, because every copy they lost to \
+                 is gone or changed",
             ),
             (&self.delete_failed, "file(s) marked DELETE could not be removed"),
             // A --from-report row this build could not make sense of. Squarely a
@@ -323,6 +339,18 @@ mod tests {
 
         assert_eq!(t.count(), 50, "every occurrence must be counted");
         assert_eq!(t.samples().len(), MAX_SAMPLES, "only a few examples are kept");
+    }
+
+    #[test]
+    fn test_the_examples_kept_do_not_depend_on_the_order_they_arrive_in() {
+        let names: Vec<String> = (0..30).map(|i| format!("/v/{:02}.mp4", (i * 7) % 30)).collect();
+        let forward = Tally::default();
+        let backward = Tally::default();
+        names.iter().for_each(|n| forward.record(n.clone()));
+        names.iter().rev().for_each(|n| backward.record(n.clone()));
+        let want: Vec<String> = (0..MAX_SAMPLES).map(|i| format!("/v/{:02}.mp4", i)).collect();
+        assert_eq!(forward.samples(), want);
+        assert_eq!(backward.samples(), want);
     }
 
     #[test]

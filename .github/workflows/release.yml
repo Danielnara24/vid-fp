@@ -148,8 +148,8 @@ jobs:
             --cache "$RUNNER_TEMP/fx.redb" -o "$RUNNER_TEMP/fx.csv" || rc=$?
           if [ "$rc" -gt 2 ]; then echo "::error::vid-fp exited $rc"; exit 1; fi
           GOT="$(sed "s|$PWD/||g" "$RUNNER_TEMP/fx.csv" | sha256sum | cut -c1-16)"
-          if [ "$GOT" != "bf0d92829a7c68ce" ]; then
-            echo "::error::the fixtures' report is $GOT, not the reviewed bf0d92829a7c68ce"
+          if [ "$GOT" != "14950cfd8dce525c" ]; then
+            echo "::error::the fixtures' report is $GOT, not the reviewed 14950cfd8dce525c"
             cat "$RUNNER_TEMP/fx.csv"
             exit 1
           fi

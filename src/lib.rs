@@ -62,7 +62,7 @@ include!(concat!(env!("OUT_DIR"), "/static_ffmpeg_version_check.rs"));
 /// the C code everywhere) was measured and declined: it cost every x86 user a
 /// re-decode and 2-6% of a cold scan for agreement no x86 user needs.
 const CACHE_TABLE: TableDefinition<&str, &[u8]> =
-    TableDefinition::new(concat!("fingerprints_dct_ct_ff8_turned", env!("VID_FP_ARCH_TABLE_SUFFIX")));
+    TableDefinition::new(concat!("fingerprints_dct_ct_ff8_picture", env!("VID_FP_ARCH_TABLE_SUFFIX")));
 
 /// Files this build looked at and refused before opening: see `NotMedia`.
 ///
@@ -226,7 +226,12 @@ const IDENTITY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("ident
 ///   the segment, which spans the audio, where the video track's own
 ///   `DURATION` tag is now read first (`fingerprint::duration_seconds`). Same
 ///   fields, same units, values moved, invisible to the `Stamp`.
-const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 14] = [
+/// - `fingerprints_dct_ct_ff8_turned` has no `picture` (the share of the frame
+///   inside its bars), which the Resolution ranking now reads so a letterboxed
+///   copy no longer outranks a cropped one on its black bars. Appending the
+///   field alone would have made those entries fail to load and be decoded
+///   again anyway; the rename also hands their pages back.
+const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 15] = [
     TableDefinition::new("fingerprints"),
     TableDefinition::new("fingerprints_by_path"),
     TableDefinition::new("fingerprints_dct"),
@@ -241,6 +246,7 @@ const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 14] = [
     TableDefinition::new(concat!("fingerprints_dct_ct_ff8_detail", env!("VID_FP_ARCH_TABLE_SUFFIX"))),
     TableDefinition::new(concat!("fingerprints_dct_ct_ff8_inset", env!("VID_FP_ARCH_TABLE_SUFFIX"))),
     TableDefinition::new(concat!("fingerprints_dct_ct_ff8_s128", env!("VID_FP_ARCH_TABLE_SUFFIX"))),
+    TableDefinition::new(concat!("fingerprints_dct_ct_ff8_turned", env!("VID_FP_ARCH_TABLE_SUFFIX"))),
 ];
 
 /// Refusal tables earlier builds wrote. Kept apart from the list above because
@@ -541,10 +547,16 @@ type CacheEntry = (Stamp, VideoFingerprint);
 /// `m2v` (elementary MPEG-2, a DVD's video track), `f4v` (Flash-era MP4),
 /// `rm`/`rmvb` (RealMedia) and `ogm`. `mod` is also a tracker-music suffix,
 /// the same loud-and-localised cost `.ts` carries.
-const DEFAULT_EXTENSIONS: [&str; 28] = [
+///
+/// The third ten likewise: `trp`/`tp` (DVB and set-top-box captures, MPEG-TS),
+/// `wtv` (Windows Media Center recordings), `3g2` and `qt` (MOV family), `mk3d`
+/// (Matroska 3D), `vro` (DVD-VR camcorder and recorder discs, MPEG-PS), `lrv`
+/// (the low-resolution MP4 proxy a GoPro writes beside every clip, a duplicate
+/// by construction) and `mpe`/`m1v` (MPEG-1 elementary and program streams).
+const DEFAULT_EXTENSIONS: [&str; 38] = [
     "mp4", "m4v", "mkv", "webm", "avi", "mov", "flv", "wmv", "asf", "mpg", "mpeg", "m2ts", "mts",
     "ts", "vob", "ogv", "3gp", "divx", "mxf", "m2t", "mod", "tod", "dv", "m2v", "f4v", "rm",
-    "rmvb", "ogm",
+    "rmvb", "ogm", "trp", "tp", "wtv", "3g2", "qt", "mk3d", "vro", "lrv", "mpe", "m1v",
 ];
 
 #[derive(Parser, Debug)]
@@ -789,6 +801,9 @@ struct Args {
     cache: Option<String>,
 
     /// Delete ALL cache before running
+    ///
+    /// A cache file that cannot be read as one is moved aside to
+    /// <name>.damaged and a new cache started.
     #[arg(long = "clear-cache")]
     clear_cache: bool,
 
@@ -2512,20 +2527,14 @@ pub fn default_cache_file() -> PathBuf {
 /// `--cache /mnt/scratch` obviously means "a cache in here", and the
 /// alternative is a redb file named `scratch`.
 fn resolve_cache_path(explicit: Option<&str>) -> Result<PathBuf> {
-    let Some(raw) = explicit else {
+    let path = cache_file_for(explicit);
+    let Some(_) = explicit else {
         let cache_dir = default_cache_dir();
 
         std::fs::create_dir_all(&cache_dir).context("Failed to create cache directory")?;
         retire_legacy_cache(&cache_dir);
 
-        return Ok(cache_dir.join(CACHE_FILE_NAME));
-    };
-
-    let given = Path::new(raw);
-    let path = if raw.ends_with('/') || given.is_dir() {
-        given.join(CACHE_FILE_NAME)
-    } else {
-        given.to_path_buf()
+        return Ok(path);
     };
 
     // The default location is created for the user, so a named one is too --
@@ -2540,6 +2549,70 @@ fn resolve_cache_path(explicit: Option<&str>) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// The cache file `resolve_cache_path` will open, worked out without creating
+/// anything, so it can be compared with the report and log paths before any of
+/// the three is touched.
+fn cache_file_for(explicit: Option<&str>) -> PathBuf {
+    let Some(raw) = explicit else {
+        return default_cache_dir().join(CACHE_FILE_NAME);
+    };
+    let given = Path::new(raw);
+    if raw.ends_with('/') || given.is_dir() {
+        given.join(CACHE_FILE_NAME)
+    } else {
+        given.to_path_buf()
+    }
+}
+
+/// Whether `a` and `b` name the same file: the same inode when both exist,
+/// otherwise the same absolute path once the folder holding each is resolved.
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    if let (Ok(x), Ok(y)) = (std::fs::metadata(a), std::fs::metadata(b)) {
+        return x.dev() == y.dev() && x.ino() == y.ino();
+    }
+    let resolved = |p: &Path| -> Option<PathBuf> {
+        let abs = std::path::absolute(p).ok()?;
+        let name = abs.file_name()?.to_owned();
+        let parent = abs.parent()?;
+        Some(std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf()).join(name))
+    };
+    matches!((resolved(a), resolved(b)), (Some(x), Some(y)) if x == y)
+}
+
+/// Refuse a run whose report, log and cache are not three different files.
+///
+/// Each of them replaces what is at its path: the report is renamed over it,
+/// the log is truncated at start-up, and the cache is a database the other two
+/// would write straight through. `-o cache.redb` turned the whole fingerprint
+/// cache into a text report at the end of the run; `--log-file cache.redb`
+/// emptied it before it was opened, so every file was decoded again; and
+/// `-o x.txt --log-file x.txt` left the report where the log had been.
+fn refuse_shared_outputs(args: &Args) -> Result<()> {
+    let cache = cache_file_for(args.cache.as_deref());
+    let output = args.output.as_deref().filter(|o| *o != "-").map(Path::new);
+    let log = args.log_file.as_deref().map(Path::new);
+    let mut named: Vec<(&str, &Path)> = vec![("--cache", cache.as_path())];
+    named.extend(output.map(|p| ("--output", p)));
+    named.extend(log.map(|p| ("--log-file", p)));
+    for i in 0..named.len() {
+        for j in i + 1..named.len() {
+            let ((fa, a), (fb, b)) = (named[i], named[j]);
+            if same_file(a, b) {
+                let what = if fa == "--cache" { "the fingerprint cache".to_string() } else { format!("{} {}", fa, a.display()) };
+                anyhow::bail!(
+                    "{} {} is {}, and writing both to one file would destroy one of them. \
+                     Choose another file name.",
+                    fb,
+                    b.display(),
+                    what
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Why the cache could not be opened, and whether the run has to stop for it.
 ///
 /// `locked` is the one failure a mode can survive: it says another run holds
@@ -2549,6 +2622,9 @@ fn resolve_cache_path(explicit: Option<&str>) -> Result<PathBuf> {
 /// distinction; see `main`.
 struct CacheUnavailable {
     locked: bool,
+    /// The file is there but is not a cache this build can read: damaged, or
+    /// not a redb file at all. `--clear-cache` sets it aside and starts afresh.
+    damaged: bool,
     reason: anyhow::Error,
 }
 
@@ -2568,12 +2644,13 @@ struct CacheUnavailable {
 /// kernel when a process ends, however it ends, so there is no such thing as a
 /// stale one to advise clearing.
 fn open_cache(db_path: &Path) -> std::result::Result<Database, CacheUnavailable> {
-    let fatal = |reason| CacheUnavailable { locked: false, reason };
+    let fatal = |reason| CacheUnavailable { locked: false, damaged: false, reason };
 
     match Database::builder().set_cache_size(CACHE_SIZE_BYTES).create(db_path) {
         Ok(db) => Ok(db),
         Err(DatabaseError::DatabaseAlreadyOpen) => Err(CacheUnavailable {
             locked: true,
+            damaged: false,
             reason: anyhow::anyhow!(
                 "Another vid-fp run is using the fingerprint cache at {}.\n\
                  A run holds that cache for its whole scan, not just while it reads it, \
@@ -2601,11 +2678,64 @@ fn open_cache(db_path: &Path) -> std::result::Result<Database, CacheUnavailable>
                 e
             )))
         }
+        // Not a cache: a file that is not redb at all, or one a crash or a full
+        // disk left unreadable. Every later run would fail the same way, and
+        // `--clear-cache` could not help, since it needs the database open
+        // first -- so it is the one flag that is told to set the file aside.
+        Err(DatabaseError::Storage(StorageError::Corrupted(_))) if is_regular(db_path) => {
+            Err(damaged(db_path))
+        }
+        Err(DatabaseError::Storage(StorageError::Io(e)))
+            if matches!(e.kind(), std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof)
+                && is_regular(db_path) =>
+        {
+            Err(damaged(db_path))
+        }
         Err(e) => Err(fatal(anyhow::Error::new(e).context(format!(
             "Failed to open the fingerprint cache at {}",
             db_path.display()
         )))),
     }
+}
+
+/// The refusal for a cache file that is there and cannot be read as one.
+fn damaged(db_path: &Path) -> CacheUnavailable {
+    CacheUnavailable {
+        locked: false,
+        damaged: true,
+        reason: anyhow::anyhow!(
+            "The fingerprint cache at {} is damaged or is not a vid-fp cache.\n\
+             Run again with --clear-cache to set it aside as {} and start a new one \
+             (every video will be fingerprinted again), or delete it.",
+            db_path.display(),
+            set_aside_path(db_path).display()
+        ),
+    }
+}
+
+/// Only a regular file is ever called damaged: anything else at the cache
+/// path is a mistake of another kind, and is not moved.
+fn is_regular(db_path: &Path) -> bool {
+    std::fs::symlink_metadata(db_path).is_ok_and(|m| m.is_file())
+}
+
+/// Where `--clear-cache` moves a damaged cache: beside it, under a name that
+/// is not taken.
+fn set_aside_path(db_path: &Path) -> PathBuf {
+    let mut name = db_path.file_name().unwrap_or_default().to_os_string();
+    name.push(".damaged");
+    let first = db_path.with_file_name(&name);
+    if std::fs::symlink_metadata(&first).is_err() {
+        return first;
+    }
+    (1..)
+        .map(|n| {
+            let mut numbered = name.clone();
+            numbered.push(format!(".{}", n));
+            db_path.with_file_name(numbered)
+        })
+        .find(|p| std::fs::symlink_metadata(p).is_err())
+        .expect("some numbered name is free")
 }
 
 /// How loud each destination is, which is two answers rather than one.
@@ -2734,6 +2864,7 @@ Interrupted with Ctrl-C.
     if let Some(path) = &args.output {
         refuse_to_overwrite_an_input("--output", path, &args)?;
     }
+    refuse_shared_outputs(&args)?;
 
     // Opened before the logger exists, so a bad path is reported by the ordinary
     // error path rather than by a logger that is not installed yet. Truncating
@@ -2903,6 +3034,19 @@ Interrupted with Ctrl-C.
                 db_path.display()
             );
             None
+        }
+        Err(e) if e.damaged && args.clear_cache => {
+            let aside = set_aside_path(&db_path);
+            std::fs::rename(&db_path, &aside).with_context(|| {
+                format!("Could not move the damaged cache {} aside", db_path.display())
+            })?;
+            log::warn!(
+                "The fingerprint cache at {} could not be read; it was moved to {} and a new \
+                 one started.",
+                db_path.display(),
+                aside.display()
+            );
+            Some(open_cache(&db_path).map_err(|e| e.reason)?)
         }
         Err(e) => return Err(e.reason),
     };
@@ -5431,6 +5575,7 @@ mod tests {
             detail_hashes: Vec::new(),
             mirrored_detail_hashes: Vec::new(),
             reframed: Vec::new(),
+            picture: 0.0,
         }
     }
 

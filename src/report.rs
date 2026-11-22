@@ -68,6 +68,8 @@ const KNOWN_ACTIONS: [&str; 10] = [
 /// A row that asked for its file to be disposed of.
 #[derive(Debug)]
 struct Marked {
+    /// The groups the row stands in, by the name the report gives them.
+    groups: Vec<String>,
     path: String,
     /// The file's length when the report was written. The staleness check is
     /// taken against this, so a row without a usable one is not actionable at
@@ -79,6 +81,9 @@ struct Marked {
 #[derive(Debug)]
 struct Report {
     marked: Vec<Marked>,
+    /// Per group, the files the report leaves in place, with the size each was
+    /// measured at. A DELETE rests on these; see `apply`.
+    holders: std::collections::HashMap<String, Vec<(String, u64)>>,
     /// Data rows seen, however they were labelled.
     rows: usize,
 }
@@ -93,6 +98,8 @@ struct Report {
 /// complaint you cannot act on.
 struct Row<'a> {
     at: String,
+    /// The group the row belongs to, where the report names one.
+    group: Option<String>,
     action: &'a str,
     /// Deliberately untrimmed. See `Rows::consider`.
     file: &'a str,
@@ -108,6 +115,7 @@ struct Row<'a> {
 #[derive(Default)]
 struct Rows {
     marked: Vec<Marked>,
+    holders: std::collections::HashMap<String, Vec<(String, u64)>>,
     rows: usize,
     /// One file can only be disposed of once. A report vid-fp wrote never
     /// repeats a path within its own decisions, but one assembled by hand or
@@ -153,6 +161,14 @@ impl Rows {
         }
 
         if lower != ACT_ON {
+            // Every other word this tool writes leaves the file where it is,
+            // except the three that say it already went.
+            let stays = !matches!(lower.as_str(), "deleted" | "unlinked" | "moved");
+            if let (true, Some(group), Ok(size)) = (stays, &row.group, row.size.trim().parse::<u64>()) {
+                if !row.file.trim().is_empty() {
+                    self.holders.entry(group.clone()).or_default().push((row.file.to_string(), size));
+                }
+            }
             return;
         }
 
@@ -237,15 +253,21 @@ impl Rows {
 
         if self.seen.insert(row.file.to_string()) {
             self.marked.push(Marked {
+                groups: row.group.into_iter().collect(),
                 path: row.file.to_string(),
                 size,
             });
+        } else if let Some(group) = row.group {
+            if let Some(m) = self.marked.iter_mut().find(|m| m.path == row.file) {
+                m.groups.push(group);
+            }
         }
     }
 
     fn finish(self) -> Report {
         Report {
             marked: self.marked,
+            holders: self.holders,
             rows: self.rows,
         }
     }
@@ -345,6 +367,36 @@ fn looks_like_json(path: &str) -> bool {
         .is_some_and(|b| *b == b'{' || *b == b'[')
 }
 
+/// The separator the CSV report was written with.
+///
+/// vid-fp writes `;`, but a spreadsheet that opens the report and saves it
+/// again writes its own locale's choice, which is `,` for most of the world,
+/// and a tab for "text" exports. Read with the wrong one the header is a single
+/// column, and the replay was refused for want of `full_path` -- a column the
+/// file plainly has. So the header line is asked which separator makes
+/// `full_path` one of its columns; `;` when none does, so the complaint about a
+/// file that is not a report at all is the one it always was.
+fn csv_delimiter(path: &str) -> u8 {
+    use std::io::{BufRead, Read};
+
+    const WRITTEN: u8 = b';';
+    let Ok(file) = std::fs::File::open(path) else { return WRITTEN };
+    let mut header = Vec::new();
+    if std::io::BufReader::new(file).take(64 * 1024).read_until(b'\n', &mut header).is_err() {
+        return WRITTEN;
+    }
+    [WRITTEN, b',', b'\t']
+        .into_iter()
+        .find(|&d| {
+            csv::ReaderBuilder::new()
+                .delimiter(d)
+                .from_reader(header.as_slice())
+                .headers()
+                .is_ok_and(|h| h.iter().any(|c| c.trim().eq_ignore_ascii_case("full_path")))
+        })
+        .unwrap_or(WRITTEN)
+}
+
 /// The CSV report, located by column name.
 ///
 /// A missing *column* means this is not a vid-fp CSV at all, and that does abort
@@ -352,7 +404,7 @@ fn looks_like_json(path: &str) -> bool {
 /// had simply been empty.
 fn read_csv(path: &str, stats: &RunStats) -> Result<Report> {
     let mut rdr = csv::ReaderBuilder::new()
-        .delimiter(b';')
+        .delimiter(csv_delimiter(path))
         // A hand-edited file can easily carry a row with a field too few or too
         // many. That is this function's problem to report, one row at a time,
         // not the parser's to die on.
@@ -368,6 +420,9 @@ fn read_csv(path: &str, stats: &RunStats) -> Result<Report> {
     let path_col = column(&headers, "full_path")?;
     let size_col = column(&headers, "size_bytes")?;
     let action_col = column(&headers, "action")?;
+    // Optional: a report without it simply has no groups to check a DELETE
+    // against, which is how a hand-built one would read.
+    let group_col = headers.iter().position(|h| h.trim().eq_ignore_ascii_case("group"));
 
     let mut rows = Rows::default();
 
@@ -410,6 +465,10 @@ fn read_csv(path: &str, stats: &RunStats) -> Result<Report> {
         rows.consider(
             Row {
                 at: format!("line {}", line),
+                group: group_col
+                    .and_then(|c| record.get(c))
+                    .map(|g| g.trim().to_string())
+                    .filter(|g| !g.is_empty()),
                 action: record.get(action_col).unwrap_or(""),
                 file: record.get(path_col).unwrap_or(""),
                 size: record.get(size_col).unwrap_or(""),
@@ -516,6 +575,7 @@ fn read_json(path: &str, stats: &RunStats) -> Result<Report> {
             rows.consider(
                 Row {
                     at: format!("{} file {}", group_name, f + 1),
+                    group: Some(group_name.clone()),
                     action: &file.action,
                     file: &file.full_path,
                     size: &file.size_bytes,
@@ -757,8 +817,24 @@ pub fn apply(
         return Ok(Vec::new());
     }
 
-    let targets: Vec<Target> = report
-        .marked
+    // A row is the user's decision, and a group may be emptied on purpose: a
+    // DELETE in a group whose every row is DELETE is taken as written. What is
+    // NOT the user's decision is a copy the report says stays and that has
+    // since gone. When every file the report keeps in the row's groups is gone
+    // or changed, removing this one would remove the last copy the report
+    // knows of -- the premise the row was written on no longer holds -- so it
+    // is left alone, as the window leaves it (`Move::stays`).
+    let (marked, unheld): (Vec<&Marked>, Vec<&Marked>) = report.marked.iter().partition(|m| {
+        let holders: Vec<&(String, u64)> =
+            m.groups.iter().filter_map(|g| report.holders.get(g)).flatten().collect();
+        holders.is_empty()
+            || holders.iter().any(|(path, size)| export::still_holds(path, *size))
+    });
+    for m in &unheld {
+        export::refuse_unheld(&m.path, stats);
+    }
+
+    let targets: Vec<Target> = marked
         .iter()
         .map(|m| Target {
             path: &m.path,
@@ -783,12 +859,22 @@ pub fn apply(
     let mut removed_bytes = 0u64;
     let mut deleted_paths: Vec<String> = Vec::new();
 
-    for m in &report.marked {
+    for m in &unheld {
+        info!(
+            "\t{:<width$} {}, {}",
+            "SKIPPED,",
+            format_size(m.size),
+            m.path,
+            width = export::ACTION_COLUMN
+        );
+    }
+
+    for m in &marked {
         if shutdown_requested() {
             info!(
                 "Interrupted: stopped after {} file(s); {} left untouched.",
                 removed_count,
-                report.marked.len() - removed_count - failed_count - changed_count
+                marked.len() - removed_count - failed_count - changed_count
             );
             break;
         }
@@ -832,7 +918,7 @@ pub fn apply(
 
     let mut summary = export::disposed_line(disposal, removed_count, removed_bytes);
     summary.push_str(&export::aliased_line(aliased_count, aliased_bytes));
-    summary.push_str(&export::trouble_lines(failed_count, changed_count));
+    summary.push_str(&export::trouble_lines(failed_count, changed_count, unheld.len()));
     info!("\n{}", summary);
 
     Ok(deleted_paths)
@@ -968,6 +1054,70 @@ shared_to_seconds";
         let path = dir.path().join(name);
         std::fs::write(&path, vec![b'x'; size]).unwrap();
         path.to_string_lossy().to_string()
+    }
+
+    /// `row`, under another group label.
+    fn row_of(group: &str, path: &str, size: u64, action: &str) -> String {
+        row(path, size, action).replacen("group_1", group, 1)
+    }
+
+    #[test]
+    fn test_a_delete_whose_kept_copies_are_all_gone_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let kept = make_file(&dir, "kept.mkv", 10);
+        let lone = make_file(&dir, "lone.mkv", 20);
+        let held = make_file(&dir, "held.mkv", 30);
+        let anchor = make_file(&dir, "anchor.mkv", 40);
+        let body = format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            HEADER,
+            row_of("group_1", &kept, 10, "KEEP"),
+            row_of("group_1", &lone, 20, "DELETE"),
+            row_of("group_2", &anchor, 40, "KEEP"),
+            row_of("group_2", &held, 30, "DELETE"),
+        );
+        let path = write_report(&dir, &body);
+        std::fs::remove_file(&kept).unwrap();
+
+        let stats = RunStats::default();
+        let removed = apply(&path, &Disposal::Permanent, true, &stats).unwrap();
+        assert_eq!(removed, vec![held.clone()]);
+        assert!(Path::new(&lone).exists(), "the last copy is kept");
+        assert_eq!(stats.delete_unheld.count(), 1);
+    }
+
+    #[test]
+    fn test_a_group_marked_entirely_delete_is_still_emptied() {
+        // The user's decision, and nothing was kept for it to rest on.
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_file(&dir, "a.mkv", 10);
+        let b = make_file(&dir, "b.mkv", 20);
+        let body = format!("{}\n{}\n{}\n", HEADER, row(&a, 10, "DELETE"), row(&b, 20, "DELETE"));
+        let path = write_report(&dir, &body);
+
+        let stats = RunStats::default();
+        let removed = apply(&path, &Disposal::Permanent, true, &stats).unwrap();
+        assert_eq!(removed.len(), 2);
+        assert_eq!(stats.delete_unheld.count(), 0);
+    }
+
+    #[test]
+    fn test_a_report_a_spreadsheet_saved_with_another_separator_still_replays() {
+        for sep in [",", "\t"] {
+            let dir = tempfile::tempdir().unwrap();
+            let body = format!(
+                "\u{feff}{}\r\n{}\r\n{}\r\n",
+                HEADER.replace(';', sep),
+                row("/a.mkv", 10, "KEEP").replace(';', sep),
+                row("/b.mkv", 20, "DELETE").replace(';', sep),
+            );
+            let path = write_report(&dir, &body);
+            let stats = RunStats::default();
+            let report = read(&path, &stats).unwrap();
+            assert_eq!(report.marked.len(), 1, "separator {:?}", sep);
+            assert_eq!(report.marked[0].path, "/b.mkv");
+            assert_eq!(report.marked[0].size, 20);
+        }
     }
 
     #[test]

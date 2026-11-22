@@ -92,15 +92,27 @@ fn intent(disposal: &Disposal, count: usize, bytes: u64) -> String {
     }
 }
 
+/// Whether pressing Return alone answers yes.
+///
+/// It does for the two disposals that can be undone (the trash, `--move-to`),
+/// where the common case should be one keystroke. It does not for
+/// `--permanent`: a Return pressed out of habit there removes files for good,
+/// so that one prompt reads `[y/N]` and needs the letter typed, as the window's
+/// own delete dialog defaults to leaving files in place.
+fn return_means_yes(disposal: &Disposal) -> bool {
+    !matches!(disposal, Disposal::Permanent)
+}
+
 /// One line of input as an answer, or `None` if it was not one.
 ///
-/// Empty means the user pressed Return, which the `[Y/n]` in the prompt
-/// promises is a yes. Anything unrecognised is deliberately NOT read as a
+/// Empty means the user pressed Return, which answers `default` -- what the
+/// capital letter in the prompt promises. Anything unrecognised is deliberately NOT read as a
 /// default -- someone who typed a word meant something by it, and guessing
 /// which way is the one mistake this function exists to prevent.
-fn interpret(line: &str) -> Option<bool> {
+fn interpret(line: &str, default: bool) -> Option<bool> {
     match line.trim().to_ascii_lowercase().as_str() {
-        "" | "y" | "yes" => Some(true),
+        "" => Some(default),
+        "y" | "yes" => Some(true),
         "n" | "no" => Some(false),
         _ => None,
     }
@@ -147,9 +159,10 @@ pub fn approve(
 
     let stdin = std::io::stdin();
     let mut line = String::new();
+    let default = return_means_yes(disposal);
 
     for _ in 0..MAX_ATTEMPTS {
-        let _ = write!(err, "Continue? [Y/n] ");
+        let _ = write!(err, "Continue? {} ", if default { "[Y/n]" } else { "[y/N]" });
         let _ = err.flush();
 
         line.clear();
@@ -165,7 +178,7 @@ pub fn approve(
                 if shutdown_requested() {
                     return false;
                 }
-                match interpret(&line) {
+                match interpret(&line, default) {
                     Some(answer) => return answer,
                     None => {
                         let _ = writeln!(err, "Please answer y or n.");
@@ -191,18 +204,28 @@ mod tests {
     #[test]
     fn test_return_means_yes() {
         // The whole point of [Y/n]: the common case is one keystroke.
-        assert_eq!(interpret(""), Some(true));
-        assert_eq!(interpret("\n"), Some(true));
-        assert_eq!(interpret("  \n"), Some(true));
+        assert_eq!(interpret("", true), Some(true));
+        assert_eq!(interpret("\n", true), Some(true));
+        assert_eq!(interpret("  \n", true), Some(true));
+    }
+
+    #[test]
+    fn test_return_alone_never_deletes_permanently() {
+        assert!(!return_means_yes(&Disposal::Permanent));
+        assert!(return_means_yes(&Disposal::Trash));
+        assert!(return_means_yes(&Disposal::MoveTo(PathBuf::from("/x"))));
+        assert_eq!(interpret("", false), Some(false));
+        assert_eq!(interpret("\n", false), Some(false));
+        assert_eq!(interpret("y", false), Some(true));
     }
 
     #[test]
     fn test_both_answers_in_any_case() {
         for yes in ["y", "Y", "yes", "YES", " Yes "] {
-            assert_eq!(interpret(yes), Some(true), "{:?} should be a yes", yes);
+            assert_eq!(interpret(yes, false), Some(true), "{:?} should be a yes", yes);
         }
         for no in ["n", "N", "no", "NO", " No "] {
-            assert_eq!(interpret(no), Some(false), "{:?} should be a no", no);
+            assert_eq!(interpret(no, true), Some(false), "{:?} should be a no", no);
         }
     }
 
@@ -211,7 +234,7 @@ mod tests {
         // Not false, and above all not true: these re-ask. "yeah" reading as a
         // yes is a guess, and "delete" reading as one is a catastrophe.
         for junk in ["yeah", "sure", "delete", "q", "yn", "1"] {
-            assert_eq!(interpret(junk), None, "{:?} should not be an answer", junk);
+            assert_eq!(interpret(junk, true), None, "{:?} should not be an answer", junk);
         }
     }
 

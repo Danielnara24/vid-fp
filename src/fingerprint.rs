@@ -150,6 +150,18 @@ pub struct VideoFingerprint {
     /// Each sample hashed again inside a smaller part of the picture, one entry
     /// per `REFRAMINGS`, so a copy cut down to that part can be found.
     pub reframed: Vec<Reframed>,
+    /// The share of the frame inside its bars, the largest any usable sample
+    /// shows (`frame_crop`, `largest_share`), in (0, 1]; 0 when not measured
+    /// (a fixture).
+    ///
+    /// What the Resolution ranking reads (`utils::resolution`), rather than the
+    /// stored width x height: a letterboxed 1920x1080 copy and the same film
+    /// cropped to 1920x800 hold the same picture, and on stored pixels the bars
+    /// alone won the first by 26%. Each copy's own crop finds the same picture,
+    /// so the products agree to within the line `frame_crop` peels beside each
+    /// bar (under 1% a side at `SIDE` = 128). The reported width and height
+    /// stay the stored ones.
+    pub picture: f32,
 }
 
 /// The samples of a fingerprint that a reframing applies to, and their hashes
@@ -1772,6 +1784,8 @@ pub(crate) struct Hashed {
     pub flat: Vec<bool>,
     pub detail: Vec<u64>,
     pub mirrored_detail: Vec<u64>,
+    /// Share of each frame inside its crop.
+    pub picture: Vec<f32>,
     /// One per `Reframing`, in `REFRAMINGS` order: each frame's hashes inside
     /// that sub-rectangle, or `None` where the reframing does not apply.
     pub reframed: Vec<Vec<Option<[u64; 4]>>>,
@@ -2156,6 +2170,7 @@ pub(crate) fn hash_frames_fully(u_frames: &[u8], dims: (u32, u32), on_frame: &dy
         detail: Vec::with_capacity(n_unique),
         mirrored_detail: Vec::with_capacity(n_unique),
         reframed: vec![Vec::with_capacity(n_unique); REFRAMINGS.len()],
+        picture: Vec::with_capacity(n_unique),
     };
 
     for (i, frame) in u_frames.chunks_exact(FRAME_STRIDE).enumerate() {
@@ -2163,6 +2178,8 @@ pub(crate) fn hash_frames_fully(u_frames: &[u8], dims: (u32, u32), on_frame: &dy
             on_frame(i);
         }
         let (rect, tiny) = frame_crop_or_tiny(frame);
+        let (y1, y2, x1, x2) = rect;
+        out.picture.push(((y2 - y1 + 1) * (x2 - x1 + 1)) as f32 / FRAME_STRIDE as f32);
         let coefficients = hasher.coefficients(frame, rect);
         out.hashes.push(hash_of(&coefficients));
         out.mirrored.push(hash_of(&mirror_coefficients(&coefficients)));
@@ -2184,6 +2201,18 @@ pub(crate) fn hash_frames_fully(u_frames: &[u8], dims: (u32, u32), on_frame: &dy
     }
 
     out
+}
+
+/// The largest of the per-sample picture shares, or 0 for none.
+///
+/// The largest rather than a median because the two things `frame_crop` peels
+/// differ in how often they appear: a letterbox or pillarbox is on every frame,
+/// while a flat edge belonging to the picture (a dark scene, a sky) is on some.
+/// The median read those edges as bars, so copies of one stream that sampled
+/// different scenes (a clip, a stream copy) measured up to 22% apart on the
+/// generated corpus where their stored pixels were identical.
+fn largest_share(shares: Vec<f32>) -> f32 {
+    shares.into_iter().fold(0.0, f32::max)
 }
 
 /// The coefficients of the same picture mirrored left to right. The basis
@@ -3049,10 +3078,12 @@ pub fn fingerprint_video(
     let mut final_detail = Vec::with_capacity(changes_hashes.len());
     let mut final_mirrored_detail = Vec::with_capacity(changes_hashes.len());
     let mut reframed: Vec<Reframed> = vec![Reframed::default(); REFRAMINGS.len()];
+    let mut pictures: Vec<f32> = Vec::with_capacity(changes_hashes.len());
 
     for i in 0..changes_hashes.len() {
         if changes_valid[i] {
             let frame = changes_frame[i];
+            pictures.push(hashed.picture[frame]);
             for (v, r) in reframed.iter_mut().enumerate() {
                 if let Some(h) = hashed.reframed[v][frame] {
                     r.samples.push(final_hashes.len() as u32);
@@ -3111,6 +3142,7 @@ pub fn fingerprint_video(
         detail_hashes: final_detail,
         mirrored_detail_hashes: final_mirrored_detail,
         reframed,
+        picture: largest_share(pictures),
     }))
 }
 
@@ -3272,6 +3304,21 @@ mod tests {
             .expect("min_duration is off, nothing should be skipped")
     }
 
+    #[test]
+    fn test_a_letterboxed_copy_measures_the_same_picture_as_the_bare_one() {
+        // The same 160x80 footage, stored bare and padded to 160x120 with black
+        // bars: 50% more stored pixels and the same picture. Resolution ranks
+        // on the picture (`utils::resolution`), so the two must agree within
+        // the band that calls two resolutions level (`RESOLUTION_TOLERANCE`).
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let bare = fingerprint_path(&dir.join("test_video_cropped.mp4"));
+        let boxed = fingerprint_path(&dir.join("test_video_letterboxed.mp4"));
+        assert_eq!((bare.width * bare.height, boxed.width * boxed.height), (12_800, 19_200));
+        assert!(boxed.picture > 0.0 && boxed.picture < 0.75, "the bars are measured: {}", boxed.picture);
+        let (a, b) = (crate::utils::resolution(&bare) as f64, crate::utils::resolution(&boxed) as f64);
+        assert!((a - b).abs() / a.max(b) < crate::utils::RESOLUTION_TOLERANCE, "bare {a} against letterboxed {b}");
+    }
+
     fn fingerprint_fixture(threads: usize) -> VideoFingerprint {
         init_ffmpeg_for_tests();
 
@@ -3303,6 +3350,7 @@ mod tests {
             detail_hashes: Vec::new(),
             mirrored_detail_hashes: Vec::new(),
             reframed: Vec::new(),
+            picture: 0.0,
         }
     }
 

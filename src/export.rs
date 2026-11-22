@@ -789,6 +789,26 @@ pub enum Fate {
     Failed,
 }
 
+/// Whether a file a DELETE rests on is still at `path` as it was measured:
+/// there, a regular file, and the same length.
+///
+/// The window asks the same of a deletion's holders before it trashes it
+/// (`Move::stays`); this is the command line's copy of that check.
+pub fn still_holds(path: &str, measured_size: u64) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() == measured_size)
+}
+
+/// Log and tally a DELETE left alone because nothing it lost to remains.
+pub fn refuse_unheld(path: &str, stats: &RunStats) {
+    log::error!(
+        target: crate::stats::COUNTED,
+        "Not removing {}: every copy it lost to is gone or changed since the scan, so it may be \
+         the last one",
+        path
+    );
+    stats.delete_unheld.record(path.to_string());
+}
+
 /// Take one file off its path, with the staleness check that has to precede it.
 ///
 /// This is the whole of the destructive step, and the only copy of it: the
@@ -1321,7 +1341,7 @@ pub fn output_results(
     // end-to-end conclusion is their sum. That is deliberate: the alternative is
     // holding the tail of every chain back and asking the user to re-run until
     // it has collapsed a hop at a time.
-    let Verdicts { review: review_set, delete: delete_indices, .. } = match ranking.into() {
+    let Verdicts { review: review_set, delete: delete_indices, lost_to } = match ranking.into() {
         Ranking::By(priority) => verdicts(final_groups, fingerprints, matches, priority),
         Ranking::Pinned(decided) => decided,
     };
@@ -1362,10 +1382,15 @@ pub fn output_results(
     let mut removed_count = 0usize;
     let mut failed_count = 0usize;
     let mut changed_count = 0usize;
+    let mut unheld_count = 0usize;
     let mut aliased_count = 0usize;
     let mut aliased_bytes = 0u64;
     let mut removed_bytes = 0u64;
     let delete_candidate_count = delete_indices.len();
+    // Files this pass has taken away. A deletion may rest on one of them: the
+    // scan's DELETEs chain (c lost to b, b to a), and b was only removed because
+    // what it lost to was still there, so the chain still ends on a copy.
+    let mut removed_here: HashSet<usize> = HashSet::new();
 
     // What a run WOULD reclaim, computed from the same set the loop below
     // walks, so the dry run's figure and the real run's figure cannot disagree
@@ -1400,11 +1425,28 @@ pub fn output_results(
                 info!(
                     "Interrupted: stopped after {} file(s); {} left untouched.",
                     removed_count,
-                    delete_candidate_count - removed_count - failed_count - changed_count
+                    delete_candidate_count - removed_count - failed_count - changed_count - unheld_count
                 );
                 break;
             }
             let fp = &fingerprints[idx];
+
+            // What it lost to has to still be there, as it was measured, or
+            // have gone in this pass on the same terms. The scan may be hours
+            // old by now, and the confirmation prompt waits as long as it is
+            // left: a copy removed in that time leaves this one the last.
+            let held = lost_to.get(&idx).is_none_or(|winners| {
+                winners.is_empty()
+                    || winners.iter().any(|&w| {
+                        removed_here.contains(&w) || still_holds(&fingerprints[w].path, fingerprints[w].file_size)
+                    })
+            });
+            if !held {
+                refuse_unheld(&fp.path, stats);
+                unheld_count += 1;
+                delete_outcome.insert(idx, "SKIPPED");
+                continue;
+            }
 
             match dispose_one(&fp.path, fp.file_size, disposal, stats) {
                 Fate::Done { aliased } => {
@@ -1417,6 +1459,7 @@ pub fn output_results(
                         removed_bytes += fp.file_size;
                     }
                     deleted_paths.push(fp.path.clone());
+                    removed_here.insert(idx);
                     delete_outcome.insert(idx, disposal.done_label(aliased));
                 }
                 Fate::Changed => {
@@ -2006,7 +2049,7 @@ pub fn output_results(
 
     if acting {
         summary.push_str(&aliased_line(aliased_count, aliased_bytes));
-        summary.push_str(&trouble_lines(failed_count, changed_count));
+        summary.push_str(&trouble_lines(failed_count, changed_count, unheld_count));
     }
 
     if show_summary {
@@ -2142,8 +2185,14 @@ pub fn aliased_line(count: usize, bytes: u64) -> String {
 
 /// The lines that follow it when the pass did not get everything, each omitted
 /// when its count is zero.
-pub fn trouble_lines(failed: usize, changed: usize) -> String {
+pub fn trouble_lines(failed: usize, changed: usize, unheld: usize) -> String {
     let mut out = String::new();
+    if unheld > 0 {
+        out.push_str(&format!(
+            "\n{} file(s) were left alone because every copy they lost to is gone or changed.",
+            unheld
+        ));
+    }
     if failed > 0 {
         out.push_str(&format!(
             "\n{} file(s) could not be removed (see errors above).",
@@ -2199,6 +2248,7 @@ matched_from_seconds;matched_to_seconds";
             detail_hashes: Vec::new(),
             mirrored_detail_hashes: Vec::new(),
             reframed: Vec::new(),
+            picture: 0.0,
         }
     }
 
@@ -3457,6 +3507,50 @@ matched_from_seconds;matched_to_seconds";
         expected.sort();
         assert_eq!(deleted, expected);
         assert!(Path::new(&p0).exists());
+    }
+
+    #[test]
+    fn test_a_deletion_whose_every_winner_is_gone_is_left_alone() {
+        // The chain above, with the head removed between the scan and the
+        // disposal (the prompt waits as long as it is left). 1 lost only to 0,
+        // which is gone, so 1 would be the last copy and stays. 2 lost to 1,
+        // which is still there, so 2 goes as before.
+        let dir = tempfile::tempdir().unwrap();
+        let p0 = at(&dir, "best.mkv");
+        let p1 = at(&dir, "bridge.mkv");
+        let p2 = at(&dir, "tail.mkv");
+        let fps = vec![mock_fp_at(&p0, 100.0), mock_fp_at(&p1, 90.0), mock_fp_at(&p2, 10.0)];
+        materialize_all(&fps);
+        std::fs::remove_file(&p0).unwrap();
+
+        let stats = RunStats::default();
+        let deleted = output_results(
+            &[vec![1, 0, 2]], &fps, &chain_of_three(), None, 0, Priority::Length,
+            Some(&Disposal::Permanent), true, &stats,
+        ).unwrap();
+
+        assert_eq!(deleted, vec![p2]);
+        assert!(Path::new(&p1).exists(), "the last copy is kept");
+        assert_eq!(stats.delete_unheld.count(), 1);
+    }
+
+    #[test]
+    fn test_a_winner_that_changed_size_holds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let p0 = at(&dir, "best.mkv");
+        let p1 = at(&dir, "bridge.mkv");
+        let p2 = at(&dir, "tail.mkv");
+        let fps = vec![mock_fp_at(&p0, 100.0), mock_fp_at(&p1, 90.0), mock_fp_at(&p2, 10.0)];
+        materialize_all(&fps);
+        std::fs::write(&p0, b"truncated").unwrap();
+
+        let stats = RunStats::default();
+        output_results(
+            &[vec![1, 0, 2]], &fps, &chain_of_three(), None, 0, Priority::Length,
+            Some(&Disposal::Permanent), true, &stats,
+        ).unwrap();
+        assert!(Path::new(&p1).exists());
+        assert_eq!(stats.delete_unheld.count(), 1);
     }
 
     #[test]

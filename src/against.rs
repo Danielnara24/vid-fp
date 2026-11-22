@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use crate::compare::Match;
 use crate::export::{judge, Verdicts};
 use crate::fingerprint::VideoFingerprint;
-use crate::utils::{outranks, GroupMaxima, Priority};
+use crate::utils::{outranks_on_metrics, GroupMaxima, Priority};
 
 /// What the library makes of one scanned file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, clap::ValueEnum)]
@@ -60,8 +60,8 @@ pub struct Answered {
 /// of it is for.
 ///
 /// The ranking is the one a scan uses, run over the file and the library files
-/// it matched (`export::judge` for the REVIEW cases, `utils::outranks` for the
-/// rest), so a clip of a library video is a repeat because its host is longer,
+/// it matched (`export::judge` for the REVIEW cases, `utils::outranks_on_metrics`
+/// for the rest, which leaves a tie level rather than breaking it by path), so a clip of a library video is a repeat because its host is longer,
 /// and a host of a library clip is better for the same reason.
 pub fn answer(
     fingerprints: &[VideoFingerprint],
@@ -109,7 +109,7 @@ pub fn answer(
             let level_or_above: Vec<usize> = group[1..]
                 .iter()
                 .copied()
-                .filter(|&h| !outranks(&fingerprints[s], &fingerprints[h], priority, &maxima))
+                .filter(|&h| !outranks_on_metrics(&fingerprints[s], &fingerprints[h], priority, &maxima))
                 .collect();
             if flagged.contains(&s) {
                 Answer::Review
@@ -162,6 +162,7 @@ mod tests {
             detail_hashes: Vec::new(),
             mirrored_detail_hashes: Vec::new(),
             reframed: Vec::new(),
+            picture: 0.0,
         }
     }
 
@@ -204,6 +205,17 @@ mod tests {
         assert!(!answered.verdicts.delete.contains(&0) && !answered.verdicts.review.contains(&0));
         assert_eq!(answered.verdicts.delete, vec![1, 2]);
         assert_eq!(answered.verdicts.lost_to[&1], vec![0]);
+    }
+
+    #[test]
+    fn test_an_equal_copy_is_a_repeat_whichever_folder_sorts_first() {
+        // The path tiebreak `outranks` ends on used to decide this: a scanned
+        // folder sorting before the library made an exact copy `better`.
+        for (lib, new) in [("/a/lib/x.mkv", "/b/new/x.mkv"), ("/b/lib/x.mkv", "/a/new/x.mkv")] {
+            let fps = vec![fp(lib, 600.0, 1080, "h264"), fp(new, 600.0, 1080, "h264")];
+            let got = answers_of(&fps, &[link(1, 0, 1.0, 1.0)], &[true, false]);
+            assert_eq!(got, vec![Answer::Repeat], "library {lib}, scanned {new}");
+        }
     }
 
     #[test]
