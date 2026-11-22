@@ -90,6 +90,11 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.44.0" date="2026-11-21">
+      <description>
+        <p>A letterboxed copy no longer outranks the same film without its black bars, a deletion whose kept copy has since gone is left alone, and a damaged cache can be reset with the Empty the cache option. Fingerprints are rebuilt once.</p>
+      </description>
+    </release>
     <release version="0.43.0" date="2026-11-21">
       <description>
         <p>Phone videos that only carry a rotation flag now match their re-encodes, MKV files report their video's own length, broadcast captures get a real thumbnail, and camera formats such as MXF and HDV are found in folders. Fingerprints are rebuilt once.</p>
