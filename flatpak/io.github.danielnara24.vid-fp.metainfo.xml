@@ -90,6 +90,11 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.45.0" date="2026-11-21">
+      <description>
+        <p>The fingerprint cache is kept in a simpler layout. It is converted on the first run, without fingerprinting anything again.</p>
+      </description>
+    </release>
     <release version="0.44.0" date="2026-11-21">
       <description>
         <p>A letterboxed copy no longer outranks the same film without its black bars, a deletion whose kept copy has since gone is left alone, and a damaged cache can be reset with the Empty the cache option. Fingerprints are rebuilt once.</p>
