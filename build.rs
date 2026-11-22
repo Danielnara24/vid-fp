@@ -35,7 +35,7 @@
 //! (-lgme, -lopenmpt, -lgnutls ...) is not installed; on a host that has those
 //! it links, and the result is the silently-wrong static binary this file
 //! exists to prevent -- the same class of fault CLAUDE.md records as costing a
-//! `CACHE_TABLE` rename, since decoder output is not bit-identical across
+//! cache table rename (`cache::TABLE`), since decoder output is not bit-identical across
 //! FFmpeg majors.
 //!
 //! It is also sticky. `ffmpeg-sys-next` emits no `rerun-if-env-changed` of any
@@ -63,8 +63,8 @@ use std::path::{Path, PathBuf};
 fn main() {
     println!("cargo:rerun-if-env-changed=FFMPEG_DIR");
 
-    // The suffix on the cache tables whose contents depend on the processor
-    // (lib.rs, `CACHE_TABLE`): libswscale's fast bilinear scaler rounds
+    // The suffix on the cache table, whose contents depend on the processor
+    // (`cache::TABLE`): libswscale's fast bilinear scaler rounds
     // differently in x86 SIMD than in the C code other architectures run.
     // Empty on x86_64, so the tables every existing cache holds keep their
     // names; `_<arch>` elsewhere, so a cache shared between an ARM and an x86

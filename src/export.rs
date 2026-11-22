@@ -3973,7 +3973,7 @@ matched_from_seconds;matched_to_seconds";
         // The other half of the same rule, and the half with the consequence:
         // the report is the LAST thing `output_results` does, so a failure
         // there must not take the disposal pass's answer out with it. Without
-        // those paths `main` never calls `cache_forget`, and the cache goes on
+        // those paths `main` never calls `Cache::forget`, and the cache goes on
         // offering fingerprints for files that are gone.
         let dir = tempfile::tempdir().unwrap();
         let fps = vec![

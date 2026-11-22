@@ -1,4 +1,5 @@
 mod against;
+mod cache;
 mod clustering;
 mod compare;
 mod confirm;
@@ -13,6 +14,7 @@ pub mod thumbnail;
 pub mod utils;
 mod sources;
 pub use sources::desktop_dir;
+pub use cache::default_cache_file;
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
@@ -22,8 +24,7 @@ use export::{Disposal, Format, ReportTarget, Sink};
 use fingerprint::{fingerprint_video, VideoFingerprint, MAX_DECODE_THREADS};
 use log::info;
 use rayon::prelude::*;
-use redb::{Database, DatabaseError, ReadableTable, StorageError, TableDefinition};
-use serde::{Deserialize, Serialize};
+use cache::{Cache, Known, Refusal, Stamp};
 use stats::RunStats;
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -42,275 +43,6 @@ use utils::{shutdown_requested, Priority};
 #[cfg(feature = "static-ffmpeg")]
 include!(concat!(env!("OUT_DIR"), "/static_ffmpeg_version_check.rs"));
 
-/// The one table in the cache: absolute file path -> bincode'd `CacheEntry`.
-///
-/// One entry per path, overwritten in place. That is the entire invalidation
-/// story, and it is why the cache is bounded by the number of files ever
-/// scanned rather than by the number of times they have changed: a file that is
-/// re-encoded, re-muxed, or scanned with different sampling settings replaces
-/// its own entry instead of growing a second one beside it.
-///
-/// Per architecture, through the suffix `build.rs` supplies (empty on x86_64,
-/// `_aarch64` on ARM). The keyframes are shrunk by libswscale's fast bilinear
-/// scaler, and its x86 SIMD code rounds differently from the C code ARM runs:
-/// the same file hashes slightly differently on the two, and about one link in
-/// eight of the local corpus's report differs between them, at the same
-/// accuracy against the labeled pairs. So a cache two architectures share
-/// keeps a table each rather than handing one's fingerprints to the other.
-/// Every x86 instruction level from SSE2 to AVX2 gives the same pictures, so
-/// x86 machines do share one. Making all of them agree (the scaler built from
-/// the C code everywhere) was measured and declined: it cost every x86 user a
-/// re-decode and 2-6% of a cold scan for agreement no x86 user needs.
-const CACHE_TABLE: TableDefinition<&str, &[u8]> =
-    TableDefinition::new(concat!("fingerprints_dct_ct_ff8_picture", env!("VID_FP_ARCH_TABLE_SUFFIX")));
-
-/// Files this build looked at and refused before opening: see `NotMedia`.
-///
-/// A SEPARATE table, which is the whole reason this was affordable. The
-/// fingerprint table's layout is untouched, so adding this invalidates nothing
-/// and costs no re-decode -- and the two halves can be retired on completely
-/// different schedules, which they need to be.
-///
-/// The name carries the rules, and it is meant to be thrown away. A positive
-/// entry is expensive to rebuild (it is a decode) so `Stamp` guards it as
-/// tightly as it can and the table is renamed only when a field changes meaning.
-/// A refusal is worth half a millisecond, so it can be discarded on the merest
-/// suspicion -- and it has to be, because it depends on things `Stamp`
-/// deliberately does not record: the vendored FFmpeg's demuxer set (`ff8`) and
-/// this tool's own gate (`probe6` = `FIRST_PROBE_BYTES`/`SECOND_PROBE_BYTES`/
-/// `NO_EVIDENCE`, and what a `NotMedia` counts). A `Refusal::Said` widens that
-/// list to everything the DECODE can decide, since it stores the sentence a run
-/// printed: which decoder answers fail a file, and the words they fail it in,
-/// are part of what is in this table. Change any of those and the
-/// entries are wrong in the direction that matters -- a file that would now be
-/// read as video, remembered as junk -- so bump the suffix and push the old name
-/// into `SUPERSEDED_REFUSAL_TABLES`, which is a separate list precisely because
-/// what this costs (one cheap re-probe of the library) is not what retiring a
-/// fingerprint table costs, and the run says so in different words. Putting it
-/// in `SUPERSEDED_TABLES` would tell a user with a large library to expect a
-/// re-decode that is not coming.
-///
-/// Per architecture like `CACHE_TABLE`, because one verdict it remembers --
-/// every sampled frame featureless -- is a judgement on the scaled pictures.
-const REFUSED_TABLE: TableDefinition<&str, &[u8]> =
-    TableDefinition::new(concat!("refused_ff8_probe6", env!("VID_FP_ARCH_TABLE_SUFFIX")));
-
-/// What each fingerprinted path held: absolute path -> bincode'd
-/// `content::Identity`.
-///
-/// Beside the fingerprints rather than inside them, so adding it cost no
-/// `CACHE_TABLE` rename and no re-decode. An identity vouches for a fingerprint
-/// only while that path's `CACHE_TABLE` stamp is the stat the identity was
-/// taken at (`IdentityIndex`), which is what lets either table be written,
-/// overwritten or lost without the other one lying: a mismatch is a record
-/// nobody reads. See `content` for what an identity is for.
-///
-/// No FFmpeg or decoder suffix, because nothing in it comes out of a decoder:
-/// it is bytes on disk. A change to what `content::sample` reads is a rename
-/// here and a re-sample, never a re-decode.
-const IDENTITY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("identity_s1");
-
-/// Tables earlier builds wrote, all dead. They are dropped whole on the first
-/// run of this one.
-///
-/// Renaming the table is how a fingerprint that no longer MEANS the same thing
-/// is retired, and it is the only mechanism that works here. `VideoFingerprint`
-/// relies on a changed layout failing to deserialize, which catches a field
-/// being added but not a field changing units underneath the same `u32` -- an
-/// entry written when those numbers counted keyframes decodes perfectly as one
-/// that counts milliseconds, and quietly reports nonsense. A name no lookup
-/// will ever ask for cannot be misread.
-///
-/// - `fingerprints` was keyed by path AND mtime AND size AND the sampling
-///   knobs. That key was a leak: touching a file wrote a NEW key and left the
-///   old one behind for the life of the cache, and `--prune-cache` could not
-///   tell the two apart because it only compared the path portion.
-/// - `fingerprints_by_path` fixed the key, but holds difference hashes over an
-///   8x9 thumbnail and sample times counted in keyframes. This build hashes
-///   DCT coefficients and counts milliseconds; the two are not comparable.
-/// - `fingerprints_dct` holds the right hashes against the wrong clock. Its
-///   sample times came from the presentation timestamps libavformat reported,
-///   and on MP4 those are skewed by up to a reorder delay because discarding
-///   the non-key samples desynchronises the demuxer's `ctts` cursor. This build
-///   measures decode time from the first keyframe instead. Same field, same
-///   units, different milliseconds -- exactly the case a layout check cannot
-///   catch.
-/// - `fingerprints_dct_ct` holds the right hashes off a different decoder. The
-///   released binary now links a vendored FFmpeg 8 (see
-///   scripts/build-ffmpeg-static.sh) where it used to link whatever the host
-///   shipped, in practice FFmpeg 6. Decoder output is not bit-identical across
-///   major versions and measurably is not here: on the `-d 4 -p 20` accuracy
-///   profile one pair's coverage falls by a single 0.5s sample and drops under
-///   the gate. That is a smaller change than the ones above, which is exactly
-///   why it needed the rename -- the `Stamp` records mtime, size and the
-///   sampling knobs but deliberately not an FFmpeg version, so entries written
-///   either side of the switch are indistinguishable to a lookup and would have
-///   mixed silently, forever.
-/// - `fingerprints_dct_ct_ff8` holds the right hashes against a `total_ms` that
-///   is a few tenths of a percent short. `sample_times` extends the last sample
-///   by one average gap when the samples outrun the runtime the container
-///   reported, and it divided the span by the number of SAMPLES rather than by
-///   the number of gaps between them. The field keeps its name and its units and
-///   only its value moves, which is precisely the case a layout check cannot
-///   catch -- and it moves for real files, three of the 727 in the local corpus.
-/// - `fingerprints_dct_ct_ff8_tail` holds, for any file whose container
-///   restarts its clock part way through, the first segment of that file and
-///   nothing else. Both halves of the demux loop navigated by timestamps that
-///   a spliced capture reuses -- the dedup guard read the restart as a seek
-///   landing short and dropped every keyframe after it, and the seek path
-///   aimed past a timestamp that exists twice -- so `cat s1.ts s2.ts` was
-///   fingerprinted as `s1.ts`, with `s1.ts`'s runtime, and lost the ranking to
-///   the file it contains. Same fields, same units, half the values, and the
-///   `Stamp` cannot see it: the entry matches its file's mtime and size
-///   perfectly. Nothing else moved -- the 756-file local corpus reports
-///   byte-identical CSVs either side -- which is precisely why the name had to
-///   change rather than the layout.
-/// - `fingerprints_dct_ct_ff8_splice` holds, for any file whose stream changes
-///   resolution or pixel format part way through, everything up to the change
-///   and nothing after it. The scaler was built from the first frame the
-///   decoder produced and never rebuilt, and libswscale refuses a frame that is
-///   not the shape its context was built for -- so every later frame came back
-///   `InputChanged`, both call sites discarded it, and the file stopped being
-///   sampled where it changed size. Same shape of damage as the entry above and
-///   reached by an entirely separate route: no clock restart is needed, only a
-///   broadcaster switching feeds or two encodes concatenated. Same fields, same
-///   units, half the values, invisible to the `Stamp`.
-/// - `fingerprints_dct_ct_ff8_rescale` holds, for a run that asked for
-///   `--keyframe-interval N --min-keyframes 0` (or a negative, or NaN), every
-///   keyframe in the file rather than one every N seconds. `--min-keyframes` is
-///   a floor on the interval, so a floor of nothing means the interval stands;
-///   it used to mean the interval was dropped as well. The stamp cannot see it:
-///   it records `kf_interval = N` either way, so the entries an old build wrote
-///   under those flags match a new run's stamp exactly and would be handed back
-///   with roughly N times too many hashes. Narrower than every entry above --
-///   it needs that flag pair to have been typed, and a cache that never saw it
-///   holds nothing wrong -- but there is no bit in the stamp that separates the
-///   two, which is the only test that has ever decided this.
-/// - `fingerprints_dct_ct_ff8_kffloor` holds, for HEVC files with open-GOP
-///   (CRA) keyframes more than 128 frames apart, pictures filed under another
-///   keyframe's time. A decoder shown only keyframes cannot see the CRA's
-///   picture order count wrap, hands them back out of order, and the scan read
-///   each frame's time from `best_effort_timestamp`, which then falls back to
-///   the dts of the packet being SENT -- a later keyframe's. It now reads the
-///   frame's own `pts`. Only builds linking FFmpeg 6.x did it (17 of the local
-///   corpus's 19 HEVC files); the vendored FFmpeg 8 never did, and its entries
-///   are right -- but no field of an entry says which libavcodec wrote it, so
-///   the whole table goes. Same fields, same units, values moved between
-///   samples, invisible to the `Stamp`.
-/// - `fingerprints_dct_ct_ff8_pts` holds hashes taken inside ONE crop
-///   rectangle per file, found from the variance of every sampled frame of
-///   that file together. A clip samples a different set of frames from its
-///   source and could get a different rectangle, which reframes every hash:
-///   pixel-identical frames came out 22 bits apart. Each frame is now cropped
-///   by its own flat edges (`frame_crop`), so every value of `valid_hashes`
-///   can move. The entries also lack `mirrored_hashes`, which on its own would
-///   only have made them fail to load.
-/// - `fingerprints_dct_ct_ff8_framecrop` kept frames whose AC energy was
-///   between the old featureless floor (8) and the new one (50): dark,
-///   low-contrast frames whose hash is mostly the position of one bright patch,
-///   which matched unrelated dark frames. Which samples a fingerprint holds
-///   changed, and the entries lack the detail and reframed hashes.
-/// - `fingerprints_dct_ct_ff8_detail` holds two reframings per sample, not
-///   three: no `Inset`, so a picture-in-picture copy of a file cached there
-///   would never be found, and nothing in an entry says so.
-/// - `fingerprints_dct_ct_ff8_inset` holds hashes read from a 64x64 working
-///   frame where they are now read from 128x128 (`fingerprint::SIDE`), so every
-///   value moved; frames whose picture is under a quarter of the frame kept as
-///   usable; bars carrying a caption left unpeeled; and no `Strip` or `Cut43`
-///   reframing, which an entry would load without and then never match under.
-/// - `fingerprints_dct_ct_ff8_s128` holds, for any file whose container asks
-///   for its pictures to be turned (a phone's display matrix), hashes of the
-///   pictures as stored rather than as seen, so the file never matched a copy
-///   with the turn baked into its pixels, and the width and height of the
-///   stored buffer. For a Matroska file it also holds a `duration` read from
-///   the segment, which spans the audio, where the video track's own
-///   `DURATION` tag is now read first (`fingerprint::duration_seconds`). Same
-///   fields, same units, values moved, invisible to the `Stamp`.
-/// - `fingerprints_dct_ct_ff8_turned` has no `picture` (the share of the frame
-///   inside its bars), which the Resolution ranking now reads so a letterboxed
-///   copy no longer outranks a cropped one on its black bars. Appending the
-///   field alone would have made those entries fail to load and be decoded
-///   again anyway; the rename also hands their pages back.
-const SUPERSEDED_TABLES: [TableDefinition<&str, &[u8]>; 15] = [
-    TableDefinition::new("fingerprints"),
-    TableDefinition::new("fingerprints_by_path"),
-    TableDefinition::new("fingerprints_dct"),
-    TableDefinition::new("fingerprints_dct_ct"),
-    TableDefinition::new("fingerprints_dct_ct_ff8"),
-    TableDefinition::new("fingerprints_dct_ct_ff8_tail"),
-    TableDefinition::new("fingerprints_dct_ct_ff8_splice"),
-    TableDefinition::new("fingerprints_dct_ct_ff8_rescale"),
-    TableDefinition::new("fingerprints_dct_ct_ff8_kffloor"),
-    TableDefinition::new(concat!("fingerprints_dct_ct_ff8_pts", env!("VID_FP_ARCH_TABLE_SUFFIX"))),
-    TableDefinition::new(concat!("fingerprints_dct_ct_ff8_framecrop", env!("VID_FP_ARCH_TABLE_SUFFIX"))),
-    TableDefinition::new(concat!("fingerprints_dct_ct_ff8_detail", env!("VID_FP_ARCH_TABLE_SUFFIX"))),
-    TableDefinition::new(concat!("fingerprints_dct_ct_ff8_inset", env!("VID_FP_ARCH_TABLE_SUFFIX"))),
-    TableDefinition::new(concat!("fingerprints_dct_ct_ff8_s128", env!("VID_FP_ARCH_TABLE_SUFFIX"))),
-    TableDefinition::new(concat!("fingerprints_dct_ct_ff8_turned", env!("VID_FP_ARCH_TABLE_SUFFIX"))),
-];
-
-/// Refusal tables earlier builds wrote. Kept apart from the list above because
-/// what it costs to drop one is not comparable: retiring a fingerprint table is
-/// a re-decode of the whole library, retiring this is a re-probe measured in
-/// seconds, and the run says so in different words.
-///
-/// `refused_ff8_probe1` was retired for a reason no fingerprint table would
-/// ever be retired for: `Refusal::Said` stores the sentence the run printed, so
-/// the WORDING is part of what is in there. Trimming the duplicated path out of
-/// those messages would otherwise have left a cache printing two formats in one
-/// run, half of them naming the file twice.
-///
-/// `refused_ff8_probe2` went for the same kind of reason one rung down.
-/// `NotMedia` stores numbers rather than a sentence, but `bytes` changed
-/// meaning: it was the probe size the gate had reached and it is now that size
-/// capped by what the file actually holds, so an entry written by the old build
-/// regenerates "the first 16384 bytes" for a file with nothing in it. Same
-/// field, same units, different value -- which is exactly the case a layout
-/// check cannot see, and which costs a re-probe measured in seconds.
-///
-/// `refused_ff8_probe3` went on suspicion rather than on a measured difference,
-/// which is the whole reason this list is cheap enough to have. The first
-/// reading used to be probed out of a buffer already holding all 16 KB, so the
-/// 32 bytes of padding past the 2 KB window were the file's own data where
-/// `av_probe_input_buffer2` memsets zeros -- a demuxer that reads its padding
-/// was answering a question libavformat never asks. It now reads 2 KB and pads
-/// them properly. No file changed its score: 98,209 files across the build tree
-/// and both video corpora were probed both ways and every one agreed. But a
-/// score CAN move in principle, and the direction that matters is a file read
-/// as junk by the old gate and as video by this one, so the entries go.
-///
-/// `refused_ff8_probe4` is the first entry here that has nothing to do with the
-/// probe gate, and it is the one that shows why the wording is worth retiring
-/// over. A build in between read a decode error out of `send_packet` as the
-/// decoder refusing the keyframe, and refused the whole video for it -- nine
-/// files of one folder on a plain build against the system FFmpeg, each one a
-/// perfectly good 10-bit HEVC remux that had decoded 827 of its 835 keyframes.
-/// Every one of those went into this table as `Refusal::Said`, which is exactly
-/// the entry that stops a later run ever opening the file again. The verdict is
-/// wrong now, nothing about the file changed, and no `Stamp` can tell: the
-/// entries have to go by name or those videos stay invisible for ever.
-///
-/// `refused_ff8_probe5` holds `Refusal::TooShort` runtimes read from a
-/// Matroska segment, which spans the audio, where the video track's own
-/// `DURATION` tag is now read first. A remembered runtime answers before the
-/// header is read again, so it has to be measured the way the decode measures.
-const SUPERSEDED_REFUSAL_TABLES: [TableDefinition<&str, &[u8]>; 5] = [
-    TableDefinition::new("refused_ff8_probe1"),
-    TableDefinition::new("refused_ff8_probe2"),
-    TableDefinition::new("refused_ff8_probe3"),
-    TableDefinition::new("refused_ff8_probe4"),
-    TableDefinition::new(concat!("refused_ff8_probe5", env!("VID_FP_ARCH_TABLE_SUFFIX"))),
-];
-
-/// Hard ceiling on the cache's page cache.
-///
-/// A cached fingerprint is a few kilobytes, so even a fifty-thousand-file
-/// library is a few hundred megabytes on disk and is read exactly once per run,
-/// in key order. There is nothing here for a large cache to help with, and this
-/// binary works hard elsewhere (see the `mallopt` calls below) to keep resident
-/// memory flat across a long scan -- letting the database quietly grow a
-/// gigabyte-scale cache would undo that.
-const CACHE_SIZE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Exit code for a run that finished, reported, and did everything it could --
 /// but hit at least one problem on the way (an unreadable file, a video that
@@ -400,126 +132,6 @@ const MAX_THREAD_OVERSUBSCRIPTION: usize = 4;
 /// where thread creation starts to hurt.
 const MIN_THREAD_CEILING: usize = 16;
 
-/// Everything other than the file's contents that decides whether a cached
-/// fingerprint is still the right answer for the file at a given path.
-///
-/// This used to be spelled into the cache key. Moving it into the value is what
-/// makes a path map to exactly one entry: on a mismatch the file is
-/// re-fingerprinted and the insert OVERWRITES, rather than filing the new
-/// fingerprint under a new key and leaving the old one to accumulate.
-///
-/// `mtime`, `mtime_nsec` and `size` are whatever the scan's single stat()
-/// reported -- see `sources::ScannedFile`. Nothing here re-derives them, so the
-/// figure the stamp is written with is the same figure the file was selected
-/// and sorted on, and a file changing mid-run cannot make those three disagree.
-///
-/// Fixed-size fields only, and serialized BEFORE the fingerprint, so the
-/// fingerprint always begins at the same byte offset. That is what keeps the
-/// discipline `VideoFingerprint` already documents working: a field appended to
-/// the end of it makes older payloads run out of bytes, bincode fails, and the
-/// file is fingerprinted again. Changing THIS struct moves the offset and has
-/// no such guarantee, so it needs the same treatment `SUPERSEDED_TABLES` got.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
-struct Stamp {
-    mtime: i64,
-    mtime_nsec: i64,
-    size: u64,
-    kf_interval: f64,
-    min_kf_samples: f64,
-}
-
-impl Stamp {
-    /// Whether an entry stamped `self` may be reused for a file stamped
-    /// `other`.
-    ///
-    /// Deliberately not `PartialEq`: `NaN != NaN`, and clap parses
-    /// `--keyframe-interval nan` without complaint. Derived equality would make
-    /// every lookup in such a run miss, re-decode the whole library, and miss
-    /// again on the next run. Nothing would leak any more -- the entry is
-    /// overwritten either way -- but there is no reason to decode twice for it.
-    fn matches(&self, other: &Stamp) -> bool {
-        self.mtime == other.mtime
-            && self.mtime_nsec == other.mtime_nsec
-            && self.size == other.size
-            && same_sampling(self.kf_interval, other.kf_interval)
-            // `--min-keyframes` is a FLOOR on the sampling interval, and with no
-            // interval in force there is nothing for it to floor -- see
-            // `effective_interval`, which requires a real interval before it
-            // reads this at all. Comparing it regardless threw away a whole
-            // library's fingerprints for a flag that provably changed not one
-            // frame. Either both intervals are known equal by here or both are
-            // off, so testing either side's flag is the same test.
-            && (!sampling_is_on(other.kf_interval)
-                || same_floor(self.min_kf_samples, other.min_kf_samples))
-    }
-}
-
-fn same_setting(a: f64, b: f64) -> bool {
-    a == b || (a.is_nan() && b.is_nan())
-}
-
-/// Whether two runs sample keyframes the same way.
-///
-/// The interval is not a number the decode reads, it is a number the decode
-/// asks a question of: `effective_interval` is `kf_interval > 0.0`, so EVERY
-/// value that fails that test -- 0.0, any negative, NaN -- decodes every
-/// keyframe and produces bit-identical fingerprints. Comparing the figures
-/// instead of the answers made `--keyframe-interval=-5` a different setting
-/// from the default, and the miss overwrites the entry it missed, so the next
-/// default run missed too: alternating the two re-decoded the whole library
-/// every time, twice over, for a flag that provably changed not one frame.
-/// Same class of bug as the one `--min-keyframes` used to cause below, and the
-/// same fix -- ask the predicate the decode asks.
-fn same_sampling(a: f64, b: f64) -> bool {
-    if !sampling_is_on(a) && !sampling_is_on(b) {
-        // Both mean "decode every keyframe". Nothing downstream can tell them
-        // apart, so neither may invalidate the other's entry.
-        return true;
-    }
-    same_setting(a, b)
-}
-
-/// Whether keyframe subsampling actually happens at this interval.
-///
-/// Mirrors `fingerprint::fingerprint_video`'s own `effective_interval` guard
-/// exactly, NaN and all: a nonsense interval subsamples nothing, so nothing is
-/// floored by `--min-keyframes` either. Spelled as a named predicate rather
-/// than inlined so the negation in `Stamp::matches` reads as "sampling is off"
-/// instead of as a comparison against a float that might not be comparable.
-fn sampling_is_on(kf_interval: f64) -> bool {
-    kf_interval > 0.0
-}
-
-/// Whether two runs floor the interval the same way.
-///
-/// The third of these predicates, and the same argument as `same_sampling` one
-/// step down: `effective_interval` computes the floor only when
-/// `min_kf_samples > 0.0`, so 0.0, any negative and NaN all mean "no floor" and
-/// leave the interval exactly as the user typed it. They cannot be told apart
-/// from the fingerprint they produce, so none of them may invalidate another's
-/// entry. Only reached with an interval in force, which is the only time this
-/// flag decides anything at all.
-fn same_floor(a: f64, b: f64) -> bool {
-    if !floor_is_on(a) && !floor_is_on(b) {
-        return true;
-    }
-    same_setting(a, b)
-}
-
-/// Whether `--min-keyframes` actually floors anything at this value.
-///
-/// Mirrors the `min_kf_samples > 0.0` test in `fingerprint::fingerprint_video`,
-/// NaN and all, for the same reason `sampling_is_on` mirrors the one beside it.
-fn floor_is_on(min_kf_samples: f64) -> bool {
-    min_kf_samples > 0.0
-}
-
-/// What one cache value holds.
-///
-/// A tuple rather than a pair of structs so the borrowed write path
-/// (`&(stamp, fp)`) and the owned read path cannot drift apart, and so storing
-/// a fingerprint never has to clone one.
-type CacheEntry = (Stamp, VideoFingerprint);
 
 /// What a folder walk assumes a video is called.
 ///
@@ -1331,7 +943,7 @@ fn conclude_without_comparing(
 /// the report does not already say.
 fn run_from_report(
     args: &Args,
-    db: Option<&Database>,
+    db: Option<&Cache>,
     report_path: &str,
     stats: &RunStats,
 ) -> Result<Outcome> {
@@ -1357,7 +969,7 @@ fn run_from_report(
 
     if !deleted_paths.is_empty() && forgets(&disposal) {
         match db {
-            Some(db) => match cache_forget(db, &deleted_paths) {
+            Some(db) => match db.forget(&deleted_paths) {
                 Ok(forgotten) => {
                     log::debug!("Dropped {} cache entry(ies) for removed file(s).", forgotten)
                 }
@@ -1369,7 +981,7 @@ fn run_from_report(
             // The cache was busy when this run started, and `main` chose the
             // deletions over the bookkeeping -- the reasoning is there. One
             // record for the whole batch, exactly as the failure arm above
-            // does, because `cache_forget` is one transaction either way, and
+            // does, because `Cache::forget` is one transaction either way, and
             // because a count with a single sample would render as "... and N
             // more (see the errors above)" pointing at errors nothing printed.
             None => stats.cache_purge_failed.record(format!(
@@ -1782,647 +1394,6 @@ fn install_signal_handler() -> Result<()> {
     .context("Failed to install signal handler")
 }
 
-/// Create the cache table if this is a fresh database.
-///
-/// Opening a table inside a write transaction creates it, so this is also the
-/// cheapest way to guarantee that every later *read* transaction finds
-/// something to open -- reads cannot create tables, and a missing one would
-/// otherwise turn every lookup on a new machine into an error path.
-fn ensure_cache_table(db: &Database) -> Result<()> {
-    let txn = db.begin_write().context("Failed to start a cache transaction")?;
-    txn.open_table(CACHE_TABLE).context("Failed to create the cache table")?;
-    txn.open_table(REFUSED_TABLE).context("Failed to create the refusals table")?;
-    txn.open_table(IDENTITY_TABLE).context("Failed to create the identity table")?;
-    txn.commit().context("Failed to commit the cache table")?;
-    Ok(())
-}
-
-/// Empty the cache, and hand the space back to the filesystem while doing so is
-/// still free.
-///
-/// Emptying a table frees its pages inside the file but does not shrink the
-/// file, so the space only comes back via a compaction -- and a compaction is a
-/// copy of every live page into a fresh, dense file. Right here there are no
-/// live pages, so it costs microseconds and returns the whole of whatever the
-/// cache had grown to.
-///
-/// This used to run at the END of the run instead, which is the one moment it
-/// is worth nothing: by then the clear has been followed by a full re-scan, so
-/// every page is live, the file is already dense (the inserts reused the very
-/// pages the clear freed), and the compaction rewrites the entire library's
-/// fingerprints to reclaim nothing.
-///
-/// Every table in the file goes, not only this build's: a cache shared with a
-/// machine of another architecture holds that machine's fingerprint tables
-/// too (`CACHE_TABLE`), and "clear the cache" leaving them behind would be a
-/// cache that is not clear.
-fn clear_cache(db: &mut Database) -> Result<()> {
-    let txn = db.begin_write().context("Failed to start a cache transaction")?;
-    let tables: Vec<_> = txn.list_tables().context("Failed to list the cache's tables")?.collect();
-    for table in tables {
-        txn.delete_table(table).context("Failed to clear the cache")?;
-    }
-    txn.commit().context("Failed to commit the cache clear")?;
-
-    // Dropping the table dropped its definition too; every later lookup needs
-    // something to open.
-    ensure_cache_table(db).context("Failed to recreate the cache table")?;
-
-    // Not fatal: a cache that could not be shrunk is still a correct, empty
-    // cache, and the run that follows works either way.
-    if let Err(e) = db.compact() {
-        log::error!("Could not compact the fingerprint cache: {}", e);
-    }
-
-    Ok(())
-}
-
-/// Drop every table this build's cache replaced, if any are still there.
-///
-/// Returns whether there were any, so the caller can decide about reclaiming
-/// the space: deleting a table frees its pages inside the file but does not
-/// shrink the file, and only a compaction hands that back to the filesystem.
-fn retire_superseded_tables(db: &Database) -> Result<Retired> {
-    let txn = db.begin_write().context("Failed to start a cache transaction")?;
-    // Tracked apart, because what the user is told it costs depends on which
-    // one went: a retired fingerprint table is a re-decode of the whole
-    // library, a retired refusals table is a re-probe measured in seconds.
-    let mut retired = Retired::default();
-    for table in SUPERSEDED_TABLES {
-        retired.fingerprints |= txn
-            .delete_table(table)
-            .context("Failed to remove a superseded cache table")?;
-    }
-    for table in SUPERSEDED_REFUSAL_TABLES {
-        retired.refusals |= txn
-            .delete_table(table)
-            .context("Failed to remove a superseded refusals table")?;
-    }
-    txn.commit().context("Failed to commit the cache table removal")?;
-    Ok(retired)
-}
-
-/// Which kinds of superseded table this run found and dropped.
-#[derive(Default)]
-struct Retired {
-    fingerprints: bool,
-    refusals: bool,
-}
-
-/// One redb table, in the shape both of this program's are.
-type CacheTable = redb::ReadOnlyTable<&'static str, &'static [u8]>;
-
-/// Both cache tables as a single read transaction sees them.
-///
-/// The cache pass asks two questions of every file -- was this one refused
-/// before, and is there a fingerprint on record for it -- and each used to open
-/// a read transaction and a table of its own. A warm `-x '*'` scan of 157k
-/// files therefore took 314k transactions to answer 157k files' worth of
-/// questions, all of them against a database nothing was writing to: the pass
-/// runs before any decode, so both tables are still exactly as `open_cache`
-/// left them for the whole of it. One snapshot answers every question in the
-/// pass, so `open` is called once above the `par_iter` and the workers share it
-/// by reference.
-///
-/// The tables are owned rather than borrowed from the transaction. redb's
-/// `open_table` clones the transaction guard into the table it hands back, so
-/// each table keeps the snapshot alive by itself and the `ReadTransaction`
-/// is dropped at the end of `open` -- which is what lets this be a plain struct
-/// rather than a self-referential one.
-///
-/// A table that will not open is `None` rather than an error, and every lookup
-/// through it then answers `None`. That is what the per-call `.ok()?` did and
-/// it means the same thing here: an unreadable table is a cache that knows
-/// nothing, so every file is a miss and gets fingerprinted again.
-struct CacheView {
-    fingerprints: Option<CacheTable>,
-    refusals: Option<CacheTable>,
-}
-
-impl CacheView {
-    /// Take the snapshot. Infallible for the reason above -- there is nothing a
-    /// caller could do with a failure that answering "nothing is cached" does
-    /// not already do.
-    fn open(db: &Database) -> Self {
-        let Ok(read) = db.begin_read() else {
-            return Self { fingerprints: None, refusals: None };
-        };
-        Self {
-            fingerprints: read.open_table(CACHE_TABLE).ok(),
-            refusals: read.open_table(REFUSED_TABLE).ok(),
-        }
-    }
-
-    /// Read one fingerprint out of the cache, or `None` for anything that isn't
-    /// a clean hit.
-    ///
-    /// A missing entry, an unreadable table, a payload that no longer
-    /// deserializes, and a payload whose stamp no longer describes the file on
-    /// disk all mean exactly the same thing to the caller -- fingerprint the
-    /// file again -- so they collapse into one answer here rather than making
-    /// every call site handle four failure shapes that need identical
-    /// treatment. A stale entry is left where it is on the way past, because
-    /// whichever pass takes the file next is about to write over it:
-    /// `cache_store` if it decodes, `refusals_store` if it is refused. Both of
-    /// those remove the path from the OTHER table in the same transaction,
-    /// which is what keeps "one path, one entry" true -- leaving a stale entry
-    /// here is only safe because neither of them leaves one behind.
-    fn fingerprint(&self, path: &str, stamp: &Stamp) -> Option<VideoFingerprint> {
-        let stored = self.fingerprints.as_ref()?.get(path).ok()??;
-
-        match bincode::deserialize::<CacheEntry>(stored.value()) {
-            // An entry with no hashes in it is one an older build wrote for a
-            // file whose every frame was featureless, back when that returned a
-            // fingerprint instead of failing. It matches nothing at any `-d`, so
-            // handing it back is what made those files silent -- and the `Stamp`
-            // cannot tell it from a good entry, since nothing about the file
-            // changed. Re-decoding is what a cache MISS means and it is what
-            // this is: the decode fails loudly, and `REFUSED_TABLE` remembers
-            // the sentence, so the cost is one decode per such file, once,
-            // rather than the whole-library re-decode a `CACHE_TABLE` rename
-            // would charge every user for a handful of blank videos. No fresh
-            // entry can be empty.
-            Ok((_, fp)) if fp.valid_hashes.is_empty() => None,
-            Ok((cached, fp)) if cached.matches(stamp) => Some(fp),
-            // The file was edited, or the sampling knobs moved. Either way the
-            // fingerprint on record describes something that is no longer there.
-            Ok(_) => None,
-            Err(e) => {
-                // Corrupt, or written by a build whose struct no longer matches.
-                // Either way it is about to be overwritten by a fresh decode.
-                log::debug!("Cache entry for {} did not deserialize ({}); re-processing.", path, e);
-                None
-            }
-        }
-    }
-
-    /// The refusal on record for this path, if this exact file was refused
-    /// before.
-    ///
-    /// Guarded by the same `Stamp` a fingerprint is, so an edited file is
-    /// re-asked; the sampling knobs are in there too, which is stricter than
-    /// this verdict needs but costs nothing and cannot be wrong.
-    fn refusal(&self, path: &str, stamp: &Stamp) -> Option<Refusal> {
-        let stored = self.refusals.as_ref()?.get(path).ok()??;
-
-        match bincode::deserialize::<(Stamp, Refusal)>(stored.value()) {
-            Ok((cached, verdict)) if cached.matches(stamp) => Some(verdict),
-            Ok(_) => None,
-            Err(_) => None,
-        }
-    }
-}
-
-/// Both lookups against a snapshot of their own, for tests that ask one
-/// question of a database they have just written to and want to see the write.
-#[cfg(test)]
-fn cache_lookup(db: &Database, path: &str, stamp: &Stamp) -> Option<VideoFingerprint> {
-    CacheView::open(db).fingerprint(path, stamp)
-}
-
-#[cfg(test)]
-fn refusal_lookup(db: &Database, path: &str, stamp: &Stamp) -> Option<Refusal> {
-    CacheView::open(db).refusal(path, stamp)
-}
-
-/// Why a file will not be fingerprinted, in the form the cache keeps it.
-///
-/// Two shapes because the common one deserves to be small. The probe gate
-/// refuses hundreds of thousands of files in a single `-x '*'` run and its
-/// sentence is two numbers in a fixed template, so it is stored as the two
-/// numbers; everything else is a handful of files a run, and storing what they
-/// actually said is both cheaper to write and impossible to get wrong.
-#[derive(Serialize, Deserialize, Clone)]
-enum Refusal {
-    /// Nothing in the file looked like media. Regenerated for printing, so the
-    /// wording always belongs to the build doing the printing.
-    NotMedia(fingerprint::NotMedia),
-    /// It opened, and then something else was wrong with it -- no video stream,
-    /// streams that would not parse, no frame that decoded. The message is the
-    /// one the run printed when it found out.
-    Said(String),
-    /// The runtime the header reported, for a file the weighing pass found
-    /// shorter than `--min-duration`.
-    ///
-    /// The odd one out, and deliberately so: the other two are verdicts and this
-    /// is a MEASUREMENT, because "too short" is not a fact about the file.
-    /// `--min-duration` is comparison-time and is kept out of the `Stamp` for
-    /// the same reason `-d` and `-p` are, so a run that remembered the verdict
-    /// would hand the same skip to a later run that asked for a lower threshold.
-    /// Remembering the number instead lets every run decide for itself, from the
-    /// same figure the decode would have read, without opening the file.
-    ///
-    /// It is not a problem and is never counted as one: `Tally::record` is not
-    /// reached for it and the exit code does not move. It shares this table
-    /// because it is the same kind of entry -- one per file this build looked at
-    /// and will not fingerprint, guarded by the same `Stamp`, worth half a
-    /// millisecond to rebuild.
-    ///
-    /// It is also the one entry in this table a fingerprint can supersede, and
-    /// `cache_store` is what takes it away. The reverse -- this entry landing on
-    /// a path a fingerprint is already under, which an edited file reaches -- is
-    /// `refusals_store`'s to undo. Falling through -- which is the
-    /// whole point of storing a number rather than a verdict -- puts the file
-    /// back in `todo`, so a lowered `--min-duration` decodes it and files a
-    /// fingerprint under the same path this entry is under. The argument that
-    /// used to sit here, that a fingerprinted file never reaches the weighing
-    /// pass, is exactly the case that is wrong: it reaches it on the run that
-    /// decodes it. Left behind, the entry does not go stale -- the `Stamp` still
-    /// matches -- and `Lookup::Short` reads it before `cache_lookup` is ever
-    /// asked, so a header runtime would outrank a decoded one for ever.
-    ///
-    /// Appended last on purpose: bincode tags a variant by its position, so the
-    /// two above keep their numbers and caches written before this existed are
-    /// still read.
-    TooShort(f64),
-}
-
-impl Refusal {
-    /// Whether this is the verdict "no demuxer recognised it" rather than
-    /// "it opened and then something went wrong".
-    ///
-    /// Asked by the one line of a warm run that puts a NOUN on these files.
-    /// Every other place they are reported prints the sentence the refusal
-    /// carries, which has always been its own; this is the only place the two
-    /// verdicts were ever collapsed, and collapsing them told a user whose
-    /// 1080p HEVC episode the decoder gave up on that it was not video.
-    fn is_not_media(&self) -> bool {
-        matches!(self, Refusal::NotMedia(_))
-    }
-}
-
-impl std::fmt::Display for Refusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Refusal::NotMedia(verdict) => write!(f, "{}", verdict),
-            Refusal::Said(said) => write!(f, "{}", said),
-            // Never printed as a failure -- the cache pass takes this one apart
-            // before anything asks it for a sentence. Written out anyway so
-            // that a future caller that does ask gets something true rather
-            // than whatever an `_` arm would have said on its behalf.
-            Refusal::TooShort(duration) => {
-                write!(f, "shorter than --min-duration ({:.2}s)", duration)
-            }
-        }
-    }
-}
-
-/// What to remember about a failure, if anything.
-///
-/// `None` for a failure that is about the moment rather than the file -- see
-/// `fingerprint::is_transient`. This is the only gate between an error and the
-/// cache, so both callers (the weighing pass and the decode) ask it rather than
-/// classifying for themselves.
-fn worth_remembering(error: &anyhow::Error) -> Option<Refusal> {
-    if let Some(verdict) = fingerprint::not_media(error) {
-        return Some(Refusal::NotMedia(verdict));
-    }
-    if fingerprint::is_transient(error) {
-        return None;
-    }
-    Some(Refusal::Said(format!("{:#}", error)))
-}
-
-/// Write a whole pass worth of refusals in ONE transaction, replacing whatever
-/// was filed under each path before.
-///
-/// Deliberately not shaped like `cache_store`, which commits per video because a
-/// decode costs seconds and an interrupt must not throw one away. A refusal
-/// costs half a millisecond, and there can be a quarter of a million of them in
-/// a single `-x '*'` run: one fsync each would cost far more than re-probing
-/// every file next time. Losing the lot to an interrupt is fine -- the next run
-/// simply pays the same half-millisecond again.
-///
-/// "Whatever was filed under each path before" includes a FINGERPRINT, and this
-/// is the mirror of the removal `cache_store` makes. `cache_lookup` leaves a
-/// stale entry where it lies on the grounds that the re-fingerprint is about to
-/// overwrite it -- which is true of every file that goes on to decode, and is
-/// precisely what a refusal denies: the refused file is the one that never gets
-/// decoded, so nothing ever writes over it. An edited video whose new runtime
-/// falls under `--min-duration` reaches it in three steps (fingerprint; edit;
-/// run with a floor above the new runtime), and so does one edited into
-/// something that is not video at all. The path then sits in BOTH tables, which
-/// falsifies the reasoning written into `Refusal::TooShort` and `cache_forget`,
-/// and `--prune-cache` reports one file as "1 stale entries and 1 stale
-/// refusal(s)".
-///
-/// Every path that reaches here is one `cache_lookup` has already answered
-/// `None` for -- both callers refuse only jobs drawn from `todo`, and `todo` is
-/// built from `Lookup::Miss` -- so any fingerprint still under it is one of the
-/// four things that answer is made of (absent, stale, undeserializable, or
-/// empty), and none of them is worth keeping. Removing it in the same
-/// transaction as the insert is what makes "one path, one table" true by
-/// construction from this side, exactly as `cache_store` makes it true from the
-/// other.
-fn refusals_store(db: &Database, refused: &[(String, Stamp, Refusal)]) -> Result<()> {
-    if refused.is_empty() {
-        return Ok(());
-    }
-
-    let txn = db.begin_write().context("Failed to start a cache transaction")?;
-    {
-        let mut table =
-            txn.open_table(REFUSED_TABLE).context("Failed to open the refusals table")?;
-        // Opened once for the whole pass rather than per entry, and normally
-        // finding nothing: the common case is a file that was never
-        // fingerprinted, so this is a b-tree descent against a table a
-        // `-x '*'` run barely uses.
-        let mut cached =
-            txn.open_table(CACHE_TABLE).context("Failed to open the cache table")?;
-        for (path, stamp, verdict) in refused {
-            let encoded = bincode::serialize(&(stamp, verdict))
-                .context("Failed to serialize a refusal")?;
-            table
-                .insert(path.as_str(), encoded.as_slice())
-                .context("Failed to record a refusal")?;
-            cached
-                .remove(path.as_str())
-                .context("Failed to drop a superseded fingerprint")?;
-        }
-    }
-    txn.commit().context("Failed to commit the refusals")?;
-
-    Ok(())
-}
-
-/// Write one fingerprint to the cache, durably, replacing whatever was filed
-/// under this path before.
-///
-/// One transaction per video, committed immediately -- deliberately not
-/// batched. The batch this pattern replaces held finished fingerprints in
-/// memory, which is precisely the work an interrupt threw away. A commit costs
-/// an fsync against a decode measured in seconds, and when it returns the entry
-/// is on disk: no background flusher, no window, nothing for a
-/// `std::process::exit` to cut short.
-///
-/// Only one write transaction exists at a time, so concurrent callers queue
-/// here. The serialization happens outside the transaction so that queue is
-/// only ever holding a b-tree insert -- and the caller hands its decoder
-/// threads back BEFORE calling this, so nothing waits on an fsync while
-/// holding a share of the budget.
-///
-/// "Whatever was filed under this path before" includes a REFUSAL, which is
-/// what makes this two tables rather than one. `Refusal::TooShort` is the route
-/// there: it is a measurement rather than a verdict, so the cache pass lets a
-/// file whose runtime clears THIS run's `--min-duration` fall through to be
-/// decoded like any other miss -- and nothing then took the refusal away, so
-/// one `--min-duration 60` run followed by a `--min-duration 0` one left the
-/// path in both tables at once. That falsifies the reasoning written into
-/// `Refusal::TooShort` and `cache_forget` ("a path is remembered by exactly one
-/// of them"), and it is the direction that can be WRONG rather than merely
-/// untidy: `Lookup::Short` answers before `cache_lookup` is reached, so the
-/// header runtime the weighing pass measured outranks the one the decode went
-/// on to measure, for ever. The two differ for a file that restarts its clock
-/// (`fingerprint_video` takes the runtime from the samples there, and it is
-/// LONGER), which today cannot also be `header_is_complete` and so cannot also
-/// have a `TooShort` -- a latent contradiction rather than a visible one, and
-/// one nothing in the `Stamp` could ever catch, since neither entry is stale.
-///
-/// Removing it here rather than where the fall-through happens is what makes
-/// the invariant true by construction: a path with a fingerprint has no refusal
-/// beside it because writing the fingerprint is what takes the refusal away.
-///
-/// Several files go in one transaction when they come from ONE decode: a file
-/// and the byte-identical copies that share it. They exist at the same moment,
-/// so one commit loses nothing the per-video rule protects, and a folder of N
-/// copies pays one fsync rather than N.
-fn cache_store(db: &Database, entries: &[(&str, Stamp, &VideoFingerprint)]) -> Result<()> {
-    // `&(stamp, fp)` rather than an owned pair: serde follows the reference, so
-    // this writes the exact bytes `CacheEntry` reads back without copying the
-    // hash vectors to get there.
-    let encoded = entries
-        .iter()
-        .map(|(_, stamp, fp)| bincode::serialize(&(stamp, fp)).context("Failed to serialize fingerprint"))
-        .collect::<Result<Vec<_>>>()?;
-
-    let txn = db.begin_write().context("Failed to start a cache transaction")?;
-    {
-        let mut table = txn.open_table(CACHE_TABLE).context("Failed to open the cache table")?;
-        // Unconditional, and cheap because it is a b-tree descent that normally
-        // finds nothing: the common case is a first decode with no refusal to
-        // take away. In the same transaction as the insert, so the two tables
-        // can never disagree about a path even if the process dies between
-        // them.
-        let mut refused =
-            txn.open_table(REFUSED_TABLE).context("Failed to open the refusals table")?;
-        for ((path, _, _), encoded) in entries.iter().zip(&encoded) {
-            table
-                .insert(*path, encoded.as_slice())
-                .context("Failed to insert the fingerprint")?;
-            refused.remove(*path).context("Failed to drop a superseded refusal")?;
-        }
-    }
-    txn.commit().context("Failed to commit the fingerprint")?;
-
-    Ok(())
-}
-
-/// `cache_store` for one file, as most tests write one.
-#[cfg(test)]
-fn cache_store_one(db: &Database, path: &str, stamp: Stamp, fp: &VideoFingerprint) -> Result<()> {
-    cache_store(db, &[(path, stamp, fp)])
-}
-
-/// Forget the fingerprints of files that are no longer where they were.
-///
-/// Called with what the run actually acted on -- trashed, unlinked, or moved
-/// under `--move-to`. Those entries describe bytes that are somewhere else or
-/// gone entirely, so nothing will ever match them at that path again: keeping
-/// them means every cleanup run grows the cache a little and it only shrinks if
-/// the user happens to remember `--prune-cache`. Acting on duplicates is the
-/// one thing this tool does that makes an entry obsolete WITHOUT writing a
-/// replacement over it, so it is the one place that has to say so out loud.
-///
-/// One transaction for the whole list, unlike `cache_store`. There is no
-/// partial state worth protecting here -- the files are already gone, and a run
-/// killed midway simply leaves entries the next `--prune-cache` will collect --
-/// so this pays one fsync rather than one per file.
-///
-/// Returns how many entries actually existed, which is normally all of them and
-/// is only interesting when it isn't.
-fn cache_forget(db: &Database, paths: &[String]) -> Result<usize> {
-    if paths.is_empty() {
-        return Ok(0);
-    }
-
-    let mut forgotten = 0usize;
-
-    let txn = db.begin_write().context("Failed to start a cache transaction")?;
-    {
-        let mut table = txn.open_table(CACHE_TABLE).context("Failed to open the cache table")?;
-        // Both tables: a file that was trashed or moved is no longer at this
-        // path whichever of the two had something to say about it, and a
-        // refusal left behind would outlive the bytes it was about exactly the
-        // way a fingerprint would.
-        let mut refused =
-            txn.open_table(REFUSED_TABLE).context("Failed to open the refusals table")?;
-        let mut identities =
-            txn.open_table(IDENTITY_TABLE).context("Failed to open the identity table")?;
-        for path in paths {
-            let had_fingerprint = table
-                .remove(path.as_str())
-                .context("Failed to remove a cache entry")?
-                .is_some();
-            let had_refusal =
-                refused.remove(path.as_str()).context("Failed to remove a refusal")?.is_some();
-            // Not counted: an identity is only ever beside a fingerprint, and
-            // without one it vouches for nothing. Removed so a file moved by
-            // this run is not later "recognised" through the path it left.
-            identities.remove(path.as_str()).context("Failed to remove an identity")?;
-            // Either table counts, and a path is remembered by at most one of
-            // them -- each of the two writers removes the path from the other
-            // table in the same transaction (`cache_store` and
-            // `refusals_store`), which is what keeps that true across a lowered
-            // `--min-duration` in one direction and an edited file in the other
-            // -- so this is a count of paths the cache had something to say
-            // about, not a total that can exceed `paths.len()`. The `||` does
-            // not rest on that invariant, only the arithmetic does. Counting
-            // only the fingerprints made the one case worth logging (an entry
-            // that was not there) look identical to the one case that is
-            // routine.
-            if had_fingerprint || had_refusal {
-                forgotten += 1;
-            }
-        }
-    }
-    txn.commit().context("Failed to commit the cache removals")?;
-
-    Ok(forgotten)
-}
-
-/// `--prune-cache`: remove every entry whose path is not in `valid_files`.
-/// `Ok(false)` means the run was interrupted, with nothing removed.
-fn prune_cache(db: &Database, valid_files: &HashSet<&str>, stats: &RunStats) -> Result<bool> {
-    info!("Pruning cache for files not in the current scan...");
-
-    // A key IS a path now, so this is the whole of pruning: an entry
-    // survives exactly when the file it describes is in front of us. It
-    // used to have to reconstruct a path out of a compound key and could
-    // not see the difference between the current entry for a file and four
-    // superseded ones -- all five matched a live path, so all five stayed.
-    //
-    // Collected under a read transaction and removed under a write one,
-    // rather than filtered in place. Only this shape can abandon the scan
-    // partway through on Ctrl-C without leaving a half-applied prune behind
-    // -- the removals are one atomic commit or nothing at all.
-    // Both tables, for one reason: an entry the scan cannot see is an entry
-    // nothing will ever overwrite, and that is as true of a refusal as of a
-    // fingerprint. The refusals table is also the one that GROWS without
-    // bound -- a `-x '*'` run files one entry per file that is not video,
-    // so a library that moves around leaves far more of them behind than it
-    // ever leaves fingerprints.
-    let mut stale: Vec<String> = Vec::new();
-    let mut stale_refusals: Vec<String> = Vec::new();
-    // Not reported on their own: an identity only ever stands beside a
-    // fingerprint, so its count is the fingerprints' count again.
-    let mut stale_identities: Vec<String> = Vec::new();
-    {
-        let read = db.begin_read().context("Failed to open the cache for reading")?;
-        let table = read
-            .open_table(CACHE_TABLE)
-            .context("Failed to open the cache table")?;
-
-        for entry in table.iter().context("Failed to iterate the cache")? {
-            if shutdown_requested() {
-                return Ok(false);
-            }
-
-            let (key, _) = entry.context("Failed to read a cache entry")?;
-            let path = key.value();
-
-            if !valid_files.contains(path) {
-                stale.push(path.to_string());
-            }
-        }
-
-        let refused = read
-            .open_table(REFUSED_TABLE)
-            .context("Failed to open the refusals table")?;
-
-        for entry in refused.iter().context("Failed to iterate the refusals")? {
-            if shutdown_requested() {
-                return Ok(false);
-            }
-
-            let (key, _) = entry.context("Failed to read a refusal")?;
-            let path = key.value();
-
-            if !valid_files.contains(path) {
-                stale_refusals.push(path.to_string());
-            }
-        }
-
-        let identities = read
-            .open_table(IDENTITY_TABLE)
-            .context("Failed to open the identity table")?;
-
-        for entry in identities.iter().context("Failed to iterate the identities")? {
-            if shutdown_requested() {
-                return Ok(false);
-            }
-
-            let (key, _) = entry.context("Failed to read an identity")?;
-            let path = key.value();
-
-            if !valid_files.contains(path) {
-                stale_identities.push(path.to_string());
-            }
-        }
-    }
-
-    if !stale.is_empty() || !stale_refusals.is_empty() || !stale_identities.is_empty() {
-        let txn = db.begin_write().context("Failed to start a cache transaction")?;
-        {
-            let mut table = txn
-                .open_table(CACHE_TABLE)
-                .context("Failed to open the cache table")?;
-            for key in &stale {
-                table
-                    .remove(key.as_str())
-                    .context("Failed to remove a stale cache entry")?;
-            }
-
-            let mut refused = txn
-                .open_table(REFUSED_TABLE)
-                .context("Failed to open the refusals table")?;
-            for key in &stale_refusals {
-                refused
-                    .remove(key.as_str())
-                    .context("Failed to remove a stale refusal")?;
-            }
-
-            let mut identities = txn
-                .open_table(IDENTITY_TABLE)
-                .context("Failed to open the identity table")?;
-            for key in &stale_identities {
-                identities
-                    .remove(key.as_str())
-                    .context("Failed to remove a stale identity")?;
-            }
-        }
-        txn.commit().context("Failed to apply cache pruning")?;
-        // The one thing `main` needs from this block: entries were really
-        // removed, so the file now holds dead pages and the compaction it
-        // does after `run` returns has something to reclaim. Both tables
-        // count, because a page freed by a refusal is the same page.
-        stats.record_prune(stale.len() + stale_refusals.len() + stale_identities.len());
-        // Counted apart: they are different things, and a user watching the
-        // fingerprint count is watching the one that cost something.
-        if stale_refusals.is_empty() {
-            info!("Pruned {} stale entries from cache.", stale.len());
-        } else {
-            info!(
-                "Pruned {} stale entries and {} stale refusal(s) from cache.",
-                stale.len(),
-                stale_refusals.len()
-            );
-        }
-    } else {
-        info!("No stale entries found to prune.");
-    }
-    Ok(true)
-}
-
 /// Why `--prune-cache` must not run this time, if it must not.
 ///
 /// A prune keeps exactly the entries whose file is in front of the run and
@@ -2464,106 +1435,6 @@ fn prune_obstacle(stats: &RunStats, found: usize) -> Option<String> {
     None
 }
 
-/// Delete the cache this tool used to keep, if it is still lying around.
-///
-/// sled stored a directory; redb stores a single file, so the two cannot even
-/// share a name and an old cache is bytes nothing will ever read again. Failure
-/// is uninteresting -- the worst case is some dead weight in the cache
-/// directory -- so it is logged at debug and otherwise ignored.
-fn retire_legacy_cache(cache_dir: &Path) {
-    let legacy = cache_dir.join("video_hashes.db");
-    if !legacy.is_dir() {
-        return;
-    }
-
-    match std::fs::remove_dir_all(&legacy) {
-        Ok(()) => info!("Removed the superseded cache at {}.", legacy.display()),
-        Err(e) => log::debug!(
-            "Could not remove the superseded cache at {}: {}",
-            legacy.display(),
-            e
-        ),
-    }
-}
-
-/// Where the cache lives when `--cache` is not given.
-///
-/// Only the default location gets the legacy sweep and the XDG lookup; a cache
-/// the user named is theirs, and this build has never written anything else
-/// beside it.
-const CACHE_FILE_NAME: &str = "fingerprints.redb";
-
-/// Where the cache lives when `--cache` does not say: the XDG Base Directory
-/// Specification's cache folder, `vid-fp` in it.
-fn default_cache_dir() -> PathBuf {
-    std::env::var("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            if let Ok(home) = std::env::var("HOME") {
-                PathBuf::from(home).join(".cache")
-            } else {
-                PathBuf::from("/tmp")
-            }
-        })
-        .join("vid-fp")
-}
-
-/// The cache file a run without `--cache` uses, for the desktop app to show
-/// where it is. Nothing is created.
-pub fn default_cache_file() -> PathBuf {
-    default_cache_dir().join(CACHE_FILE_NAME)
-}
-
-/// Decide which file this run's fingerprints are cached in.
-///
-/// A cache holds an exclusive lock for the whole run -- not just the cache pass
-/// -- so two concurrent scans cannot share one, and `--cache` is the only way
-/// to run them at all. See `open_cache`.
-///
-/// `--cache` names the database FILE, because that is what it is and because a
-/// user pointing at a scratch disk wants to know exactly what appears there.
-/// A path that is already a directory, or that is written with a trailing
-/// slash, is treated as one instead and gets the default filename inside it:
-/// `--cache /mnt/scratch` obviously means "a cache in here", and the
-/// alternative is a redb file named `scratch`.
-fn resolve_cache_path(explicit: Option<&str>) -> Result<PathBuf> {
-    let path = cache_file_for(explicit);
-    let Some(_) = explicit else {
-        let cache_dir = default_cache_dir();
-
-        std::fs::create_dir_all(&cache_dir).context("Failed to create cache directory")?;
-        retire_legacy_cache(&cache_dir);
-
-        return Ok(path);
-    };
-
-    // The default location is created for the user, so a named one is too --
-    // otherwise `--cache /mnt/scratch/vid-fp/cache.redb` fails on a directory
-    // the user would have created without thinking about it.
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!("Failed to create the cache directory {}", parent.display())
-        })?;
-    }
-
-    Ok(path)
-}
-
-/// The cache file `resolve_cache_path` will open, worked out without creating
-/// anything, so it can be compared with the report and log paths before any of
-/// the three is touched.
-fn cache_file_for(explicit: Option<&str>) -> PathBuf {
-    let Some(raw) = explicit else {
-        return default_cache_dir().join(CACHE_FILE_NAME);
-    };
-    let given = Path::new(raw);
-    if raw.ends_with('/') || given.is_dir() {
-        given.join(CACHE_FILE_NAME)
-    } else {
-        given.to_path_buf()
-    }
-}
-
 /// Whether `a` and `b` name the same file: the same inode when both exist,
 /// otherwise the same absolute path once the folder holding each is resolved.
 fn same_file(a: &Path, b: &Path) -> bool {
@@ -2589,7 +1460,7 @@ fn same_file(a: &Path, b: &Path) -> bool {
 /// emptied it before it was opened, so every file was decoded again; and
 /// `-o x.txt --log-file x.txt` left the report where the log had been.
 fn refuse_shared_outputs(args: &Args) -> Result<()> {
-    let cache = cache_file_for(args.cache.as_deref());
+    let cache = cache::cache_file_for(args.cache.as_deref());
     let output = args.output.as_deref().filter(|o| *o != "-").map(Path::new);
     let log = args.log_file.as_deref().map(Path::new);
     let mut named: Vec<(&str, &Path)> = vec![("--cache", cache.as_path())];
@@ -2611,131 +1482,6 @@ fn refuse_shared_outputs(args: &Args) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Why the cache could not be opened, and whether the run has to stop for it.
-///
-/// `locked` is the one failure a mode can survive: it says another run holds
-/// the file, not that anything is wrong with the file. Everything else -- an
-/// unreadable format, no permission, a full disk -- is a reason to stop, since
-/// nothing about it improves by carrying on. Only `--from-report` uses the
-/// distinction; see `main`.
-struct CacheUnavailable {
-    locked: bool,
-    /// The file is there but is not a cache this build can read: damaged, or
-    /// not a redb file at all. `--clear-cache` sets it aside and starts afresh.
-    damaged: bool,
-    reason: anyhow::Error,
-}
-
-/// Open the fingerprint cache, and say something useful when that fails.
-///
-/// A single file, an explicitly bounded page cache, and no background threads:
-/// every write is durable when its transaction commits, so there is no buffered
-/// work to lose and nothing that has to be told to stop.
-///
-/// Opening takes an exclusive `flock` on the file, which is what keeps two
-/// concurrent runs from fighting over the same cache -- and is also the most
-/// likely way this call fails, because scanning two libraries at once is a
-/// perfectly ordinary thing to do. redb reports that case as its own error
-/// variant, so every branch here can name both the file and what to do about
-/// it; a single `.context()` over the lot used to print one sentence with no
-/// path and no cause for four unrelated failures. The lock is released by the
-/// kernel when a process ends, however it ends, so there is no such thing as a
-/// stale one to advise clearing.
-fn open_cache(db_path: &Path) -> std::result::Result<Database, CacheUnavailable> {
-    let fatal = |reason| CacheUnavailable { locked: false, damaged: false, reason };
-
-    match Database::builder().set_cache_size(CACHE_SIZE_BYTES).create(db_path) {
-        Ok(db) => Ok(db),
-        Err(DatabaseError::DatabaseAlreadyOpen) => Err(CacheUnavailable {
-            locked: true,
-            damaged: false,
-            reason: anyhow::anyhow!(
-                "Another vid-fp run is using the fingerprint cache at {}.\n\
-                 A run holds that cache for its whole scan, not just while it reads it, \
-                 so only one at a time can have it.\n\
-                 Wait for the other run to finish, or give this one a cache of its own:\n    \
-                 vid-fp --cache /path/to/other-cache.redb ...",
-                db_path.display()
-            ),
-        }),
-        Err(DatabaseError::UpgradeRequired(version)) => Err(fatal(anyhow::anyhow!(
-            "The fingerprint cache at {} is in an older on-disk format (version {}) \
-             that this build cannot open.\n\
-             Delete the file and it will be rebuilt on the next scan.",
-            db_path.display(),
-            version
-        ))),
-        Err(DatabaseError::Storage(StorageError::Io(e)))
-            if e.kind() == std::io::ErrorKind::PermissionDenied =>
-        {
-            Err(fatal(anyhow::anyhow!(
-                "No permission to open the fingerprint cache at {}: {}.\n\
-                 Fix the permissions, or point this run somewhere writable with \
-                 --cache /path/to/cache.redb.",
-                db_path.display(),
-                e
-            )))
-        }
-        // Not a cache: a file that is not redb at all, or one a crash or a full
-        // disk left unreadable. Every later run would fail the same way, and
-        // `--clear-cache` could not help, since it needs the database open
-        // first -- so it is the one flag that is told to set the file aside.
-        Err(DatabaseError::Storage(StorageError::Corrupted(_))) if is_regular(db_path) => {
-            Err(damaged(db_path))
-        }
-        Err(DatabaseError::Storage(StorageError::Io(e)))
-            if matches!(e.kind(), std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof)
-                && is_regular(db_path) =>
-        {
-            Err(damaged(db_path))
-        }
-        Err(e) => Err(fatal(anyhow::Error::new(e).context(format!(
-            "Failed to open the fingerprint cache at {}",
-            db_path.display()
-        )))),
-    }
-}
-
-/// The refusal for a cache file that is there and cannot be read as one.
-fn damaged(db_path: &Path) -> CacheUnavailable {
-    CacheUnavailable {
-        locked: false,
-        damaged: true,
-        reason: anyhow::anyhow!(
-            "The fingerprint cache at {} is damaged or is not a vid-fp cache.\n\
-             Run again with --clear-cache to set it aside as {} and start a new one \
-             (every video will be fingerprinted again), or delete it.",
-            db_path.display(),
-            set_aside_path(db_path).display()
-        ),
-    }
-}
-
-/// Only a regular file is ever called damaged: anything else at the cache
-/// path is a mistake of another kind, and is not moved.
-fn is_regular(db_path: &Path) -> bool {
-    std::fs::symlink_metadata(db_path).is_ok_and(|m| m.is_file())
-}
-
-/// Where `--clear-cache` moves a damaged cache: beside it, under a name that
-/// is not taken.
-fn set_aside_path(db_path: &Path) -> PathBuf {
-    let mut name = db_path.file_name().unwrap_or_default().to_os_string();
-    name.push(".damaged");
-    let first = db_path.with_file_name(&name);
-    if std::fs::symlink_metadata(&first).is_err() {
-        return first;
-    }
-    (1..)
-        .map(|n| {
-            let mut numbered = name.clone();
-            numbered.push(format!(".{}", n));
-            db_path.with_file_name(numbered)
-        })
-        .find(|p| std::fs::symlink_metadata(p).is_err())
-        .expect("some numbered name is free")
 }
 
 /// How loud each destination is, which is two answers rather than one.
@@ -3007,7 +1753,7 @@ Interrupted with Ctrl-C.
     ffmpeg_next::init().context("Failed to initialize FFmpeg bindings.")?;
     ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Quiet);
 
-    let db_path = resolve_cache_path(args.cache.as_deref())?;
+    let db_path = cache::resolve_cache_path(args.cache.as_deref())?;
 
     // `--from-report` is the one mode that can run without a cache, and a busy
     // cache is the one failure it can survive. That mode reads nothing out of
@@ -3023,7 +1769,7 @@ Interrupted with Ctrl-C.
     //
     // `--clear-cache` is exempt. Emptying a cache is not bookkeeping -- it is
     // the thing that was asked for, and it cannot be given up quietly.
-    let mut db = match open_cache(&db_path) {
+    let mut db = match Cache::open(&db_path) {
         Ok(db) => Some(db),
         Err(e) if e.locked && args.from_report.is_some() && !args.clear_cache => {
             log::warn!(
@@ -3036,7 +1782,7 @@ Interrupted with Ctrl-C.
             None
         }
         Err(e) if e.damaged && args.clear_cache => {
-            let aside = set_aside_path(&db_path);
+            let aside = cache::set_aside_path(&db_path);
             std::fs::rename(&db_path, &aside).with_context(|| {
                 format!("Could not move the damaged cache {} aside", db_path.display())
             })?;
@@ -3046,50 +1792,36 @@ Interrupted with Ctrl-C.
                 db_path.display(),
                 aside.display()
             );
-            Some(open_cache(&db_path).map_err(|e| e.reason)?)
+            Some(Cache::open(&db_path).map_err(|e| e.reason)?)
         }
         Err(e) => return Err(e.reason),
     };
 
     if let Some(db) = db.as_mut() {
-        ensure_cache_table(db).context("Failed to initialize the fingerprint cache")?;
-
-        // Once, on the first run of this build. Nothing will ever look in those
-        // tables again, so every byte of them is dead. Compacting right
-        // afterwards is the only thing that returns those pages to the
-        // filesystem.
-        match retire_superseded_tables(db) {
-            Ok(retired) if retired.fingerprints || retired.refusals => {
-                if retired.fingerprints {
-                    info!(
-                        "Removed the superseded fingerprint cache; fingerprints will be rebuilt \
-                         once."
-                    );
-                } else {
-                    // Worth a different sentence rather than the one above:
-                    // nothing is being re-decoded, and a user who reads
-                    // "fingerprints will be rebuilt" before a scan of a large
-                    // library is being told to expect an hour that is not
-                    // coming.
-                    info!(
-                        "Removed the superseded record of files that are not video; they will be \
-                         re-checked once."
-                    );
-                }
-                if let Err(e) = db.compact() {
-                    log::error!("Could not compact the fingerprint cache: {}", e);
-                }
-            }
-            Ok(_) => {}
-            Err(e) => log::error!("{:#}", e),
-        }
-
         // Handled here rather than inside `run` because compaction needs an
         // exclusive handle on the database, and because this is the only point
-        // in the run where compacting is free. See `clear_cache`.
+        // in the run where compacting is free. A clear drops every table, the
+        // superseded ones included, so it needs no preparing first.
         if args.clear_cache {
             info!("Clearing all cache...");
-            clear_cache(db)?;
+            db.clear()?;
+        } else {
+            // Once, on the first run of this build: an older layout is carried
+            // over and every dead table dropped. Nothing will ever look in those
+            // again, and compacting right afterwards is the only thing that
+            // returns their pages to the filesystem.
+            let prepared = db.prepare().context("Failed to initialize the fingerprint cache")?;
+            if prepared.rebuilt {
+                info!("Removed the superseded fingerprint cache; fingerprints will be rebuilt once.");
+            }
+            if prepared.converted > 0 {
+                info!("Converted {} cache entries to this build's layout.", prepared.converted);
+            }
+            if prepared.reclaimable {
+                if let Err(e) = db.compact() {
+                    log::error!("{:#}", e);
+                }
+            }
         }
     }
 
@@ -3142,7 +1874,7 @@ Interrupted with Ctrl-C.
             match db.compact() {
                 Ok(true) => info!("Compacted the fingerprint cache."),
                 Ok(false) => {}
-                Err(e) => log::error!("Could not compact the fingerprint cache: {}", e),
+                Err(e) => log::error!("{:#}", e),
             }
         }
     }
@@ -3392,95 +2124,74 @@ fn unpack_lookups(
     pass
 }
 
+/// Remember a pass's refusals, in one transaction. A failure to write is not a
+/// failure of the run: everything these entries would have saved is time.
+fn store_refusals(cache: &Cache, refused: &[(String, Stamp, Refusal)]) -> Result<()> {
+    let writes: Vec<cache::Write> = refused
+        .iter()
+        .map(|(path, stamp, refusal)| cache::Write::Refusal(path, *stamp, refusal.clone()))
+        .collect();
+    cache.write(&writes)
+}
+
 /// The identities the cache holds, sorted by what they can be used for.
 ///
-/// `current` are the records still describing a walked file as it is now: that
+/// `current` are the records still describing a file this pass is about: that
 /// file's sample and digest without reading it. `former` are the rest -- a path
 /// this run did not walk, or one whose file has changed since -- keyed by what
-/// the path HELD, and kept only where that path's fingerprint is still the one
-/// the identity was taken beside. Those are what a moved or touched file is
-/// recognised by.
-///
-/// The fingerprint behind a `former` record is read only when a file asks for
-/// it, through the same kind of owned table `CacheView` holds, so a cache
-/// thousands of files bigger than the scan costs a pass over small records and
-/// not a deserialization of every fingerprint in it.
+/// the path HELD. Those are what a moved or touched file is recognised by, so
+/// they are gathered only when some file is queued to be recognised; a walk of
+/// them reads each record's head and not its fingerprint.
 struct IdentityIndex {
     current: HashMap<String, content::Identity>,
     former: HashMap<(u64, content::Sample), Vec<(String, content::Identity)>>,
-    fingerprints: Option<CacheTable>,
+    view: cache::View,
 }
 
 impl IdentityIndex {
-    fn open(db: &Database, files: &HashMap<&str, &sources::ScannedFile>) -> Self {
-        let mut index =
-            Self { current: HashMap::new(), former: HashMap::new(), fingerprints: None };
-        let Ok(read) = db.begin_read() else { return index };
-        index.fingerprints = read.open_table(CACHE_TABLE).ok();
-        let Ok(table) = read.open_table(IDENTITY_TABLE) else { return index };
-        let Ok(iter) = table.iter() else { return index };
-        for entry in iter.flatten() {
-            let (key, value) = entry;
-            let Ok(identity) = bincode::deserialize::<content::Identity>(value.value()) else {
-                continue;
-            };
-            let path = key.value();
-            match files.get(path) {
-                Some(file) if identity.describes(file) => {
-                    index.current.insert(path.to_string(), identity);
+    fn open(
+        cache: &Cache,
+        files: &HashMap<&str, &sources::ScannedFile>,
+        subjects: &[String],
+        adopting: bool,
+    ) -> Self {
+        let view = cache.view();
+        let describes = |path: &str, identity: &content::Identity| {
+            files.get(path).is_some_and(|file| identity.describes(file))
+        };
+        let current = subjects
+            .iter()
+            .filter_map(|path| Some((path.clone(), view.identity(path)?)))
+            .filter(|(path, identity)| describes(path, identity))
+            .collect();
+        let mut former: HashMap<_, Vec<_>> = HashMap::new();
+        if adopting {
+            // In path order, which is the order the table iterates in, so the
+            // holder a file adopts from does not depend on anything else.
+            for (path, identity) in view.identities() {
+                if !describes(&path, &identity) {
+                    former.entry((identity.size, identity.sample)).or_default().push((path, identity));
                 }
-                _ => index
-                    .former
-                    .entry((identity.size, identity.sample))
-                    .or_default()
-                    .push((path.to_string(), identity)),
             }
         }
-        for candidates in index.former.values_mut() {
-            candidates.sort_by(|a, b| a.0.cmp(&b.0));
-        }
-        index
+        Self { current, former, view }
     }
 
     /// The fingerprint a file holding `identity` can take over, if a former
-    /// holder of the same bytes left one this run's settings can use.
-    ///
-    /// The holder's `CACHE_TABLE` entry has to carry exactly the stat its
-    /// identity was taken at -- that is the whole proof the fingerprint was
-    /// made from these bytes, and it holds however either table was written,
-    /// overwritten or lost since -- and this run's sampling knobs, which
-    /// `Stamp::matches` checks in the same breath. Where both sides were read
-    /// whole, the digests have to agree as well; where either was not, the
-    /// sample is the cache key it is documented to be.
-    fn adoptable(
-        &self,
-        identity: &content::Identity,
-        kf_interval: f64,
-        min_kf_samples: f64,
-    ) -> Option<VideoFingerprint> {
-        let table = self.fingerprints.as_ref()?;
-        for (path, held) in self.former.get(&(identity.size, identity.sample))? {
+    /// holder of the same bytes left one this run's sampling can use. The
+    /// holder's identity and fingerprint are one record, so they are about the
+    /// same bytes by construction. Where both sides were read whole, the
+    /// digests have to agree as well; where either was not, the sample is the
+    /// cache key it is documented to be.
+    fn adoptable(&self, identity: &content::Identity, sampling: &cache::Sampling) -> Option<VideoFingerprint> {
+        self.former.get(&(identity.size, identity.sample))?.iter().find_map(|(path, held)| {
             if let (Some(a), Some(b)) = (identity.full, held.full) {
                 if a != b {
-                    continue;
+                    return None;
                 }
             }
-            let Ok(Some(stored)) = table.get(path.as_str()) else { continue };
-            let Ok((stamp, fp)) = bincode::deserialize::<CacheEntry>(stored.value()) else {
-                continue;
-            };
-            let then = Stamp {
-                mtime: held.mtime,
-                mtime_nsec: held.mtime_nsec,
-                size: held.size,
-                kf_interval,
-                min_kf_samples,
-            };
-            if stamp.matches(&then) && !fp.valid_hashes.is_empty() {
-                return Some(fp);
-            }
-        }
-        None
+            self.view.fingerprint_held_with(path, sampling)
+        })
     }
 }
 
@@ -3507,20 +2218,20 @@ struct Identified {
 ///
 /// `Ok(None)` is an interrupt.
 fn identify(
-    db: &Database,
+    cache: &Cache,
     files: &HashMap<&str, &sources::ScannedFile>,
     hits: &[VideoFingerprint],
     todo: Vec<Job>,
     kf_interval: f64,
     min_kf_samples: f64,
 ) -> Result<Option<Identified>> {
-    let index = IdentityIndex::open(db, files);
-
     // Every subject is a walked file: hits first, then the queue, so a subject
     // number below `hits.len()` is a hit.
     let paths: Vec<String> =
         hits.iter().map(|f| f.path.clone()).chain(todo.iter().map(|j| j.path.clone())).collect();
     let n_hits = hits.len();
+    let index = IdentityIndex::open(cache, files, &paths, !todo.is_empty());
+    let sampling = cache::Sampling { kf_interval, min_kf_samples };
 
     let mut identities: Vec<Option<content::Identity>> =
         paths.iter().map(|p| index.current.get(p.as_str()).copied()).collect();
@@ -3619,7 +2330,7 @@ fn identify(
     let mut fates: Vec<Fate> = (0..todo.len())
         .map(|t| {
             identities[n_hits + t]
-                .and_then(|id| index.adoptable(&id, kf_interval, min_kf_samples))
+                .and_then(|id| index.adoptable(&id, &sampling))
                 .map_or(Fate::Decode, |fp| Fate::Adopt(Box::new(fp)))
         })
         .collect();
@@ -3684,7 +2395,12 @@ fn identify(
         .filter(|&i| dirty[i])
         .filter_map(|i| identities[i].map(|id| (paths[i].as_str(), id)))
         .collect();
-    if let Err(e) = identities_store(db, &learned, &adopted) {
+    let writes: Vec<cache::Write> = learned
+        .iter()
+        .map(|&(path, identity)| cache::Write::Identity(path, identity))
+        .chain(adopted.iter().map(|(path, stamp, fp)| cache::Write::Fingerprint(path, *stamp, fp)))
+        .collect();
+    if let Err(e) = cache.write(&writes) {
         // Losing these costs the next run a re-sample, or a re-adoption, and
         // nothing else -- the fingerprints adopted are in hand either way.
         log::debug!("Could not record {} identit(ies): {:#}", learned.len(), e);
@@ -3717,46 +2433,9 @@ fn identify(
     }))
 }
 
-/// Record identities, and the fingerprints files took over by content, in one
-/// transaction.
-///
-/// An adopted fingerprint is written exactly as `cache_store` writes a fresh
-/// one -- under the new path, with the new stamp, and taking any refusal at
-/// that path away -- and its identity beside it at the same stat, which is
-/// what lets the next run find it by path and the run after a move find it by
-/// content again.
-fn identities_store(
-    db: &Database,
-    learned: &[(&str, content::Identity)],
-    adopted: &[(String, Stamp, VideoFingerprint)],
-) -> Result<()> {
-    if learned.is_empty() && adopted.is_empty() {
-        return Ok(());
-    }
-    let txn = db.begin_write().context("Failed to start a cache transaction")?;
-    {
-        let mut ids = txn.open_table(IDENTITY_TABLE).context("Failed to open the identity table")?;
-        for (path, identity) in learned {
-            let encoded = bincode::serialize(identity).context("Failed to serialize an identity")?;
-            ids.insert(*path, encoded.as_slice()).context("Failed to record an identity")?;
-        }
-        let mut table = txn.open_table(CACHE_TABLE).context("Failed to open the cache table")?;
-        let mut refused =
-            txn.open_table(REFUSED_TABLE).context("Failed to open the refusals table")?;
-        for (path, stamp, fp) in adopted {
-            let encoded =
-                bincode::serialize(&(stamp, fp)).context("Failed to serialize fingerprint")?;
-            table.insert(path.as_str(), encoded.as_slice()).context("Failed to insert the fingerprint")?;
-            refused.remove(path.as_str()).context("Failed to drop a superseded refusal")?;
-        }
-    }
-    txn.commit().context("Failed to commit the identities")?;
-    Ok(())
-}
-
 fn run(
     args: &Args,
-    db: Option<&Database>,
+    db: Option<&Cache>,
     start_time: Instant,
     active_threads: usize,
     stats: &RunStats,
@@ -4037,20 +2716,16 @@ fn run(
     // work there is, and that work is what the decoder thread budget is
     // apportioned against.
 
-    // One snapshot for the whole pass rather than two transactions per file;
-    // see `CacheView`. Nothing writes to either table between here and the
-    // decode, so every worker reads the same cache the first one would have.
+    // One snapshot for the whole pass rather than a transaction per file; see
+    // `cache::View`. Nothing writes to the cache between here and the decode,
+    // so every worker reads the same cache the first one would have.
     let read = progress::begin_counted(progress::Stage::CacheRead, total_videos as u64, total_videos as u64);
-    let cache = CacheView::open(db);
+    let cache = db.view();
 
     let lookups: Vec<Lookup> = video_files
         .par_iter()
         .map(|file| {
             read.tick();
-            // Thread count is deliberately NOT part of the stamp. Threading
-            // changes only how fast frames arrive, never which ones, so a
-            // fingerprint made with 8 threads is byte-identical to one made with
-            // 1 and stays valid across runs with different -t.
             let stamp = Stamp {
                 mtime: file.mtime,
                 mtime_nsec: file.mtime_nsec,
@@ -4059,33 +2734,18 @@ fn run(
                 min_kf_samples,
             };
 
-            match cache.refusal(&file.path, &stamp) {
+            match cache.lookup(&file.path, &stamp) {
+                Known::Fingerprint(fp) => Lookup::Hit(*fp),
                 // A remembered runtime, not a remembered verdict -- see
                 // `Refusal::TooShort`. Too short for this run's threshold is a
-                // skip; long enough for it falls through to the lookup below and
-                // is decoded like any other miss, which is what makes lowering
-                // `--min-duration` work from a warm cache.
-                Some(Refusal::TooShort(duration)) => {
-                    if min_duration > 0.0 && duration > 0.0 && duration < min_duration {
-                        return Lookup::Short;
-                    }
+                // skip; long enough is decoded like any other miss, which is
+                // what makes lowering `--min-duration` work from a warm cache.
+                Known::Refused(Refusal::TooShort(duration))
+                    if min_duration > 0.0 && duration > 0.0 && duration < min_duration =>
+                {
+                    Lookup::Short
                 }
-                // Regenerated rather than stored: the cache keeps the two
-                // numbers, so the sentence a re-run prints is this build's
-                // sentence and cannot drift from the one a first run prints.
-                Some(verdict) => {
-                    return Lookup::Refused {
-                        reason: format!("{}", verdict),
-                        path: file.path.clone(),
-                        not_media: verdict.is_not_media(),
-                    }
-                }
-                None => {}
-            }
-
-            match cache.fingerprint(&file.path, &stamp) {
-                Some(fp) => Lookup::Hit(fp),
-                None => Lookup::Miss(Job {
+                Known::Refused(Refusal::TooShort(_)) | Known::Nothing => Lookup::Miss(Job {
                     path: file.path.clone(),
                     stamp,
                     // Weighed by the pass below, once it is known which files
@@ -4097,13 +2757,21 @@ fn run(
                     size: file.size,
                     followers: Vec::new(),
                 }),
+                // Regenerated rather than stored: the cache keeps the two
+                // numbers, so the sentence a re-run prints is this build's
+                // sentence and cannot drift from the one a first run prints.
+                Known::Refused(verdict) => Lookup::Refused {
+                    reason: format!("{}", verdict),
+                    path: file.path.clone(),
+                    not_media: verdict.is_not_media(),
+                },
             }
         })
         .collect();
 
     // Let go of the snapshot the moment the pass is done with it. A live read
     // transaction pins every page it can see, so holding this one across the
-    // decode would stop redb reclaiming anything `cache_store` supersedes for
+    // decode would stop redb reclaiming anything the decode's writes supersede for
     // the whole of the run's longest stage.
     drop(cache);
 
@@ -4230,8 +2898,8 @@ fn run(
                     stats.fingerprint_failed.record(format!("{}: {:#}", job.path, e));
 
                     // Remembered unless it was about the moment rather than
-                    // the file -- see `worth_remembering` and `REFUSED_TABLE`.
-                    if let Some(verdict) = worth_remembering(&e) {
+                    // the file -- see `cache::worth_remembering`.
+                    if let Some(verdict) = cache::worth_remembering(&e) {
                         refused.push((job.path.clone(), job.stamp, verdict));
                     }
                 }
@@ -4254,10 +2922,10 @@ fn run(
         }
         todo = kept;
 
-        // One transaction for the whole pass -- see `refusals_store`. A failure
+        // One transaction for the whole pass -- see `Cache::write`. A failure
         // to write is not a failure of the run: everything these entries would
         // have saved is time, and the next run simply spends it again.
-        if let Err(e) = refusals_store(db, &refused) {
+        if let Err(e) = store_refusals(db, &refused) {
             log::debug!("Could not record {} refusal(s): {:#}", refused.len(), e);
         }
 
@@ -4313,8 +2981,14 @@ fn run(
     // Here rather than with the obstacle check above: see `prune_now`.
     if prune_now {
         let valid_files: HashSet<&str> = video_files.iter().map(|f| f.path.as_str()).collect();
-        if !prune_cache(db, &valid_files, stats)? {
-            return Ok(Outcome::Interrupted);
+        info!("Pruning cache for files not in the current scan...");
+        match db.prune(&valid_files)? {
+            None => return Ok(Outcome::Interrupted),
+            Some(0) => info!("No stale entries found to prune."),
+            Some(n) => {
+                stats.record_prune(n);
+                info!("Pruned {} stale entries from cache.", n);
+            }
         }
     }
 
@@ -4358,7 +3032,7 @@ fn run(
         let collected: Mutex<Vec<(usize, VideoFingerprint)>> =
             Mutex::new(Vec::with_capacity(todo_count));
         // Failures worth remembering, gathered from every worker and written
-        // once when they have all joined -- see `refusals_store`.
+        // once when they have all joined -- see `Cache::write`.
         let refused_here: Mutex<Vec<(String, Stamp, Refusal)>> = Mutex::new(Vec::new());
 
         // The bar's own position is decode work, so it cannot answer "how
@@ -4601,7 +3275,7 @@ fn run(
                                         // container with no frame, a stream that
                                         // will not parse -- and re-reading them
                                         // every run was the whole of a warm scan.
-                                        if let Some(verdict) = worth_remembering(&e) {
+                                        if let Some(verdict) = cache::worth_remembering(&e) {
                                             refused_here
                                                 .lock()
                                                 .unwrap_or_else(|p| p.into_inner())
@@ -4615,7 +3289,7 @@ fn run(
                         };
 
                         // Committed the moment it exists, over whatever this path
-                        // held before. See cache_store: this is one transaction
+                        // held before. See `Cache::write`: this is one transaction
                         // per video on purpose, so an interrupt (or a kill, or a
                         // crash) can only ever cost the decode still in flight.
                         //
@@ -4630,9 +3304,12 @@ fn run(
                             .collect();
                         let made: Vec<VideoFingerprint> = std::iter::once(fp).chain(copies).collect();
                         let members: Vec<&Job> = std::iter::once(job).chain(&job.followers).collect();
-                        let entries: Vec<(&str, Stamp, &VideoFingerprint)> =
-                            members.iter().zip(&made).map(|(m, f)| (m.path.as_str(), m.stamp, f)).collect();
-                        match cache_store(db, &entries) {
+                        let entries: Vec<cache::Write> = members
+                            .iter()
+                            .zip(&made)
+                            .map(|(m, f)| cache::Write::Fingerprint(&m.path, m.stamp, f))
+                            .collect();
+                        match db.write(&entries) {
                             Ok(()) => {
                                 newly_cached.fetch_add(entries.len(), Ordering::Relaxed);
                             }
@@ -4667,7 +3344,7 @@ fn run(
         progress::detail(String::new());
 
         let remember = refused_here.lock().unwrap_or_else(|e| e.into_inner()).split_off(0);
-        if let Err(e) = refusals_store(db, &remember) {
+        if let Err(e) = store_refusals(db, &remember) {
             log::debug!("Could not record {} refusal(s): {:#}", remember.len(), e);
         }
 
@@ -4869,7 +3546,7 @@ fn run(
     // happened, and stopping is no reason to leave the cache claiming
     // otherwise. It is one small transaction either way.
     if !deleted_paths.is_empty() && disposal.as_ref().is_some_and(forgets) {
-        match cache_forget(db, &deleted_paths) {
+        match db.forget(&deleted_paths) {
             Ok(forgotten) => {
                 log::debug!("Dropped {} cache entry(ies) for removed file(s).", forgotten)
             }
@@ -4890,7 +3567,7 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use redb::ReadableTableMetadata;
+    use cache::{Known, Write as CacheWrite};
 
     fn dest() -> PathBuf {
         PathBuf::from("/mnt/scratch/dupes")
@@ -5337,152 +4014,13 @@ mod tests {
         assert!(active_thread_count(usize::MAX, usize::MAX) > 0);
     }
 
-    fn stamp(mtime: i64, size: u64) -> Stamp {
+    pub(crate) fn stamp(mtime: i64, size: u64) -> Stamp {
         Stamp {
             mtime,
             mtime_nsec: 0,
             size,
             kf_interval: 0.0,
             min_kf_samples: 4.0,
-        }
-    }
-
-    #[test]
-    fn test_an_edited_file_invalidates_the_entry_it_is_about_to_overwrite() {
-        // The bug this whole change exists to fix, stated as a property: a
-        // re-encode does not produce a SECOND valid entry, it produces a
-        // mismatch against the only entry this path has -- which is then
-        // replaced. Nothing accumulates, so nothing needs pruning.
-        let before = stamp(1_700_000_000, 12_345);
-        let after = stamp(1_700_009_999, 999);
-
-        assert!(before.matches(&before), "an untouched file must still hit");
-        assert!(!before.matches(&after), "a rewritten file must miss");
-        assert!(
-            !stamp(1_700_000_000, 999).matches(&before),
-            "a same-second edit is still caught by the size"
-        );
-    }
-
-    #[test]
-    fn test_a_same_second_edit_that_preserves_the_size_is_still_caught() {
-        // The hole whole seconds leave open: a re-mux or a scripted re-encode
-        // finishing inside the same second the last one did, landing on the
-        // same byte count. Seconds and size both agree, and the fingerprint on
-        // record describes footage that is no longer in the file.
-        let before = stamp(1_700_000_000, 12_345);
-        let after = Stamp { mtime_nsec: 500_000_000, ..before };
-
-        assert!(!before.matches(&after), "the nanoseconds are the only thing that differs");
-        assert!(after.matches(&after));
-    }
-
-    #[test]
-    fn test_the_sampling_knobs_are_part_of_what_makes_an_entry_valid() {
-        // These change which keyframes are decoded, so a fingerprint made under
-        // one setting is not an answer for a run using another.
-        let base = stamp(1_700_000_000, 12_345);
-
-        let sampled = Stamp { kf_interval: 5.0, ..base };
-        assert!(!base.matches(&sampled));
-        assert!(sampled.matches(&sampled));
-    }
-
-    #[test]
-    fn test_min_keyframes_only_invalidates_while_it_is_flooring_something() {
-        // `--min-keyframes` is a floor on the sampling interval. With sampling
-        // off -- which is the DEFAULT -- there is no interval for it to floor
-        // and it changes not one decoded frame, so an entry cannot stop being
-        // valid because it moved. Comparing it regardless re-fingerprinted whole
-        // libraries for a flag that did nothing.
-        let base = stamp(1_700_000_000, 12_345);
-        let fewer = Stamp { min_kf_samples: 2.0, ..base };
-
-        assert!(
-            base.matches(&fewer),
-            "with no interval in force this flag decides nothing and must not invalidate"
-        );
-
-        // Turn sampling on and it is load-bearing again, so it counts.
-        let sampled = Stamp { kf_interval: 5.0, ..base };
-        let sampled_fewer = Stamp { kf_interval: 5.0, ..fewer };
-
-        assert!(!sampled.matches(&sampled_fewer), "now it changes which frames are kept");
-        assert!(sampled_fewer.matches(&sampled_fewer));
-    }
-
-    #[test]
-    fn test_an_unparseable_interval_does_not_miss_forever() {
-        // clap accepts `--keyframe-interval nan`, and NaN != NaN. Derived
-        // equality would re-decode the entire library on every single run.
-        let nonsense = Stamp {
-            kf_interval: f64::NAN,
-            ..stamp(1_700_000_000, 12_345)
-        };
-
-        assert!(nonsense.matches(&nonsense), "an entry must be able to match itself");
-    }
-
-    #[test]
-    fn test_every_interval_that_samples_nothing_is_the_same_setting() {
-        // `effective_interval` is gated on `kf_interval > 0.0`, so 0.0, a
-        // negative and NaN all decode every keyframe and cannot be told apart
-        // from the fingerprint they produce. Comparing the figures made them
-        // three settings: `--keyframe-interval=-5` missed against a default
-        // entry, overwrote it, and the next default run missed in turn, so
-        // alternating them never hit the cache at all.
-        let base = stamp(1_700_000_000, 12_345); // kf_interval 0.0, the default
-        let negative = Stamp { kf_interval: -5.0, ..base };
-        let other_negative = Stamp { kf_interval: -0.5, ..base };
-        let nonsense = Stamp { kf_interval: f64::NAN, ..base };
-
-        for off in [negative, other_negative, nonsense] {
-            assert!(base.matches(&off), "sampling is off either way; the entry stands");
-            assert!(off.matches(&base), "and it stands in the other direction too");
-        }
-        assert!(negative.matches(&nonsense), "two ways of spelling the same non-setting");
-
-        // A real interval is still a real change, in both directions.
-        let sampled = Stamp { kf_interval: 5.0, ..base };
-        assert!(!negative.matches(&sampled));
-        assert!(!sampled.matches(&negative));
-        assert!(!nonsense.matches(&sampled), "NaN is off, 5.0 is not");
-        assert!(!sampled.matches(&nonsense));
-    }
-
-    #[test]
-    fn test_min_keyframes_still_decides_nothing_beside_an_interval_that_is_off() {
-        // The two guards have to agree about what "off" means, or the wrong
-        // one of them starts comparing a flag the decode never reads.
-        let negative = Stamp { kf_interval: -5.0, ..stamp(1_700_000_000, 12_345) };
-        let fewer = Stamp { min_kf_samples: 2.0, ..negative };
-
-        assert!(negative.matches(&fewer), "no interval to floor, so this floors nothing");
-    }
-
-    #[test]
-    fn test_every_floor_that_floors_nothing_is_the_same_setting() {
-        // One rung down from the interval test above, and the same argument:
-        // `effective_interval` computes the floor only when
-        // `min_kf_samples > 0.0`, so 0.0, a negative and NaN all leave the
-        // interval exactly as typed and produce identical fingerprints. Told
-        // apart, `-i 5 -m 0` and `-i 5 -m nan` would each overwrite the other's
-        // entry and neither would ever hit.
-        let sampled = Stamp { kf_interval: 5.0, ..stamp(1_700_000_000, 12_345) };
-        let unfloored = [
-            Stamp { min_kf_samples: 0.0, ..sampled },
-            Stamp { min_kf_samples: -5.0, ..sampled },
-            Stamp { min_kf_samples: f64::NAN, ..sampled },
-        ];
-
-        for a in unfloored {
-            for b in unfloored {
-                assert!(a.matches(&b), "both leave the 5 s interval standing alone");
-            }
-            // A real floor is a real change, in both directions: it makes the
-            // interval finer for anything shorter than 5 s x 12.
-            assert!(!a.matches(&sampled), "12 samples is a floor, none is not");
-            assert!(!sampled.matches(&a));
         }
     }
 
@@ -5558,7 +4096,7 @@ mod tests {
         assert_eq!(stats.skipped_short.count(), 0);
     }
 
-    fn mock_fp(path: &str) -> VideoFingerprint {
+    pub(crate) fn mock_fp(path: &str) -> VideoFingerprint {
         VideoFingerprint {
             path: path.to_string(),
             valid_hashes: vec![1, 2, 3],
@@ -5580,138 +4118,32 @@ mod tests {
     }
 
     /// A cache of its own, inside a directory that cleans itself up.
-    fn temp_db(dir: &tempfile::TempDir) -> Database {
-        let db = Database::create(dir.path().join("fingerprints.redb")).unwrap();
-        ensure_cache_table(&db).unwrap();
-        db
+    fn temp_db(dir: &tempfile::TempDir) -> Cache {
+        Cache::create(&dir.path().join("fingerprints.redb"))
     }
 
-    #[test]
-    fn test_a_fingerprint_round_trips_through_the_cache() {
-        // The stamp is written ahead of the fingerprint, so this also pins the
-        // offset everything after it is read from: the borrowed write path and
-        // the owned read path have to agree byte for byte.
-        let dir = tempfile::tempdir().unwrap();
-        let db = temp_db(&dir);
-        let written = stamp(1_700_000_000, 12_345);
-        let fp = mock_fp("/videos/some_show_s01e01.mkv");
-
-        cache_store_one(&db, &fp.path, written, &fp).unwrap();
-
-        let hit = cache_lookup(&db, &fp.path, &written).expect("an untouched file must hit");
-        assert_eq!(hit.valid_hashes, fp.valid_hashes);
-        assert_eq!(hit.codec, fp.codec);
+    fn cache_store_one(db: &Cache, path: &str, stamp: Stamp, fp: &VideoFingerprint) -> Result<()> {
+        db.write(&[CacheWrite::Fingerprint(path, stamp, fp)])
     }
 
-    /// A fingerprint holding no hashes is not a fingerprint, however well its
-    /// stamp matches.
-    ///
-    /// Only an older build could have written one: a file whose every frame was
-    /// featureless used to return an empty hash list instead of failing, and
-    /// that entry then matched nothing at any `-d` for ever -- the file was
-    /// silently absent from every report, on a run that had never decoded it and
-    /// so had nothing to say about it either. Nothing about the file changed, so
-    /// the `Stamp` cannot see it; the emptiness is the only tell there is.
-    #[test]
-    fn test_a_cached_fingerprint_with_no_hashes_in_it_is_not_handed_back() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = temp_db(&dir);
-        let s = stamp(1_700_000_000, 12_345);
-
-        let path = "/videos/ten_minutes_of_black.mp4";
-        let mut empty = mock_fp(path);
-        empty.valid_hashes.clear();
-        empty.valid_t_start.clear();
-        empty.valid_t_end.clear();
-        cache_store_one(&db, path, s, &empty).unwrap();
-
-        assert!(
-            cache_lookup(&db, path, &s).is_none(),
-            "an empty entry has to read as a miss, so the decode re-runs and says why"
-        );
-
-        // And the check is about the hashes rather than about the path: an
-        // ordinary entry under the same stamp still hits.
-        let good = mock_fp(path);
-        cache_store_one(&db, path, s, &good).unwrap();
-        assert!(cache_lookup(&db, path, &s).is_some());
+    fn cache_lookup(db: &Cache, path: &str, now: &Stamp) -> Option<VideoFingerprint> {
+        match db.view().lookup(path, now) {
+            Known::Fingerprint(fp) => Some(*fp),
+            _ => None,
+        }
     }
 
-    #[test]
-    fn test_a_rewritten_file_replaces_its_entry_rather_than_adding_one() {
-        // What the key change actually buys, at the level the bug lived at: a
-        // path holds ONE entry no matter how many times its file is rewritten.
-        // The superseded fingerprint is not merely unreachable, it is gone.
-        let dir = tempfile::tempdir().unwrap();
-        let db = temp_db(&dir);
-        let path = "/videos/some_show_s01e01.mkv";
-
-        let old = stamp(1_700_000_000, 12_345);
-        let new = stamp(1_700_009_999, 6_000);
-
-        cache_store_one(&db, path, old, &mock_fp(path)).unwrap();
-        cache_store_one(&db, path, new, &mock_fp(path)).unwrap();
-
-        assert!(cache_lookup(&db, path, &new).is_some(), "the file as it stands now hits");
-        assert!(cache_lookup(&db, path, &old).is_none(), "the superseded stamp cannot");
-
-        let read = db.begin_read().unwrap();
-        let table = read.open_table(CACHE_TABLE).unwrap();
-        assert_eq!(table.len().unwrap(), 1, "one file, one entry, however often it changes");
+    fn refusal_lookup(db: &Cache, path: &str, now: &Stamp) -> Option<Refusal> {
+        match db.view().lookup(path, now) {
+            Known::Refused(r) => Some(r),
+            _ => None,
+        }
     }
 
-    #[test]
-    fn test_a_deleted_file_is_forgotten() {
-        // The other half of keeping the cache bounded. A cleanup run takes the
-        // duplicate off disk (or moves it under --move-to) and nothing will ever
-        // ask about that path again, so leaving the fingerprint would make every
-        // armed run grow the cache by exactly what it just cleaned up.
-        let dir = tempfile::tempdir().unwrap();
-        let db = temp_db(&dir);
-        let kept = "/videos/keep.mkv";
-        let gone = "/videos/duplicate.mkv";
-        let s = stamp(1_700_000_000, 12_345);
-
-        cache_store_one(&db, kept, s, &mock_fp(kept)).unwrap();
-        cache_store_one(&db, gone, s, &mock_fp(gone)).unwrap();
-
-        let forgotten = cache_forget(&db, &[gone.to_string()]).unwrap();
-
-        assert_eq!(forgotten, 1);
-        assert!(cache_lookup(&db, gone, &s).is_none(), "a removed file keeps no fingerprint");
-        assert!(cache_lookup(&db, kept, &s).is_some(), "and its neighbours are untouched");
-    }
-
-    /// The other table counts too. A path is remembered by exactly one of the
-    /// two, so a count that reads only `CACHE_TABLE` reports a refusal that was
-    /// really there as an entry that was not -- which is the one thing the
-    /// figure exists to distinguish.
-    #[test]
-    fn test_a_forgotten_path_is_counted_whichever_table_remembered_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = temp_db(&dir);
-        let refused_path = "/videos/not_really_a_video.mkv";
-        let s = stamp(1_700_000_000, 12_345);
-
-        refusals_store(
-            &db,
-            &[(refused_path.to_string(), s, Refusal::Said("nope".to_string()))],
-        )
-        .unwrap();
-
-        let forgotten = cache_forget(&db, &[refused_path.to_string()]).unwrap();
-
-        assert_eq!(forgotten, 1, "the cache had something to say about this path");
-        assert!(
-            refusal_lookup(&db, refused_path, &s).is_none(),
-            "and it no longer says it"
-        );
-
-        assert_eq!(
-            cache_forget(&db, &["/videos/never_seen.mkv".to_string()]).unwrap(),
-            0,
-            "a path neither table held is still not an entry"
-        );
+    /// Every record's verdict, read whatever stamp it was made under, so a test
+    /// does not have to rebuild the `Stamp` of a file `run` stat'ed.
+    fn verdicts(db: &Cache) -> Vec<(String, Known)> {
+        db.view().verdicts()
     }
 
     /// A report and a real file to go with it, sized to agree with `mock_fp`.
@@ -5825,48 +4257,28 @@ mod tests {
     /// prune measured against a scan that failed would collect by mistake.
     const ORPHAN: &str = "/videos/long_gone.mkv";
 
-    fn cache_with_an_orphan(dir: &tempfile::TempDir) -> Database {
+    fn cache_with_an_orphan(dir: &tempfile::TempDir) -> Cache {
         let db = temp_db(dir);
         cache_store_one(&db, ORPHAN, stamp(1_700_000_000, 12_345), &mock_fp(ORPHAN)).unwrap();
         db
     }
 
-    fn cached_paths(db: &Database) -> Vec<String> {
-        let read = db.begin_read().unwrap();
-        let table = read.open_table(CACHE_TABLE).unwrap();
-        table
-            .iter()
-            .unwrap()
-            .map(|e| e.unwrap().0.value().to_string())
-            .collect()
+    fn cached_paths(db: &Cache) -> Vec<String> {
+        verdicts(db).into_iter().filter(|(_, k)| matches!(k, Known::Fingerprint(_))).map(|(p, _)| p).collect()
     }
 
-    fn refused_paths(db: &Database) -> Vec<String> {
-        let read = db.begin_read().unwrap();
-        let table = read.open_table(REFUSED_TABLE).unwrap();
-        table
-            .iter()
-            .unwrap()
-            .map(|e| e.unwrap().0.value().to_string())
-            .collect()
+    fn refused_paths(db: &Cache) -> Vec<String> {
+        refusals(db).into_iter().map(|(p, _)| p).collect()
     }
 
     /// Every refusal in the cache, with the verdict it holds.
     ///
-    /// Read straight out of the table rather than through `refusal_lookup`, so
-    /// the test does not have to rebuild the `Stamp` of a file `run` stat'ed.
-    fn refusals(db: &Database) -> Vec<(String, Refusal)> {
-        let read = db.begin_read().unwrap();
-        let table = read.open_table(REFUSED_TABLE).unwrap();
-        table
-            .iter()
-            .unwrap()
-            .map(|e| {
-                let entry = e.unwrap();
-                let path = entry.0.value().to_string();
-                let (_, verdict): (Stamp, Refusal) =
-                    bincode::deserialize(entry.1.value()).expect("this build wrote it");
-                (path, verdict)
+    fn refusals(db: &Cache) -> Vec<(String, Refusal)> {
+        verdicts(db)
+            .into_iter()
+            .filter_map(|(p, k)| match k {
+                Known::Refused(r) => Some((p, r)),
+                _ => None,
             })
             .collect()
     }
@@ -5971,102 +4383,6 @@ mod tests {
         assert!(cached_paths(&db).is_empty(), "and nothing about it is cached");
     }
 
-    /// A refusal survives the run that made it, and is guarded by the same stamp
-    /// a fingerprint is -- so editing the file asks again rather than trusting a
-    /// verdict about bytes that are no longer there.
-    #[test]
-    fn test_a_refusal_is_remembered_until_the_file_changes() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = temp_db(&dir);
-        let path = "/videos/not-really.mkv";
-        let verdict = Refusal::NotMedia(fingerprint::NotMedia { bytes: 2048, score: 0 });
-        let written = stamp(1_700_000_000, 12_345);
-
-        refusals_store(&db, &[(path.to_string(), written, verdict)]).unwrap();
-
-        let remembered = refusal_lookup(&db, path, &written).expect("the same file is remembered");
-        assert!(format!("{}", remembered).contains("2048"), "and says what it saw");
-
-        assert!(
-            refusal_lookup(&db, path, &stamp(1_700_000_001, 12_345)).is_none(),
-            "an edit re-opens the question"
-        );
-        assert!(
-            refusal_lookup(&db, path, &stamp(1_700_000_000, 12_346)).is_none(),
-            "and so does a change of size"
-        );
-    }
-
-    /// What the cache keeps about a file under `--min-duration` is its RUNTIME,
-    /// not the skip -- because the threshold belongs to the run and is kept out
-    /// of the `Stamp` along with every other comparison-time flag. Remembering
-    /// the verdict would hand a run that lowered the flag a skip it never asked
-    /// for, and there is no bit in the stamp that would catch it.
-    #[test]
-    fn test_a_remembered_runtime_is_re_decided_against_each_run_s_floor() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = temp_db(&dir);
-        let path = "/videos/clip.mp4";
-        let written = stamp(1_700_000_000, 12_345);
-
-        refusals_store(&db, &[(path.to_string(), written, Refusal::TooShort(8.84))]).unwrap();
-
-        let Some(Refusal::TooShort(duration)) = refusal_lookup(&db, path, &written) else {
-            panic!("the runtime is what comes back");
-        };
-        assert_eq!(duration, 8.84, "verbatim, so every run can decide for itself");
-
-        // Which is the whole point: one threshold skips this file and the other
-        // sends it to the decode, off one entry neither run had to open a file
-        // to read.
-        assert!(duration < 60.0, "--min-duration 60 skips it");
-        assert!(duration >= 5.0, "--min-duration 5 does not");
-
-        assert!(
-            refusal_lookup(&db, path, &stamp(1_700_000_001, 12_345)).is_none(),
-            "and an edit re-opens the question, exactly as for a refusal"
-        );
-    }
-
-    /// One path, one table. A `TooShort` entry is the only one a fingerprint can
-    /// ever land on top of -- the other two verdicts never fall through to a
-    /// decode -- and the run that lowers `--min-duration` is exactly the run
-    /// that does it: the file is decoded and filed under the same path the
-    /// refusal is under.
-    ///
-    /// Both halves are asserted because the failure is silent from either side
-    /// on its own. A leftover refusal is not stale (its `Stamp` still matches
-    /// the file, so nothing collects it), and `Lookup::Short` reads that table
-    /// BEFORE `cache_lookup`, so the header runtime it holds would outrank the
-    /// runtime the decode went on to measure for as long as the entry lived.
-    #[test]
-    fn test_a_fingerprint_supersedes_the_refusal_it_fell_through() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = temp_db(&dir);
-        let path = "/videos/clip.mp4";
-        let written = stamp(1_700_000_000, 12_345);
-
-        // Run one, `--min-duration 60`: the weighing pass measures 8.84s and
-        // files the number rather than the verdict.
-        refusals_store(&db, &[(path.to_string(), written, Refusal::TooShort(8.84))]).unwrap();
-        assert!(refusal_lookup(&db, path, &written).is_some(), "which run two will read");
-
-        // Run two, `--min-duration 0`: the number clears this run's floor, so
-        // the file falls through, decodes, and is stored.
-        let mut fp = mock_fp(path);
-        fp.duration = 8.84;
-        cache_store_one(&db, path, written, &fp).unwrap();
-
-        assert!(
-            cache_lookup(&db, path, &written).is_some(),
-            "the fingerprint is what this path means now"
-        );
-        assert!(
-            refusal_lookup(&db, path, &written).is_none(),
-            "and the measurement it superseded went with it"
-        );
-    }
-
     /// The same property through `run`, because the argument for it is about a
     /// route rather than about two cache calls: the file has to really reach the
     /// weighing pass on the run that decodes it, which is the step the reasoning
@@ -6106,18 +4422,12 @@ mod tests {
         );
     }
 
-    /// The same invariant from the other side, and the side nothing was
-    /// enforcing: a REFUSAL landing on a path a fingerprint is already filed
-    /// under.
-    ///
-    /// `cache_store` takes a refusal away because a fingerprint supersedes one;
-    /// nothing did the reverse, and `cache_lookup`'s reasoning for leaving a
-    /// stale entry where it lies ("the re-fingerprint is about to overwrite
-    /// it") is exactly what a refusal denies -- the file that is refused is the
-    /// one that never gets decoded. So an edited file whose new runtime falls
-    /// under `--min-duration` left the old fingerprint standing and wrote the
-    /// runtime beside it: one path in both tables, which `--prune-cache` then
-    /// reports as "1 stale entries and 1 stale refusal(s)" for a single file.
+    /// The same invariant from the other side: a REFUSAL landing on a path a
+    /// fingerprint is already filed under. An edited file whose new runtime
+    /// falls under `--min-duration` is refused and never decoded, so nothing
+    /// else would ever write over its old fingerprint. When the two lived in
+    /// separate tables this left one path in both; one record per path makes
+    /// it impossible, and this drives the route that used to reach it.
     #[test]
     fn test_a_refusal_supersedes_the_fingerprint_it_lands_on() {
         let dir = tempfile::tempdir().unwrap();
@@ -6166,7 +4476,7 @@ mod tests {
         let elsewhere = "/videos/was-a-video.mkv";
         let written = stamp(1_700_000_000, 12_345);
         cache_store_one(&db, elsewhere, written, &mock_fp(elsewhere)).unwrap();
-        refusals_store(
+        store_refusals(
             &db,
             &[(
                 elsewhere.to_string(),
@@ -6185,14 +4495,14 @@ mod tests {
         );
     }
 
-    /// The two tables are pruned together. The refusals table is the one that
-    /// grows without bound -- one entry per file that is not video -- so a prune
-    /// that only swept fingerprints would leave the larger half behind.
+    /// A prune collects refusals as well as fingerprints. Refusals are what
+    /// grows without bound -- one per file that is not video -- so a prune that
+    /// only swept fingerprints would leave the larger half behind.
     #[test]
     fn test_pruning_collects_refusals_as_well_as_fingerprints() {
         let dir = tempfile::tempdir().unwrap();
         let db = cache_with_an_orphan(&dir);
-        refusals_store(
+        store_refusals(
             &db,
             &[(
                 ORPHAN.to_string(),
@@ -6218,31 +4528,6 @@ mod tests {
             refusal_lookup(&db, ORPHAN, &stamp(1_700_000_000, 12_345)).is_none(),
             "and so is the refusal, which nothing else would ever overwrite"
         );
-    }
-
-    /// Disposing of a file forgets both of the things the cache might know about
-    /// it. A refusal left behind outlives its bytes exactly the way a
-    /// fingerprint would, and the next file to land on that path would inherit
-    /// a verdict about a different one -- caught by the stamp, but only by luck.
-    #[test]
-    fn test_forgetting_a_file_forgets_its_refusal_too() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = temp_db(&dir);
-        let path = "/videos/gone.mkv";
-        let written = stamp(1_700_000_000, 12_345);
-        refusals_store(
-            &db,
-            &[(
-                path.to_string(),
-                written,
-                Refusal::NotMedia(fingerprint::NotMedia { bytes: 16384, score: 1 }),
-            )],
-        )
-        .unwrap();
-
-        cache_forget(&db, &[path.to_string()]).unwrap();
-
-        assert!(refusal_lookup(&db, path, &written).is_none());
     }
 
     /// A remembered refusal has to read exactly like the one that discovered it.
@@ -6605,7 +4890,7 @@ mod tests {
         Args::parse_from(argv)
     }
 
-    fn run_error(dir: &tempfile::TempDir, db: &Database, extra: &[&str]) -> String {
+    fn run_error(dir: &tempfile::TempDir, db: &Cache, extra: &[&str]) -> String {
         let stats = RunStats::default();
         run(&args_over(dir, extra), Some(db), Instant::now(), 1, &stats)
             .expect_err("this run should have been refused")
@@ -7023,118 +5308,6 @@ mod tests {
         assert!(err.contains("-o -"), "{}", err);
     }
 
-    #[test]
-    fn test_forgetting_something_uncached_is_not_an_error() {
-        // A file whose cache write failed earlier in the run is still a
-        // perfectly good target, and its absence here means nothing.
-        let dir = tempfile::tempdir().unwrap();
-        let db = temp_db(&dir);
-
-        assert_eq!(cache_forget(&db, &[]).unwrap(), 0);
-        assert_eq!(cache_forget(&db, &["/videos/never-cached.mkv".to_string()]).unwrap(), 0);
-    }
-
-    #[test]
-    fn test_clearing_the_cache_leaves_a_usable_empty_table() {
-        // The clear now compacts on its way past, which drops and recreates
-        // pages under the table definition. The run that follows immediately
-        // starts writing fingerprints into it, so "empty" must not mean "gone".
-        let dir = tempfile::tempdir().unwrap();
-        let mut db = temp_db(&dir);
-        let path = "/videos/some_show_s01e01.mkv";
-        let s = stamp(1_700_000_000, 12_345);
-
-        cache_store_one(&db, path, s, &mock_fp(path)).unwrap();
-        clear_cache(&mut db).unwrap();
-
-        assert!(cache_lookup(&db, path, &s).is_none(), "nothing survives a clear");
-
-        cache_store_one(&db, path, s, &mock_fp(path)).unwrap();
-        assert!(
-            cache_lookup(&db, path, &s).is_some(),
-            "and the table is ready for the scan that follows"
-        );
-    }
-
-    #[test]
-    fn test_clearing_the_cache_clears_another_architecture_s_tables_too() {
-        // A cache on a share an ARM and an x86 machine both scan holds a
-        // fingerprint table for each; --clear-cache from either empties both.
-        let dir = tempfile::tempdir().unwrap();
-        let mut db = temp_db(&dir);
-        let other: TableDefinition<&str, &[u8]> = TableDefinition::new("fingerprints_dct_ct_ff8_s128_riscv64");
-        let txn = db.begin_write().unwrap();
-        txn.open_table(other).unwrap().insert("/videos/a.mkv", &b"x"[..]).unwrap();
-        txn.commit().unwrap();
-
-        clear_cache(&mut db).unwrap();
-
-        let names: Vec<String> =
-            db.begin_read().unwrap().list_tables().unwrap().map(|t| redb::TableHandle::name(&t).to_string()).collect();
-        assert!(!names.iter().any(|n| n.ends_with("_riscv64")), "{names:?}");
-    }
-
-    #[test]
-    fn test_a_locked_cache_names_the_file_and_the_way_out() {
-        // Scanning two libraries at once is ordinary, and this is what the
-        // second run hits. flock conflicts between two open file descriptions
-        // whether or not they belong to the same process, so holding `_first`
-        // here reproduces the concurrent run exactly.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("fingerprints.redb");
-        let _first = Database::create(&path).unwrap();
-
-        let err = open_cache(&path).expect_err("the lock is held");
-        let message = format!("{:#}", err.reason);
-
-        assert!(
-            err.locked,
-            "the one failure --from-report is allowed to carry on through has to be \
-             distinguishable from the ones it is not"
-        );
-
-        assert!(
-            message.contains(&path.display().to_string()),
-            "the message has to say WHICH cache: {message}"
-        );
-        assert!(
-            message.contains("--cache"),
-            "and how to get a run of your own going: {message}"
-        );
-    }
-
-    #[test]
-    fn test_the_named_cache_path_is_used_verbatim() {
-        let dir = tempfile::tempdir().unwrap();
-        let wanted = dir.path().join("libraries").join("anime.redb");
-
-        let resolved = resolve_cache_path(Some(wanted.to_str().unwrap())).unwrap();
-
-        assert_eq!(resolved, wanted, "a named file is the cache, whatever it is called");
-        assert!(
-            wanted.parent().unwrap().is_dir(),
-            "and its directory is created, as the default location's is"
-        );
-    }
-
-    #[test]
-    fn test_a_directory_gets_the_default_filename_inside_it() {
-        // `--cache /mnt/scratch` means "a cache in here". Both the existing
-        // directory and the trailing slash say so; the second is the one a
-        // shell's tab completion writes for a directory that isn't there yet.
-        let dir = tempfile::tempdir().unwrap();
-
-        let existing = resolve_cache_path(Some(dir.path().to_str().unwrap())).unwrap();
-        assert_eq!(existing, dir.path().join(CACHE_FILE_NAME));
-
-        let not_yet = dir.path().join("scratch");
-        let trailing = format!("{}/", not_yet.display());
-        let resolved = resolve_cache_path(Some(&trailing)).unwrap();
-
-        assert_eq!(resolved, not_yet.join(CACHE_FILE_NAME));
-        assert!(not_yet.is_dir(), "the directory it named is created, not a file called `scratch`");
-    }
-
     // --- What a file holds (`identify`, `content`) -----------------------------
 
     fn fixture(name: &str) -> PathBuf {
@@ -7175,7 +5348,7 @@ mod tests {
     /// The content pass over `queued`, as `run` would call it with `hits`
     /// already answered by path.
     fn identify_over(
-        db: &Database,
+        db: &Cache,
         hits: &[VideoFingerprint],
         queued: &[&Path],
         kf_interval: f64,
@@ -7193,7 +5366,7 @@ mod tests {
 
     /// Fingerprint everything under `dir` the ordinary way, so the cache holds
     /// it as a real run left it.
-    fn scan(dir: &Path, db: &Database, extra: &[&str]) -> RunStats {
+    fn scan(dir: &Path, db: &Cache, extra: &[&str]) -> RunStats {
         let mut argv = vec!["vid-fp".to_string(), dir.to_string_lossy().into_owned()];
         argv.extend(extra.iter().map(|s| s.to_string()));
         let stats = RunStats::default();
@@ -7201,11 +5374,11 @@ mod tests {
         stats
     }
 
-    fn cached(db: &Database, path: &Path) -> Option<VideoFingerprint> {
-        let read = db.begin_read().unwrap();
-        let table = read.open_table(CACHE_TABLE).unwrap();
-        let stored = table.get(path.to_string_lossy().as_ref()).unwrap()?;
-        Some(bincode::deserialize::<CacheEntry>(stored.value()).unwrap().1)
+    fn cached(db: &Cache, path: &Path) -> Option<VideoFingerprint> {
+        verdicts(db).into_iter().find_map(|(p, k)| match k {
+            Known::Fingerprint(fp) if p == path.to_string_lossy() => Some(*fp),
+            _ => None,
+        })
     }
 
     #[test]
@@ -7233,10 +5406,7 @@ mod tests {
 
         // Filed under the new path, so the next run is an ordinary hit.
         assert_eq!(cached(&db, &after).unwrap().valid_hashes, original.valid_hashes);
-        let hit = CacheView::open(&db).fingerprint(
-            &after.to_string_lossy(),
-            &job_for(&scanned(&after), 0.0).stamp,
-        );
+        let hit = cache_lookup(&db, &after.to_string_lossy(), &job_for(&scanned(&after), 0.0).stamp);
         assert!(hit.is_some(), "the adopted entry carries the new path's stamp");
     }
 
@@ -7441,6 +5611,6 @@ mod tests {
         assert!(!stats.had_problems());
         assert_eq!(cached_paths(&db), vec![after.to_string_lossy().into_owned()]);
         assert_eq!(cached(&db, &after).unwrap().valid_hashes, marker.valid_hashes);
-        assert_eq!(stats.entries_pruned(), 2, "the old fingerprint and its identity");
+        assert_eq!(stats.entries_pruned(), 1, "the old path's record, identity and fingerprint together");
     }
 }

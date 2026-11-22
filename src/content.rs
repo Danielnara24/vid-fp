@@ -5,13 +5,12 @@
 //! scratch -- hours, for a library that changed drives. This module gives each
 //! fingerprinted file an [`Identity`]: the stat it was taken against, a
 //! [`Sample`] of its bytes, and, for a file that might be a copy of another, a
-//! [`Digest`] of all of them. `lib.rs` keeps the identities in a table of their
-//! own beside the fingerprints and uses them two ways:
+//! [`Digest`] of all of them. The cache keeps each in the same record as the
+//! path's fingerprint (`cache::Entry`), and `lib.rs` uses them two ways:
 //!
 //! - **A file the cache misses by path is looked up by its sample.** A record
-//!   under another path (or under this path at an older stat) whose
-//!   fingerprint is still the one it was taken beside hands its fingerprint
-//!   over, and the file is not decoded.
+//!   under another path (or under this path at an older stat) hands over the
+//!   fingerprint in the same record, and the file is not decoded.
 //! - **Files whose size and sample agree are read whole and hashed**, and the
 //!   ones whose digests agree are byte-identical: one of them is decoded for
 //!   all, and the report says the link between them is a copy rather than a
@@ -66,8 +65,8 @@ pub struct Digest(pub [u8; 32]);
 /// ([`Identity::describes`]); after that it speaks for whatever bytes the path
 /// HELD, which is exactly what a moved file is looked up by.
 ///
-/// Appending a field is self-invalidating the way it is for a fingerprint:
-/// older records run out of bytes, fail to deserialize, and are sampled again.
+/// The cache stores it without the stat (the record's own), so its serialized
+/// form is read only from the layout before that: see `cache::migrate_identities`.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub struct Identity {
     pub mtime: i64,
