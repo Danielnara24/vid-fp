@@ -15,7 +15,10 @@
 //! a fade), a third and then half way, keeping the busiest of those looked at.
 //! A file whose runtime is unknown is read from its start.
 
-use crate::fingerprint::{clock_may_restart, display_turns, duration_seconds, header_is_complete, open_video, probe_streams};
+use crate::fingerprint::{
+    clock_may_restart, decode_stamp, display_turns, duration_seconds, header_is_complete, open_video, probe_streams,
+    ticks_to_ms, SampleClock,
+};
 use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Context, Result};
 use ffmpeg_next::format::Pixel;
@@ -127,7 +130,6 @@ pub fn frame_at(path: &str, at_ms: u32, max_w: u32, max_h: u32) -> Result<(u32, 
         (stream.index(), stream.time_base(), stream.parameters(), display_turns(&stream))
     };
     let tb = if time_base.numerator() > 0 && time_base.denominator() > 0 { f64::from(time_base) } else { 1.0 / 90_000.0 };
-    let stamp = |p: &ffmpeg_next::Packet| p.dts().or_else(|| p.pts());
     if clock_may_restart(&ictx) {
         let packet = by_restart_index(path, &mut ictx, index, tb, at_ms)?;
         return decode_one(parameters, &packet, at_ms, max_w, max_h, turns);
@@ -138,7 +140,7 @@ pub fn frame_at(path: &str, at_ms: u32, max_w: u32, max_h: u32) -> Result<(u32, 
         .packets()
         .take(MOST_PACKETS)
         .filter(|(s, p)| s.index() == index && p.is_key())
-        .find_map(|(_, p)| stamp(&p))
+        .find_map(|(_, p)| decode_stamp(&p))
         .ok_or_else(|| anyhow!("No keyframe with a timestamp"))?;
     let target = anchor + (at_ms as f64 / 1000.0 / tb).round() as i64;
 
@@ -161,7 +163,7 @@ pub fn frame_at(path: &str, at_ms: u32, max_w: u32, max_h: u32) -> Result<(u32, 
             if stream.index() != index || !packet.is_key() {
                 continue;
             }
-            let Some(ts) = stamp(&packet) else { continue };
+            let Some(ts) = decode_stamp(&packet) else { continue };
             first.get_or_insert(ts);
             let off = (ts - target).abs();
             if nearest.as_ref().is_none_or(|(o, _)| off < *o) {
@@ -264,32 +266,20 @@ fn by_restart_index(path: &str, ictx: &mut ffmpeg_next::format::context::Input, 
 }
 
 /// Every keyframe of the stream from the start, timed by the scan's clock:
-/// gaps between timestamps accumulated, and a step backwards (a restart)
-/// charged the last gap seen, exactly as `fingerprint_video` times its
-/// samples, so each lands on the millisecond the scan gave it.
+/// `SampleClock`, the very clock `fingerprint_video` times its samples by, so
+/// each lands on the millisecond the scan gave it.
 fn restart_index(ictx: &mut ffmpeg_next::format::context::Input, index: usize, tb: f64) -> Vec<(u32, i64)> {
     if ictx.seek(0, ..1).is_err() {
         // SAFETY: as in `by_restart_index`.
         unsafe { ffmpeg_next::ffi::av_seek_frame(ictx.as_mut_ptr(), -1, 0, ffmpeg_next::ffi::AVSEEK_FLAG_BYTE) };
     }
-    let (mut out, mut prev, mut elapsed, mut last_gap) = (Vec::new(), None::<i64>, 0i64, 0i64);
+    let (mut out, mut clock) = (Vec::new(), SampleClock::default());
     for (stream, packet) in ictx.packets() {
         if stream.index() != index || !packet.is_key() {
             continue;
         }
-        let Some(ts) = packet.dts().or_else(|| packet.pts()) else { continue };
-        match prev {
-            None => elapsed = 0,
-            Some(p) if ts >= p => {
-                if ts > p {
-                    last_gap = ts - p;
-                }
-                elapsed = elapsed.saturating_add(ts - p);
-            }
-            Some(_) => elapsed = elapsed.saturating_add(last_gap.max(1)),
-        }
-        prev = Some(ts);
-        out.push(((elapsed as f64 * tb * 1000.0) as u32, packet.position() as i64));
+        let Some(ts) = decode_stamp(&packet) else { continue };
+        out.push((ticks_to_ms(clock.tick(ts), tb), packet.position() as i64));
     }
     out
 }

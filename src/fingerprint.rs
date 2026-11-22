@@ -1,15 +1,12 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
-// `Packet::as_mut_ptr` lives on this trait; the demux loop below needs the raw
-// pointer to unref the packet it reuses.
-use ffmpeg_next::codec::packet::Mut as _;
-use crate::utils::shutdown_requested;
 
-// Every stored frame is a SIDE x SIDE GRAY8 buffer. Crucially we keep them all in ONE
-// contiguous allocation (`u_frames` below) instead of a Vec<Vec<u8>>. A single
-// large buffer is served by mmap on Linux and returned to the OS (munmap) the
-// moment this video is done, so RSS falls back between videos instead of
-// ratcheting up across a multi-threaded run.
+mod keyframes;
+pub(crate) use keyframes::{clock_may_restart, decode_stamp, ticks_to_ms, SampleClock};
+use keyframes::{seconds_per_tick, Captured, FrameCapture, KeyframeDecoder, Keyframes, Thinning};
+#[cfg(test)]
+use keyframes::{feed_keyframe, is_decoding_error, take_ready_frames};
+
 /// Side of the working frame every keyframe is scaled to before it is hashed.
 ///
 /// 128 rather than the 64 it was. The thumbnails the hashes are read from stay
@@ -23,12 +20,6 @@ use crate::utils::shutdown_requested;
 /// 256 bought little more for a 450 s cold scan and 1.5 GB of peak memory.
 pub(crate) const SIDE: usize = 128;
 const FRAME_STRIDE: usize = SIDE * SIDE;
-
-/// `FF_THREAD_FRAME` and `FF_THREAD_SLICE` from libavcodec. Spelled out rather
-/// than taken from the bindings because they are plain `#define`s, and the name
-/// bindgen gives them has moved between ffmpeg-sys-next releases.
-const FF_THREAD_FRAME: i32 = 1;
-const FF_THREAD_SLICE: i32 = 2;
 
 /// Ceiling on decoder threads for a single video. Past roughly this point extra
 /// threads buy almost nothing on keyframe-only decoding, and each one costs a
@@ -65,32 +56,6 @@ const KEEP: usize = 8;
 /// a full episode's keyframes is around 60), so nothing with a picture in it is
 /// at risk of being dropped.
 const MIN_AC_ENERGY: f32 = 50.0;
-
-/// How many times in a row the demuxer may fail before the file is treated as
-/// finished.
-///
-/// The backstop for a demuxer that errors forever without ever reaching EOF --
-/// `input_is_spent` covers the far commoner case where it has, and mis-reports
-/// it. Generous on purpose: a real file that stumbles this many times CONSECUTIVELY,
-/// with not one packet in between, is damaged past the point where the tail of
-/// its keyframes would be worth having. Each iteration is one failed read, so
-/// even the full count costs milliseconds.
-const MAX_CONSECUTIVE_DEMUX_ERRORS: u32 = 1024;
-
-/// How many pictures in a row the decoder may fail to produce before the file
-/// is failed rather than sampled short.
-///
-/// The backstop for the other half of `is_decoding_error`: a single picture the
-/// decoder could not build is one lost sample, which is what a featureless
-/// frame already costs and is not worth failing a file over, but a decoder that
-/// produces NOTHING while claiming to consume everything is a fingerprint made
-/// of nothing at all. Counted consecutively -- one good frame resets it -- and
-/// generous for the same reason the demux figure is: a real file that stumbles
-/// this many times in a row, with not one picture in between, has nothing left
-/// worth hashing. A file whose every keyframe fails still lands on the existing
-/// "no valid frames" path, so this is only about the middle of a file.
-const MAX_CONSECUTIVE_DECODE_ERRORS: u32 = 1024;
-
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct VideoFingerprint {
@@ -1021,36 +986,6 @@ pub(crate) fn open_video(filepath: &str) -> Result<ffmpeg_next::format::context:
     })
 }
 
-/// Whether the demuxer has read everything there is, whatever error it chose to
-/// report instead of saying so.
-///
-/// `avio_feof` is the byte-level truth: the packet layer's `AVERROR_EOF` is a
-/// convention demuxers are free to ignore, and several do. Null-checked because
-/// `pb` is only guaranteed for a context that owns its I/O.
-fn input_is_spent(ictx: &ffmpeg_next::format::context::Input) -> bool {
-    unsafe {
-        let pb = (*ictx.as_ptr()).pb;
-        !pb.is_null() && ffmpeg_next::ffi::avio_feof(pb) != 0
-    }
-}
-
-/// Whether libavformat says this container is allowed to restart its clock
-/// part way through.
-///
-/// `AVFMT_TS_DISCONT` is the demuxer's own declaration that the timestamps it
-/// produces need not run forwards, and it is set on exactly the formats that
-/// can be built by joining two recordings end to end: MPEG-TS (`.ts`, `.mts`,
-/// `.m2ts` -- DVB captures, camcorder splits) and MPEG-PS (`.mpg`, `.vob`).
-/// Every container that has to be remuxed rather than concatenated -- MP4,
-/// Matroska, AVI, ASF -- leaves it clear, so the seek path this gates keeps the
-/// file it was written for.
-pub(crate) fn clock_may_restart(ictx: &ffmpeg_next::format::context::Input) -> bool {
-    unsafe {
-        let iformat = (*ictx.as_ptr()).iformat;
-        !iformat.is_null() && ((*iformat).flags & ffmpeg_next::ffi::AVFMT_TS_DISCONT) != 0
-    }
-}
-
 /// `avformat_find_stream_info`: the probe `open_input` deliberately skips.
 ///
 /// One function so the two callers cannot drift. The weighing pass reports a
@@ -1497,160 +1432,6 @@ fn index_keyframes(ictx: &ffmpeg_next::format::context::Input, stream_index: usi
     }
 }
 
-/// Whether an answer from the decoder is about the PICTURE or about the
-/// TRANSACTION, which are two different findings and must not be treated alike.
-///
-/// `avcodec_send_packet` and `avcodec_receive_frame` both document four answers
-/// about the state of the decoder -- `EAGAIN`, `EOF`, `EINVAL`, `ENOMEM` -- and
-/// then say of everything else, in as many words, "other errors: legitimate
-/// decoding errors". Those two halves want opposite handling, and the reason is
-/// what the call did with the packet before it answered. A transaction answer
-/// is a packet NOT taken: the caller has to drain, or stop, or give up. A
-/// decoding error is a packet already spent -- `avcodec_send_packet` hands it
-/// to the bitstream filter and only THEN decodes eagerly, so by the time a
-/// decode can fail the packet is gone -- and the only thing lost is the picture
-/// it would have produced. Resending such a packet decodes it twice.
-///
-/// Reading the second half as the first is what this exists to stop, and it
-/// cost whole files. A 10-bit HEVC remux sampled with `AVDISCARD_NONKEY` hands
-/// the decoder keyframes with the frames between them removed, and hevcdec
-/// eventually meets an IRAP whose POC is already in its DPB: "Duplicate POC in
-/// a sequence", `AVERROR_INVALIDDATA`, out of `send_packet`. Eight of them in a
-/// 1080p episode -- against 827 keyframes that decoded perfectly -- and the
-/// whole file was refused, cached as refused, and never looked at again. Nine
-/// files of one folder went that way on a plain build against the system
-/// FFmpeg, taking the folder from 5 groups to 1. The vendored FFmpeg 8 hands
-/// that frame back with a log line instead of an error, which is the only
-/// reason the shipped binary was not affected: the same source, the same file,
-/// a different libavcodec, and a different set of videos this tool can see.
-fn is_decoding_error(e: &ffmpeg_next::Error) -> bool {
-    match e {
-        ffmpeg_next::Error::Eof => false,
-        ffmpeg_next::Error::Other { errno } => {
-            !matches!(*errno, libc::EAGAIN | libc::EINVAL | libc::ENOMEM)
-        }
-        _ => true,
-    }
-}
-
-/// Take every frame the decoder has ready, handing each to `process`.
-///
-/// The two "nothing more just now" answers are `EAGAIN` (feed me another
-/// packet) and `Eof` (I am drained), and both end the loop normally.
-///
-/// What is left splits the way `is_decoding_error` splits it. A picture the
-/// decoder could not build is counted in `lost` and the drain CONTINUES, since
-/// the frames queued behind it are still good and stopping here is what leaves
-/// the queue full; that is one missing sample, which is exactly what a
-/// featureless frame costs and is not worth throwing a file away for.
-/// `MAX_CONSECUTIVE_DECODE_ERRORS` in a row is a decoder producing nothing, and
-/// that IS the whole file, so it comes back as an error -- as does any answer
-/// about the transaction itself, which the caller has to act on rather than
-/// count. See `refused` at the call site.
-fn take_ready_frames(
-    decoder: &mut ffmpeg_next::decoder::Video,
-    decoded: &mut ffmpeg_next::frame::Video,
-    process: &mut impl FnMut(&ffmpeg_next::frame::Video),
-    lost: &mut u32,
-) -> Result<(), ffmpeg_next::Error> {
-    let mut consecutive = 0u32;
-    loop {
-        match decoder.receive_frame(decoded) {
-            Ok(()) => {
-                consecutive = 0;
-                process(decoded);
-            }
-            Err(ffmpeg_next::Error::Eof) => return Ok(()),
-            Err(ffmpeg_next::Error::Other { errno }) if errno == libc::EAGAIN => return Ok(()),
-            Err(e) if is_decoding_error(&e) => {
-                *lost += 1;
-                consecutive += 1;
-                log::debug!("decoder produced no picture for a keyframe ({e}); sample lost");
-                if consecutive >= MAX_CONSECUTIVE_DECODE_ERRORS {
-                    return Err(e);
-                }
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
-
-/// Hand one keyframe packet to the decoder and take back everything it produces.
-///
-/// `EAGAIN` from `send_packet` is not a failure and must not be read as one: it
-/// is the decoder saying its output queue is full, and the API's own contract
-/// is that the packet is to be RESENT once that output has been read, after
-/// which "the call will not fail with EAGAIN". This used to be
-/// `if decoder.send_packet(&packet).is_ok() { while receive_frame ... }`, which
-/// gets that exactly backwards in the one way that cannot recover: the drain
-/// sits behind the same `&&`, so an `EAGAIN` skipped the drain, left the queue
-/// full, and every later keyframe hit the same full queue and was dropped too.
-/// One transient EAGAIN therefore ended the sampling of the file -- silently,
-/// with the header's runtime still on the fingerprint, so the last surviving
-/// hash stood for the whole rest of the video and the file read as a complete
-/// copy of itself. That is the `_splice` and `_rescale` failure again: not a
-/// smaller answer but a wrong one, and cached.
-///
-/// One retry, because the contract allows exactly one: a second `EAGAIN` after
-/// a full drain is a decoder doing something this code has no model of, and is
-/// reported rather than papered over with a loop.
-///
-/// `EAGAIN` is not the only answer that must not be read as a refusal, and the
-/// other one arrives by the same route for the opposite reason. `send_packet`
-/// consumes the packet and then decodes eagerly, so a picture that cannot be
-/// built is reported HERE, out of the send, with the packet already spent --
-/// see `is_decoding_error`, which is where that line is drawn and why. Such a
-/// packet is never resent (it would decode twice) and never fatal (it is one
-/// sample, the same cost as a featureless frame); it is counted in `lost` and
-/// the decoder, which is still perfectly healthy, is drained and fed the next
-/// keyframe as usual.
-fn feed_keyframe(
-    decoder: &mut ffmpeg_next::decoder::Video,
-    packet: &ffmpeg_next::Packet,
-    decoded: &mut ffmpeg_next::frame::Video,
-    process: &mut impl FnMut(&ffmpeg_next::frame::Video),
-    lost: &mut u32,
-) -> Result<(), ffmpeg_next::Error> {
-    match send_and_take(decoder, packet, decoded, process, lost) {
-        Err(ffmpeg_next::Error::Other { errno }) if errno == libc::EAGAIN => {
-            // Invisible when it works, so say so: nothing else in the run
-            // records that the decoder ever asked for its output to be read.
-            log::debug!("decoder queue full; draining and resending the keyframe");
-            take_ready_frames(decoder, decoded, process, lost)?;
-            send_and_take(decoder, packet, decoded, process, lost)
-        }
-        other => other,
-    }
-}
-
-/// Hand the packet over once and take back whatever that produced.
-///
-/// Split out of `feed_keyframe` so that the retry after a full queue is the
-/// same transaction as the first attempt rather than a barer version of it: the
-/// resend used to be a plain `send_packet(packet)?`, which would have made a
-/// picture that failed to decode on the SECOND try fatal while the same failure
-/// on the first try costs one sample. `EAGAIN` is passed up for the caller to
-/// answer, and it is the only answer here that has a second attempt behind it.
-fn send_and_take(
-    decoder: &mut ffmpeg_next::decoder::Video,
-    packet: &ffmpeg_next::Packet,
-    decoded: &mut ffmpeg_next::frame::Video,
-    process: &mut impl FnMut(&ffmpeg_next::frame::Video),
-    lost: &mut u32,
-) -> Result<(), ffmpeg_next::Error> {
-    match decoder.send_packet(packet) {
-        Ok(()) => take_ready_frames(decoder, decoded, process, lost),
-        Err(e) if is_decoding_error(&e) => {
-            *lost += 1;
-            log::debug!("decoder could not build a keyframe's picture ({e}); sample lost");
-            take_ready_frames(decoder, decoded, process, lost)
-        }
-        Err(e) => Err(e),
-    }
-}
-
-/// How far a pixel of a bar may stray from the bar's own level, at most and on
-/// average, in grey levels of the working frame. A bar an encoder adds is flat to
 /// within compression noise; an edge of the picture itself almost never is.
 const BAR_MAX_DEVIATION: i32 = 4;
 const BAR_MEAN_DEVIATION: i32 = 1;
@@ -2280,7 +2061,6 @@ pub fn fingerprint_video(
     file_size: u64,
     progress: &dyn Fn(Step),
 ) -> Result<Option<VideoFingerprint>> {
-    // 1. Native Zero-Copy Extraction (No Subprocess Overhead)
     let mut ictx = open_video(filepath)?;
 
     // The probe is the expensive half of opening a file, and for an ordinary
@@ -2295,842 +2075,166 @@ pub fn fingerprint_video(
         .streams()
         .best(ffmpeg_next::media::Type::Video)
         .ok_or_else(|| anyhow!("No video stream found"))?;
-    let video_stream_index = input.index();
-
+    let stream = input.index();
     let duration_sec = duration_seconds(&input, &ictx);
 
-    // Bail before the decoder, the scaler, and the 4 MiB frame buffer exist.
-    // Only a positive, known duration can disqualify a file.
+    // Bail before the decoder and the frame buffer exist. Only a positive,
+    // known duration can disqualify a file.
     if min_duration > 0.0 && duration_sec > 0.0 && duration_sec < min_duration {
         return Ok(None);
     }
 
-    // --- Codec and frame rate ------------------------------------------------
-    // Both come straight out of the stream parameters the demuxer parsed while
-    // reading the header, so they cost nothing beyond the open that just
-    // happened -- no probe, no decode, no second pass.
-    //
-    // The codec is stored by NAME rather than as a numeric id: the id is an
-    // enum whose values are FFmpeg's business and could be renumbered, while
-    // "h264" is stable, is what the user sees in the report, and is what the
-    // comparison rules key on.
-    //
-    // `Id::name` is avcodec_get_name, which answers "what codec is this" from
-    // the id alone. It deliberately does NOT go through avcodec_find_decoder:
-    // that returns whichever DECODER the local FFmpeg prefers for the id, and
-    // reports its name -- "libdav1d" for AV1 on a build that has it, "av1" on
-    // one that doesn't, "libvpx-vp9" or "vp9" for the same file depending on
-    // how FFmpeg was compiled.
-    //
-    // That made the recorded codec a property of the machine rather than of the
-    // video, which is wrong three times over: the report named a decoder where
-    // the user expected a codec, the codec-standoff rule compared those names
-    // for equality (so the same AV1 file scanned on two builds looked like two
-    // different codecs and deadlocked a group that should have resolved), and
-    // the cache stores the string -- so entries written by one build disagreed
-    // with entries written by another.
+    // The codec by NAME (`avcodec_get_name`), never through
+    // `avcodec_find_decoder`: that names whichever decoder this FFmpeg prefers
+    // ("libdav1d" or "av1" for one AV1 file), which made the recorded codec a
+    // property of the machine -- in the report, in the codec-standoff rule's
+    // equality test, and in the cache.
     let codec = input.parameters().id().name().to_string();
-
     let frame_rate = frame_rate_of(&input, duration_sec);
-
-    // The turn the container asks for, applied to every working frame below so
-    // the hashes are of the picture as it is seen (`display_turns`), and the
-    // reported width and height are its shape as seen too.
     let turns = display_turns(&input);
-    let shown = |w: u32, h: u32| if turns % 2 == 1 { (h, w) } else { (w, h) };
+    let tb = seconds_per_tick(&input);
 
-    let mut context_decoder = ffmpeg_next::codec::context::Context::from_parameters(input.parameters())
-        .context("Failed to create codec context from parameters")?;
+    let mut decoder = KeyframeDecoder::open(input.parameters(), decode_threads)?;
+    let mut capture = FrameCapture::new(turns, tb);
+    let mut thinning = Thinning::new(kf_interval, min_kf_samples, duration_sec);
+    let mut clock = SampleClock::default();
+    let mut keyframes = Keyframes::new(ictx, stream, progress);
 
-    let decode_threads = decode_threads.clamp(1, MAX_DECODE_THREADS);
-
-    unsafe {
-        let ctx = context_decoder.as_mut_ptr();
-        (*ctx).thread_count = decode_threads as i32;
-        (*ctx).skip_loop_filter = ffmpeg_next::ffi::AVDiscard::AVDISCARD_ALL;
-        // The cast is redundant against the headers we build on today and is
-        // kept anyway: these constants have no declared type in FFmpeg, so
-        // bindgen infers one per #define from the literal's width and sign, and
-        // the results are not uniform. In the very same header AV_CODEC_FLAG2_*
-        // comes out c_int except ICC_PROFILES (bit 31) which is u32, and the
-        // whole AV_CODEC_FLAG_* family is c_uint -- which is why LOW_DELAY
-        // below needs a cast that really does convert. Both fields are c_int.
-        #[allow(clippy::unnecessary_cast)]
-        {
-            (*ctx).flags2 |= ffmpeg_next::ffi::AV_CODEC_FLAG2_FAST as i32;
+    while let Some(packet) = keyframes.next()? {
+        let at = decode_stamp(packet).map(|ts| clock.tick(ts));
+        // The sample clock rides through the decoder on the packet's pts,
+        // which libavcodec copies onto the frame it produces; under frame
+        // threading nothing else pairs a frame with its packet.
+        if let Some(ticks) = at {
+            packet.set_pts(Some(ticks));
         }
-        if decode_threads > 1 {
-            // Frame threading preferred; slice threading is the fallback for
-            // codecs that don't advertise AV_CODEC_CAP_FRAME_THREADS. FFmpeg
-            // picks between them itself from the codec's capabilities.
-            (*ctx).thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
-        } else {
-            (*ctx).flags |= ffmpeg_next::ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
+        let t = at.filter(|_| tb > 0.0).map(|ticks| ticks as f64 * tb);
+        if thinning.keep(t) {
+            decoder.feed(packet, &mut |frame| capture.take(frame));
         }
-        (*ctx).skip_frame = ffmpeg_next::ffi::AVDiscard::AVDISCARD_NONKEY;
+        if clock.restarted() {
+            keyframes.stop_seeking();
+        }
+        // Past the keyframes the interval would discard anyway, in one hop.
+        let step = thinning.wait_after(t).map_or(1, |s| ((s / tb).ceil() as i64).max(1));
+        keyframes.seek_past(step);
     }
+    decoder.finish(&mut |frame| capture.take(frame));
 
-    let mut decoder = context_decoder.decoder().video()
-        .context("Failed to initialize video decoder")?;
-
-    // Built from the first frame the decoder produces rather than from the
-    // header. Without the probe the container never reports a pixel format --
-    // and this was always the more honest source anyway, since the decoder, not
-    // the header, is the authority on what it is emitting.
-    let mut scaler: Option<ffmpeg_next::software::scaling::context::Context> = None;
-    // The geometry of the FIRST frame, which is what the report and the
-    // resolution ranking read. A file that rescales part way through has no one
-    // true answer and this is the one the header would have given, so no file's
-    // reported resolution moves because of the rebuild below.
-    let mut frame_dims: Option<(u32, u32)> = None;
-    // Frames the decoder produced that could not be turned into a sample. Not a
-    // count to report: any at all and the fingerprint covers less footage than
-    // it claims to, which is the whole failure this guards against, so the file
-    // is failed at the end and re-read next run rather than cached short.
-    let mut unscalable: Option<ffmpeg_next::Error> = None;
-    // A keyframe the decoder would not take, or would not finish. Held for the
-    // same reason as `unscalable` above and reported separately, because "the
-    // decoder refused a frame" and "the frame could not be scaled" are two
-    // different findings about a file and the run has to say which happened.
-    let mut refused: Option<ffmpeg_next::Error> = None;
-    // Pictures the decoder consumed a keyframe for and could not produce. NOT
-    // the same finding as `refused` above and deliberately not fatal: the
-    // packet was taken, the decoder carried straight on, and what is missing is
-    // one sample -- which is what `is_featureless` drops routinely and what a
-    // skipped corrupt packet costs the demux loop. Counted so the run can say
-    // how many, because "sampled short" is the one thing a fingerprint cannot
-    // say about itself once it is cached.
-    let mut lost_pictures: u32 = 0;
-
-    // All unique frames packed back-to-back, FRAME_STRIDE bytes each. One growable
-    // allocation instead of N tiny ones -> no heap fragmentation/retention, and the
-    // whole thing is released to the OS when this function returns.
-    let mut u_frames: Vec<u8> = Vec::with_capacity(FRAME_STRIDE * 64);
-    // When each kept frame is shown, in milliseconds. `None` for a frame the
-    // container gave no timestamp for; a video with any of those falls back to
-    // spacing its samples evenly (see `sample_times`).
-    let mut unique_frame_times: Vec<Option<u32>> = Vec::new();
-
-    // Seconds per unit of the video stream's timestamps. Zero when the header
-    // never said, which makes every frame time unknown.
-    let stream_time_base = {
-        let tb = ictx.stream(video_stream_index).unwrap().time_base();
-        if tb.denominator() > 0 {
-            tb.numerator() as f64 / tb.denominator() as f64
-        } else {
-            0.0
-        }
-    };
-
-    let mut frame_idx = 0;
-    let mut prev_frame = vec![0u8; FRAME_STRIDE];
-    let mut is_first = true;
-
-    // By hoisting `decoded`, `scaled`, and `current_frame` outside the loop,
-    // we prevent extremely slow and fragmenting continuous allocation of AVFrame structures and memory buffers.
-    // FFmpeg's zero-copy buffer pool is now properly utilized.
-    let mut decoded = ffmpeg_next::frame::Video::empty();
-    let mut scaled = ffmpeg_next::frame::Video::empty();
-    let mut current_frame = vec![0u8; FRAME_STRIDE];
-    let mut turn_scratch: Vec<u8> = Vec::with_capacity(if turns == 0 { 0 } else { FRAME_STRIDE });
-
-    // Rebuilt whenever the decoder's output changes shape, not merely built once.
-    // A stream is allowed to change resolution or pixel format mid-file -- a
-    // broadcaster switching feeds, a camcorder dropping to a lower mode, two
-    // recordings concatenated -- and `Context::run` refuses outright any frame
-    // that is not the shape its context was built for. Built once and never
-    // rebuilt, every frame after such a change returned `Error::InputChanged`,
-    // both call sites discarded that, and the file simply stopped being sampled
-    // at the change: nothing counted, nothing logged, exit code 0, and the
-    // half-length fingerprint cached for every run after. That is the same
-    // silent half-a-video as the splice bug and it needs no clock restart to
-    // reach -- one `cat` of two encodes at different sizes is enough.
-    //
-    // The check is asked of the context's own record of what it was built for
-    // rather than of a second copy kept beside it, so there is nothing to drift.
-    let mut process_frame = |dec: &ffmpeg_next::frame::Video| -> Result<(), ffmpeg_next::Error> {
-        let rebuild = match &scaler {
-            None => true,
-            Some(built) => {
-                let input = built.input();
-                input.format != dec.format()
-                    || input.width != dec.width()
-                    || input.height != dec.height()
-            }
-        };
-        if rebuild {
-            scaler = Some(ffmpeg_next::software::scaling::context::Context::get(
-                dec.format(),
-                dec.width(),
-                dec.height(),
-                ffmpeg_next::format::Pixel::GRAY8,
-                SIDE as u32,
-                SIDE as u32,
-                ffmpeg_next::software::scaling::flag::Flags::FAST_BILINEAR,
-            )?);
-            frame_dims.get_or_insert(shown(dec.width(), dec.height()));
-        }
-        let scaler = scaler.as_mut().unwrap();
-
-        scaler.run(dec, &mut scaled)?;
-
-        let data = scaled.data(0);
-        let stride = scaled.stride(0);
-
-        for y in 0..SIDE {
-            let src_idx = y * stride;
-            let dst_idx = y * SIDE;
-            current_frame[dst_idx..dst_idx + SIDE].copy_from_slice(&data[src_idx..src_idx + SIDE]);
-        }
-        turn_square(&mut current_frame, turns, &mut turn_scratch);
-
-        if is_first || current_frame != prev_frame {
-            // Append into the single flat buffer instead of pushing a new Vec.
-            u_frames.extend_from_slice(&current_frame);
-
-            // Read off the FRAME rather than the packet, because with frame
-            // threading a frame surfaces several packets after the one that
-            // carried it and the packet in hand when it arrives is somebody
-            // else's. What the frame carries is whatever the demux loop stamped
-            // onto its packet -- see `sample_ts` there -- so this is the
-            // container's own clock making the round trip, not the decoder's
-            // opinion of it.
-            //
-            // The frame's own `pts`, and NOT `best_effort_timestamp`, which is
-            // what `Frame::timestamp` reads. That is libavcodec's guess, and
-            // once it has seen presentation times go backwards it stops
-            // trusting them and answers with `pkt_dts` -- the dts of the packet
-            // being SENT when this frame came out, which is a later keyframe's.
-            // HEVC hands keyframes back out of order whenever two open-GOP
-            // keyframes are more than half the picture-order-count range apart
-            // (the decoder never sees the frames between them to tell that the
-            // count wrapped), and from the first such reordering on every
-            // picture was filed under someone else's time: the matched-frames
-            // window showed a 0-bit match between two different shots. Seen with
-            // FFmpeg 6.1 on 17 of the local corpus's 19 HEVC files, and never
-            // with the vendored FFmpeg 8. See
-            // `test_a_sample_is_the_picture_of_the_keyframe_it_is_timed_at`.
-            unique_frame_times.push(match dec.pts() {
-                Some(pts) if stream_time_base > 0.0 && pts >= 0 => {
-                    Some((pts as f64 * stream_time_base * 1000.0) as u32)
-                }
-                _ => None,
-            });
-
-            prev_frame.copy_from_slice(&current_frame);
-            is_first = false;
-        }
-        frame_idx += 1;
-        Ok(())
-    };
-
-    // The one place a decoded frame is handed on, so both the demux loop and
-    // the drain after it record a frame they could not use identically.
-    let mut sample_frame = |dec: &ffmpeg_next::frame::Video| {
-        if let Err(e) = process_frame(dec) {
-            unscalable.get_or_insert(e);
-        }
-    };
-
-    // Non-key video packets are skipped, and the audio and subtitle streams are
-    // dropped outright: their payloads used to be read off disk, allocated and
-    // copied into a packet on every iteration of the demux loop below, purely
-    // so the `stream.index()` test could throw them away again.
-    unsafe {
-        let fmt_ctx = ictx.as_mut_ptr();
-        for i in 0..(*fmt_ctx).nb_streams as usize {
-            let stream_ptr = *(*fmt_ctx).streams.add(i);
-            (*stream_ptr).discard = if i == video_stream_index {
-                ffmpeg_next::ffi::AVDiscard::AVDISCARD_NONKEY
-            } else {
-                ffmpeg_next::ffi::AVDiscard::AVDISCARD_ALL
-            };
-        }
-    }
-
-    // --- Length-aware keyframe subsampling -----------------------------------
-    // A fixed interval decimates short videos long before long ones. Scaling the
-    // interval WITH duration would fix that but break clip detection: a long host
-    // sampled sparsely no longer has sampled frames inside a short clip's time
-    // window, so the clip's hashes find nothing to match. So we bound the interval
-    // in absolute time (protecting clip detection in long hosts) and FLOOR it for
-    // short videos so they always keep at least min_kf_samples frames.
-    //
-    // The interval is the setting; the floor only ever makes it FINER. So a
-    // floor that cannot be computed -- 0, a negative, NaN -- means "no floor",
-    // and the interval stands on its own. It used to mean "no interval either":
-    // `-i 3 -m 0` decoded every keyframe, which is the one reading of a
-    // MINIMUM that turns the maximum spacing off as well, and it stamped those
-    // every-keyframe fingerprints with `kf_interval = 3.0` -- so alternating
-    // `-i 3 -m 0` with a default run re-decoded the whole library each way for
-    // a setting that provably changed not one frame. Same class of bug as the
-    // one `main::same_sampling` fixed for the interval itself.
-    //
-    // A duration of zero is deliberately still "sample everything", and that is
-    // not the same question: with no runtime there is nothing for the interval
-    // to be measured against here either, and `sample_times` is what recovers
-    // such a file's clock afterwards.
-    let floor = if min_kf_samples > 0.0 { duration_sec / min_kf_samples } else { f64::INFINITY };
-    let effective_interval = if kf_interval > 0.0 && duration_sec > 0.0 {
-        kf_interval.min(floor)
-    } else {
-        0.0
-    };
-    let mut last_kept_t: Option<f64> = None;
-
-    // --- Rapid demuxing: only key packets ever reach the decoder --------------
-    //
-    // `AVDISCARD_NONKEY` on the stream asks the demuxer to drop everything else
-    // before it is ever assembled into a packet, and MP4/MOV honours that by
-    // walking its sample table and reading only the sync samples -- roughly a
-    // tenth of the file. Matroska has no such shortcut: it hands back every
-    // block in the file, payload and all, and we throw ~90% of the bytes away.
-    // On a 714 MB episode that is 615 MB read, allocated and copied for nothing,
-    // and it lands on the one thread that also has to feed the decoder.
-    //
-    // So when a demuxer proves it is going to do that -- by handing us a non-key
-    // packet we already asked it not to -- we stop reading forward and start
-    // SEEKING from one keyframe to the next instead. The seek costs an index
-    // lookup and lands on exactly the keyframe a linear scan would have reached,
-    // having read none of the bytes in between.
-    //
-    // Two properties keep this from changing what gets fingerprinted:
-    //
-    //   * A seek that lands short (or on a keyframe already decoded) is caught
-    //     by the `ts <= last` guard below, so no frame is ever hashed twice.
-    //   * Anything that goes wrong -- a container with no index, a stream with
-    //     no timestamps, a seek that simply fails -- sets `seeking_broken` and
-    //     the loop finishes as a plain linear scan, which is exactly the old
-    //     behaviour.
-    //
-    // A container whose clock is allowed to restart never enters the seek path
-    // at all, because a timestamp there is no guide to what is further into the
-    // file. `cat s1.ts s2.ts > capture.ts` gives the second segment the same
-    // timestamps as the first, and every way of navigating by them lands
-    // somewhere wrong: a forward seek out of segment one binary-searched its
-    // way into the middle of segment two (three of six keyframes read, two of
-    // them never looked at), and on the mpeg-ps build of the same file it
-    // reached the end of segment one and then reported EOF. What the seek does
-    // wrong varies with the demuxer; that it cannot be trusted does not.
-    //
-    // The decoder is deliberately NOT flushed across a seek. Every packet it is
-    // fed is a keyframe and therefore self-contained, so there is no state to
-    // invalidate, and flushing would throw away frames still in flight.
-    let mut packet = ffmpeg_next::codec::packet::Packet::empty();
-    let mut last_key_ts: Option<i64> = None;
-    // Whether a seek has been issued that no keyframe has been accepted after
-    // yet. The dedup guard is asked only while this is set: a seek is the only
-    // thing that can hand the loop a frame it has already had, and asking it of
-    // a plain linear read is what used to truncate a spliced file at the join.
-    let mut after_seek = false;
-    let mut demuxer_ignores_discard = false;
-    let mut seeking_broken = clock_may_restart(&ictx);
-    // Consecutive failed reads. Reset by any successful one, so a file that
-    // stumbles and recovers is unaffected however often it stumbles.
-    let mut demux_errors: u32 = 0;
-
-    // --- The sample clock ----------------------------------------------------
-    //
-    // Kept as a running total of the gaps between keyframes rather than as an
-    // offset from the first one, because a container's clock is not guaranteed
-    // to run forwards for the whole file. Concatenating two recordings -- how a
-    // DVB capture, a camcorder split and half the `.ts` files on a disk are
-    // made -- restarts it at the join, and measuring from the first keyframe
-    // then puts the whole second half back on top of the first half's times.
-    // Accumulating gaps instead means the clock only ever moves forward, and a
-    // restart costs one estimated gap rather than every sample after it.
-    //
-    // For a file whose clock does run forwards -- every file with one segment,
-    // which is nearly all of them -- this is `ts - first_key_ts` exactly, term
-    // by term, and no sample time moves.
-    let mut prev_raw_ts: Option<i64> = None;
-    let mut elapsed: i64 = 0;
-    // The last forward gap seen, which is what a restart is charged. There is
-    // no way to know how long the join really was: the second segment's own
-    // clock says only where it starts, not when that was.
-    let mut last_gap: i64 = 0;
-    // Set the first time the clock goes backwards. Two things read it: seeking,
-    // which is answered from that clock and is therefore no longer trustworthy,
-    // and the runtime this file reports (see below), which was measured from
-    // the same broken arithmetic.
-    let mut clock_restarted = false;
-
-    loop {
-        if shutdown_requested() {
-            return Err(anyhow!("Interrupted while fingerprinting"));
-        }
-
-        // `av_read_frame` fills the packet it is handed WITHOUT releasing what
-        // that packet already holds -- it moves a reference in over the top of
-        // the old one, which is then unreachable and never freed. The packet
-        // iterator this loop replaced hid that by allocating a fresh packet per
-        // read and dropping it (ffmpeg-next's `Drop` is the unref); reusing one
-        // packet, as this loop does to avoid that churn, has to say it out loud.
-        //
-        // Every key packet's payload leaked otherwise -- ~100 KB a frame, held
-        // for the life of the process -- which is a gigabyte across a few
-        // thousand keyframes and is why RSS climbed for the whole of a run
-        // instead of levelling off.
-        //
-        // Unreffing at the TOP rather than after `send_packet` is what makes it
-        // exhaustive: every `continue` below (wrong stream, non-key, a seek
-        // landing short, a demux error) leaves a packet in hand, and all of them
-        // come back through here.
-        unsafe {
-            ffmpeg_next::ffi::av_packet_unref(packet.as_mut_ptr());
-        }
-
-        match packet.read(&mut ictx) {
-            Ok(()) => demux_errors = 0,
-            Err(ffmpeg_next::Error::Eof) => break,
-            // A recoverable demux error skips the packet rather than ending the
-            // video -- but only while there is something left to skip TO.
-            //
-            // `AVERROR_EOF` is a convention, not a guarantee, and a demuxer that
-            // does not follow it turns this arm into an infinite loop: it is
-            // asked for a packet at the end of the file, says "invalid data"
-            // instead of "end of file", and is asked again forever. That is not
-            // hypothetical and it is not obscure -- `ncdec.c` ends
-            // `while (state != NC_VIDEO_FLAG) { if (avio_feof(pb)) return
-            // AVERROR_INVALIDDATA; ... }`, and the `nc` demuxer claims any file
-            // named `*.v` on an extension match alone. A 132-byte linker version
-            // script (`libavcodec.v`, one per FFmpeg build directory) probes as
-            // an mpeg4 video of unspecified size, and fingerprinting it span one
-            // core until the process was killed: 80 minutes, 2.9 MB RSS, no
-            // output. Under `-x '*'` a handful of those is the whole run, since
-            // every decode worker eventually lands on one.
-            //
-            // So the loop ends when the input is spent, whatever the demuxer
-            // calls that, and `MAX_CONSECUTIVE_DEMUX_ERRORS` catches the same
-            // shape of failure mid-file, where `feof` is not yet true. Both are
-            // ordinary ends of stream rather than errors: the file keeps the
-            // frames it did give up, and if that is none, the caller's existing
-            // "no frames" path reports it.
-            Err(_) => {
-                demux_errors += 1;
-                if demux_errors >= MAX_CONSECUTIVE_DEMUX_ERRORS || input_is_spent(&ictx) {
-                    break;
-                }
-                continue;
-            }
-        }
-
-        if packet.stream() != video_stream_index {
-            continue;
-        }
-
-        // Reported after the stream filter and before the keyframe one, so it
-        // follows the stream we are actually walking. On a container we seek
-        // through the offset leaps a keyframe at a time; on one we scan
-        // linearly it creeps, and either way it is the truthful answer to "how
-        // far into this file are we". Two pointer derefs and an indirect call
-        // -- the caller decides how much of that is worth drawing.
-        //
-        // Reporting EVERY packet's offset, which is what this used to do, is
-        // not a wider version of the same measurement: an attached picture
-        // (cover art, a poster frame) is a stream of its own whose single
-        // packet libavformat hands back FIRST, ahead of any demuxing, and it is
-        // stored at the END of the file. One 5 GB MP4 with cover art therefore
-        // opened by reporting offset 5321112043 of 5321218376 before a frame
-        // had been decoded, which credited the whole file to the bar in one
-        // step and then left it motionless for the 100 seconds the decode
-        // actually took. Any stream laid out away from the video's bytes does
-        // the same thing to a smaller degree.
-        let pos = packet.position();
-        if pos >= 0 {
-            progress(Step::Read(pos as u64));
-        }
-
-        if !packet.is_key() {
-            // The discard hint was ignored. Note it: from the next keyframe on
-            // we jump rather than read.
-            demuxer_ignores_discard = true;
-            continue;
-        }
-
-        // The timestamp the container's index is keyed on, which is what a seek
-        // target is measured against.
-        let index_ts = packet.dts().or_else(|| packet.pts());
-
-        // A seek may land on or before a keyframe already decoded. Skip those
-        // rather than hashing the same frame twice.
-        //
-        // Asked only after a seek, because a seek is the only thing that can
-        // produce one. Asked of every keyframe -- which is what it used to be
-        // -- it reads a container whose clock restarts mid-file as a seek that
-        // keeps landing short, and throws away everything after the restart:
-        // `cat s1.ts s2.ts > capture.ts` kept the five keyframes of its first
-        // segment and silently dropped all five of its second. A file that
-        // CONTAINED another was then fingerprinted as its equal, ranked below
-        // it on encoder quality, and marked DELETE against it -- exit code 0,
-        // nothing in the problem summary, and the truncated fingerprint cached
-        // for every run after.
-        if after_seek {
-            if matches!((index_ts, last_key_ts), (Some(ts), Some(last)) if ts <= last) {
-                continue;
-            }
-            after_seek = false;
-        }
-
-        // --- When this keyframe happens -------------------------------------
-        //
-        // Measured from the first keyframe rather than from zero, and taken
-        // from `index_ts` -- decode order -- rather than from the packet's
-        // presentation timestamp. Both of those are deliberate, and the reason
-        // is that `AVDISCARD_NONKEY` is not free.
-        //
-        // MP4 stores presentation time as a per-sample offset from decode time
-        // (the `ctts` table) and the demuxer walks that table with a cursor
-        // that only advances over samples it RETURNS. Discarding the non-key
-        // samples desynchronises it, so the pts we are handed is a real offset
-        // belonging to the wrong sample: on one 2-second clip the container
-        // says its keyframes are at 0 / 29029 / 58058 and libavformat reports
-        // 0 / 32032 / 57057 -- 100 ms late and then 34 ms early. Matroska has
-        // no such table and its pts is exact; AVI has no pts at all.
-        //
-        // Decode time is immune. It comes out of a plain cumulative sum
-        // (`stts`) with no cursor to lose, and it was correct in every
-        // container tested. It differs from presentation time by the codec's
-        // reorder delay, which is constant across a file's keyframes -- so
-        // subtracting the first sample's value cancels it exactly, and what is
-        // left reproduces the container's own presentation times. On the clip
-        // above it gives 0 / 29029 / 58058, to the tick.
-        //
-        // Anchoring also settles two things the raw clock got wrong: a first
-        // keyframe with a negative dts (an MP4 with B-frames opens at -1001)
-        // used to fail the `pts >= 0` test and drop the whole video to evenly
-        // spaced samples, and a stream whose clock does not start at zero used
-        // to measure its samples against a runtime that does.
-        //
-        // The gap is accumulated rather than subtracted so that a clock which
-        // restarts mid-file still produces times that only go forwards -- see
-        // `prev_raw_ts` above. A backwards step is a splice, never a late
-        // packet: only keyframes reach this point, and they are handed over in
-        // decode order.
-        let sample_ts = match index_ts {
-            Some(ts) => {
-                match prev_raw_ts {
-                    None => elapsed = 0,
-                    Some(prev) if ts >= prev => {
-                        let gap = ts - prev;
-                        if gap > 0 {
-                            last_gap = gap;
-                        }
-                        elapsed = elapsed.saturating_add(gap);
-                    }
-                    // The clock restarted. Charge the join the last gap this
-                    // file showed -- an estimate, and the only one available --
-                    // and stop navigating by timestamps, which have just been
-                    // shown to be no guide to what is further into the file.
-                    Some(_) => {
-                        clock_restarted = true;
-                        seeking_broken = true;
-                        elapsed = elapsed.saturating_add(last_gap.max(1));
-                    }
-                }
-                prev_raw_ts = Some(ts);
-                Some(elapsed)
-            }
-            None => None,
-        };
-
-        // Hand the corrected clock to the decoder, which copies a packet's pts
-        // onto the frame it produces. That is what carries it back out through
-        // frame threading, where nothing else can pair the two up.
-        if let Some(ts) = sample_ts {
-            packet.set_pts(Some(ts));
-        }
-
-        // Seconds, for the interval rule.
-        let show_t = if stream_time_base > 0.0 {
-            sample_ts.map(|ts| ts as f64 * stream_time_base)
-        } else {
-            None
-        };
-
-        let mut kept = true;
-        if effective_interval > 0.0 {
-            if let Some(t) = show_t {
-                if let Some(last) = last_kept_t {
-                    if t - last < effective_interval {
-                        kept = false; // too close to the last kept keyframe
-                    }
-                }
-                if kept {
-                    last_kept_t = Some(t);
-                }
-            }
-            // If PTS/DTS is missing we fall through and keep the frame (safe default).
-        }
-
-        if kept {
-            if let Err(e) = feed_keyframe(
-                &mut decoder,
-                &packet,
-                &mut decoded,
-                &mut sample_frame,
-                &mut lost_pictures,
-            ) {
-                refused.get_or_insert(e);
-            }
-        }
-
-        if let Some(ts) = index_ts {
-            last_key_ts = Some(ts);
-        }
-
-        // --- Jump to the next keyframe we actually want ----------------------
-        if demuxer_ignores_discard && !seeking_broken {
-            match index_ts {
-                // No clock to seek by. Reading forward is the only option left.
-                None => seeking_broken = true,
-                Some(ts) => {
-                    // One tick past the current keyframe is the least that can
-                    // land on a new one. When an interval is in force, skip the
-                    // whole rest of it in the same hop -- the keyframes in
-                    // between were going to be read and discarded.
-                    let mut step = 1i64;
-                    if effective_interval > 0.0 && stream_time_base > 0.0 {
-                        if let (Some(t), Some(last)) = (show_t, last_kept_t) {
-                            let remaining = last + effective_interval - t;
-                            if remaining > 0.0 {
-                                step = step.max((remaining / stream_time_base).ceil() as i64);
-                            }
-                        }
-                    }
-
-                    let ok = unsafe {
-                        ffmpeg_next::ffi::av_seek_frame(
-                            ictx.as_mut_ptr(),
-                            video_stream_index as i32,
-                            ts.saturating_add(step),
-                            0,
-                        ) >= 0
-                    };
-                    if ok {
-                        after_seek = true;
-                    } else {
-                        // Past the last keyframe a forward seek fails, which is
-                        // indistinguishable from a container that cannot seek at
-                        // all. Either way, finish by reading.
-                        seeking_broken = true;
-                    }
-                }
-            }
-        }
-    }
-
-    // With frame threading the decoder holds up to thread_count frames back, so
-    // this drain is not a formality -- on a short video it can be where MOST of
-    // the frames arrive.
-    //
-    // A decoder that will not be TOLD the input is over hands back nothing
-    // here, which loses exactly those frames, so that is recorded like any
-    // other lost frame. `Eof` is not a failure: it says the decoder was already
-    // draining, which is the state this call is asking for.
-    match decoder.send_eof() {
-        Ok(()) | Err(ffmpeg_next::Error::Eof) => {}
-        Err(e) => {
-            refused.get_or_insert(e);
-        }
-    }
-    if let Err(e) = take_ready_frames(
-        &mut decoder,
-        &mut decoded,
-        &mut sample_frame,
-        &mut lost_pictures,
-    ) {
-        refused.get_or_insert(e);
-    }
-
-    // A frame the decoder produced and this pass could not use. Failed rather
-    // than returned short, because a fingerprint quietly missing its second
-    // half is not a smaller answer but a wrong one: it reads as the same length
-    // as the file it was cut from, wins the ranking on encoder quality, and
-    // marks that file DELETE -- and cached, it does so on every run after.
-    //
-    // Asked before the "no valid frames" line below rather than after it, so a
-    // file that decoded and could not be scaled says which of the two happened.
-    // The rebuild above answers the one cause of this that is a normal property
-    // of a stream, so what is left is a pixel format libswscale will not take
-    // or a frame with no size -- neither of which a single frame can have on
-    // its own, which is why in practice this fires for a whole file or not at
-    // all. Nothing in the 756-file local corpus reaches it.
-    if let Some(e) = unscalable {
+    // Each of these is a sample missing from a fingerprint that would still
+    // claim the whole runtime, and asked in this order so the file says which
+    // happened: a picture decoded and not scaled, then a keyframe the decoder
+    // refused, then nothing decoded at all.
+    if let Some(e) = capture.unscalable() {
         return Err(anyhow!(e).context("Failed to convert a decoded frame"));
     }
-
-    // A keyframe the decoder would not take, or would not hand back. Fatal for
-    // exactly the reason above, and it is the same damage: a sample that should
-    // be in this fingerprint is not, while the runtime it claims is the whole
-    // file's, so the surviving hash on either side of the hole stands for
-    // footage nothing looked at.
-    //
-    // It is not the ordinary reading of a damaged file: a corrupt packet is
-    // skipped by the demux loop and a corrupt FRAME is normally handed over
-    // anyway, concealment and all. What reaches here is the decoder refusing
-    // the TRANSACTION and nothing else -- `is_decoding_error` is where that
-    // line is drawn. The two answers about the transaction that are routine
-    // never arrive: `EAGAIN` because `feed_keyframe` drains and resends the way
-    // the API asks, and a picture the decoder could not build because that is
-    // not a refusal at all -- the packet was taken, the decoder carried on, and
-    // the cost is the one sample counted in `lost_pictures`.
-    if let Some(e) = refused {
+    if let Some(e) = decoder.refused.take() {
         return Err(anyhow!(e).context("The decoder would not take a keyframe"));
     }
+    let captured = capture
+        .finish()
+        .ok_or_else(|| anyhow!("No valid frames found or successfully decoded"))?;
 
-    if frame_idx == 0 {
-        return Err(anyhow!("No valid frames found or successfully decoded"));
-    }
-
-    // Said out loud rather than counted, and said only by a file that produced
-    // a fingerprint -- one that produced none has already returned above with a
-    // better sentence. Not a problem and not a skip: the run did what it was
-    // asked and the file is still worth comparing, it is simply covered by
-    // fewer samples than its keyframes promised. Both numbers, because 8 of 835
-    // is a remux libavcodec quibbles with and 800 of 835 is a file to go and
-    // look at, and nothing downstream can tell those apart.
-    if lost_pictures > 0 {
+    // Not a problem and not a skip: the file is still worth comparing, it is
+    // covered by fewer samples than its keyframes promised. Both numbers,
+    // because 8 of 835 is a remux libavcodec quibbles with and 800 of 835 is a
+    // file to go and look at.
+    if decoder.lost > 0 {
         log::warn!(
             "{}: the decoder could not build {} of {} keyframes; those samples are missing",
             filepath,
-            lost_pictures,
-            lost_pictures as usize + frame_idx
+            decoder.lost,
+            decoder.lost as usize + captured.count
         );
     }
 
-    // From the frames the decoder actually produced. Identical to what the
-    // probe used to leave in the stream parameters -- it copies the decoder's
-    // view back into them -- and correct even where a header disagrees with its
-    // own bitstream.
-    let (width, height) = frame_dims.unwrap_or_else(|| shown(decoder.width(), decoder.height()));
+    let hashed = hash_frames_fully(&captured.frames, captured.dims, &|done| {
+        progress(Step::Hashed(done, captured.times.len()))
+    });
+    assemble(filepath, captured, hashed, duration_sec, clock.restarted(), codec, frame_rate, file_size)
+}
 
-    // u_frames holds n_unique * FRAME_STRIDE bytes; the frame count is the time list.
-    let n_unique = unique_frame_times.len();
+/// The fingerprint of the frames a decode kept: put in time order, a sample
+/// that repeats the one before it folded in, and featureless ones dropped, each
+/// survivor standing for the footage until the next sample.
+#[allow(clippy::too_many_arguments)]
+fn assemble(
+    filepath: &str,
+    captured: Captured,
+    hashed: Hashed,
+    duration_sec: f64,
+    clock_restarted: bool,
+    codec: String,
+    frame_rate: f64,
+    file_size: u64,
+) -> Result<Option<VideoFingerprint>> {
+    let Captured { frames, times, dims: (width, height), .. } = captured;
+    // Release the frame buffer (munmap) before the cheap tail work.
+    drop(frames);
+    let sampled = times.len();
+    let (times, total_ms) = sample_times(&times, duration_sec);
 
-    let hashed = hash_frames_fully(&u_frames, (width, height), &|done| progress(Step::Hashed(done, n_unique)));
-    let (hashes, mirrored, flat) = (&hashed.hashes, &hashed.mirrored, &hashed.flat);
+    // A container whose clock restarted mis-states its runtime by the same
+    // arithmetic -- two five-second recordings joined report five seconds --
+    // and the samples, taken by walking the whole file, are the better
+    // witness. Length is the first ranking metric, so left at the header's
+    // figure a capture CONTAINING another video loses to it on quality and is
+    // marked DELETE. Only such a file is touched, so `total_ms >= duration *
+    // 1000` still holds everywhere.
+    let duration_sec = if clock_restarted { duration_sec.max(total_ms as f64 / 1000.0) } else { duration_sec };
 
-    // Frame pixels are no longer needed; release the large buffer (munmap) now
-    // rather than at end of scope, trimming the peak during the cheap tail work.
-    drop(u_frames);
-
-    let (times, total_ms) = sample_times(&unique_frame_times, duration_sec);
-
-    // A container whose clock restarted mis-stated its runtime by the same
-    // arithmetic: what a demuxer reports is its last timestamp minus its first,
-    // and across a splice both of those belong to segments, not to the file --
-    // two five-second recordings cat'ed together report five seconds. The
-    // samples are the better witness here, because they were taken by walking
-    // the whole file, so where they outrun the header the header is what is
-    // wrong.
-    //
-    // This is a ranking metric, not a cosmetic one. Length is the first thing
-    // `utils::find_best` compares and the property that normally keeps a long
-    // file safe from the clip cut out of it; left at the header's figure, a
-    // capture that CONTAINS another video reads as no longer than it, loses the
-    // comparison on encoder quality or size, and is the one marked DELETE.
-    //
-    // Only a file that was seen to restart its clock is touched, so no runtime
-    // that was merely rounded moves, and `total_ms >= duration * 1000` -- which
-    // `MatchIndex::matched_seconds` rests on -- still holds, with equality.
-    let duration_sec = if clock_restarted {
-        duration_sec.max(total_ms as f64 / 1000.0)
-    } else {
-        duration_sec
-    };
-
-    // Keyframes do not always leave the decoder in presentation order -- an open
-    // GOP or a B-pyramid can put a later one out first -- and every span below
-    // is "until the next sample", so the samples are put in time order before
-    // anything is measured from them.
-    let mut order: Vec<usize> = (0..hashes.len()).collect();
+    // Keyframes do not always leave the decoder in presentation order, and a
+    // span runs "until the next sample", so order by time first. A sample
+    // that repeats the one before it (hash and featurelessness both) adds
+    // nothing and is folded into it. A featureless sample still ends the span
+    // before it, but holds no hash of its own.
+    let mut order: Vec<usize> = (0..hashed.hashes.len()).collect();
     order.sort_by_key(|&i| times[i]);
+    order.dedup_by(|cur, prev| hashed.hashes[*cur] == hashed.hashes[*prev] && hashed.flat[*cur] == hashed.flat[*prev]);
 
-    let mut changes_hashes = Vec::new();
-    let mut changes_frame = Vec::new();
-    let mut changes_mirrored = Vec::new();
-    let mut changes_t_start = Vec::new();
-    let mut changes_valid = Vec::new();
+    let n = order.len();
+    let mut valid_hashes = Vec::with_capacity(n);
+    let mut valid_t_start = Vec::with_capacity(n);
+    let mut valid_t_end = Vec::with_capacity(n);
+    let mut mirrored_hashes = Vec::with_capacity(n);
+    let mut detail_hashes = Vec::with_capacity(n);
+    let mut mirrored_detail_hashes = Vec::with_capacity(n);
+    let mut reframed: Vec<Reframed> = vec![Reframed::default(); REFRAMINGS.len()];
+    let mut pictures: Vec<f32> = Vec::with_capacity(n);
 
     for (k, &i) in order.iter().enumerate() {
-        let h = hashes[i];
-        let valid = !flat[i];
-
-        let should_push = k == 0 || {
-            let prev = order[k - 1];
-            h != hashes[prev] || valid != !flat[prev]
-        };
-
-        if should_push {
-            changes_hashes.push(h);
-            changes_frame.push(i);
-            changes_mirrored.push(mirrored[i]);
-            changes_t_start.push(times[i]);
-            changes_valid.push(valid);
+        if hashed.flat[i] {
+            continue;
         }
-    }
-
-    let mut final_hashes = Vec::with_capacity(changes_hashes.len());
-    let mut final_mirrored = Vec::with_capacity(changes_hashes.len());
-    let mut final_t_start = Vec::with_capacity(changes_hashes.len());
-    let mut final_t_end = Vec::with_capacity(changes_hashes.len());
-    let mut final_detail = Vec::with_capacity(changes_hashes.len());
-    let mut final_mirrored_detail = Vec::with_capacity(changes_hashes.len());
-    let mut reframed: Vec<Reframed> = vec![Reframed::default(); REFRAMINGS.len()];
-    let mut pictures: Vec<f32> = Vec::with_capacity(changes_hashes.len());
-
-    for i in 0..changes_hashes.len() {
-        if changes_valid[i] {
-            let frame = changes_frame[i];
-            pictures.push(hashed.picture[frame]);
-            for (v, r) in reframed.iter_mut().enumerate() {
-                if let Some(h) = hashed.reframed[v][frame] {
-                    r.samples.push(final_hashes.len() as u32);
-                    r.hashes.push(h);
-                }
-            }
-            final_detail.push(hashed.detail[frame]);
-            final_mirrored_detail.push(hashed.mirrored_detail[frame]);
-            final_hashes.push(changes_hashes[i]);
-            final_mirrored.push(changes_mirrored[i]);
-            final_t_start.push(changes_t_start[i]);
-
-            if i + 1 < changes_hashes.len() {
-                final_t_end.push(changes_t_start[i + 1]);
-            } else {
-                final_t_end.push(total_ms);
+        for (v, r) in reframed.iter_mut().enumerate() {
+            if let Some(h) = hashed.reframed[v][i] {
+                r.samples.push(valid_hashes.len() as u32);
+                r.hashes.push(h);
             }
         }
+        valid_hashes.push(hashed.hashes[i]);
+        mirrored_hashes.push(hashed.mirrored[i]);
+        detail_hashes.push(hashed.detail[i]);
+        mirrored_detail_hashes.push(hashed.mirrored_detail[i]);
+        pictures.push(hashed.picture[i]);
+        valid_t_start.push(times[i]);
+        valid_t_end.push(order.get(k + 1).map_or(total_ms, |&next| times[next]));
     }
 
-    // Every frame this file gave up was featureless -- black, a fade, a title
-    // card -- so `is_featureless` dropped all of them and there is nothing left
-    // to compare with. A failure rather than a fingerprint holding no hashes,
-    // for the same reason the unscalable frame above is one: an empty
-    // fingerprint is cached like any other and matches nothing at any `-d`, so
-    // two identical all-black recordings were reported as no duplicates at all
-    // -- exit 0, nothing in the problem list, and the empty entry read back as
-    // a legitimate fingerprint on every run after, which is the one state where
-    // no setting the user can reach makes the tool say what it found.
-    //
-    // Asked separately from the `frame_idx == 0` line above because "it decoded
-    // and there was nothing in the picture" is a different finding from "it
-    // decoded nothing", and one of them is answered by looking at the file
-    // while the other is answered by re-encoding it. The distinction is also
-    // what the user sees, since `Refusal::Said` remembers this sentence.
-    if final_hashes.is_empty() {
-        return Err(anyhow!(
-            "No usable frames: all {} sampled frame(s) were featureless",
-            n_unique
-        ));
+    // Every frame was featureless -- black, a fade, a title card. A failure
+    // rather than an empty fingerprint, which would be cached like any other
+    // and match nothing at any `-d`: two identical all-black recordings
+    // reported no duplicates, exit 0. A different sentence from "decoded
+    // nothing", and `Refusal::Said` remembers it.
+    if valid_hashes.is_empty() {
+        return Err(anyhow!("No usable frames: all {} sampled frame(s) were featureless", sampled));
     }
 
     Ok(Some(VideoFingerprint {
         path: filepath.to_string(),
-        valid_hashes: final_hashes,
-        valid_t_start: final_t_start,
-        valid_t_end: final_t_end,
+        valid_hashes,
+        valid_t_start,
+        valid_t_end,
         total_ms,
         width,
         height,
@@ -3138,9 +2242,9 @@ pub fn fingerprint_video(
         file_size,
         codec,
         frame_rate,
-        mirrored_hashes: final_mirrored,
-        detail_hashes: final_detail,
-        mirrored_detail_hashes: final_mirrored_detail,
+        mirrored_hashes,
+        detail_hashes,
+        mirrored_detail_hashes,
         reframed,
         picture: largest_share(pictures),
     }))
