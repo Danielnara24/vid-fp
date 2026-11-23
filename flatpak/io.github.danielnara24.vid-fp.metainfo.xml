@@ -90,6 +90,11 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.46.0" date="2026-11-23">
+      <description>
+        <p>Quality and size are ranked on the video stream where the file states its size, so cover art and audio no longer put one copy ahead of another. A file replaced by another of the same length since the scan is no longer deleted. Scans are faster on long videos.</p>
+      </description>
+    </release>
     <release version="0.45.3" date="2026-11-22">
       <description>
         <p>Internal restructuring of how a scan records each file. Results are unchanged.</p>
