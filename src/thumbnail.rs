@@ -537,7 +537,7 @@ mod tests {
         init().unwrap();
         for path in ["tests/fixtures/test_video_capture.ts", "tests/fixtures/test_video_segment.ts", "tests/fixtures/test_video_rescaled.ts", "tests/fixtures/test_video.mp4"] {
             let size = std::fs::metadata(path).unwrap().len();
-            let fp = crate::fingerprint::fingerprint_video(path, 0.0, 0.0, 1, 0.0, size, &|_| {}).unwrap().expect("the fixture fingerprints");
+            let fp = crate::fingerprint::fingerprint_video(path, 0.0, 0.0, 1, crate::fingerprint::Floor::OFF, size, &|_| {}).unwrap().expect("the fixture fingerprints");
             let oracle = keyframes_in_order(path, 64);
             assert!(fp.valid_t_start.len() > 1 || path.ends_with(".mp4"), "{path}: more than one sample to tell apart");
             for &t in &fp.valid_t_start {

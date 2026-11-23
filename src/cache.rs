@@ -261,7 +261,7 @@ pub(crate) enum Refusal {
 impl Refusal {
     /// Whether this is "no demuxer recognised it" rather than "it opened and
     /// then something went wrong" -- two findings with opposite responses, which
-    /// the warm run's headline counts apart (`remembered_clause`).
+    /// the warm run's headline counts apart (`scan::Answered::headline`).
     pub fn is_not_media(&self) -> bool {
         matches!(self, Refusal::NotMedia(_))
     }
@@ -1520,8 +1520,8 @@ mod tests {
     ///
     /// Both halves are asserted because the failure is silent from either side
     /// on its own. A leftover refusal is not stale (its `Stamp` still matches
-    /// the file, so nothing collects it), and `Lookup::Short` reads that table
-    /// BEFORE `cache_lookup`, so the header runtime it holds would outrank the
+    /// the file, so nothing collects it), and the cache pass read a remembered
+    /// runtime BEFORE `cache_lookup`, so the header runtime it holds would outrank the
     /// runtime the decode went on to measure for as long as the entry lived.
     #[test]
     fn test_a_fingerprint_supersedes_the_refusal_it_fell_through() {

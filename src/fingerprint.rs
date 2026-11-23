@@ -1096,6 +1096,31 @@ const ASSUMED_KEYFRAME_SECONDS: f64 = 2.0;
 /// files average 3.8 keyframe-pixels per byte.
 pub(crate) const WORK_PER_BYTE: f64 = 3.8;
 
+/// `--min-duration`: the shortest runtime, in seconds, a video may have and
+/// still be compared. 0 is off.
+///
+/// The one statement of the rule. Every place a runtime meets the flag -- the
+/// weighing pass on a header, the decode on the same header, the cache pass and
+/// the content pass on a fingerprint they already hold -- asks `rejects`, so
+/// the passes cannot drift apart on what "too short" means. Only a positive,
+/// known runtime can be rejected: 0 is how `duration_seconds` says the
+/// container never told us, and an unmeasured file is not a short one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Floor(pub f64);
+
+impl Floor {
+    #[cfg(test)]
+    pub const OFF: Floor = Floor(0.0);
+
+    pub fn is_on(self) -> bool {
+        self.0 > 0.0
+    }
+
+    pub fn rejects(self, duration: f64) -> bool {
+        self.is_on() && duration > 0.0 && duration < self.0
+    }
+}
+
 /// How much decoding this file is going to cost, in keyframe-pixels.
 ///
 /// The unit is "one pixel of one decoded keyframe", scaled by `codec_cost`.
@@ -1129,19 +1154,19 @@ pub(crate) const WORK_PER_BYTE: f64 = 3.8;
 /// `fingerprint_video` provably takes too. `TooShort` is not an estimate either,
 /// and rests on the same kind of argument -- see the same function.
 ///
-/// `min_duration` is the `--min-duration` this run was given (seconds, 0 = off),
-/// and it is here for the same reason the keyframe interval is: it decides how
-/// much decoding this file implies, and for a file under it the answer is none.
+/// `floor` is this run's `--min-duration`, and it is here for the same reason
+/// the keyframe interval is: it decides how much decoding this file implies,
+/// and for a file under it the answer is none.
 pub fn weigh_decode(
     filepath: &str,
     kf_interval: f64,
     min_kf_samples: f64,
-    min_duration: f64,
+    floor: Floor,
     size: u64,
 ) -> Weighed {
     let from_bytes = || ((size as f64 * WORK_PER_BYTE) as u64).max(1);
 
-    match weigh_from_container(filepath, kf_interval, min_kf_samples, min_duration) {
+    match weigh_from_container(filepath, kf_interval, min_kf_samples, floor) {
         Ok(Some(weighed)) => weighed,
         Ok(None) => Weighed::Work(from_bytes(), 0),
         Err(e) => Weighed::Undecodable(e),
@@ -1194,7 +1219,7 @@ pub enum Weighed {
 /// it is issued
 /// only when `header_is_complete` says this header answers every question the
 /// decode asks of it, which is exactly the condition under which
-/// `fingerprint_video` will NOT probe -- so it reads its `min_duration` against
+/// `fingerprint_video` will NOT probe -- so it reads its `floor` against
 /// the same `duration_seconds` of the same stream of the same header, and
 /// reaches the same conclusion. Where the header is not complete the question is
 /// left alone entirely, because a probe can move the runtime and the direction
@@ -1241,7 +1266,7 @@ fn weigh_from_container(
     filepath: &str,
     kf_interval: f64,
     min_kf_samples: f64,
-    min_duration: f64,
+    floor: Floor,
 ) -> Result<Option<Weighed>> {
     let mut ictx = open_video(filepath)?;
 
@@ -1280,10 +1305,10 @@ fn weigh_from_container(
     // here rather than by the decode that would otherwise open this file a
     // second time to decide it. Only a header the decode would trust unprobed
     // may answer -- see the note above.
-    if min_duration > 0.0 && header_is_complete(&ictx) {
+    if floor.is_on() && header_is_complete(&ictx) {
         if let Some(stream) = ictx.stream(stream_index) {
             let duration = duration_seconds(&stream, &ictx);
-            if duration > 0.0 && duration < min_duration {
+            if floor.rejects(duration) {
                 return Ok(Some(Weighed::TooShort(duration)));
             }
         }
@@ -2017,7 +2042,7 @@ fn mirror_coefficients(c: &[f32; KEEP * KEEP]) -> [f32; KEEP * KEEP] {
 /// decided by the caller from how many decodes are still outstanding. It is
 /// clamped to `1..=MAX_DECODE_THREADS`, so passing 0 is harmless.
 ///
-/// `min_duration` (seconds, 0 = off) skips the video entirely if it is shorter
+/// `floor` (`--min-duration`) skips the video entirely if it is shorter
 /// than the shortest match we are willing to report — such a file cannot
 /// possibly contain a long enough shared clip, so decoding it is pure waste.
 /// Returns `Ok(None)` in that case: a skip is not an error, and the caller must
@@ -2057,7 +2082,7 @@ pub fn fingerprint_video(
     kf_interval: f64,
     min_kf_samples: f64,
     decode_threads: usize,
-    min_duration: f64,
+    floor: Floor,
     file_size: u64,
     progress: &dyn Fn(Step),
 ) -> Result<Option<VideoFingerprint>> {
@@ -2080,7 +2105,7 @@ pub fn fingerprint_video(
 
     // Bail before the decoder and the frame buffer exist. Only a positive,
     // known duration can disqualify a file.
-    if min_duration > 0.0 && duration_sec > 0.0 && duration_sec < min_duration {
+    if floor.rejects(duration_sec) {
         return Ok(None);
     }
 
@@ -2403,7 +2428,7 @@ mod tests {
 
         let filepath = path.to_string_lossy().to_string();
         let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        fingerprint_video(&filepath, 0.0, 4.0, 1, 0.0, size, &|_| {})
+        fingerprint_video(&filepath, 0.0, 4.0, 1, Floor::OFF, size, &|_| {})
             .unwrap_or_else(|e| panic!("failed to fingerprint {}: {:?}", filepath, e))
             .expect("min_duration is off, nothing should be skipped")
     }
@@ -2431,7 +2456,7 @@ mod tests {
         assert!(fixture_path.exists(), "Fixture video not found at: {}.", filepath);
 
         let size = std::fs::metadata(&fixture_path).map(|m| m.len()).unwrap_or(0);
-        let result = fingerprint_video(&filepath, 0.0, 4.0, threads, 0.0, size, &|_| {});
+        let result = fingerprint_video(&filepath, 0.0, 4.0, threads, Floor::OFF, size, &|_| {});
         assert!(result.is_ok(), "Failed to fingerprint video: {:?}", result.err());
         result.unwrap().expect("min_duration is off, nothing should be skipped")
     }
@@ -2505,7 +2530,7 @@ mod tests {
 
         // The fixture is ~1s; an hour-long floor must reject it without error.
         let size = std::fs::metadata(fixture_path()).map(|m| m.len()).unwrap_or(0);
-        let skipped = fingerprint_video(&filepath, 0.0, 4.0, 1, 3600.0, size, &|_| {}).unwrap();
+        let skipped = fingerprint_video(&filepath, 0.0, 4.0, 1, Floor(3600.0), size, &|_| {}).unwrap();
         assert!(skipped.is_none(), "a short video must be skipped, not fingerprinted");
     }
 
@@ -2525,18 +2550,18 @@ mod tests {
         let size = std::fs::metadata(&path).unwrap().len();
         let filepath = path.to_string_lossy().to_string();
 
-        let Weighed::TooShort(duration) = weigh_decode(&filepath, 0.0, 4.0, 3600.0, size) else {
+        let Weighed::TooShort(duration) = weigh_decode(&filepath, 0.0, 4.0, Floor(3600.0), size) else {
             panic!("the fixture is about a second long and an hour-long floor rejects it");
         };
         assert!(duration > 0.0, "the verdict carries the runtime it was measured against");
 
         let under = duration - 0.01;
         assert!(
-            matches!(weigh_decode(&filepath, 0.0, 4.0, under, size), Weighed::Work(..)),
+            matches!(weigh_decode(&filepath, 0.0, 4.0, Floor(under), size), Weighed::Work(..)),
             "a floor under the runtime is not one this file falls under"
         );
         assert!(
-            fingerprint_video(&filepath, 0.0, 4.0, 1, under, size, &|_| {})
+            fingerprint_video(&filepath, 0.0, 4.0, 1, Floor(under), size, &|_| {})
                 .unwrap()
                 .is_some(),
             "and the decode reads it the same way, which is what lets the weigher answer at all"
@@ -2544,16 +2569,16 @@ mod tests {
 
         let over = duration + 0.01;
         assert!(
-            matches!(weigh_decode(&filepath, 0.0, 4.0, over, size), Weighed::TooShort(_)),
+            matches!(weigh_decode(&filepath, 0.0, 4.0, Floor(over), size), Weighed::TooShort(_)),
             "a floor over the runtime is"
         );
         assert!(
-            fingerprint_video(&filepath, 0.0, 4.0, 1, over, size, &|_| {}).unwrap().is_none(),
+            fingerprint_video(&filepath, 0.0, 4.0, 1, Floor(over), size, &|_| {}).unwrap().is_none(),
             "and again the decode agrees, on the same side of the same number"
         );
 
         assert!(
-            matches!(weigh_decode(&filepath, 0.0, 4.0, 0.0, size), Weighed::Work(..)),
+            matches!(weigh_decode(&filepath, 0.0, 4.0, Floor::OFF, size), Weighed::Work(..)),
             "0 turns the flag off and nothing is short"
         );
     }
@@ -2575,7 +2600,7 @@ mod tests {
         let filepath = path.to_string_lossy().to_string();
 
         let offsets = std::cell::RefCell::new(Vec::new());
-        fingerprint_video(&filepath, 0.0, 4.0, 1, 0.0, size, &|step| {
+        fingerprint_video(&filepath, 0.0, 4.0, 1, Floor::OFF, size, &|step| {
             if let Step::Read(pos) = step {
                 offsets.borrow_mut().push(pos)
             }
@@ -2615,7 +2640,7 @@ mod tests {
         let filepath = path.to_string_lossy().to_string();
 
         let offsets = std::cell::RefCell::new(Vec::new());
-        fingerprint_video(&filepath, 0.0, 4.0, 1, 0.0, size, &|step| {
+        fingerprint_video(&filepath, 0.0, 4.0, 1, Floor::OFF, size, &|step| {
             if let Step::Read(pos) = step {
                 offsets.borrow_mut().push(pos)
             }
@@ -2683,7 +2708,7 @@ mod tests {
         let size = bytes.len() as u64;
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let outcome = fingerprint_video(&filepath, 0.0, 4.0, 1, 0.0, size, &|_| {});
+            let outcome = fingerprint_video(&filepath, 0.0, 4.0, 1, Floor::OFF, size, &|_| {});
             let _ = tx.send(outcome.is_err());
         });
 
@@ -2721,7 +2746,7 @@ mod tests {
         init_ffmpeg_for_tests();
         let path = fixture_named("test_video_open_gop.mkv").to_str().unwrap().to_string();
         let size = std::fs::metadata(&path).unwrap().len();
-        let fp = fingerprint_video(&path, 0.0, 0.0, 1, 0.0, size, &|_| {}).unwrap().expect("the fixture fingerprints");
+        let fp = fingerprint_video(&path, 0.0, 0.0, 1, Floor::OFF, size, &|_| {}).unwrap().expect("the fixture fingerprints");
 
         let mut ictx = open_video(&path).unwrap();
         let stream = ictx.streams().best(ffmpeg_next::media::Type::Video).unwrap();
@@ -2919,7 +2944,7 @@ mod tests {
         let filepath = path.to_string_lossy().to_string();
         let size = std::fs::metadata(&path).unwrap().len();
         let samples = |kf_interval: f64, min_kf_samples: f64| {
-            fingerprint_video(&filepath, kf_interval, min_kf_samples, 1, 0.0, size, &|_| {})
+            fingerprint_video(&filepath, kf_interval, min_kf_samples, 1, Floor::OFF, size, &|_| {})
                 .expect("the fixture decodes")
                 .expect("min_duration is off")
                 .valid_hashes
@@ -2987,7 +3012,7 @@ mod tests {
         let path = dir.path().join("notes.rlib");
         std::fs::write(&path, "the quick brown fox\n".repeat(400)).unwrap();
 
-        let Weighed::Undecodable(e) = weigh_decode(&path.to_string_lossy(), 0.0, 4.0, 0.0, 8000) else {
+        let Weighed::Undecodable(e) = weigh_decode(&path.to_string_lossy(), 0.0, 4.0, Floor::OFF, 8000) else {
             panic!("a text file is not a video");
         };
         let said = format!("{:#}", e);
@@ -3015,7 +3040,7 @@ mod tests {
         std::fs::write(&path, &text).unwrap();
 
         let Weighed::Undecodable(e) =
-            weigh_decode(&path.to_string_lossy(), 0.0, 4.0, 0.0, text.len() as u64)
+            weigh_decode(&path.to_string_lossy(), 0.0, 4.0, Floor::OFF, text.len() as u64)
         else {
             panic!("this is text, whatever it is called");
         };
@@ -3041,7 +3066,7 @@ mod tests {
         let path = dir.path().join("stub.mp3");
         std::fs::write(&path, "the quick brown fox\n").unwrap();
 
-        let Weighed::Undecodable(e) = weigh_decode(&path.to_string_lossy(), 0.0, 4.0, 0.0, 20)
+        let Weighed::Undecodable(e) = weigh_decode(&path.to_string_lossy(), 0.0, 4.0, Floor::OFF, 20)
         else {
             panic!("twenty bytes of text is not a video");
         };
@@ -3061,7 +3086,7 @@ mod tests {
         let path = dir.path().join("interrupted.mp4");
         std::fs::write(&path, b"").unwrap();
 
-        let Weighed::Undecodable(e) = weigh_decode(&path.to_string_lossy(), 0.0, 4.0, 0.0, 0) else {
+        let Weighed::Undecodable(e) = weigh_decode(&path.to_string_lossy(), 0.0, 4.0, Floor::OFF, 0) else {
             panic!("an empty file is not a video");
         };
         let said = format!("{:#}", e);
@@ -3080,7 +3105,7 @@ mod tests {
         let path = dir.path().join("truncated.mp4");
         std::fs::write(&path, b"\0").unwrap();
 
-        let Weighed::Undecodable(e) = weigh_decode(&path.to_string_lossy(), 0.0, 4.0, 0.0, 1) else {
+        let Weighed::Undecodable(e) = weigh_decode(&path.to_string_lossy(), 0.0, 4.0, Floor::OFF, 1) else {
             panic!("one byte is not a video");
         };
         let said = format!("{:#}", e);
@@ -3105,7 +3130,7 @@ mod tests {
         let path = fixture_path();
         let size = std::fs::metadata(&path).unwrap().len();
         assert!(
-            matches!(weigh_decode(&path.to_string_lossy(), 0.0, 4.0, 0.0, size), Weighed::Work(..)),
+            matches!(weigh_decode(&path.to_string_lossy(), 0.0, 4.0, Floor::OFF, size), Weighed::Work(..)),
             "the fixture is a real MP4 and scores 100 on its first 2 KB"
         );
     }
@@ -3135,7 +3160,7 @@ mod tests {
         let fp = fingerprint_fixture(1);
         let decoded_pixels = fp.valid_hashes.len() as u64 * (fp.width * fp.height) as u64;
 
-        let weight = work_of(weigh_decode(&filepath, 0.0, 4.0, 0.0, size));
+        let weight = work_of(weigh_decode(&filepath, 0.0, 4.0, Floor::OFF, size));
         let expected = (decoded_pixels as f64 * codec_cost(&fp.codec)) as u64;
 
         // Not an equality: the decode drops frames that hash the same as their
@@ -3183,7 +3208,7 @@ mod tests {
         let pixels = (fp.width * fp.height) as f64 * codec_cost(&fp.codec);
         let truth = fp.valid_hashes.len() as f64 * pixels;
 
-        let weight = work_of(weigh_decode(&filepath, 0.0, 12.0, 0.0, size)) as f64;
+        let weight = work_of(weigh_decode(&filepath, 0.0, 12.0, Floor::OFF, size)) as f64;
 
         assert!(
             weight > pixels,
@@ -3211,7 +3236,7 @@ mod tests {
         init_ffmpeg_for_tests();
 
         let Weighed::Undecodable(e) =
-            weigh_decode("/nonexistent/not-a-video.mkv", 0.0, 4.0, 0.0, 1_000_000)
+            weigh_decode("/nonexistent/not-a-video.mkv", 0.0, 4.0, Floor::OFF, 1_000_000)
         else {
             panic!("a path with nothing behind it cannot be decoded, and this pass knows it");
         };
@@ -3258,11 +3283,11 @@ mod tests {
         let filepath = path.to_string_lossy().to_string();
         let size = bytes.len() as u64;
 
-        let Weighed::Undecodable(weighed) = weigh_decode(&filepath, 0.0, 4.0, 0.0, size) else {
+        let Weighed::Undecodable(weighed) = weigh_decode(&filepath, 0.0, 4.0, Floor::OFF, size) else {
             panic!("300 kB of noise is not a video, and opening it twice will not make it one");
         };
 
-        let Err(decoded) = fingerprint_video(&filepath, 0.0, 4.0, 1, 0.0, size, &|_| {}) else {
+        let Err(decoded) = fingerprint_video(&filepath, 0.0, 4.0, 1, Floor::OFF, size, &|_| {}) else {
             panic!("the decode has to fail on the same file");
         };
 
@@ -3284,10 +3309,10 @@ mod tests {
         let filepath = fixture_path().to_string_lossy().to_string();
         let size = std::fs::metadata(fixture_path()).unwrap().len();
 
-        let full = work_of(weigh_decode(&filepath, 0.0, 4.0, 0.0, size));
+        let full = work_of(weigh_decode(&filepath, 0.0, 4.0, Floor::OFF, size));
         // One sample over the whole clip: the floor for short videos is what
         // decides this, exactly as it does inside the decode.
-        let thinned = work_of(weigh_decode(&filepath, 3600.0, 1.0, 0.0, size));
+        let thinned = work_of(weigh_decode(&filepath, 3600.0, 1.0, Floor::OFF, size));
 
         assert!(
             thinned <= full,
@@ -3427,7 +3452,7 @@ mod tests {
         let filepath = path.to_string_lossy().to_string();
         let size = std::fs::metadata(&path).unwrap().len();
 
-        let fp = fingerprint_video(&filepath, 0.0, 4.0, 1, 0.0, size, &|_| {})
+        let fp = fingerprint_video(&filepath, 0.0, 4.0, 1, Floor::OFF, size, &|_| {})
             .unwrap()
             .expect("min_duration is off, nothing should be skipped");
 
@@ -3516,7 +3541,7 @@ mod tests {
         let filepath = path.to_string_lossy().to_string();
         let size = std::fs::metadata(&path).unwrap().len();
 
-        let err = match fingerprint_video(&filepath, 0.0, 4.0, 1, 0.0, size, &|_| {}) {
+        let err = match fingerprint_video(&filepath, 0.0, 4.0, 1, Floor::OFF, size, &|_| {}) {
             Err(e) => e,
             Ok(_) => panic!("an all-black video has nothing to fingerprint"),
         };
@@ -3547,7 +3572,7 @@ mod tests {
         init_ffmpeg_for_tests();
         let filepath = fixture_path().to_string_lossy().to_string();
 
-        let fp = fingerprint_video(&filepath, 0.0, 4.0, 1, 0.0, 12_345, &|_| {})
+        let fp = fingerprint_video(&filepath, 0.0, 4.0, 1, Floor::OFF, 12_345, &|_| {})
             .unwrap()
             .unwrap();
 
