@@ -127,6 +127,40 @@ pub struct VideoFingerprint {
     /// bar (under 1% a side at `SIDE` = 128). The reported width and height
     /// stay the stored ones.
     pub picture: f32,
+    /// What this run measured about the file on disk beside its fingerprint
+    /// (`Measured`), or `None` where nothing did (a fixture). Never stored.
+    ///
+    /// One pointer rather than the fields themselves, and that is measured:
+    /// growing this struct by the 32 bytes `Measured` holds slowed phase 1 of
+    /// the comparison by ~30% on VIDS (7.7 s -> 10.1 s warm, three interleaved
+    /// runs each, an unrelated change to the same build moving nothing), almost
+    /// certainly because the fields every pair check reads then straddle one
+    /// more cache line across ~50 million checks. A boxed `Option` is 8 bytes
+    /// and measured level with the struct without it.
+    #[serde(skip)]
+    pub measured: Option<Box<Measured>>,
+}
+
+/// What a run measures about a file on disk, beside the fingerprint it read
+/// from the cache or decoded: facts about this moment rather than about the
+/// footage, so they are never stored.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Measured {
+    /// The bytes of the video stream alone, when the container states them
+    /// (`video_stream_bytes`); 0 when it does not. What `quality` and the Size
+    /// ranking read in place of `file_size` whenever every file they are
+    /// compared with has one too (`utils::GroupMaxima`), so a cover picture, a
+    /// second audio track or subtitles are not ranked as picture. Measured
+    /// from the header of each file a comparison matched, just before ranking
+    /// (`lib::run`); storing it would cost every cache a full re-decode for a
+    /// figure that takes one header read of the few files that are ranked.
+    pub video_bytes: u64,
+    /// The file's change time (seconds, nanoseconds) as this run's walk saw
+    /// it. The disposal pass refuses a file, or a holder, whose change time
+    /// has moved since: replaced by another of the same length, even with
+    /// `cp -p` or `rsync -a`, which put back an mtime but cannot put back a
+    /// ctime (`export::changed_since`).
+    pub ctime: Option<(i64, i64)>,
 }
 
 /// The samples of a fingerprint that a reframing applies to, and their hashes
@@ -139,6 +173,21 @@ pub struct Reframed {
 }
 
 impl VideoFingerprint {
+    /// `Measured::video_bytes`, or 0 when nothing measured it.
+    pub fn video_bytes(&self) -> u64 {
+        self.measured.as_ref().map_or(0, |m| m.video_bytes)
+    }
+
+    /// `Measured::ctime`, or `None` when nothing measured it.
+    pub fn ctime(&self) -> Option<(i64, i64)> {
+        self.measured.as_ref().and_then(|m| m.ctime)
+    }
+
+    /// What this run has measured about the file, to be added to.
+    pub fn measured_mut(&mut self) -> &mut Measured {
+        self.measured.get_or_insert_with(Box::default)
+    }
+
     /// Overall bitrate in bits per second.
     ///
     /// Derived from bytes and seconds rather than read from the container, on
@@ -162,13 +211,23 @@ impl VideoFingerprint {
         }
     }
 
-    /// Bits spent on an average frame: bitrate divided by frame rate.
+    /// Bits spent on an average frame of the picture: the video stream's
+    /// bits per second, divided by the frame rate.
     ///
     /// This is what ranks two copies, not raw bitrate. Bitrate answers "how
     /// many bits per second", and a 60 fps copy spends those bits across twice
     /// as many frames as a 30 fps one -- so the same bitrate is half the
     /// picture. Dividing by the frame rate asks how much was spent on each
     /// frame instead, which is much closer to what a viewer actually sees.
+    ///
+    /// Counted from the video stream's own bytes where the container states
+    /// them (`video_bytes`), and from the whole file where it does not. The
+    /// whole file counts audio, subtitles and a cover picture as picture, so a
+    /// copy with a second audio track, or an embedded JPEG, outranked the same
+    /// video stream without one -- a byte-identical stream marked DELETE beside
+    /// it. The ranking never mixes the two readings within a codec
+    /// (`utils::GroupMaxima`); this one, for display, takes the better reading
+    /// each file has.
     ///
     /// It is still NOT comparable across codecs: 20 kbit/frame of AV1 looks
     /// considerably better than 20 kbit/frame of MPEG-4, and ranking the two
@@ -180,8 +239,19 @@ impl VideoFingerprint {
     /// 0 when the frame rate (or duration) is unknown. Read that as "no claim
     /// either way", not as "the worst copy here".
     pub fn quality(&self) -> u64 {
-        if self.frame_rate > 0.0 {
-            (self.bitrate() as f64 / self.frame_rate) as u64
+        self.quality_from(match self.video_bytes() {
+            0 => self.file_size,
+            stream => stream,
+        })
+    }
+
+    /// Bits per frame, counting `bytes` as the file's picture.
+    pub fn quality_from(&self, bytes: u64) -> u64 {
+        if self.frame_rate > 0.0 && self.duration > 0.0 {
+            // Truncated to whole bits a second first, as `bitrate` is, so a
+            // file measured on its whole size reads exactly as it always has.
+            let per_second = ((bytes as f64 * 8.0) / self.duration) as u64;
+            (per_second as f64 / self.frame_rate) as u64
         } else {
             0
         }
@@ -1428,6 +1498,69 @@ fn weighable_facts(
     ))
 }
 
+/// The bytes of one stream, as the container states them, or 0 when it does
+/// not state them completely.
+///
+/// Two sources, both read from the header with nothing decoded. An index that
+/// holds every packet of the stream with its size, which is what MP4, MOV and
+/// AVI build while reading the header: trusted only when its entry count is the
+/// stream's own frame count, since a fragmented MP4 or a Matroska file's Cues
+/// index part of a stream, and a sum over part of it is not the stream's size.
+/// Then a Matroska track's `NUMBER_OF_BYTES` statistics tag, which mkvmerge
+/// writes and FFmpeg's muxer does not. Anything else is unknown, and an
+/// unknown never stands beside a measured figure in the ranking
+/// (`utils::GroupMaxima`).
+fn stream_bytes(ictx: &ffmpeg_next::format::context::Input, stream_index: usize) -> u64 {
+    let Some(stream) = ictx.stream(stream_index) else {
+        return 0;
+    };
+    let frames = stream.frames();
+    let indexed = unsafe {
+        let sp = stream.as_ptr();
+        let count = ffmpeg_next::ffi::avformat_index_get_entries_count(sp);
+        let mut sum = 0u64;
+        let mut whole = count > 0 && i64::from(count) == frames;
+        for i in 0..count {
+            if !whole {
+                break;
+            }
+            let entry = ffmpeg_next::ffi::avformat_index_get_entry(sp as *mut ffmpeg_next::ffi::AVStream, i);
+            if entry.is_null() || (*entry).size() <= 0 {
+                whole = false;
+            } else {
+                sum += (*entry).size() as u64;
+            }
+        }
+        whole.then_some(sum)
+    };
+    indexed
+        .or_else(|| {
+            stream
+                .metadata()
+                .iter()
+                .find(|(k, _)| {
+                    let k = k.to_ascii_uppercase();
+                    k == "NUMBER_OF_BYTES" || k.starts_with("NUMBER_OF_BYTES-")
+                })
+                .and_then(|(_, v)| v.trim().parse::<u64>().ok())
+        })
+        .unwrap_or(0)
+}
+
+/// The bytes of a file's video stream, from its header (`stream_bytes`), or 0
+/// when it cannot be opened or does not say. About a millisecond: the run asks
+/// it only of the files a comparison matched, just before they are ranked
+/// (`lib::run`), so it costs a library nothing it is not about to report on.
+pub fn video_stream_bytes(path: &str) -> u64 {
+    let Ok(ictx) = open_video(path) else {
+        return 0;
+    };
+    let Some(index) = ictx.streams().best(ffmpeg_next::media::Type::Video).map(|s| s.index()) else {
+        return 0;
+    };
+    stream_bytes(&ictx, index)
+}
+
 /// How many entries of this stream's index are keyframes.
 ///
 /// Counted rather than taken from the entry total because MP4 indexes every
@@ -1965,6 +2098,76 @@ pub enum Step {
     Hashed(usize, usize),
 }
 
+/// `hash_frames_fully` on up to `threads` threads, each hashing one contiguous
+/// run of the frames, the runs joined back in order.
+///
+/// The decode pass reserves a video's share of the thread budget for the
+/// whole of `fingerprint_video`, and the hashing comes after the last keyframe
+/// is decoded: run on the calling thread alone, it left the rest of that share
+/// idle while every other worker waited on the budget for it. On a 1h43m
+/// 540p file at `-t 8` that was the last 3.5 s of a 14.5 s decode at one core.
+/// Each frame is hashed on its own and a `Hasher`'s caches only save work, so
+/// the result is bit-identical to the serial one whatever `threads` is
+/// (`test_hashing_on_several_threads_is_bit_identical`).
+///
+/// `on_frame` is called on this thread only, with how many frames all the
+/// threads have hashed so far, so a caller's progress hook need not be `Sync`.
+pub(crate) fn hash_frames_on(
+    u_frames: &[u8],
+    dims: (u32, u32),
+    threads: usize,
+    on_frame: &dyn Fn(usize),
+) -> Hashed {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let n = u_frames.len() / FRAME_STRIDE;
+    let threads = threads.clamp(1, n.max(1));
+    if threads == 1 {
+        return hash_frames_fully(u_frames, dims, on_frame);
+    }
+    let per = n.div_ceil(threads);
+    let runs: Vec<&[u8]> = u_frames[..n * FRAME_STRIDE].chunks(per * FRAME_STRIDE).collect();
+    let done = AtomicUsize::new(0);
+    let parts: Vec<Hashed> = std::thread::scope(|scope| {
+        let others: Vec<_> = runs[1..]
+            .iter()
+            .map(|run| {
+                let done = &done;
+                scope.spawn(move || {
+                    hash_frames_fully(run, dims, &|i| {
+                        if i > 0 {
+                            done.fetch_add(1, Ordering::Relaxed);
+                        }
+                    })
+                })
+            })
+            .collect();
+        let first = hash_frames_fully(runs[0], dims, &|i| {
+            if i > 0 {
+                on_frame(done.fetch_add(1, Ordering::Relaxed) + 1);
+            }
+        });
+        std::iter::once(first)
+            .chain(others.into_iter().map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e))))
+            .collect()
+    });
+
+    let mut parts = parts.into_iter();
+    let mut out = parts.next().expect("at least one run");
+    for part in parts {
+        out.hashes.extend(part.hashes);
+        out.mirrored.extend(part.mirrored);
+        out.flat.extend(part.flat);
+        out.detail.extend(part.detail);
+        out.mirrored_detail.extend(part.mirrored_detail);
+        out.picture.extend(part.picture);
+        for (into, from) in out.reframed.iter_mut().zip(part.reframed) {
+            into.extend(from);
+        }
+    }
+    out
+}
+
 /// `on_frame` is told how many frames are hashed so far, as each next one starts.
 pub(crate) fn hash_frames_fully(u_frames: &[u8], dims: (u32, u32), on_frame: &dyn Fn(usize)) -> Hashed {
     let n_unique = u_frames.len() / FRAME_STRIDE;
@@ -2173,7 +2376,11 @@ pub fn fingerprint_video(
         );
     }
 
-    let hashed = hash_frames_fully(&captured.frames, captured.dims, &|done| {
+    // The decoder and the demuxer are done with: let their threads and buffers
+    // go before the hashing, which takes over this video's share of the budget.
+    drop(decoder);
+    drop(keyframes);
+    let hashed = hash_frames_on(&captured.frames, captured.dims, decode_threads.clamp(1, MAX_DECODE_THREADS), &|done| {
         progress(Step::Hashed(done, captured.times.len()))
     });
     assemble(filepath, captured, hashed, duration_sec, clock.restarted(), codec, frame_rate, file_size)
@@ -2272,6 +2479,7 @@ fn assemble(
         mirrored_detail_hashes,
         reframed,
         picture: largest_share(pictures),
+        measured: None,
     }))
 }
 
@@ -2292,6 +2500,58 @@ mod tests {
                 ((r * 3 + c * 5) as u32 % 128 + (x % 96)) as u8
             })
             .collect()
+    }
+
+    /// Splitting the frames across threads is a schedule, not a different
+    /// computation: every hash, flag, share and reframing comes back the same
+    /// and in the same order, whatever the thread count and however unevenly
+    /// the frames divide. Frames with bars are in it so the crop and the
+    /// reframings are exercised, at both a landscape and a portrait shape.
+    /// The video stream's bytes come out of an MP4's index exactly, and the
+    /// cover picture beside the stream is not among them: the two fixtures
+    /// hold one byte-identical H.264 stream, 4,818 bytes by `ffprobe
+    /// -show_packets`. A Matroska file FFmpeg wrote states no figure, and
+    /// says so with 0 rather than a sum over the keyframes its Cues index.
+    #[test]
+    fn test_the_video_stream_is_measured_without_what_sits_beside_it() {
+        let at = |name: &str| format!("{}/tests/fixtures/{}", env!("CARGO_MANIFEST_DIR"), name);
+        assert_eq!(video_stream_bytes(&at("test_video.mp4")), 4818);
+        assert_eq!(video_stream_bytes(&at("test_video_cover_art.mp4")), 4818);
+        assert_eq!(video_stream_bytes(&at("test_video_open_gop.mkv")), 0);
+        assert_eq!(video_stream_bytes(&at("no_such_file.mp4")), 0);
+    }
+
+    #[test]
+    fn test_hashing_on_several_threads_is_bit_identical() {
+        let mut frames = Vec::new();
+        for seed in 1..=23u32 {
+            let mut f = busy_frame(seed);
+            if seed % 3 == 0 {
+                // A letterbox: flat rows top and bottom.
+                for r in (0..SIDE / 8).chain(SIDE - SIDE / 8..SIDE) {
+                    f[r * SIDE..(r + 1) * SIDE].fill(16);
+                }
+            }
+            frames.extend(f);
+        }
+        for dims in [(1920, 1080), (720, 1280)] {
+            let serial = hash_frames_fully(&frames, dims, &|_| {});
+            for threads in [1, 2, 3, 4, 7, 23, 64] {
+                let seen = std::sync::Mutex::new(Vec::new());
+                let h = hash_frames_on(&frames, dims, threads, &|d| seen.lock().unwrap().push(d));
+                assert_eq!(h.hashes, serial.hashes, "{threads} threads");
+                assert_eq!(h.mirrored, serial.mirrored);
+                assert_eq!(h.flat, serial.flat);
+                assert_eq!(h.detail, serial.detail);
+                assert_eq!(h.mirrored_detail, serial.mirrored_detail);
+                assert_eq!(h.picture, serial.picture);
+                assert_eq!(h.reframed, serial.reframed);
+                let seen = seen.into_inner().unwrap();
+                assert!(seen.windows(2).all(|w| w[0] < w[1]), "progress only moves forward: {seen:?}");
+                assert!(seen.iter().all(|&d| d < 23), "and never past the frames there are");
+            }
+        }
+        assert_eq!(hash_frames_on(&[], (0, 0), 8, &|_| {}).hashes, Vec::<u64>::new());
     }
 
     #[test]
@@ -2480,6 +2740,7 @@ mod tests {
             mirrored_detail_hashes: Vec::new(),
             reframed: Vec::new(),
             picture: 0.0,
+            measured: None,
         }
     }
 

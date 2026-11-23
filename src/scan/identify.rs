@@ -336,6 +336,7 @@ mod tests {
             size: meta.len(),
             mtime: meta.mtime(),
             mtime_nsec: meta.mtime_nsec(),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
         }
     }
 

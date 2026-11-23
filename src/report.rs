@@ -828,7 +828,7 @@ pub fn apply(
         let holders: Vec<&(String, u64)> =
             m.groups.iter().filter_map(|g| report.holders.get(g)).flatten().collect();
         holders.is_empty()
-            || holders.iter().any(|(path, size)| export::still_holds(path, *size))
+            || holders.iter().any(|(path, size)| export::still_holds(path, *size, None))
     });
     for m in &unheld {
         export::refuse_unheld(&m.path, stats);
@@ -837,7 +837,7 @@ pub fn apply(
     let targets: Vec<(usize, Target)> = marked
         .iter()
         .enumerate()
-        .map(|(i, m)| (i, Target { path: &m.path, size: m.size }))
+        .map(|(i, m)| (i, Target { path: &m.path, size: m.size, ctime: None }))
         .collect();
     let plain: Vec<Target> = targets.iter().map(|(_, t)| *t).collect();
 

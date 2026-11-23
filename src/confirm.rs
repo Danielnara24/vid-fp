@@ -34,6 +34,9 @@ const MAX_ATTEMPTS: usize = 3;
 pub struct Target<'a> {
     pub path: &'a str,
     pub size: u64,
+    /// Its change time when it was measured, where the measurement recorded
+    /// one: a scan does, a report does not. See `export::changed_since`.
+    pub ctime: Option<(i64, i64)>,
 }
 
 /// What answering `n` gets you, which is not the same in both modes.
@@ -273,6 +276,7 @@ mod tests {
         let targets = [Target {
             path: "/tmp/a.mkv",
             size: 1,
+            ctime: None,
         }];
         assert!(approve(&Disposal::Permanent, &targets, true, Decline::ShowsReport));
     }

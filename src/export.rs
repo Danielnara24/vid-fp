@@ -129,6 +129,8 @@ struct OnDisk {
     /// The file's current length, or `None` when it could not be read. See
     /// `changed_since` for why that is not treated as a change.
     size: Option<u64>,
+    /// Its change time, read from the same stat; `None` with `size`.
+    ctime: Option<(i64, i64)>,
     /// Whether this path is one of several names for the same data, and which
     /// kind -- which is not the same question in every disposal mode. See
     /// `Alias`.
@@ -173,19 +175,22 @@ enum Alias {
 /// exactly the case where removing this one frees nothing.
 fn on_disk(path: &str) -> OnDisk {
     let Ok(md) = std::fs::symlink_metadata(path) else {
-        return OnDisk { size: None, alias: Alias::None };
+        return OnDisk { size: None, ctime: None, alias: Alias::None };
     };
 
     if md.file_type().is_symlink() {
         // A broken link has no size to check and is still an alias: what goes
-        // when it goes is a pointer.
+        // when it goes is a pointer. The change time is the target's, which is
+        // what the walk read through the link.
+        let target = std::fs::metadata(path).ok();
         OnDisk {
-            size: std::fs::metadata(path).ok().map(|m| m.len()),
+            size: target.as_ref().map(|m| m.len()),
+            ctime: target.as_ref().map(|m| (m.ctime(), m.ctime_nsec())),
             alias: Alias::Symlink,
         }
     } else {
         let alias = if md.nlink() > 1 { Alias::HardLink } else { Alias::None };
-        OnDisk { size: Some(md.len()), alias }
+        OnDisk { size: Some(md.len()), ctime: Some((md.ctime(), md.ctime_nsec())), alias }
     }
 }
 
@@ -213,8 +218,8 @@ fn frees_nothing(alias: Alias, disposal: &Disposal) -> bool {
     }
 }
 
-/// Whether the file at `path` is still the length it was when it was measured,
-/// and a description of the discrepancy if not.
+/// Whether the file at `path` is still the file that was measured, and a
+/// description of the discrepancy if not.
 ///
 /// Every DELETE decision rests on measurements taken at the start of the scan,
 /// and a scan of a large library runs for hours -- longer still when the
@@ -224,26 +229,38 @@ fn frees_nothing(alias: Alias, disposal: &Disposal) -> bool {
 /// redundant. A stat immediately before an irreversible syscall is a cheap way
 /// to notice, and `on_disk` has already taken it -- `current` is what it read.
 ///
-/// Size is the only property compared, because it is the only one the
-/// fingerprint records. It catches everything that changes a file's length,
-/// which is essentially every way a video file is rewritten in practice, but it
-/// cannot see an in-place edit that happens to preserve the byte count.
-/// Recording an mtime or an inode alongside the fingerprint would close that
-/// gap at the cost of a field on every cache entry; nothing has needed it yet.
+/// Two properties, the second only where the measurement recorded one. The
+/// length catches essentially every way a video file is rewritten. The change
+/// time catches the rest: a file replaced by another of the same length, which
+/// `cp -p` and `rsync -a` do while putting the old mtime back, and which the
+/// window has always refused (`last::changed_since`) while this, its
+/// command-line counterpart, compared the length alone. A scan records the
+/// walk's ctime (`fingerprint::Measured::ctime`) and compares it exactly, with no
+/// clock involved; a report records none, so a replay is held to the length.
+/// Anything that touches the inode moves a ctime -- a chmod, a new hard link --
+/// and that errs the safe way: the file is left alone and the run says so.
 ///
-/// A length that could not be read is deliberately NOT reported as a change. It
-/// proves nothing about the file's contents, and the removal that follows will fail with the
-/// real reason -- so a file that vanished mid-scan reads as a deletion that
-/// could not happen rather than as a file quietly left alone.
-fn changed_since(path: &str, measured_size: u64, current: Option<u64>) -> Option<String> {
-    let size = current?;
+/// A file that could not be read is deliberately NOT reported as a change. It
+/// proves nothing about the file's contents, and the removal that follows will
+/// fail with the real reason -- so a file that vanished mid-scan reads as a
+/// deletion that could not happen rather than as a file quietly left alone.
+fn changed_since(
+    path: &str,
+    measured: (u64, Option<(i64, i64)>),
+    current: (Option<u64>, Option<(i64, i64)>),
+) -> Option<String> {
+    let (measured_size, measured_ctime) = measured;
+    let size = current.0?;
 
-    (size != measured_size).then(|| {
-        format!(
-            "{}: {} bytes when scanned, {} bytes now",
-            path, measured_size, size
-        )
-    })
+    if size != measured_size {
+        return Some(format!("{}: {} bytes when scanned, {} bytes now", path, measured_size, size));
+    }
+    match (measured_ctime, current.1) {
+        (Some(then), Some(now)) if then != now => {
+            Some(format!("{}: replaced or changed in place since it was scanned (same length)", path))
+        }
+        _ => None,
+    }
 }
 
 /// What became of one file the disposal pass reached.
@@ -266,12 +283,17 @@ enum Fate {
 }
 
 /// Whether a file a DELETE rests on is still at `path` as it was measured:
-/// there, a regular file, and the same length.
+/// there, a regular file, the same length, and -- where the measurement
+/// recorded one -- the same change time (see `changed_since`).
 ///
 /// The window asks the same of a deletion's holders before it trashes it
 /// (`Move::stays`); this is the command line's copy of that check.
-pub fn still_holds(path: &str, measured_size: u64) -> bool {
-    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() == measured_size)
+pub fn still_holds(path: &str, measured_size: u64, measured_ctime: Option<(i64, i64)>) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| {
+        m.is_file()
+            && m.len() == measured_size
+            && measured_ctime.is_none_or(|then| then == (m.ctime(), m.ctime_nsec()))
+    })
 }
 
 /// Log and tally a DELETE left alone because nothing it lost to remains.
@@ -288,17 +310,18 @@ pub fn refuse_unheld(path: &str, stats: &RunStats) {
 /// Take one file off its path, with the staleness check that has to precede it.
 ///
 /// This is the whole of the destructive step, and the only copy of it: the
-/// grouped run reaches it with a size it fingerprinted, `--from-report` with a
-/// size a report recorded, and neither gets a version of the check that the
-/// other does not. `measured_size` is the file's length at the moment the
-/// decision to remove it was made, whenever that was.
+/// grouped run reaches it with a size it fingerprinted and the change time its
+/// walk read, `--from-report` with a size a report recorded and no change time,
+/// and the check is the same function for both. `measured` is the file's length
+/// (and ctime, where known) at the moment the decision to remove it was made,
+/// whenever that was.
 ///
 /// Errors are logged and tallied here rather than returned, because both callers
 /// want the same thing from a failure -- a line in the log, a line in the
 /// summary, a non-zero exit -- and none of them wants the loop to stop.
 fn dispose_one(
     path: &str,
-    measured_size: u64,
+    measured: (u64, Option<(i64, i64)>),
     disposal: &Disposal,
     stats: &RunStats,
 ) -> Fate {
@@ -307,7 +330,7 @@ fn dispose_one(
     // decision being acted on may be hours or days old.
     let disk = on_disk(path);
 
-    if let Some(detail) = changed_since(path, measured_size, disk.size) {
+    if let Some(detail) = changed_since(path, measured, (disk.size, disk.ctime)) {
         log::error!(
             target: crate::stats::COUNTED,
             "Not removing {}: it changed on disk after it was scanned",
@@ -803,7 +826,11 @@ pub fn output_results(
     };
     let targets: Vec<(usize, Target)> = delete
         .iter()
-        .map(|&idx| (idx, Target { path: &fingerprints[idx].path, size: fingerprints[idx].file_size }))
+        .map(|&idx| (idx, Target {
+            path: &fingerprints[idx].path,
+            size: fingerprints[idx].file_size,
+            ctime: fingerprints[idx].ctime(),
+        }))
         .collect();
 
     // Asked here rather than at start-up because only now is there a question
@@ -833,7 +860,7 @@ pub fn output_results(
                     winners.is_empty()
                         || winners.iter().any(|&w| {
                             removed.contains(&w)
-                                || still_holds(&fingerprints[w].path, fingerprints[w].file_size)
+                                || still_holds(&fingerprints[w].path, fingerprints[w].file_size, fingerprints[w].ctime())
                         })
                 })
             },
@@ -1047,7 +1074,7 @@ pub fn dispose_all<K: Copy + Eq + std::hash::Hash>(
             continue;
         }
 
-        let label = match dispose_one(target.path, target.size, disposal, stats) {
+        let label = match dispose_one(target.path, (target.size, target.ctime), disposal, stats) {
             Fate::Done { aliased } => {
                 tally.removed += 1;
                 if aliased {
@@ -1117,6 +1144,7 @@ matched_from_seconds;matched_to_seconds";
             mirrored_detail_hashes: Vec::new(),
             reframed: Vec::new(),
             picture: 0.0,
+            measured: None,
         }
     }
 
@@ -2438,6 +2466,88 @@ matched_from_seconds;matched_to_seconds";
         assert_eq!(deleted, vec![p2]);
         assert!(Path::new(&p1).exists(), "the last copy is kept");
         assert_eq!(stats.delete_unheld.count(), 1);
+    }
+
+    /// The walk's change time, as `scan::fingerprint_all` sets it.
+    fn walked(mut fp: VideoFingerprint) -> VideoFingerprint {
+        let md = fs::metadata(&fp.path).unwrap();
+        fp.measured_mut().ctime = Some((md.ctime(), md.ctime_nsec()));
+        fp
+    }
+
+    /// Put another file of the same length at `path`, as `rsync -a` would: a
+    /// new inode renamed over the old one, the old modification time put back.
+    /// Nothing about its length can tell.
+    fn replace_keeping_length(path: &str) {
+        let len = fs::metadata(path).unwrap().len();
+        let mtime = fs::metadata(path).unwrap().modified().unwrap();
+        // Past the filesystem's timestamp granularity, which can be coarser
+        // than the nanoseconds it reports.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let staged = format!("{path}.staged");
+        fs::write(&staged, vec![0x5a; len as usize]).unwrap();
+        fs::File::options().write(true).open(&staged).unwrap().set_modified(mtime).unwrap();
+        fs::rename(&staged, path).unwrap();
+        assert_eq!(fs::metadata(path).unwrap().len(), len);
+    }
+
+    /// The window refuses a file replaced by one of the same length between
+    /// the scan and the disposal (`last::changed_since`, by ctime), and the
+    /// command line compared lengths alone: the prompt waits as long as it is
+    /// left, and `rsync -a` puts back the length and the mtime. Both the
+    /// target and the file it lost to are held to their walk's ctime now.
+    #[test]
+    fn test_a_file_replaced_by_one_of_the_same_length_is_not_the_file_that_was_judged() {
+        // The target replaced: left alone, CHANGED.
+        let dir = tempfile::tempdir().unwrap();
+        let keep = at(&dir, "keep.mkv");
+        let target = at(&dir, "target.mkv");
+        let fps = vec![mock_fp_at(&keep, 60.0), mock_fp_at(&target, 10.0)];
+        materialize_all(&fps);
+        let fps: Vec<VideoFingerprint> = fps.into_iter().map(walked).collect();
+        replace_keeping_length(&target);
+
+        let stats = RunStats::default();
+        let deleted = output_results(
+            &[vec![0, 1]], &fps, &all_compared(2), None, 0, Priority::Length,
+            Some(&Disposal::Permanent), true, &stats,
+        ).unwrap();
+        assert!(deleted.is_empty());
+        assert!(Path::new(&target).exists(), "a replaced file is not the one that was judged");
+        assert_eq!(stats.delete_stale.count(), 1);
+
+        // The file it lost to replaced: it holds nothing, so the target stays.
+        let dir = tempfile::tempdir().unwrap();
+        let keep = at(&dir, "keep.mkv");
+        let target = at(&dir, "target.mkv");
+        let fps = vec![mock_fp_at(&keep, 60.0), mock_fp_at(&target, 10.0)];
+        materialize_all(&fps);
+        let fps: Vec<VideoFingerprint> = fps.into_iter().map(walked).collect();
+        replace_keeping_length(&keep);
+
+        let stats = RunStats::default();
+        let deleted = output_results(
+            &[vec![0, 1]], &fps, &all_compared(2), None, 0, Priority::Length,
+            Some(&Disposal::Permanent), true, &stats,
+        ).unwrap();
+        assert!(deleted.is_empty());
+        assert!(Path::new(&target).exists(), "what it lost to is not there as measured");
+        assert_eq!(stats.delete_unheld.count(), 1);
+
+        // Untouched since the walk: removed as before.
+        let dir = tempfile::tempdir().unwrap();
+        let keep = at(&dir, "keep.mkv");
+        let target = at(&dir, "target.mkv");
+        let fps = vec![mock_fp_at(&keep, 60.0), mock_fp_at(&target, 10.0)];
+        materialize_all(&fps);
+        let fps: Vec<VideoFingerprint> = fps.into_iter().map(walked).collect();
+        let stats = RunStats::default();
+        let deleted = output_results(
+            &[vec![0, 1]], &fps, &all_compared(2), None, 0, Priority::Length,
+            Some(&Disposal::Permanent), true, &stats,
+        ).unwrap();
+        assert_eq!(deleted, vec![target]);
+        assert!(!stats.had_problems());
     }
 
     #[test]

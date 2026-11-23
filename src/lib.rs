@@ -2010,6 +2010,25 @@ fn run(
         return Ok(Outcome::Interrupted);
     }
 
+    // The video stream's bytes, for the ranking to read in place of the file's
+    // (`fingerprint::Measured::video_bytes`): one header read of each file that
+    // matched something, since only those are ever ranked.
+    {
+        use rayon::prelude::*;
+        let began = Instant::now();
+        let mut ranked: Vec<usize> = matches.iter().flat_map(|m| [m.a, m.b]).collect();
+        ranked.sort_unstable();
+        ranked.dedup();
+        let measured: Vec<(usize, u64)> = ranked
+            .par_iter()
+            .map(|&i| (i, fingerprint::video_stream_bytes(&fingerprints[i].path)))
+            .collect();
+        for (i, bytes) in measured {
+            fingerprints[i].measured_mut().video_bytes = bytes;
+        }
+        log::debug!("Read the video stream size of {} matched file(s) in {:.2?}.", ranked.len(), began.elapsed());
+    }
+
     if answering {
         info!("Answering each scanned file against the library...");
     } else {
@@ -2380,6 +2399,7 @@ mod tests {
             mirrored_detail_hashes: Vec::new(),
             reframed: Vec::new(),
             picture: 0.0,
+            measured: None,
         }
     }
 

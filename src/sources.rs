@@ -101,6 +101,10 @@ pub struct ScannedFile {
     pub size: u64,
     pub mtime: i64,
     pub mtime_nsec: i64,
+    /// The change time, which nothing but the disposal pass reads: a file
+    /// whose ctime has moved since the walk is not the file that was judged,
+    /// whatever its length says (`export::changed_since`).
+    pub ctime: (i64, i64),
 }
 
 impl ScannedFile {
@@ -126,6 +130,7 @@ impl ScannedFile {
             size: meta.len(),
             mtime: meta.mtime(),
             mtime_nsec: meta.mtime_nsec(),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
         })
     }
 }
@@ -1966,6 +1971,7 @@ mod tests {
             size: 5,
             mtime: 1,
             mtime_nsec: 0,
+            ctime: (1, 0),
         };
         let id = (7, 42);
 

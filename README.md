@@ -575,8 +575,13 @@ they *are* comparable with, so they're marked DELETE as usual: five HEVC encodes
 and three H.264 encodes of one episode end up as two files to look at, not
 eight.
 
-Note that bitrate (and so quality) includes audio, so a copy with lossless 5.1
-can outrank one with a better video track and stereo AAC.
+**Quality and size count the video stream where the container states its
+size**: MP4, MOV and AVI indexes, and Matroska files written by mkvmerge. Then
+an extra audio track, subtitles or cover art don't count as picture, and two
+copies of one video stream tie. This applies only when every file of that codec
+in the group states it; otherwise the whole file is counted for all of them, and
+audio counts. The report's quality column follows the same rule per file, while
+its bitrate is always the whole file's.
 
 Every report shows the codec, frame rate, size, bitrate and quality of each
 file.
@@ -785,8 +790,9 @@ still reaches files with no extension.
 - **`-e` protects the file, not the spelling.** An excluded file stays excluded
   when the scan reaches it by another route, such as a symlink.
 - **Nothing is acted on twice, or blind.** Every target is re-checked against
-  its recorded size immediately before it's touched, and a file that changed
-  since the scan is left alone and reported. So is one whose every copy it lost
+  its recorded size, and in a scan its change time, immediately before it's
+  touched, and a file that changed or was replaced since the scan is left alone
+  and reported. So is one whose every copy it lost
   to has gone or changed since, since removing it would remove the last copy.
 - **Mixed codecs are never guessed at.** When the only thing separating two
   copies is which encoder made them, both are flagged REVIEW.

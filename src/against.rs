@@ -163,6 +163,7 @@ mod tests {
             mirrored_detail_hashes: Vec::new(),
             reframed: Vec::new(),
             picture: 0.0,
+            measured: None,
         }
     }
 

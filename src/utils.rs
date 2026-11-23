@@ -318,6 +318,13 @@ pub fn resolution(fp: &VideoFingerprint) -> u64 {
 struct CodecMaxima {
     quality: u64,
     file_size: u64,
+    /// Every file of this codec in the group states its video stream's bytes
+    /// (`VideoFingerprint::video_bytes`), so quality and size are read from
+    /// those rather than from the whole file. All or none, per codec: a stream
+    /// figure held against a whole-file one would be the very bias this
+    /// removes, pointed the other way, and choosing per codec keeps each file's
+    /// score a property of the file, so the ranking stays a total order.
+    by_stream: bool,
 }
 
 /// The best value seen for each metric within one duplicate group. Tolerance
@@ -345,13 +352,18 @@ impl GroupMaxima {
         let mut per_codec: HashMap<String, CodecMaxima> = HashMap::new();
 
         for &idx in group {
+            per_codec.entry(fps[idx].codec.clone()).or_insert(CodecMaxima { by_stream: true, ..Default::default() }).by_stream &=
+                fps[idx].video_bytes() > 0;
+        }
+        for &idx in group {
             let fp = &fps[idx];
             duration = duration.max(fp.duration);
             resolution_max = resolution_max.max(resolution(fp));
 
-            let entry = per_codec.entry(fp.codec.clone()).or_default();
-            entry.quality = entry.quality.max(fp.quality());
-            entry.file_size = entry.file_size.max(fp.file_size);
+            let entry = per_codec.get_mut(&fp.codec).expect("every codec was entered above");
+            let bytes = if entry.by_stream { fp.video_bytes() } else { fp.file_size };
+            entry.quality = entry.quality.max(fp.quality_from(bytes));
+            entry.file_size = entry.file_size.max(bytes);
         }
 
         GroupMaxima {
@@ -363,6 +375,16 @@ impl GroupMaxima {
 
     fn codec_maxima(&self, fp: &VideoFingerprint) -> CodecMaxima {
         self.per_codec.get(&fp.codec).copied().unwrap_or_default()
+    }
+
+    /// The bytes `fp`'s quality and size are ranked on: its video stream's
+    /// where its whole codec in this group states them, else the file's.
+    fn ranked_bytes(&self, fp: &VideoFingerprint) -> u64 {
+        if self.codec_maxima(fp).by_stream {
+            fp.video_bytes()
+        } else {
+            fp.file_size
+        }
     }
 
     /// The best value `metric` can be measured against for `fp`, in the units
@@ -432,9 +454,9 @@ impl GroupMaxima {
                 if fp.frame_rate <= 0.0 || fp.duration <= 0.0 {
                     return 1;
                 }
-                within(fp.quality(), self.codec_maxima(fp).quality, QUALITY_TOLERANCE)
+                within(fp.quality_from(self.ranked_bytes(fp)), self.codec_maxima(fp).quality, QUALITY_TOLERANCE)
             }
-            Priority::Size => within(fp.file_size, self.codec_maxima(fp).file_size, SIZE_TOLERANCE),
+            Priority::Size => within(self.ranked_bytes(fp), self.codec_maxima(fp).file_size, SIZE_TOLERANCE),
         }
     }
 
@@ -444,8 +466,8 @@ impl GroupMaxima {
         match metric {
             Priority::Length => (fp.duration * 1000.0) as u64,
             Priority::Resolution => resolution(fp),
-            Priority::Quality => fp.quality(),
-            Priority::Size => fp.file_size,
+            Priority::Quality => fp.quality_from(self.ranked_bytes(fp)),
+            Priority::Size => self.ranked_bytes(fp),
         }
     }
 
@@ -639,6 +661,7 @@ pub fn outranks_on_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fingerprint::Measured;
 
     /// The full mock. Most tests only vary one thing, so `fp` below fixes the
     /// codec and frame rate and this exists for the ones that don't.
@@ -668,6 +691,7 @@ mod tests {
             mirrored_detail_hashes: Vec::new(),
             reframed: Vec::new(),
             picture: 0.0,
+            measured: None,
         }
     }
 
@@ -842,6 +866,49 @@ mod tests {
     /// container reported and a frame rate none did -- because those are the
     /// only inputs that can break it, and it keeps the groups small and their
     /// values coarse so files really do tie and the later metrics are reached.
+    /// A cover picture, a second audio track or subtitles are not picture:
+    /// two files holding the same video stream tie on quality and size however
+    /// much else one of them carries, so the ranking falls through to the path.
+    /// But only where every file of that codec in the group states its stream's
+    /// bytes -- one that does not puts the codec back on whole files, because a
+    /// stream figure held against a whole-file one would be the same bias
+    /// pointed the other way.
+    #[test]
+    fn test_quality_and_size_are_read_from_the_video_stream_when_every_file_of_the_codec_states_it() {
+        let with = |path: &str, size: u64, video: u64, codec: &str| VideoFingerprint {
+            measured: Some(Box::new(Measured { video_bytes: video, ctime: None })),
+            ..fp_full(path, 60.0, 1920, 1080, size, codec, 25.0)
+        };
+        let order = ordered_metrics(Priority::Length);
+
+        // The same 50 MB stream; b also carries 10 MB of audio and art.
+        let fps = vec![with("/v/b.mkv", 60_000_000, 50_000_000, "h264"), with("/v/a.mkv", 50_000_000, 50_000_000, "h264")];
+        let maxima = GroupMaxima::of(&[0, 1], &fps);
+        assert_eq!(maxima.rank_on_metrics(&fps[0], &fps[1], order), Ordering::Equal, "the same picture");
+        assert_eq!(maxima.rank(&fps[1], &fps[0], order), Ordering::Greater, "so the path decides");
+
+        // One of them cannot say: both are read whole again, and the extra
+        // streams count as they always did.
+        let fps = vec![with("/v/b.mkv", 60_000_000, 50_000_000, "h264"), with("/v/a.mkv", 50_000_000, 0, "h264")];
+        let maxima = GroupMaxima::of(&[0, 1], &fps);
+        assert_eq!(maxima.rank(&fps[0], &fps[1], order), Ordering::Greater);
+
+        // Per codec: an HEVC file that cannot say does not move the H.264 pair
+        // off their streams.
+        let fps = vec![
+            with("/v/b.mkv", 60_000_000, 50_000_000, "h264"),
+            with("/v/a.mkv", 50_000_000, 50_000_000, "h264"),
+            with("/v/c.mkv", 30_000_000, 0, "hevc"),
+        ];
+        let maxima = GroupMaxima::of(&[0, 1, 2], &fps);
+        assert_eq!(maxima.rank_on_metrics(&fps[0], &fps[1], order), Ordering::Equal);
+
+        // And a better stream still wins on it.
+        let fps = vec![with("/v/b.mkv", 60_000_000, 40_000_000, "h264"), with("/v/a.mkv", 55_000_000, 50_000_000, "h264")];
+        let maxima = GroupMaxima::of(&[0, 1], &fps);
+        assert_eq!(maxima.rank(&fps[1], &fps[0], order), Ordering::Greater, "a's picture has 25% more bits");
+    }
+
     #[test]
     fn test_the_ranking_is_a_total_order() {
         let mut state = 0x9E3779B97F4A7C15u64;
@@ -860,15 +927,22 @@ mod tests {
                     let dur = [0.0, 10.0, 10.4, 11.0, 600.0][(next() % 5) as usize];
                     let rate = [0.0, 25.0, 30.0][(next() % 3) as usize];
                     let side = [320u32, 640, 1920][(next() % 3) as usize];
-                    fp_full(
-                        &format!("/r{}/f{}.mkv", round, i),
-                        dur,
-                        side,
-                        side * 3 / 4,
-                        1 + next() % 100_000,
-                        codecs[(next() % 3) as usize],
-                        rate,
-                    )
+                    let size = 1 + next() % 100_000;
+                    // Some state their video stream's bytes and some do not,
+                    // so a codec's basis flips between groups.
+                    let video_bytes = if next() % 2 == 0 { 0 } else { 1 + next() % size };
+                    VideoFingerprint {
+                        measured: Some(Box::new(Measured { video_bytes, ctime: None })),
+                        ..fp_full(
+                            &format!("/r{}/f{}.mkv", round, i),
+                            dur,
+                            side,
+                            side * 3 / 4,
+                            size,
+                            codecs[(next() % 3) as usize],
+                            rate,
+                        )
+                    }
                 })
                 .collect();
 

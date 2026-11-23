@@ -289,7 +289,14 @@ pub(crate) fn fingerprint_all(
     let newly_cached = decode::decode_pass(db, identified.todo, sampling, settings.threads, &mut ledger);
     ledger.remember(db);
 
-    let fingerprints = ledger.into_fingerprints();
+    let mut fingerprints = ledger.into_fingerprints();
+    // The walk's change time, for the disposal pass to hold each file to: a
+    // cached fingerprint was made by another run and knows nothing of this one.
+    for fp in &mut fingerprints {
+        if let Some(file) = by_path.get(fp.path.as_str()) {
+            fp.measured_mut().ctime = Some(file.ctime);
+        }
+    }
     if shutdown_requested() {
         info!(
             "Cached {} video(s); {} of {} are now cached in total.",
