@@ -180,10 +180,9 @@ struct Args {
 
     /// Exclude a folder or a single file; repeat for several
     ///
-    /// Matched one whole path component at a time, so -e ~/keep covers
-    /// everything under it while -e ~/clips/take does NOT cover
-    /// ~/clips/take.mkv. Applies to piped and named paths too, and resolves
-    /// through symlinks, so excluding either a link or its target covers both.
+    /// Matched by whole path components, so -e ~/clips/take does not cover
+    /// ~/clips/take.mkv. Resolved through symlinks, so excluding a link or its
+    /// target covers both.
     #[arg(short = 'e', long = "exclude", value_name = "PATH",
           value_hint = clap::ValueHint::AnyPath)]
     exclude: Vec<String>,
@@ -211,10 +210,8 @@ struct Args {
 
     /// Follow symbolic links while scanning
     ///
-    /// Files are deduplicated by (device, inode), so the same bytes are never
-    /// fingerprinted twice however many links reach them. Deleting or moving a
-    /// file found through a link acts on the file the link leads to, not on the
-    /// link; protect a folder with --exclude, which follows links too.
+    /// Deleting or moving a file found through a link acts on the file the
+    /// link leads to, not on the link.
     #[arg(long = "follow-symlinks")]
     follow_symlinks: bool,
 
@@ -238,13 +235,9 @@ struct Args {
     /// Frame-match tolerance, in bits out of 64; higher is looser
     ///
     /// Two unrelated frames sit about 32 bits apart, so the useful range is
-    /// roughly 2 to 8. Each frame carries a second, finer hash, and two frames
-    /// are compared on both together: -d sets how far below chance that
-    /// combined distance must be, the same distance below chance as -d bits are
-    /// on one hash. A lone frame match must be within it; one that another
-    /// match agrees with about the time offset may reach 1.5 standard
-    /// deviations further, and further still needs more agreeing matches.
-    /// Values above 32 are refused.
+    /// roughly 2 to 8. Higher finds more duplicates and, past about 8, more
+    /// false ones. A frame match that others agree with on the time offset may
+    /// sit a little further than this. Values above 32 are refused.
     #[arg(short = 'd', long = "hamming-distance", value_name = "N", default_value_t = 6)]
     hamming_distance: u32,
 
@@ -276,11 +269,9 @@ struct Args {
     /// Minimum keyframes to keep for short videos
     ///
     /// Only used when --keyframe-interval is above 0; 0 removes the floor.
-    /// Higher finds more matches and costs decode time, mostly on libraries of
-    /// short videos. It is not strictly monotonic: denser sampling makes each
-    /// hash stand for a shorter span, so frames that match nothing can dilute a
-    /// pair's coverage under --match-percent. Negative and non-finite values
-    /// are refused.
+    /// Higher usually finds more and costs decode time, but extra samples that
+    /// match nothing can push a pair under --match-percent. Negative and
+    /// non-finite values are refused.
     #[arg(long = "min-keyframes", value_name = "F", default_value_t = 64.0)]
     min_kf_samples: f64,
 
@@ -291,11 +282,9 @@ struct Args {
     /// Write the report here; `-` writes it to stdout
     ///
     /// The format follows the extension (.txt, .csv, .json; anything else is
-    /// written as text) unless --format overrides it. On stdout the report
-    /// replaces the terminal listing rather than repeating it, and progress,
-    /// warnings and prompts stay on stderr. A file actually named - is
-    /// reachable as ./-. A file the scan reads, or an existing file named like
-    /// a video, is refused rather than written over.
+    /// text) unless --format says otherwise. On stdout the report replaces the
+    /// terminal listing; progress and prompts stay on stderr. A file the scan
+    /// reads, or an existing file named like a video, is refused.
     #[arg(short = 'o', long = "output", value_name = "FILE",
           value_hint = clap::ValueHint::FilePath)]
     output: Option<String>,
@@ -333,14 +322,10 @@ struct Args {
 
     /// Act on a CSV or JSON report from an earlier run instead of scanning
     ///
-    /// Every row whose action reads DELETE is disposed of and nothing else is
-    /// touched, so editing that field is how you act on REVIEW rows or spare a
-    /// file. Nothing is re-fingerprinted and no groups are recomputed: the
-    /// report is the decision. Each file is re-checked against the size the
-    /// report recorded and left alone if it changed. The format is read from
-    /// the file, not its name; a .txt report cannot be replayed because it
-    /// records no size. Requires --delete or --move-to, and cannot be combined
-    /// with scanning or matching options.
+    /// Every row whose action reads DELETE is acted on and nothing else, so
+    /// edit that column to decide REVIEW rows or spare a file. A file whose
+    /// size no longer matches the report is left alone. A .txt report cannot
+    /// be replayed, since it records no size. Requires --delete or --move-to.
     #[arg(
         long = "from-report",
         value_name = "FILE",
@@ -356,23 +341,17 @@ struct Args {
 
     /// Answer each scanned file against this library instead of grouping them
     ///
-    /// Repeat for several. The library is scanned with the same options and
-    /// cached the same way, but never compared with itself and never touched:
-    /// each scanned file is a repeat (the library holds it at least as well:
-    /// marked DELETE, so --delete and --move-to act on repeats only), better
-    /// (it outranks every library file it matched), review, or new. A file
-    /// reached from both sides belongs to the side whose folder holds it more
-    /// closely, the scan's on a tie.
+    /// Repeat for several. The library is never compared with itself and never
+    /// touched. Each scanned file is a repeat (marked DELETE, so --delete and
+    /// --move-to act on repeats only), better, review or new.
     #[arg(long = "against", value_name = "LIBRARY",
           value_hint = clap::ValueHint::AnyPath)]
     against: Vec<String>,
 
     /// With --against, print the paths given these answers to stdout
     ///
-    /// Comma-separated or repeated: repeat, better, review, new. One path a
-    /// line, or NUL-separated with -0; without -0 a path holding a newline
-    /// stops the run, since it would read as two. Nothing else is printed to
-    /// stdout, so the list can be piped straight on.
+    /// Comma-separated or repeated. One path a line, or NUL-separated with -0.
+    /// Nothing else is printed to stdout, so the list can be piped on.
     #[arg(long = "list", value_name = "ANSWER", value_enum, value_delimiter = ',',
           requires = "against")]
     list: Vec<against::Answer>,
@@ -387,10 +366,8 @@ struct Args {
     /// Use this cache file instead of the default one
     ///
     /// The default is under $XDG_CACHE_HOME/vid-fp (or ~/.cache/vid-fp). A run
-    /// locks its cache for the whole scan, so scanning libraries in parallel
-    /// needs a cache each. An existing directory, or a path with a trailing
-    /// slash, gets the default filename inside it; missing parents are created.
-    /// --clear-cache and --prune-cache act on whichever cache this names.
+    /// locks its cache for the whole scan, so parallel scans need a cache each.
+    /// A directory gets the default filename inside it.
     #[arg(long = "cache", value_name = "PATH",
           value_hint = clap::ValueHint::FilePath)]
     cache: Option<String>,
@@ -404,25 +381,18 @@ struct Args {
 
     /// Write every log line to this file, including the ones the terminal hides
     ///
-    /// A failure the end-of-run summary accounts for is not also printed while
-    /// the run works, so this is where the unabridged list goes when you want
-    /// to grep it. --quiet narrows the terminal and not this file, so the two
-    /// together give a silent run and a full account on disk. Truncated at the
-    /// start of each run; a file the scan reads, or an existing file named like
-    /// a video, is refused.
+    /// The terminal summary shows up to 10 failures of each kind; this file
+    /// has them all. Not affected by --quiet. Truncated at the start of each
+    /// run.
     #[arg(long = "log-file", value_name = "PATH",
           value_hint = clap::ValueHint::FilePath)]
     log_file: Option<String>,
 
     /// Drop the cached fingerprint of every file this scan did not find
     ///
-    /// Keeps a cache from growing with libraries that have moved on. Skipped,
-    /// loudly, when the scan was not complete enough to measure against: a path
-    /// that would not resolve, a folder that could not be read, or a scan that
-    /// found no videos. Pruning against a partial scan would throw away good
-    /// fingerprints, so the run keeps them and exits 2. A file moved since the
-    /// last run is recognised by its content before anything is dropped, so it
-    /// keeps its fingerprint.
+    /// Skipped, with exit code 2, when the scan was incomplete (a path that
+    /// would not resolve, an unreadable folder, no videos found), since that
+    /// would drop good fingerprints. A moved file keeps its fingerprint.
     #[arg(long = "prune-cache")]
     prune_cache: bool,
 
@@ -432,12 +402,9 @@ struct Args {
 
     /// Maximum number of threads to use (0 = all CPU cores)
     ///
-    /// All cores is fastest for videos on a local disk: raising it further does
-    /// not measurably speed a scan up, and every concurrent decode holds a
-    /// full-resolution frame buffer, so peak memory grows in step with this
-    /// number. More workers than cores is worth trying when the videos are on a
-    /// network mount or a slow disk. Anything above four per core, or 16 if
-    /// that is larger, is capped at that with a note saying so.
+    /// More than the core count does not speed up a local scan and raises peak
+    /// memory; it can help on a network mount or a slow disk. Capped at four
+    /// per core, or 16 if that is larger.
     #[arg(short = 't', long = "threads", value_name = "N", default_value_t = 0)]
     threads: usize,
 

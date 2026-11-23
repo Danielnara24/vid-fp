@@ -30,9 +30,9 @@ pub enum Answer {
     /// It matched the library, and ranks above every library file it matched:
     /// the library's copy is the one worth replacing.
     Better,
-    /// It matched, and the ranking will not settle it -- a different codec at
-    /// the same length and resolution, a runtime nothing could measure -- the
-    /// same cases a scan holds for REVIEW.
+    /// It matched, but the ranking cannot settle it (a different codec at the
+    /// same length and resolution, or an unknown runtime), as a scan would
+    /// hold it for REVIEW.
     Review,
     /// Nothing in the library matched it.
     New,

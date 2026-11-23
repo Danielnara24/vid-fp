@@ -144,8 +144,15 @@ pub struct Comparison {
     pub matched_frames: usize,
     pub stretches: Vec<(u32, u32)>,
     pub other_stretches: Vec<(u32, u32)>,
-    /// The tolerance it was measured at, `-d`: a distance is read against it.
+    /// The tolerance it was measured at, `-d`.
     pub tolerance: u32,
+    /// What a distance in `pairs` is read against: how many bits it is out of,
+    /// and what a lone frame match could reach (`compare::Evidence`). 0 in a
+    /// result an older build saved.
+    #[serde(default)]
+    pub bits: u32,
+    #[serde(default)]
+    pub strict: u32,
 }
 
 impl Comparison {
@@ -157,7 +164,16 @@ impl Comparison {
             // First and last kept, the rest evenly between.
             (0..MOST_PAIRS).map(|k| evidence.pairs[k * (n - 1) / (MOST_PAIRS - 1)]).collect()
         };
-        Comparison { with, pairs, matched_frames: n, stretches: evidence.stretches_a, other_stretches: evidence.stretches_b, tolerance }
+        Comparison {
+            with,
+            pairs,
+            matched_frames: n,
+            stretches: evidence.stretches_a,
+            other_stretches: evidence.stretches_b,
+            tolerance,
+            bits: evidence.bits,
+            strict: evidence.strict,
+        }
     }
 }
 

@@ -298,6 +298,25 @@ impl Chart {
     }
 }
 
+/// The footer's sentence on what a pair's "bits apart" is out of. Over both
+/// hashes a distance is out of 128, so it is stated against that width and the
+/// limit the scan held a lone match to, not against `-d`, which is in 64ths:
+/// "18 bits apart" beside "the tolerance was 6" read as a broken rule.
+fn distances(c: &Comparison) -> String {
+    if c.bits == 0 {
+        // Saved by an older build, which recorded only `-d`.
+        return format!(" Each pair says how far apart the two frames' fingerprints were: 0 is identical. Scanned at tolerance {}.", c.tolerance);
+    }
+    format!(
+        " Each pair says how many of the two frames' {} fingerprint bits differ: 0 is identical and unrelated frames differ in about {}. \
+         At tolerance {} a pair on its own could differ in up to {}, and more when other pairs agree with it.",
+        c.bits,
+        c.bits / 2,
+        c.tolerance,
+        c.strict
+    )
+}
+
 fn distance_to_segment(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
     let (dx, dy) = (b.0 - a.0, b.1 - a.1);
     let len2 = dx * dx + dy * dy;
@@ -631,10 +650,7 @@ impl Matched {
             text.push_str(&format!("{shown} of the pairs are shown, spread evenly. "));
         }
         text.push_str(&placement(aligned, shown));
-        text.push_str(&format!(
-            " Each pair says how far apart the two frames' 64-bit fingerprints were: 0 is identical, and the scan's tolerance was {}.",
-            c.tolerance
-        ));
+        text.push_str(&distances(c));
         self.summary.set_text(&text);
         self.note.set_text("Click a pair, or a tick or line on the chart, to find it in both. Double click a pair to see it full size.");
 

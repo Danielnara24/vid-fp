@@ -2330,6 +2330,12 @@ pub struct Evidence {
     /// order, touching samples merged.
     pub stretches_a: Vec<(u32, u32)>,
     pub stretches_b: Vec<(u32, u32)>,
+    /// How many bits a distance in `pairs` is out of: 128 when the pair was
+    /// read on the main and detail hashes together, 64 on the main alone.
+    pub bits: u32,
+    /// The distance a lone frame match could be admitted at, in those bits
+    /// (`Tolerance::strict`); a corroborated one may sit further.
+    pub strict: u32,
 }
 
 /// `Evidence` for `fp_a` against `fp_b` at `-d max_hamming_dist`, measured
@@ -2387,6 +2393,7 @@ fn evidence_among(
         pairs: e.pairs.iter().map(|&(tb, ta, d)| (ta, tb, d)).collect(),
         stretches_a: e.stretches_b,
         stretches_b: e.stretches_a,
+        ..e
     };
     let mut chosen: Option<Evidence> = None;
     for o in orientations {
@@ -2445,7 +2452,13 @@ fn evidence_as(fp_a: &VideoFingerprint, fp_b: &VideoFingerprint, max_hamming_dis
         .enumerate()
         .filter_map(|(i, b)| b.map(|(j, d)| (fp_a.valid_t_start[i], fp_b.valid_t_start[j as usize], d)))
         .collect();
-    Evidence { pairs, stretches_a: stretches(&matched_a, fp_a), stretches_b: stretches(&matched_b, fp_b) }
+    Evidence {
+        pairs,
+        stretches_a: stretches(&matched_a, fp_a),
+        stretches_b: stretches(&matched_b, fp_b),
+        bits: if rule.tol.cap.is_some() { WIDE_BITS } else { HASH_BITS },
+        strict: rule.tol.strict,
+    }
 }
 
 /// The flagged samples of `fp` as stretches of footage: each sample stands for
