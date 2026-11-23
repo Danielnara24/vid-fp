@@ -93,7 +93,7 @@ jobs:
         # test_video_rescaled.ts, 27.00 s on x86_64) and about one link in
         # eight on a real library, at the same accuracy. That is why the two
         # keep separate cache tables (lib.rs, CACHE_TABLE). x86_64's sum,
-        # 14950cfd8dce525c, is checked in release.yml. Refresh both when the
+        # 6e4bffd36885bb30, is checked in release.yml. Refresh both when the
         # fixtures or the report layout change.
         #
         # Exit 2 is expected: one fixture is featureless on purpose and cannot
@@ -104,8 +104,8 @@ jobs:
             --cache "$RUNNER_TEMP/fx.redb" -o "$RUNNER_TEMP/fx.csv" || rc=$?
           if [ "$rc" -gt 2 ]; then echo "::error::vid-fp exited $rc"; exit 1; fi
           GOT="$(sed "s|$PWD/||g" "$RUNNER_TEMP/fx.csv" | sha256sum | cut -c1-16)"
-          if [ "$GOT" != "3f3eeddbcc95640a" ]; then
-            echo "::error::the fixtures' report is $GOT, not the reviewed aarch64 3f3eeddbcc95640a"
+          if [ "$GOT" != "5bf5c2c76aa350b4" ]; then
+            echo "::error::the fixtures' report is $GOT, not the reviewed aarch64 5bf5c2c76aa350b4"
             cat "$RUNNER_TEMP/fx.csv"
             exit 1
           fi
