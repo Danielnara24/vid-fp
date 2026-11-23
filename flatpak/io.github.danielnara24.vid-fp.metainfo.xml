@@ -90,6 +90,11 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.47.0" date="2026-11-23">
+      <description>
+        <p>New: Use a cache can be turned off, hidden folders are left out unless Include hidden folders is on, and a name or path pattern can be typed into the excluded list, such as *.part. A report names the file each deletion lost to, and acting on a report checks that file is still there.</p>
+      </description>
+    </release>
     <release version="0.46.2" date="2026-11-23">
       <description>
         <p>The Compare window states how far apart two frames are out of the bits they were compared on, so its figures read against the tolerance correctly. No change to results.</p>
