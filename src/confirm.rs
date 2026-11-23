@@ -30,6 +30,7 @@ const PREVIEW_LIMIT: usize = 10;
 const MAX_ATTEMPTS: usize = 3;
 
 /// A file about to be disposed of: what to call it, and what it weighs.
+#[derive(Clone, Copy)]
 pub struct Target<'a> {
     pub path: &'a str,
     pub size: u64,

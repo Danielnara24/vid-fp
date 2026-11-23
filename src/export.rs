@@ -1,16 +1,16 @@
+mod render;
+mod stream;
+
 use anyhow::{anyhow, Context, Result};
 use log::info;
 use crate::compare::MatchIndex;
 use crate::confirm::{self, Target};
 use crate::fingerprint::VideoFingerprint;
 use crate::stats::RunStats;
-use crate::utils::{
-    find_best, format_bitrate, format_codec, format_duration, format_frame_rate, format_quality,
-    format_shared, format_size, measurable, outranks, shutdown_requested, GroupMaxima, Priority,
-};
+use crate::utils::{find_best, format_size, measurable, outranks, shutdown_requested, GroupMaxima, Priority};
+use render::{console_for, open_report, Body, Entry, Listing, Summary};
 use std::collections::{HashMap, HashSet};
 use std::fs::{FileTimes, OpenOptions};
-use std::io::{BufWriter, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -55,521 +55,6 @@ pub enum Sink {
 pub struct ReportTarget {
     pub sink: Sink,
     pub format: Format,
-}
-
-/// A report being written next to the one it is about to replace.
-///
-/// Removed on the way out unless `keep` has been called, so a run that fails
-/// or unwinds between the create and the rename leaves the old report standing
-/// and no litter beside it. A run KILLED outright runs no destructor and does
-/// leave the scratch copy behind -- but the report it was replacing is still
-/// whole, which is the half that matters, and the name it is under is not one
-/// anything reads.
-struct Scratch {
-    path: Option<PathBuf>,
-}
-
-impl Scratch {
-    /// Open a scratch copy beside `dest`, ready to be written and renamed over
-    /// it.
-    ///
-    /// `None` is the cue to write `dest` in place instead, and there are two
-    /// ways to get one. A destination that is not a regular file must not be
-    /// replaced by a rename at all (see `replaceable_by_rename`), and a folder
-    /// that will not take a new file cannot hold a scratch copy -- which is a
-    /// case rather than an error, because `ensure_writable` deliberately allows
-    /// a read-only FOLDER holding a writable report. Writing in place is no
-    /// worse than what was there before either fix.
-    fn beside(dest: &Path) -> Option<(std::fs::File, Self)> {
-        let scratch_path = match scratch_beside(dest) {
-            Some(scratch) if replaceable_by_rename(dest) => scratch,
-            _ => return None,
-        };
-
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&scratch_path)
-            .ok()?;
-
-        Some((file, Scratch { path: Some(scratch_path) }))
-    }
-
-    /// The rename succeeded: there is nothing at this name any more.
-    fn keep(&mut self) {
-        self.path = None;
-    }
-
-    /// Put the finished copy in the report's place.
-    ///
-    /// The caller flushes and fsyncs before calling this, and it has to be that
-    /// way round: a rename that beats its own data to disk is how a crash
-    /// leaves an empty file where a whole report used to be.
-    fn commit(mut self, dest: &Path) -> std::io::Result<()> {
-        let Some(scratch_path) = self.path.clone() else {
-            return Ok(());
-        };
-
-        // A rename carries the scratch file's permissions, so a report the user
-        // had narrowed would quietly widen back to the default. Best effort --
-        // the report is worth more than its mode.
-        if let Ok(meta) = std::fs::metadata(dest) {
-            let _ = std::fs::set_permissions(&scratch_path, meta.permissions());
-        }
-
-        std::fs::rename(&scratch_path, dest)?;
-        self.keep();
-
-        // The rename is atomic to any reader either way; this is only about it
-        // surviving a power cut, and there is nothing useful to say if it fails.
-        if let Some(parent) = dest.parent() {
-            let parent = if parent.as_os_str().is_empty() { Path::new(".") } else { parent };
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
-        }
-
-        Ok(())
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        if let Some(path) = &self.path {
-            // Best effort, like `Conjured`: a run already on its way out with an
-            // error to report has nothing to add about a file it could not tidy.
-            let _ = std::fs::remove_file(path);
-        }
-    }
-}
-
-/// Where the scratch copy goes: beside the report, so the rename is within one
-/// filesystem, and named so it cannot collide with a report anybody asked for.
-///
-/// The pid is in it because nothing stops two runs writing the same `--output`
-/// (the cache lock is per cache, and `--from-report` takes no cache at all),
-/// and two runs sharing one scratch file would hand one of them the other's
-/// bytes.
-fn scratch_beside(path: &Path) -> Option<PathBuf> {
-    let name = path.file_name()?;
-    let mut scratch = std::ffi::OsString::from(".");
-    scratch.push(name);
-    scratch.push(format!(".vid-fp-{}.tmp", std::process::id()));
-    Some(path.with_file_name(scratch))
-}
-
-/// Whether this destination can be replaced by a rename at all.
-///
-/// Only a regular file, or a name with nothing at it yet. Everything else is
-/// written through in place, because for those the NAME is not what the user
-/// asked to be filled:
-///
-/// * A FIFO is a reader waiting at the other end -- `mkfifo p; vid-fp lib -o p
-///   & cat p` is a documented shape, and `ensure_writable` deliberately accepts
-///   it unexamined. A rename would replace the pipe with a regular file and
-///   leave that reader waiting for ever.
-/// * A symlink is a report kept somewhere else under a local name. `fs::write`
-///   follows it; a rename would break it and put the report where the link is
-///   instead of where it points.
-/// * A device (`-o /dev/stdout` by another spelling) is not this run's to
-///   replace either.
-///
-/// `symlink_metadata`, so the link itself is what is examined rather than
-/// whatever it leads to.
-fn replaceable_by_rename(path: &Path) -> bool {
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) => meta.file_type().is_file(),
-        // Nothing there: the ordinary case, and the one the rename is for.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-        // Anything else (a folder in the way, a permission problem on the
-        // parent) is the real write's to report, in its own words.
-        Err(_) => false,
-    }
-}
-
-/// Write the report so that the file at `path` is either the old report or the
-/// new one, never half of either.
-///
-/// `fs::write` truncates in place, and the report is the LAST thing
-/// `output_results` does -- after the disposal pass. So a run killed mid-write
-/// destroyed the previous report and left a truncated one in its place, and
-/// that is exactly the file the documented `--from-report` workflow hands back:
-/// a plan for a library that has already been acted on, minus however many rows
-/// did not make it to disk. It degrades safely rather than dangerously (a
-/// half-written row loses `size_bytes` and the replay refuses it), but "the
-/// last rows are missing" is a plan that silently keeps files it condemned.
-///
-/// Two things are given up to close it, and both are given up only where they
-/// are actually needed. A rename cannot create a file in a folder that refuses
-/// one, and `ensure_writable` deliberately allows a read-only FOLDER holding a
-/// writable report -- so a scratch file that cannot be created falls back to
-/// the write it replaced, which is no worse than what was there before. And a
-/// destination that is not a regular file is written through rather than
-/// replaced (see `replaceable_by_rename`).
-///
-/// A failure AFTER the scratch file exists is returned rather than fallen back
-/// on: whatever stopped the copy (a full disk, most likely) would stop the
-/// in-place write too, having truncated the old report first.
-fn write_file_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let Some((mut file, scratch)) = Scratch::beside(path) else {
-        // Nothing can be written beside the report. The old report is still the
-        // one thing this can be written over.
-        return std::fs::write(path, bytes);
-    };
-
-    file.write_all(bytes)?;
-    // Before the rename, not after. See `Scratch::commit`.
-    file.sync_all()?;
-    drop(file);
-
-    scratch.commit(path)
-}
-
-/// Hand the finished report to its destination.
-///
-/// The one thing here that is not a plain write is what happens when the reader
-/// of a pipe goes away first: `vid-fp DIR -o - | head` closes stdout under us,
-/// and that is a normal end to a pipeline rather than a run that did less than
-/// it was asked. Every other write failure is still a problem the caller
-/// records. (Rust ignores SIGPIPE, so this arrives as an ordinary error rather
-/// than killing the process.)
-fn write_report(target: &ReportTarget, bytes: &[u8]) -> Result<()> {
-    match &target.sink {
-        Sink::File(path) => write_file_atomically(path, bytes)
-            .with_context(|| format!("Failed to write the report to {}", path.display())),
-        Sink::Stdout => {
-            let mut out = std::io::stdout().lock();
-            match out.write_all(bytes).and_then(|()| out.flush()) {
-                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
-                other => other.context("Failed to write the report to stdout"),
-            }
-        }
-    }
-}
-
-/// The indent `serde_json::to_string_pretty` uses, and therefore the one a
-/// document assembled a piece at a time has to match.
-const JSON_INDENT: &str = "  ";
-
-/// Render one value at the depth it sits at in the finished document.
-///
-/// `to_string_pretty` always starts a value at column zero, so a piece written
-/// into the middle of a document has to be pushed out by the nesting it is
-/// being written into: `depth` is the value's OWN depth, and `indent_first`
-/// says whether it begins on a fresh line (a group inside the results array) or
-/// after a key that has already been written (the summary).
-///
-/// Splitting on '\n' is safe for exactly this input: pretty JSON never emits a
-/// blank line, and a string value carries its own newlines escaped.
-fn write_nested(
-    out: &mut dyn Write,
-    value: &serde_json::Value,
-    depth: usize,
-    indent_first: bool,
-) -> std::io::Result<()> {
-    let pad = JSON_INDENT.repeat(depth);
-    // Infallible, and was where the whole document was rendered before this.
-    // A `Value` cannot hold either of the two things that fail: `json!` takes
-    // string keys only, and `Value::from(f64)` has already turned an infinity
-    // or a NaN into `Null` rather than storing one.
-    let rendered = serde_json::to_string_pretty(value).expect("a report value serializes");
-
-    for (n, line) in rendered.split('\n').enumerate() {
-        if n > 0 {
-            out.write_all(b"\n")?;
-        }
-        if n > 0 || indent_first {
-            out.write_all(pad.as_bytes())?;
-        }
-        out.write_all(line.as_bytes())?;
-    }
-    Ok(())
-}
-
-/// Where a report is being written as it is produced.
-enum ReportOut {
-    /// Into a scratch copy beside the report, renamed over it at the end. The
-    /// same replacement `write_file_atomically` performs, held open across the
-    /// reporting pass rather than handed a finished document.
-    Replacing { file: BufWriter<std::fs::File>, scratch: Scratch, dest: PathBuf },
-    /// Straight down the pipe. Nothing else in a run writes to stdout, and
-    /// `console_for` has already decided what stderr still says beside it.
-    Stdout(BufWriter<std::io::Stdout>),
-    /// Held whole and handed to `write_report` at the end -- the write this
-    /// replaced, kept for the destinations that must not be renamed over (a
-    /// FIFO, a symlink, a device) and for a folder that will not take a scratch
-    /// file. Those keep the property streaming gives up: the report is one
-    /// `fs::write` after the run is over, so a run killed during the reporting
-    /// pass leaves the previous report standing.
-    Buffered(Vec<u8>),
-}
-
-/// The report, written as the reporting pass produces it rather than assembled
-/// in memory and handed over in one piece.
-///
-/// All three formats go through this, and the JSON is the one it was written
-/// for. A `serde_json::Value` is an `IndexMap` per file and another per link,
-/// and a group of `g` members contributes `g * (g - 1)` links, so the tree ran
-/// roughly seven times the document it rendered to and the rendered `String`
-/// was then a second whole copy of that document beside it. The other two are
-/// each one copy of their own document, which is smaller but is still the
-/// entire report held in memory for no reason -- and the text body was two,
-/// since the summary was appended by building a second `String` from the first.
-///
-/// What every format gives up for it is stated on `ReportOut::Buffered`.
-struct ReportStream {
-    out: ReportOut,
-    /// The first write failure. Everything after it is skipped rather than
-    /// retried, because nothing that stops one group finishes the next: this is
-    /// a full disk or a reader that went away. `finish` is where it is
-    /// reported, in the same words a whole-document write would have used.
-    failed: Option<std::io::Error>,
-}
-
-impl ReportStream {
-    fn open(target: &ReportTarget) -> Self {
-        let out = match &target.sink {
-            Sink::Stdout => ReportOut::Stdout(BufWriter::new(std::io::stdout())),
-            Sink::File(path) => match Scratch::beside(path) {
-                Some((file, scratch)) => ReportOut::Replacing {
-                    file: BufWriter::new(file),
-                    scratch,
-                    dest: path.clone(),
-                },
-                None => ReportOut::Buffered(Vec::new()),
-            },
-        };
-
-        ReportStream { out, failed: None }
-    }
-
-    /// Close the document and put it where it was asked for.
-    fn finish(mut self, target: &ReportTarget) -> Result<()> {
-        // A reader closing early is how a pipeline ends rather than a run that
-        // did less than it was asked, exactly as in `write_report`. Anything
-        // else is the caller's to record. The sink drops on the way out of
-        // here, which is what takes the half-written scratch copy with it and
-        // leaves the previous report standing.
-        if let Some(e) = self.failed.take() {
-            return match &target.sink {
-                Sink::Stdout if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
-                Sink::Stdout => Err(e).context("Failed to write the report to stdout"),
-                Sink::File(path) => Err(e)
-                    .with_context(|| format!("Failed to write the report to {}", path.display())),
-            };
-        }
-
-        match self.out {
-            ReportOut::Replacing { mut file, scratch, dest } => {
-                // The buffer has to reach the file before the file is synced,
-                // and the file has to be synced before the rename. `BufWriter`
-                // flushes on drop too, but silently -- a report lost to a full
-                // disk at the last block would have been renamed into place as
-                // a truncated one.
-                let flushed = file.flush().and_then(|()| file.get_ref().sync_all());
-                drop(file);
-
-                flushed
-                    .and_then(|()| scratch.commit(&dest))
-                    .with_context(|| format!("Failed to write the report to {}", dest.display()))
-            }
-            ReportOut::Stdout(mut out) => match out.flush() {
-                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
-                other => other.context("Failed to write the report to stdout"),
-            },
-            ReportOut::Buffered(bytes) => write_report(target, &bytes),
-        }
-    }
-}
-
-/// Records the first failure and tells the caller every write succeeded.
-///
-/// That is deliberate rather than sloppy, and it is what lets the three bodies
-/// be written where they are produced. A report that could not be saved is a
-/// problem this run REPORTS -- logged, tallied, exit 2 -- and never one it
-/// returns: by the time a body is being written the disposal pass has already
-/// run, and propagating an error out of `output_results` throws away
-/// `deleted_paths` on the way, leaving the cache claiming fingerprints for
-/// files this run has just removed. The `?` on a `csv::Writer` record and the
-/// `write!` on a text line are both inside that pass, so neither may carry a
-/// failure out of it. `finish` is where the first one is answered for.
-impl Write for ReportStream {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if self.failed.is_none() {
-            let wrote = match &mut self.out {
-                ReportOut::Replacing { file, .. } => file.write_all(buf),
-                ReportOut::Stdout(out) => out.write_all(buf),
-                ReportOut::Buffered(bytes) => bytes.write_all(buf),
-            };
-            if let Err(e) = wrote {
-                self.failed = Some(e);
-            }
-        }
-        Ok(buf.len())
-    }
-
-    /// Not the end of the report: `finish` is, and it is the only thing that
-    /// flushes for real. Whatever asked for this (a `csv::Writer` finishing a
-    /// record) is told it happened.
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// The JSON report, written one group at a time.
-///
-/// It is opened before the reporting loop rather than after it, which is only
-/// possible because the summary leads the document and every figure in the
-/// summary was settled by the disposal pass above -- see `output_results`.
-struct JsonBody {
-    stream: ReportStream,
-    /// How many groups have gone into `results`: the first needs no leading
-    /// comma.
-    groups_written: usize,
-    /// Whether `results` was opened as an array with something in it. An empty
-    /// one is written closed, which is the one shape writing groups cannot
-    /// reach.
-    results_open: bool,
-}
-
-impl JsonBody {
-    /// Open the document and write the summary.
-    ///
-    /// Summary first, then the groups. It is the part a human opens the file to
-    /// read, and burying it under an array with a row per duplicate makes it
-    /// something you have to go looking for.
-    fn open(target: &ReportTarget, summary: &serde_json::Value, any_groups: bool) -> Self {
-        let mut stream = ReportStream::open(target);
-
-        // Infallible: `ReportStream` records a failure rather than returning
-        // one, which is the whole of why these three writes need no handling.
-        let _ = stream.write_all(b"{\n  \"summary\": ");
-        let _ = write_nested(&mut stream, summary, 1, false);
-        let _ = stream.write_all(if any_groups {
-            b",\n  \"results\": [\n".as_slice()
-        } else {
-            b",\n  \"results\": []".as_slice()
-        });
-
-        JsonBody { stream, groups_written: 0, results_open: any_groups }
-    }
-
-    /// One group, in the place the whole-document renderer would have put it.
-    fn group(&mut self, group: &serde_json::Value) {
-        if self.groups_written > 0 {
-            let _ = self.stream.write_all(b",\n");
-        }
-        self.groups_written += 1;
-        let _ = write_nested(&mut self.stream, group, 2, true);
-    }
-
-    fn finish(mut self, target: &ReportTarget) -> Result<()> {
-        let closing: &[u8] = if self.results_open { b"\n  ]\n}" } else { b"\n}" };
-        let _ = self.stream.write_all(closing);
-        self.stream.finish(target)
-    }
-}
-
-/// The CSV report, written one record at a time.
-///
-/// A wrapper around `csv::Writer` for one reason, and it is the same reason
-/// `ReportStream::write` swallows: nothing in the reporting pass may hand a
-/// failure back to `output_results`. By the time a body is being written the
-/// disposal pass has already run, and an error returned from there throws away
-/// `deleted_paths` on the way out -- leaving the cache claiming fingerprints for
-/// files this run has just removed, which is the one bookkeeping failure that
-/// outlives the run.
-///
-/// `ReportStream` alone is not enough for that, and this is the gap it left. It
-/// makes the SINK infallible, and a `csv::Writer` has a failure of its own that
-/// the sink underneath it never sees: a record whose field count does not match
-/// the header. So the two `write_record` calls in that pass carried a `?` each,
-/// and the guarantee held only because both records happen to be the same fixed
-/// width as the header -- true today, unenforced, and exactly the kind of thing
-/// a fourteenth column is added without thinking about. `record` returns nothing
-/// at all, so there is no longer a `?` to write by accident, which is the same
-/// shape `JsonBody` above and `let _ = writeln!` on the text body already have.
-///
-/// The first failure is kept and everything after it is skipped, for the reason
-/// `ReportStream` skips: whatever makes one record unwritable makes the next one
-/// unwritable too. `finish` answers for it, and it is answered for BEFORE the
-/// sink's own failure, because it came first -- the sink saw nothing after it
-/// and would report a truncated report as a written one.
-struct CsvBody {
-    wtr: csv::Writer<ReportStream>,
-    failed: Option<csv::Error>,
-}
-
-impl CsvBody {
-    fn open(target: &ReportTarget) -> Self {
-        CsvBody {
-            wtr: csv::WriterBuilder::new().delimiter(b';').from_writer(ReportStream::open(target)),
-            failed: None,
-        }
-    }
-
-    /// One record, header included -- the header is a row of strings like any
-    /// other, and giving it a method of its own would be two ways to reach the
-    /// same swallow.
-    fn record<const N: usize>(&mut self, fields: [&str; N]) {
-        if self.failed.is_some() {
-            return;
-        }
-        if let Err(e) = self.wtr.write_record(fields) {
-            self.failed = Some(e);
-        }
-    }
-
-    fn finish(self, target: &ReportTarget) -> Result<()> {
-        // `into_inner` flushes, so it has to happen either way: the sink owns
-        // the scratch copy, and dropping the writer instead would leave it to a
-        // destructor that cannot report what it found.
-        let stream = self
-            .wtr
-            .into_inner()
-            .map_err(|e| e.into_error())
-            .context("Failed to finalize the CSV report")?;
-
-        match self.failed {
-            Some(e) => Err(e).context("Failed to write the CSV report"),
-            None => stream.finish(target),
-        }
-    }
-}
-
-
-/// Which parts of the run stderr still says out loud once the report has a
-/// destination.
-struct Console {
-    /// The per-group table of files.
-    listing: bool,
-    /// The counts, the reclaimable total and what the disposal actually did.
-    summary: bool,
-}
-
-/// A report on stdout REPLACES the console listing rather than joining it.
-///
-/// The two are the same run said twice: `-o -` printed the whole listing on
-/// stderr and the whole report on stdout, so a terminal showed everything twice
-/// and `vid-fp DIR -o - | grep DELETE` still scrolled the entire listing past
-/// the user on the way to the one line they asked for. A report written to a
-/// FILE is a different case and keeps both: the terminal is then the only place
-/// the run is visible while it happens.
-///
-/// The summary is the one part that does not simply follow the listing, because
-/// two of the three formats already end with it -- a `.txt` report is exactly
-/// this listing plus that summary, and the JSON carries the same figures under
-/// `summary`. The CSV carries neither, so there stderr keeps the receipt: what
-/// was reclaimable, what was removed, what went wrong. That is the part of a
-/// destructive run nobody should have to read out of a pipe.
-fn console_for(target: Option<&ReportTarget>) -> Console {
-    match target {
-        Some(ReportTarget { sink: Sink::Stdout, format }) => Console {
-            listing: false,
-            summary: *format == Format::Csv,
-        },
-        _ => Console { listing: true, summary: true },
-    }
 }
 
 /// What `--delete` does with a file marked DELETE.
@@ -634,15 +119,6 @@ impl Disposal {
     }
 }
 
-/// A duration in seconds for the machine-readable outputs, rounded the same way
-/// the JSON rounds it, or an empty field when it was never measured.
-///
-/// Empty is the CSV's spelling of the JSON's `null`. It has to stay
-/// distinguishable from `0.00`: one means the overlap is unknown, the other
-/// means it was measured and there was none.
-fn csv_seconds(value: Option<f64>) -> String {
-    value.map(|s| format!("{:.2}", s)).unwrap_or_default()
-}
 
 /// What one look at the disk says about a file, taken immediately before the
 /// irreversible step.
@@ -772,7 +248,7 @@ fn changed_since(path: &str, measured_size: u64, current: Option<u64>) -> Option
 
 /// What became of one file the disposal pass reached.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Fate {
+enum Fate {
     /// Gone from the path it was at -- trashed, unlinked or relocated.
     ///
     /// `aliased` says whether the bytes stayed where they were: the name went
@@ -820,7 +296,7 @@ pub fn refuse_unheld(path: &str, stats: &RunStats) {
 /// Errors are logged and tallied here rather than returned, because both callers
 /// want the same thing from a failure -- a line in the log, a line in the
 /// summary, a non-zero exit -- and none of them wants the loop to stop.
-pub fn dispose_one(
+fn dispose_one(
     path: &str,
     measured_size: u64,
     disposal: &Disposal,
@@ -1318,784 +794,129 @@ pub fn output_results(
     // a prompt under a redrawing bar is a prompt nobody can read.
     crate::progress::finish();
 
-    // --- Pass 1: resolve each file's fate across ALL groups ------------------
-    // Groups overlap, so a file can appear in several groups with different
-    // per-group roles. Precedence is REVIEW > DELETE > KEEP:
-    //   * REVIEW anywhere -> always kept for manual inspection (never deleted).
-    //   * DELETE anywhere -> deleted, even if it is the KEEP pick of another
-    //     group. This is what lets a single run remove every redundant copy: a
-    //     file that is best in one group but redundant in an overlapping one is
-    //     still removed, so you don't have to re-run until the chain collapses.
-    //   * otherwise -> kept (it was the best in every group it appears in).
-    // Using sets also guarantees each file is considered exactly once, so a
-    // file shared by several groups is never queued for deletion twice.
-    //
-    // Every DELETE here rests on a direct measurement, and the rounds below are
-    // what enforce it: a file is marked DELETE only against a survivor of the
-    // same ranking that it was actually compared with. What the global rule
-    // does add is a step of
-    // indirection at the far end -- the winner of that group may itself lose
-    // another one and be removed -- so a run can leave one survivor for a chain
-    // of files that were never all measured together. Every hop of such a chain
-    // is a direct comparison and the survivor won the last of them; the
-    // end-to-end conclusion is their sum. That is deliberate: the alternative is
-    // holding the tail of every chain back and asking the user to re-run until
-    // it has collapsed a hop at a time.
-    let Verdicts { review: review_set, delete: delete_indices, lost_to } = match ranking.into() {
+    // Each file's fate across ALL groups, REVIEW > DELETE > KEEP; see
+    // `verdicts`, and `judge` for why every DELETE rests on a direct
+    // measurement.
+    let Verdicts { review, delete, lost_to } = match ranking.into() {
         Ranking::By(priority) => verdicts(final_groups, fingerprints, matches, priority),
         Ranking::Pinned(decided) => decided,
     };
-    let delete_candidates: HashSet<usize> = delete_indices.iter().copied().collect();
-
-    // --- The confirmation ----------------------------------------------------
-    // Here rather than at start-up because only now is there a question worth
-    // answering: how many files, and how many bytes. A prompt raised from the
-    // flags alone could ask nothing more useful than "you typed --delete, did
-    // you mean it?".
-    //
-    // Declining does not abort the run. It demotes it to exactly what a run
-    // without --delete would have been -- the same report, the same reclaimable
-    // figure -- because the user who says no is the user who wants to see the
-    // list before committing, and making them re-fingerprint the library to get
-    // it would teach them to answer yes.
-    let declined = match disposal {
-        Some(d) => {
-            let targets: Vec<Target> = delete_indices
-                .iter()
-                .map(|&idx| Target {
-                    path: &fingerprints[idx].path,
-                    size: fingerprints[idx].file_size,
-                })
-                .collect();
-            !confirm::approve(d, &targets, assume_yes, confirm::Decline::ShowsReport)
-        }
-        None => false,
-    };
-
-    // From here down `disposal` is what the run is going to DO, not what its
-    // flags asked for, so the labels, the summary and the JSON all describe the
-    // same run the filesystem saw.
-    let disposal = if declined { None } else { disposal };
-    let acting = disposal.is_some();
-
-    // --- Pass 2: act on each unique target exactly once ----------------------
-    let mut removed_count = 0usize;
-    let mut failed_count = 0usize;
-    let mut changed_count = 0usize;
-    let mut unheld_count = 0usize;
-    let mut aliased_count = 0usize;
-    let mut aliased_bytes = 0u64;
-    let mut removed_bytes = 0u64;
-    let delete_candidate_count = delete_indices.len();
-    // Files this pass has taken away. A deletion may rest on one of them: the
-    // scan's DELETEs chain (c lost to b, b to a), and b was only removed because
-    // what it lost to was still there, so the chain still ends on a copy.
-    let mut removed_here: HashSet<usize> = HashSet::new();
-
-    // What a run WOULD reclaim, computed from the same set the loop below
-    // walks, so the dry run's figure and the real run's figure cannot disagree
-    // about which files they describe. Sizes come from the fingerprints, which
-    // the deletion pass re-checks against disk before touching anything, and
-    // the set is index-based -- so a file reached through a hard link
-    // contributes its bytes once.
-    //
-    // It is still an upper bound, and deliberately: a file whose data has
-    // another name OUTSIDE the run reclaims nothing when it goes, and the only
-    // way to know that is to stat every candidate. The real run does exactly
-    // that at the moment it acts (`on_disk`) and reports the difference; a dry
-    // run stats nothing and promises nothing it has measured.
-    let reclaimable_bytes: u64 = delete_indices
+    let targets: Vec<(usize, Target)> = delete
         .iter()
-        .map(|&idx| fingerprints[idx].file_size)
-        .sum();
+        .map(|&idx| (idx, Target { path: &fingerprints[idx].path, size: fingerprints[idx].file_size }))
+        .collect();
 
-    // What this function returns. Only paths that are genuinely no longer there
-    // go in here, so it is built next to the counter rather than reconstructed
-    // from `delete_indices` afterwards -- the two would differ by every
-    // failure, every file that changed under us, and everything an interrupt
-    // left untouched.
-    let mut deleted_paths: Vec<String> = Vec::new();
-
-    // Maps a file index to the outcome label to print in the results table.
-    let mut delete_outcome: HashMap<usize, &'static str> = HashMap::new();
-
-    if let Some(disposal) = disposal {
-        for &idx in &delete_indices {
-            if shutdown_requested() {
-                info!(
-                    "Interrupted: stopped after {} file(s); {} left untouched.",
-                    removed_count,
-                    delete_candidate_count - removed_count - failed_count - changed_count - unheld_count
-                );
-                break;
-            }
-            let fp = &fingerprints[idx];
-
-            // What it lost to has to still be there, as it was measured, or
-            // have gone in this pass on the same terms. The scan may be hours
-            // old by now, and the confirmation prompt waits as long as it is
-            // left: a copy removed in that time leaves this one the last.
-            let held = lost_to.get(&idx).is_none_or(|winners| {
-                winners.is_empty()
-                    || winners.iter().any(|&w| {
-                        removed_here.contains(&w) || still_holds(&fingerprints[w].path, fingerprints[w].file_size)
-                    })
-            });
-            if !held {
-                refuse_unheld(&fp.path, stats);
-                unheld_count += 1;
-                delete_outcome.insert(idx, "SKIPPED");
-                continue;
-            }
-
-            match dispose_one(&fp.path, fp.file_size, disposal, stats) {
-                Fate::Done { aliased } => {
-                    removed_count += 1;
-                    // Only bytes that actually went away. See `OnDisk`.
-                    if aliased {
-                        aliased_count += 1;
-                        aliased_bytes += fp.file_size;
-                    } else {
-                        removed_bytes += fp.file_size;
-                    }
-                    deleted_paths.push(fp.path.clone());
-                    removed_here.insert(idx);
-                    delete_outcome.insert(idx, disposal.done_label(aliased));
-                }
-                Fate::Changed => {
-                    changed_count += 1;
-                    delete_outcome.insert(idx, "CHANGED");
-                }
-                Fate::Failed => {
-                    failed_count += 1;
-                    delete_outcome.insert(idx, "FAILED");
-                }
-            }
-        }
-    }
-
-    // --- Reporting -----------------------------------------------------------
-    let Console { listing, summary: summarise } = console_for(report_target);
-
-    // Both halves are also a question about the log level, and it is asked here
-    // rather than inside `console_for` so that function stays a statement about
-    // `--output` alone. Everything the listing and the summary amount to leaves
-    // through `info!`, and `-q` sets the whole filter -- console and
-    // `--log-file` alike -- so under it there is nobody at the other end. The
-    // macro was already dropping those lines; what it cannot drop is the
-    // `format!` that built each one, and on the local corpus at `-d 18` that is
-    // 65,441 lines assembled and thrown away.
-    // Nor under the desktop app, whose results page is this listing.
-    let show_listing = listing && log::log_enabled!(log::Level::Info) && !crate::utils::is_for_window();
-    let show_summary = summarise && log::log_enabled!(log::Level::Info);
-
-    if show_listing {
-        info!("\n========================================");
-        info!("             RESULTS");
-        info!("========================================\n");
-    }
-
-    // Groups overlap, so summing their sizes counts a shared file once per
-    // group it appears in -- a figure that can exceed the number of videos
-    // scanned and means nothing to anyone. What is actually being reported is
-    // how many distinct files are implicated in a duplicate relationship at
-    // all, which is the same set the KEEP/DELETE/REVIEW labels below describe.
-    //
-    // A group of one implicates nothing. A scan never makes one; `--against`
-    // lists a file the library did not match that way, and that file is not
-    // "matched".
-    let matched_file_count = final_groups
-        .iter()
-        .filter(|g| g.len() > 1)
-        .flatten()
-        .copied()
-        .collect::<HashSet<usize>>()
-        .len();
-
-    // Which of the three report bodies this run is actually going to write.
-    //
-    // At most one of them is, and the other two used to be built in full and
-    // thrown away. The JSON tree was gated for exactly that reason and the
-    // other two were left ungated, which is the more expensive half: the text
-    // body is the whole listing accumulated in a `String` and the CSV is the
-    // whole listing again through a serializer, so a run writing JSON built
-    // both, and a run writing NO report at all still built both. Measured at
-    // `-d 18` on the local corpus (9,003 groups, a 31 MB CSV and a 17 MB txt),
-    // peak RSS: report-only 66 -> 18 MB, `-o x.csv` 67 -> 50 MB. Every format
-    // comes out byte-identical either way -- what is gone is the two copies of
-    // the report nobody asked for.
-    //
-    // The console listing is a separate question, answered by `console_for`: a
-    // run with no `--output` prints the listing to the terminal and builds no
-    // body at all, which is why the text line below is built when EITHER wants
-    // it and pushed only when the report does.
-    //
-    // The per-link JSON list is the one that scales worst -- one object per
-    // pair, so a group of `g` members contributes `g * (g - 1)` of them.
-    let format = report_target.map(|t| t.format);
-    let wants_txt = format == Some(Format::Txt);
-    let wants_csv = format == Some(Format::Csv);
-    let wants_json = format == Some(Format::Json);
-
-    // Where the report is destined, for the at-most-one body below that is
-    // going to be written into it.
-    let sink = || report_target.expect("a report format means there is a report target");
-
-    let mut txt_out = wants_txt.then(|| ReportStream::open(sink()));
-
-    // Use csv crate for robust and RFC-compliant CSV generation
-    let mut csv_wtr = wants_csv.then(|| CsvBody::open(sink()));
-
-    // The CSV carries exactly what the JSON carries, field for field, in the
-    // same order. Anything shown in a formatted column is immediately followed
-    // by the raw number it was formatted from, because the formatted one is for
-    // reading and the raw one is for sorting and filtering -- a spreadsheet
-    // cannot sort "1.0MB" against "900.0KB", nor "1920x1080" against "640x480",
-    // and no consumer of a CSV should have to parse a unit suffix or split a
-    // label to get a figure this tool already has.
-    //
-    // The columns run in three blocks, each answering one question:
-    //
-    //   who        group, action, full_path -- the row's identity and its fate.
-    //                Action sits beside the path because --from-report exists to
-    //                have it edited, and an action column you have to scroll to
-    //                is one that gets edited on the wrong row.
-    //   what       length .. quality_bits_per_frame -- the file's own properties,
-    //                ordered the way the ranking reads them: footage first
-    //                (length, resolution, frame rate), then the codec, then the
-    //                three bit-derived figures the codec governs. Codec leads
-    //                that trio deliberately: it is the reason two rows' size,
-    //                bitrate and quality may not be compared with each other.
-    //   against what   matched_with .. matched_to_seconds -- the strongest
-    //                measured link: which file, how much footage, and where in
-    //                THIS file it sits.
-    //
-    // Every column in that last block answers for the row's OWN file, which is
-    // what the `matched_` prefix is there to promise. It replaced a `shared_`
-    // block that broke the promise: `shared_seconds` was the pair's reconciled
-    // figure while the range beside it was this file's, so a row whose matched
-    // footage ran 0.00-8.84 reported 1.88 seconds of it and read as a
-    // malfunction. Nothing in the row said one of the numbers had changed
-    // subject, and nothing could -- the fix was to stop mixing them.
-    //
-    // `samples` is the number of hashes this file's fingerprint holds. It is a
-    // property of the file rather than of the link, but it sits immediately
-    // before `matched_seconds` because that is the figure it qualifies: a range
-    // much wider than the footage means either a scattered match or a file too
-    // coarsely sampled to know, and only the sample count tells those apart --
-    // at the limit, a file with ONE sample has that sample standing for its
-    // whole runtime, so its matched footage can only ever come out as all of it
-    // or none of it, and no --match-percent can gate it.
-    //
-    // `framerate` is the one figure with no formatted twin, by request: the
-    // formatted form is still on the console line, where a human reads it, and
-    // the reports keep only `framerate_fps` to sort on.
-    if let Some(csv_wtr) = &mut csv_wtr {
-        csv_wtr.record([
-            "group",
-            "action",
-            "full_path",
-            "length",
-            "length_seconds",
-            "resolution",
-            "width",
-            "height",
-            "framerate_fps",
-            "codec",
-            "size",
-            "size_bytes",
-            "bitrate",
-            "bitrate_bps",
-            "quality",
-            "quality_bits_per_frame",
-            "matched_with",
-            "identical",
-            "samples",
-            "matched_seconds",
-            "matched_from",
-            "matched_to",
-            "matched_from_seconds",
-            "matched_to_seconds",
-        ]);
-    }
-
-    // The JSON is written as the loop below produces it rather than collected
-    // into a `serde_json::Value` and rendered at the end -- see `JsonSink` for
-    // what that cost.
-    //
-    // Opening it here is what makes that possible, and it is possible because
-    // the summary leads the document: every figure in it was decided by the
-    // disposal pass above, so the part that has to be written first is already
-    // known before a single group has been formatted. Its own three blocks run
-    // what was found -> what was decided -> what was done, so a dry run's keys
-    // stop after the second one has said everything it can.
-    let mut json = wants_json.then(|| {
-        let summary = serde_json::json!({
-            "total_groups": final_groups.len(),
-            "total_files_matched": matched_file_count,
-            "time_elapsed_seconds": total_elapsed_secs,
-            // What the run would reclaim, present whether or not it did
-            // anything: a dry run's whole output is a plan, and a plan with no
-            // cost attached is not one.
-            "files_marked_delete": delete_candidate_count,
-            "reclaimable_bytes": reclaimable_bytes,
-            "deletion_enabled": acting,
-            "mode": disposal.map(|d| d.mode()).unwrap_or("report"),
-            "move_to": match disposal {
-                Some(Disposal::MoveTo(dir)) => Some(dir.to_string_lossy().to_string()),
-                _ => None,
-            },
-            "files_removed": removed_count,
-            "bytes_removed": removed_bytes,
-            // Of those removed, the ones that were a second name for data still
-            // on disk. `bytes_removed` excludes them, so this is what a reader
-            // needs to reconcile it against the rows.
-            "files_unlinked": aliased_count,
-            "bytes_unlinked": aliased_bytes,
-            "files_failed": failed_count,
-            "files_changed": changed_count,
-        });
-
-        JsonBody::open(sink(), &summary, !final_groups.is_empty())
+    // Asked here rather than at start-up because only now is there a question
+    // worth answering: how many files, and how many bytes. Declining does not
+    // abort: it demotes the run to exactly what a run without the flag would
+    // have been, so the user who wants to see the list before committing gets
+    // it without re-fingerprinting the library. From here on `disposal` is what
+    // the run DOES, so every label and figure below describes what the
+    // filesystem saw.
+    let declined = disposal.is_some_and(|d| {
+        let plain: Vec<Target> = targets.iter().map(|(_, t)| *t).collect();
+        !confirm::approve(d, &plain, assume_yes, confirm::Decline::ShowsReport)
     });
+    let disposal = if declined { None } else { disposal };
 
-    // Nothing in the loop below reaches anywhere except the console listing and
-    // the one report body this run is writing, so a run with neither has no
-    // reason to walk it at all. That combination is not a corner case: it is
-    // `-q` with no `--output`, the shape a script uses when all it wants is the
-    // exit code and the disposal. Both figures the summary quotes -- the group
-    // count and `matched_file_count` -- were settled above, and the disposal
-    // pass ran before either of them.
-    //
-    // Written as the slice to walk rather than as a guard around the loop so
-    // that the reason sits with the decision, and so that anything ever added
-    // below cannot quietly become a side effect that a `-q` run skips.
-    //
-    // Worth 0.67-0.69 s -> 0.41 s on the local corpus at `-d 18 -p 20`, which
-    // is 9,003 groups and 65,441 rows formatted for nobody.
-    let rows_to_report: &[Vec<usize>] = if show_listing || wants_txt || wants_csv || wants_json {
-        final_groups
-    } else {
-        &[]
+    // What it lost to has to still be there as it was measured, or have gone
+    // in this pass on the same terms: the scan may be hours old, and the prompt
+    // waits as long as it is left. Chains still work, because a winner removed
+    // in this pass was removed on the same condition.
+    let mut outcome: HashMap<usize, &'static str> = HashMap::new();
+    let (tally, deleted_paths) = match disposal {
+        None => (Tally::default(), Vec::new()),
+        Some(d) => dispose_all(
+            &targets,
+            |idx, removed| {
+                lost_to.get(&idx).is_none_or(|winners| {
+                    winners.is_empty()
+                        || winners.iter().any(|&w| {
+                            removed.contains(&w)
+                                || still_holds(&fingerprints[w].path, fingerprints[w].file_size)
+                        })
+                })
+            },
+            d,
+            stats,
+            |idx, label| {
+                outcome.insert(idx, label);
+            },
+        ),
     };
 
-    for (i, group) in rows_to_report.iter().enumerate() {
-        let group_name = format!("group_{}", i + 1);
-
-        if show_listing {
-            info!("{}:", group_name);
+    // Labelled by the file's GLOBAL fate. A dry run recommends; an acting run
+    // says what happened, and SKIPPED is a target an interrupt or a vanished
+    // winner left alone.
+    let marked: HashSet<usize> = delete.iter().copied().collect();
+    let action = |idx: usize| -> &'static str {
+        match (review.contains(&idx), marked.contains(&idx), disposal.is_some()) {
+            (true, _, _) => "REVIEW",
+            (_, true, false) => "DELETE",
+            (_, true, true) => outcome.get(&idx).copied().unwrap_or("SKIPPED"),
+            (_, false, false) => "KEEP",
+            (_, false, true) => "KEPT",
         }
-        if let Some(txt_out) = &mut txt_out {
-            let _ = writeln!(txt_out, "{}:", group_name);
+    };
+
+    let summary = Summary {
+        groups: final_groups.len(),
+        // A group of one implicates nothing: a scan never makes one, and an
+        // `--against` file the library did not match is not "matched".
+        matched_files: final_groups.iter().filter(|g| g.len() > 1).flatten().collect::<HashSet<_>>().len(),
+        elapsed_secs: total_elapsed_secs,
+        marked: delete.len(),
+        reclaimable_bytes: targets.iter().map(|(_, t)| t.size).sum(),
+        disposal,
+        declined,
+        tally: &tally,
+    };
+
+    // Where the groups go. Everything the listing and the summary amount to
+    // leaves through `info!`, so under `-q` nobody is at the other end of them
+    // and they are not built; nor under the desktop app, whose results page is
+    // this listing. With no listing and no report there is nothing to format,
+    // and the loop below walks nothing -- `-q` with no `--output` is how a
+    // script asks for only the disposal and the exit code.
+    let console = console_for(report_target);
+    let speaking = log::log_enabled!(log::Level::Info);
+    let mut listing = (console.listing && speaking && !crate::utils::is_for_window()).then(Listing::open);
+    let mut report = report_target.map(|t| open_report(t, &summary));
+
+    for (i, group) in final_groups.iter().enumerate() {
+        let mut bodies: Vec<&mut dyn Body> = Vec::with_capacity(2);
+        if let Some(l) = &mut listing {
+            bodies.push(l);
         }
-
-        let mut json_files = Vec::new();
-
-        // How much footage each file has in common with the rest of its group,
-        // in seconds rather than as a percentage. Every member was measured
-        // against every other, so this says how strong the strongest of those
-        // measurements was: a row reporting the whole of its runtime is a copy
-        // of something here, and one reporting eight seconds is a file that
-        // shares eight seconds with something here.
-        //
-        // A percentage was the obvious choice and the wrong one. It invites
-        // comparison against --match-percent, which measures the opposite end of
-        // the pair and so routinely sits above what is shown here -- making a
-        // correct report look broken. Worse, on short videos it quantizes
-        // brutally: a file with four keyframes can only ever score 0, 25, 50, 75
-        // or 100%, so a single incidental frame reads as an authoritative-looking
-        // 25%. In seconds that same match reads "0.8s", next to a length of
-        // "00:00:03", and needs no explaining.
-        for &idx in group {
-            let fp = &fingerprints[idx];
-
-            // Computed once and read three ways: the strongest link fills the
-            // single-figure columns the console and the CSV show, and the whole
-            // list goes to the JSON so a group of three or more can be read pair
-            // by pair. Scoped to THIS group, because a file appearing in two of
-            // them matched files in both and a row must only name files the
-            // reader can see beside it. Groups are small and this is the
-            // reporting pass, not the comparison one -- there is no measurement
-            // here, only lookups against figures phase 2 already took.
-            let links = matches.links_of(idx, group, fingerprints);
-            let best = links.first();
-            // Every figure in this block is stated in the SUBJECT's own
-            // seconds, which is `coverage x duration` -- so a file whose
-            // runtime nobody could measure has no seconds to state, and "0s
-            // matched" would read as evidence that nothing matched when what is
-            // missing is the runtime to scale the coverage by. Blank, like the
-            // length it is derived from. The link itself is kept: which file it
-            // matched, and where in that file, are both known.
-            let seconds_known = fp.duration > 0.0;
-            let matched = best.map(|l| l.matched_seconds).filter(|_| seconds_known);
-
-            let size_str = format_size(fp.file_size);
-            let bitrate_str = format_bitrate(fp.bitrate());
-            // "-" rather than 00:00:00 when no runtime could be measured, the
-            // same sentinel the frame rate and the quality columns use for the
-            // same reason: a zero-length video and a video of unknown length
-            // are different findings, and the row that reads 00:00:00 beside 20
-            // samples looks like a malfunction. See `GroupMaxima::tier`, which
-            // is where the distinction decides something.
-            let duration_str = if fp.duration > 0.0 {
-                format_duration(fp.duration)
-            } else {
-                "-".to_string()
-            };
-            let res_str = format!("{}x{}", fp.width, fp.height);
-
-            // The codec is the reason two rows' bit figures may not be compared
-            // with each other, so it is shown next to them rather than tucked
-            // away in the JSON: a reader who sees "h264" and "av1" in one group
-            // needs no explanation for why nothing was deleted.
-            let codec_str = format_codec(&fp.codec);
-            let frame_rate_str = format_frame_rate(fp.frame_rate);
-            // Bits per frame -- the figure that actually ranks these files.
-            // Bitrate stays alongside it because it is the number people know
-            // and the one their other tools print, but it never ranks anything.
-            let quality_str = format_quality(fp.quality());
-
-            // The same values as numbers, for the CSV and JSON. An unknown one
-            // is an empty field / a null rather than a zero: a container that
-            // never reported a frame rate is not a container that reported no
-            // frames, and a quality figure derived from one is unknowable
-            // rather than worst-in-group. The runtime joins them for the same
-            // reason and with more at stake -- it is the metric the ranking
-            // compares first, and a consumer sorting on this column must not
-            // see an unmeasured file as a zero-length one.
-            let length_num = (fp.duration > 0.0).then(|| (fp.duration * 100.0).round() / 100.0);
-            let frame_rate_num = (fp.frame_rate > 0.0)
-                .then(|| (fp.frame_rate * 1000.0).round() / 1000.0);
-            let quality_num = (fp.quality() > 0).then(|| fp.quality());
-
-            // The envelope, in this file's own timeline -- the same timeline
-            // `matched_seconds` is stated in, so the two can be read against
-            // each other. The JSON states it as well, so it is measured here;
-            // the two ways of writing it down are not.
-            let best_span = best.and_then(|l| l.span);
-
-            // Label by the file's GLOBAL fate (precedence REVIEW > DELETE > KEEP).
-            // A file that is redundant in an overlapping group is shown DELETE/
-            // DELETED in every group, including one where it was the local best.
-            // In a dry run the delete targets stay as the recommendation DELETE;
-            // once armed they become DELETED or MOVED, FAILED if that errored, or
-            // CHANGED if the file stopped matching its fingerprint before we got
-            // to it.
-            let action_str = if review_set.contains(&idx) {
-                "REVIEW"
-            } else if delete_candidates.contains(&idx) {
-                if acting {
-                    delete_outcome.get(&idx).copied().unwrap_or("SKIPPED")
-                } else {
-                    "DELETE"
-                }
-            } else if acting {
-                "KEPT"
-            } else {
-                "KEEP"
-            };
-
-            // 1. Console / Text Output
-            //
-            // The same three blocks as the CSV, minus the raw duplicates and the
-            // path of the matched file -- both are noise at a glance and neither
-            // fits on a terminal line.
-            //
-            // The action leads and is padded to a fixed width so it forms a
-            // column the eye can run down; the path trails because it is the one
-            // field with no bounded length, and anything after it would be
-            // ragged. "matched" is spelled out on every row because the console
-            // has no header, and two time values side by side ("00:00:09, 0.8s")
-            // would otherwise be ambiguous about which is which. It reads
-            // "matched" rather than the older "shared" because the figure is now
-            // this file's own footage rather than the pair's -- "8.8s matched"
-            // against a length of 00:00:09 says copy, and says it without the
-            // reader having to know which end of the pair it was measured from.
-            // The frame rate, the sample count and the bits-per-frame figure
-            // carry their units for the same reason.
-            //
-            // Built when either the terminal or a .txt report is going to read
-            // it, and not otherwise: on a CSV or JSON run this line is the one
-            // piece of the text body that is neither shown nor saved.
-            if show_listing || wants_txt {
-                // The formatted figure only, because a human is reading this at
-                // a glance. The CSV states the same match in seconds and the
-                // JSON as a number, so neither of them wants this string.
-                let matched_str = format_shared(matched);
-                let identical_str = if best.is_some_and(|l| l.identical) { " (identical)" } else { "" };
-
-                let line = format!(
-                    "\t{:<width$} {}, {}, {}, {}, {}, {}, {}, {} samples, {} matched{}, {}",
-                    format!("{},", action_str),
-                    duration_str,
-                    res_str,
-                    frame_rate_str,
-                    codec_str,
-                    size_str,
-                    bitrate_str,
-                    quality_str,
-                    // Hashes held, not keyframes decoded: featureless frames
-                    // are dropped below MIN_AC_ENERGY, so this is what the
-                    // comparison actually had to work with, which is the number
-                    // that explains the row.
-                    fp.valid_hashes.len(),
-                    matched_str,
-                    identical_str,
-                    fp.path,
-                    width = ACTION_COLUMN
-                );
-                if show_listing {
-                    info!("{}", line);
-                }
-                if let Some(txt_out) = &mut txt_out {
-                    let _ = writeln!(txt_out, "{}", line);
-                }
-            }
-
-            // 2. CSV Output
-            //
-            // Every string below is built here rather than above because this
-            // is the only place any of them is read. They are the raw halves of
-            // the columns -- the figure a spreadsheet sorts on, beside the
-            // formatted one a person reads -- and the JSON states the same
-            // figures as JSON numbers, so on any other run these were thirteen
-            // allocations a row, one of them a full copy of a path, built and
-            // dropped without being looked at. Measured on the local corpus at
-            // `-d 18 -p 20`, three runs each: `-o x.txt -q` 0.72-0.74 s ->
-            // 0.63-0.65 s, `-o x.json -q` 4.67-5.54 s -> 4.49-4.70 s. The CSV
-            // run gains a little too (0.79 s -> 0.72-0.77 s), because the copy
-            // of the path became a borrow of it. All three reports are
-            // byte-identical, and so is every line of the console listing.
-            if let Some(csv_wtr) = &mut csv_wtr {
-                let frame_rate_raw = frame_rate_num.map(|f| f.to_string()).unwrap_or_default();
-                let quality_raw = quality_num.map(|q| q.to_string()).unwrap_or_default();
-                let size_bytes_raw = fp.file_size.to_string();
-                let bitrate_bps_raw = fp.bitrate().to_string();
-                let matched_seconds_raw = csv_seconds(matched);
-                let samples_raw = fp.valid_hashes.len().to_string();
-                // Runtime and frame geometry as plain numbers, so every figure
-                // the ranking uses can be sorted on. Resolution's raw form is
-                // the two sides rather than their product: the product is one
-                // multiplication away in any spreadsheet, and the sides are what
-                // was measured.
-                let length_seconds_raw = if fp.duration > 0.0 {
-                    format!("{:.2}", fp.duration)
-                } else {
-                    String::new()
-                };
-                let width_raw = fp.width.to_string();
-                let height_raw = fp.height.to_string();
-
-                // The file the figures above describe. Empty rather than "-"
-                // when there is none, for the same reason every other unknown is
-                // empty: a CSV consumer should see a blank cell, not a sentinel
-                // it has to know about.
-                let matched_with_raw = best
-                    .map(|l| fingerprints[l.other].path.as_str())
-                    .unwrap_or_default();
-                // Whether that file is this one's bytes again, as opposed to a
-                // match of the picture. Blank with no link, like the path.
-                let identical_raw = best.map(|l| if l.identical { "true" } else { "false" }).unwrap_or_default();
-
-                // The envelope both ways, like every other figure here.
-                let matched_from_str =
-                    best_span.map(|s| format_duration(s.start_seconds())).unwrap_or_default();
-                let matched_to_str =
-                    best_span.map(|s| format_duration(s.end_seconds())).unwrap_or_default();
-                let matched_from_raw = csv_seconds(best_span.map(|s| s.start_seconds()));
-                let matched_to_raw = csv_seconds(best_span.map(|s| s.end_seconds()));
-
-                csv_wtr.record([
-                    &group_name,
-                    action_str,
-                    &fp.path,
-                    &duration_str,
-                    &length_seconds_raw,
-                    &res_str,
-                    &width_raw,
-                    &height_raw,
-                    &frame_rate_raw,
-                    &codec_str,
-                    &size_str,
-                    &size_bytes_raw,
-                    &bitrate_str,
-                    &bitrate_bps_raw,
-                    &quality_str,
-                    &quality_raw,
-                    matched_with_raw,
-                    identical_raw,
-                    &samples_raw,
-                    &matched_seconds_raw,
-                    &matched_from_str,
-                    &matched_to_str,
-                    &matched_from_raw,
-                    &matched_to_raw,
-                ]);
-            }
-
-            // 3. JSON File Output
-            //
-            // The JSON carries every link rather than only the strongest,
-            // because it is the format read by something that can hold a list.
-            // A group of three is where the single-figure columns stop being
-            // the whole story, and this is where the rest of it lives.
-            if !wants_json {
-                continue; // Nothing below this point but the JSON tree.
-            }
-
-            let json_matches: Vec<serde_json::Value> = links
-                .iter()
-                .map(|l| {
-                    serde_json::json!({
-                        "full_path": fingerprints[l.other].path,
-                        "identical": l.identical,
-                        "matched_seconds": seconds_known
-                            .then(|| (l.matched_seconds * 100.0).round() / 100.0),
-                        "matched_from": l.span.map(|s| format_duration(s.start_seconds())),
-                        "matched_to": l.span.map(|s| format_duration(s.end_seconds())),
-                        "matched_from_seconds": l.span
-                            .map(|s| (s.start_seconds() * 100.0).round() / 100.0),
-                        "matched_to_seconds": l.span
-                            .map(|s| (s.end_seconds() * 100.0).round() / 100.0),
-                    })
-                })
-                .collect();
-
-            // Key for key and block for block, the CSV row above. Written in
-            // that order and kept in it by serde_json's `preserve_order`.
-            json_files.push(serde_json::json!({
-                "action": action_str,
-                "full_path": fp.path,
-                "length": duration_str,
-                "length_seconds": length_num,
-                "resolution": res_str,
-                "width": fp.width,
-                "height": fp.height,
-                "framerate_fps": frame_rate_num,
-                "codec": codec_str,
-                "size": size_str,
-                "size_bytes": fp.file_size,
-                "bitrate": bitrate_str,
-                "bitrate_bps": fp.bitrate(),
-                "quality": quality_str,
-                "quality_bits_per_frame": quality_num,
-                // The strongest link, spelled out so the JSON says the same
-                // thing the CSV does without a consumer having to re-derive it
-                // from the list below.
-                "matched_with": best.map(|l| &fingerprints[l.other].path),
-                "identical": best.map(|l| l.identical),
-                "samples": fp.valid_hashes.len(),
-                "matched_seconds": matched.map(|s| (s * 100.0).round() / 100.0),
-                "matched_from": best_span.map(|s| format_duration(s.start_seconds())),
-                "matched_to": best_span.map(|s| format_duration(s.end_seconds())),
-                "matched_from_seconds": best_span
-                    .map(|s| (s.start_seconds() * 100.0).round() / 100.0),
-                "matched_to_seconds": best_span.map(|s| (s.end_seconds() * 100.0).round() / 100.0),
-                // Every measured link this file has in the group, strongest
-                // first. The entry at index 0 is the one described above.
-                "matches": json_matches,
-            }));
+        if let Some(r) = &mut report {
+            bodies.push(r.as_mut());
+        }
+        if bodies.is_empty() {
+            break;
         }
 
-        if show_listing {
-            info!(""); // Empty line for spacing
-        }
-        if let Some(txt_out) = &mut txt_out {
-            let _ = txt_out.write_all(b"\n");
-        }
-
-        if let Some(sink) = &mut json {
-            sink.group(&serde_json::json!({
-                "group": group_name,
-                "files": json_files
-            }));
+        let name = format!("group_{}", i + 1);
+        let files: Vec<Entry> =
+            group.iter().map(|&idx| Entry::of(idx, group, fingerprints, matches, action(idx))).collect();
+        for body in bodies {
+            body.group(&name, &files);
         }
     }
 
-    let total_hours = total_elapsed_secs / 3600;
-    let total_mins = (total_elapsed_secs % 3600) / 60;
-    let total_secs = total_elapsed_secs % 60;
-
-    let mut summary = format!(
-        "Total groups found: {}\nTotal files matched: {}\nTotal time elapsed: {:02}:{:02}:{:02}",
-        final_groups.len(),
-        matched_file_count,
-        total_hours,
-        total_mins,
-        total_secs
-    );
-
-    match disposal {
-        // The figure a dry run exists to produce. Printing it only after the
-        // files are gone is printing it to the one person who no longer needs
-        // it -- the decision is made here, on the strength of this number.
-        None => {
-            if delete_candidate_count > 0 {
-                summary.push_str(&format!(
-                    "\nReclaimable: {} across {} file(s) marked DELETE (nothing was removed).",
-                    format_size(reclaimable_bytes),
-                    delete_candidate_count
-                ));
-            }
-            // Said plainly, because "nothing was removed" alone reads as a
-            // report-only run and the user who declined needs to know the
-            // difference between "I wasn't asked to" and "you told me not to".
-            if declined {
-                summary.push_str("\nCancelled at the confirmation prompt.");
-            }
-        }
-        Some(d) => summary.push_str(&format!("\n{}", disposed_line(d, removed_count, removed_bytes))),
-    }
-
-    if acting {
-        summary.push_str(&aliased_line(aliased_count, aliased_bytes));
-        summary.push_str(&trouble_lines(failed_count, changed_count, unheld_count));
-    }
-
-    if show_summary {
+    if console.summary && speaking {
         info!("{}", summary);
     }
 
-    // --- Writing the report ---------------------------------------------------
-    // Logged and tallied rather than returned, which is the same treatment
-    // `dispose_one` gives a failed deletion and for a stronger reason. By this
-    // line the destructive pass has already run: propagating an error here threw
-    // away `deleted_paths` on the way out, so the caller never got to drop those
-    // files' cache entries and the cache went on claiming fingerprints for files
-    // this run had just removed. A report that could not be saved is a problem
-    // (exit 2, and a line in the Problems summary) -- it is not a reason to
-    // forget what the run did to the filesystem.
-    //
-    // `report_target_for` has already rejected the mistyped paths AND proved
-    // this destination writable before any work started, so what reaches here
-    // is a full disk, or permissions that changed while the run was going.
-    if let Some(target) = report_target {
-        // Every body has already been written where it was produced. All that
-        // is left is to close it and put it where it was asked for -- and for
-        // the text report, to add the summary, which is the one part of it that
-        // could not be known until the loop above had finished.
-        //
-        // A plain expression rather than the closure this used to be. The
-        // closure existed to catch a `?` on the CSV writer's `into_inner`,
-        // which is the last `?` the reporting pass had; `CsvBody::finish` now
-        // answers for that where every other report failure is answered for,
-        // so there is nothing here for a `?` to escape from and nothing to
-        // wrap. Whether the report was saved is decided in one place either
-        // way, and the three arms hand it back rather than returning it.
-        let written = match target.format {
-            Format::Csv => csv_wtr.expect("a CSV run opens a CSV writer").finish(target),
-            Format::Json => json.expect("a JSON run opens a JSON body").finish(target),
-            Format::Txt => {
-                let mut txt_out = txt_out.expect("a text run opens a text body");
-                let _ = writeln!(txt_out, "{}", summary);
-                txt_out.finish(target)
-            }
-        };
-
-        match written {
-            // Nothing to announce for stdout: the report is already there, and
-            // saying so on stderr would be describing the pipe to whoever is
-            // reading the other end of it.
+    // A report that could not be saved is a problem (exit 2, a line in the
+    // summary) and not an error this function returns: the disposal pass has
+    // already run, and returning would throw away `deleted_paths`, leaving the
+    // cache claiming fingerprints for files this run has just removed.
+    // `report_target_for` proved the destination writable before any work
+    // started, so what fails here is a full disk or permissions that changed.
+    if let (Some(report), Some(target)) = (report, report_target) {
+        match report.finish(&summary) {
+            // Nothing to announce for stdout: saying so on stderr would be
+            // describing the pipe to whoever is reading the other end of it.
             Ok(()) => {
                 if let Sink::File(path) = &target.sink {
                     info!("\nResults saved to {}", path.display());
@@ -2108,17 +929,10 @@ pub fn output_results(
         }
     }
 
-    // Helpful nudge when there's something to clean up but nothing was touched.
-    // Not for someone who declined: they typed the flag, saw the question, and
-    // said no. Telling them to type it again would be answering back.
-    //
-    // Printed whatever the report does, because no format carries it: it is
-    // advice about the next command to run, not a figure this one measured.
-    // Last, therefore, and after the report has been written rather than before
-    // -- on `-o -` it was landing on stderr while the report it refers to was
-    // still being built, so the terminal read "run with --delete" and only then
-    // showed the run it was talking about.
-    if !acting && !declined && delete_candidate_count > 0 && !crate::utils::is_for_window() {
+    // Advice about the next command, which no format carries, so it comes
+    // last, after the report it refers to. Not for someone who declined: they
+    // saw the question and said no.
+    if disposal.is_none() && !declined && !delete.is_empty() && !crate::utils::is_for_window() {
         info!(
             "\nRun with --delete to move the file(s) marked DELETE to the trash or with --move-to <DIR> to relocate them instead."
         );
@@ -2127,86 +941,138 @@ pub fn output_results(
     Ok(deleted_paths)
 }
 
-/// What a disposal pass did, in the words of the mode that did it.
-///
-/// Shared with `--from-report`, which performs the same three operations on a
-/// list it read rather than one it computed, and should not describe them
-/// differently for it.
-pub fn disposed_line(disposal: &Disposal, count: usize, bytes: u64) -> String {
-    match disposal {
-        Disposal::Permanent => format!(
-            "Permanently deleted {} file(s), {} freed.",
-            count,
-            format_size(bytes)
-        ),
-        Disposal::Trash => format!(
-            "Moved {} file(s) to trash ({} total).",
-            count,
-            format_size(bytes)
-        ),
-        // Deliberately not "freed": if the destination is on the same
-        // filesystem the bytes have not gone anywhere, and claiming otherwise
-        // in the one mode where it might not be true is how a summary stops
-        // being trusted.
-        Disposal::MoveTo(dir) => format!(
-            "Moved {} file(s) ({} total) under {}.",
-            count,
-            format_size(bytes),
-            dir.display()
-        ),
+/// What a disposal pass did: the counts and bytes both of its callers report.
+#[derive(Default, Debug)]
+pub struct Tally {
+    /// Every target taken off its path, aliases included.
+    pub removed: usize,
+    /// Only the bytes that went away with them. See `OnDisk`.
+    pub removed_bytes: u64,
+    /// Of `removed`, the second names for data still on disk (UNLINKED).
+    pub aliased: usize,
+    pub aliased_bytes: u64,
+    pub failed: usize,
+    pub changed: usize,
+    /// Left alone because every copy it lost to is gone or changed.
+    pub unheld: usize,
+}
+
+impl Tally {
+    fn settled(&self) -> usize {
+        self.removed + self.failed + self.changed + self.unheld
+    }
+
+    /// What the pass did, in the words of the mode that did it, followed by
+    /// what the byte figure leaves out and what was not done, each omitted when
+    /// there is nothing to say.
+    pub fn lines(&self, disposal: &Disposal) -> String {
+        let size = format_size(self.removed_bytes);
+        let mut out = match disposal {
+            Disposal::Permanent => format!("Permanently deleted {} file(s), {} freed.", self.removed, size),
+            Disposal::Trash => format!("Moved {} file(s) to trash ({} total).", self.removed, size),
+            // Deliberately not "freed": if the destination is on the same
+            // filesystem the bytes have not gone anywhere.
+            Disposal::MoveTo(dir) => {
+                format!("Moved {} file(s) ({} total) under {}.", self.removed, size, dir.display())
+            }
+        };
+
+        // Removing one of several names for a file is a good outcome -- not a
+        // problem, not a skip -- but it leaves the byte total above
+        // unaccountable without this. It carries the bytes because a
+        // `--move-to` run of nothing else reads "Moved 1 file(s) (0B total)".
+        if self.aliased > 0 {
+            out.push_str(&format!(
+                "\n{} file(s) were another name for data that is still on disk (a hard link or a \
+                 symlink), so their {} is not counted above; they are marked UNLINKED.",
+                self.aliased,
+                format_size(self.aliased_bytes)
+            ));
+        }
+        if self.unheld > 0 {
+            out.push_str(&format!(
+                "\n{} file(s) were left alone because every copy they lost to is gone or changed.",
+                self.unheld
+            ));
+        }
+        if self.failed > 0 {
+            out.push_str(&format!("\n{} file(s) could not be removed (see errors above).", self.failed));
+        }
+        if self.changed > 0 {
+            out.push_str(&format!(
+                "\n{} file(s) changed on disk after they were scanned and were left alone \
+                 (re-run to judge them as they now stand).",
+                self.changed
+            ));
+        }
+        out
     }
 }
 
-/// What the byte figure above it leaves out, when there is anything to leave
-/// out.
+/// The disposal pass: each target once, in order, each told to `each` with
+/// the label its row will carry. Shared by the grouped run and
+/// `--from-report`, so the two cannot count or describe it differently.
 ///
-/// Removing one of several names for a file is a perfectly good outcome -- the
-/// user asked for that path to go, and it went -- so this is not a problem, not
-/// a skip, and does not touch the exit code. It exists because the figure
-/// beside it would otherwise be unaccountable: rows totalling 40GB above a line
-/// reading "12GB freed", with nothing to say which rows were which. The rows
-/// are labelled UNLINKED; this says how many, how much, and why. It carries the
-/// bytes because a `--move-to` run of nothing else reads "Moved 1 file(s) (0B
-/// total)", which looks like a malfunction rather than a caveat.
-///
-/// Shared with `--from-report` for the same reason `disposed_line` is: it
-/// performs the same removals and can reach the same files.
-pub fn aliased_line(count: usize, bytes: u64) -> String {
-    if count == 0 {
-        return String::new();
-    }
-    format!(
-        "\n{} file(s) were another name for data that is still on disk (a hard link or a \
-         symlink), so their {} is not counted above; they are marked UNLINKED.",
-        count,
-        format_size(bytes)
-    )
-}
+/// `held(key, removed)` asks whether a target may still go: whether something
+/// it lost to remains, given the keys this pass has already removed. A target
+/// it refuses is SKIPPED and counted as unheld. Returns the tally and the paths
+/// that are genuinely no longer where they were -- every failure, every file
+/// that changed under us and everything an interrupt left untouched is missing
+/// from it.
+pub fn dispose_all<K: Copy + Eq + std::hash::Hash>(
+    targets: &[(K, Target)],
+    held: impl Fn(K, &HashSet<K>) -> bool,
+    disposal: &Disposal,
+    stats: &RunStats,
+    mut each: impl FnMut(K, &'static str),
+) -> (Tally, Vec<String>) {
+    let mut tally = Tally::default();
+    let mut removed: HashSet<K> = HashSet::new();
+    let mut deleted_paths = Vec::new();
 
-/// The lines that follow it when the pass did not get everything, each omitted
-/// when its count is zero.
-pub fn trouble_lines(failed: usize, changed: usize, unheld: usize) -> String {
-    let mut out = String::new();
-    if unheld > 0 {
-        out.push_str(&format!(
-            "\n{} file(s) were left alone because every copy they lost to is gone or changed.",
-            unheld
-        ));
+    for &(key, target) in targets {
+        if shutdown_requested() {
+            info!(
+                "Interrupted: stopped after {} file(s); {} left untouched.",
+                tally.removed,
+                targets.len() - tally.settled()
+            );
+            break;
+        }
+
+        if !held(key, &removed) {
+            refuse_unheld(target.path, stats);
+            tally.unheld += 1;
+            each(key, "SKIPPED");
+            continue;
+        }
+
+        let label = match dispose_one(target.path, target.size, disposal, stats) {
+            Fate::Done { aliased } => {
+                tally.removed += 1;
+                if aliased {
+                    tally.aliased += 1;
+                    tally.aliased_bytes += target.size;
+                } else {
+                    tally.removed_bytes += target.size;
+                }
+                deleted_paths.push(target.path.to_string());
+                removed.insert(key);
+                disposal.done_label(aliased)
+            }
+            Fate::Changed => {
+                tally.changed += 1;
+                "CHANGED"
+            }
+            Fate::Failed => {
+                tally.failed += 1;
+                "FAILED"
+            }
+        };
+        each(key, label);
     }
-    if failed > 0 {
-        out.push_str(&format!(
-            "\n{} file(s) could not be removed (see errors above).",
-            failed
-        ));
-    }
-    if changed > 0 {
-        out.push_str(&format!(
-            "\n{} file(s) changed on disk after they were scanned and were left alone \
-             (re-run to judge them as they now stand).",
-            changed
-        ));
-    }
-    out
+
+    (tally, deleted_paths)
 }
 
 /// Metrics that can justify a REVIEW flag, in default precedence order.
@@ -2227,6 +1093,8 @@ const REVIEW_METRICS: [Priority; 2] = [Priority::Length, Priority::Resolution];
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::render::CsvBody;
+    use super::stream::{replaceable_by_rename, scratch_beside, write_file_atomically, Scratch};
     use std::os::unix::fs::PermissionsExt;
     use crate::compare::Match;
     use crate::utils::Priority;
@@ -2412,7 +1280,7 @@ matched_from_seconds;matched_to_seconds";
         // A group of one has nobody to be compared against, so every column
         // that describes a link is empty too.
         assert!(contents.contains(
-            "group_1;KEEP;/fake/path/vid.mp4;00:01:00;60.00;1920x1080;1920;1080;30;h264;\
+            "group_1;KEEP;/fake/path/vid.mp4;00:01:00;60.0;1920x1080;1920;1080;30.0;h264;\
 1.0MB;1048576;140kbps;139810;4.7kb/f;4660;;;0;;;;;"
         ), "{}", contents);
 
@@ -2507,8 +1375,8 @@ matched_from_seconds;matched_to_seconds";
 
         assert!(
             csv.contains(
-                "group_1;KEEP;/fake/a.mp4;00:01:40;100.00;1920x1080;1920;1080;30;h264;\
-12.5MB;13107200;1.0Mbps;1048576;35.0kb/f;34952;/fake/b.mp4;false;0;80.00;"
+                "group_1;KEEP;/fake/a.mp4;00:01:40;100.0;1920x1080;1920;1080;30.0;h264;\
+12.5MB;13107200;1.0Mbps;1048576;35.0kb/f;34952;/fake/b.mp4;false;0;80.0;"
             ),
             "{}",
             csv
@@ -2523,6 +1391,44 @@ matched_from_seconds;matched_to_seconds";
         assert_eq!(file["bitrate_bps"], 1_048_576u64);
         assert_eq!(file["quality_bits_per_frame"], 34_952u64);
         assert_eq!(file["matched_seconds"], 80.0);
+
+        let _ = fs::remove_file(csv_path);
+        let _ = fs::remove_file(json_path);
+    }
+
+    #[test]
+    fn test_the_csv_columns_are_the_json_keys_in_the_same_order() {
+        // One schema, read two ways: the CSV's columns after `group` are a JSON
+        // file object's keys before `matches`, name for name and in order, and
+        // each JSON link carries the row's link block under the same names.
+        let fps = vec![mock_fp_at("/fake/a.mp4", 100.0), mock_fp_at("/fake/b.mp4", 100.0)];
+        let groups = vec![vec![0, 1]];
+        let matches = MatchIndex::new(vec![Match::new(0, 1, 0.80, 0.80)]);
+        let csv_path = report_to("csv");
+        let json_path = report_to("json");
+        for path in [&csv_path, &json_path] {
+            output_results(
+                &groups, &fps, &matches, Some(&to_file(path)), 0, Priority::Length, None,
+                true, &RunStats::default(),
+            ).unwrap();
+        }
+
+        let csv = fs::read_to_string(&csv_path).unwrap();
+        let columns: Vec<&str> = csv.lines().next().unwrap().split(';').collect();
+        assert_eq!(columns.join(";"), CSV_HEADER);
+
+        let report = read_json(&json_path);
+        let file = report["results"][0]["files"][0].as_object().unwrap();
+        let keys: Vec<&str> = file.keys().map(String::as_str).collect();
+        assert_eq!(keys.last(), Some(&"matches"));
+        assert_eq!(columns[1..], keys[..keys.len() - 1]);
+
+        let link: Vec<&str> =
+            file["matches"][0].as_object().unwrap().keys().map(String::as_str).collect();
+        let block: Vec<&str> =
+            columns.iter().copied().filter(|c| c.starts_with("matched_") && *c != "matched_with").collect();
+        assert_eq!(link[..2], ["full_path", "identical"]);
+        assert_eq!(link[2..], block[..]);
 
         let _ = fs::remove_file(csv_path);
         let _ = fs::remove_file(json_path);
@@ -2608,8 +1514,8 @@ matched_from_seconds;matched_to_seconds";
         // Read as `matched_with;matched_seconds`: each row names the other file
         // and reports the same minute of footage.
         let contents = fs::read_to_string(&path_str).unwrap();
-        assert!(contents.contains(";/fake/clip.mp4;false;0;60.00;"), "host row: {}", contents);
-        assert!(contents.contains(";/fake/host.mp4;false;0;60.00;"), "clip row: {}", contents);
+        assert!(contents.contains(";/fake/clip.mp4;false;0;60.0;"), "host row: {}", contents);
+        assert!(contents.contains(";/fake/host.mp4;false;0;60.0;"), "clip row: {}", contents);
 
         let _ = fs::remove_file(path_str);
     }
@@ -2640,13 +1546,13 @@ matched_from_seconds;matched_to_seconds";
 
         assert!(
             contents.contains("group_1;KEEP;/fake/host.mp4;")
-                && contents.contains("/fake/clip.mp4;false;0;60.00;00:14:00;00:15:00;840.00;900.00"),
+                && contents.contains("/fake/clip.mp4;false;0;60.0;00:14:00;00:15:00;840.0;900.0"),
             "the host row should point into the host's own timeline: {}",
             contents
         );
         assert!(
             contents.contains("group_1;DELETE;/fake/clip.mp4;")
-                && contents.contains("/fake/host.mp4;false;0;60.00;00:00:00;00:01:00;0.00;60.00"),
+                && contents.contains("/fake/host.mp4;false;0;60.0;00:00:00;00:01:00;0.0;60.0"),
             "the clip row should point into the clip's own timeline: {}",
             contents
         );
@@ -3956,7 +2862,7 @@ matched_from_seconds;matched_to_seconds";
         // first failure is skipped, exactly as the sink skips.
         body.record(["group_1", "KEEP", "/fake/a.mp4"]);
 
-        let failure = body.finish(&target).expect_err("a refused record is a failed report");
+        let failure = body.close().expect_err("a refused record is a failed report");
         assert!(
             format!("{:#}", failure).contains("Failed to write the CSV report"),
             "answered for in the same words a failed whole-document write uses: {:#}",

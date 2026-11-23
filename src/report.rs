@@ -41,9 +41,9 @@ use std::collections::HashSet;
 use std::path::{Component, Path};
 
 use crate::confirm::{self, Target};
-use crate::export::{self, Disposal, Fate};
+use crate::export::{self, Disposal};
 use crate::stats::RunStats;
-use crate::utils::{format_size, shutdown_requested};
+use crate::utils::format_size;
 
 /// The action word that means "act on this row". Compared case-insensitively
 /// after trimming, because someone editing a column of capitals in a
@@ -834,15 +834,14 @@ pub fn apply(
         export::refuse_unheld(&m.path, stats);
     }
 
-    let targets: Vec<Target> = marked
+    let targets: Vec<(usize, Target)> = marked
         .iter()
-        .map(|m| Target {
-            path: &m.path,
-            size: m.size,
-        })
+        .enumerate()
+        .map(|(i, m)| (i, Target { path: &m.path, size: m.size }))
         .collect();
+    let plain: Vec<Target> = targets.iter().map(|(_, t)| *t).collect();
 
-    if !confirm::approve(disposal, &targets, assume_yes, confirm::Decline::StopsHere) {
+    if !confirm::approve(disposal, &plain, assume_yes, confirm::Decline::StopsHere) {
         info!("\nCancelled at the confirmation prompt; every file was left alone.");
         return Ok(Vec::new());
     }
@@ -851,75 +850,22 @@ pub fn apply(
     info!("             RESULTS");
     info!("========================================\n");
 
-    let mut removed_count = 0usize;
-    let mut failed_count = 0usize;
-    let mut changed_count = 0usize;
-    let mut aliased_count = 0usize;
-    let mut aliased_bytes = 0u64;
-    let mut removed_bytes = 0u64;
-    let mut deleted_paths: Vec<String> = Vec::new();
-
+    // Laid out like the grouped run's results table: outcome first as a
+    // column, path last because it is the one field of unbounded width.
+    let line = |label: &str, m: &Marked| {
+        info!("\t{:<width$} {}, {}", format!("{},", label), format_size(m.size), m.path, width = export::ACTION_COLUMN);
+    };
     for m in &unheld {
-        info!(
-            "\t{:<width$} {}, {}",
-            "SKIPPED,",
-            format_size(m.size),
-            m.path,
-            width = export::ACTION_COLUMN
-        );
+        line("SKIPPED", m);
     }
 
-    for m in &marked {
-        if shutdown_requested() {
-            info!(
-                "Interrupted: stopped after {} file(s); {} left untouched.",
-                removed_count,
-                marked.len() - removed_count - failed_count - changed_count
-            );
-            break;
-        }
+    // Every row's holders were settled above, before the prompt, so nothing
+    // here is held back on the way.
+    let (mut tally, deleted_paths) =
+        export::dispose_all(&targets, |_, _| true, disposal, stats, |i, label| line(label, marked[i]));
+    tally.unheld = unheld.len();
 
-        let label = match export::dispose_one(&m.path, m.size, disposal, stats) {
-            Fate::Done { aliased } => {
-                removed_count += 1;
-                // Only bytes that actually went away. See `export::OnDisk`:
-                // this mode reaches the same files by the same paths, and a
-                // report row records a size for a file that may have had
-                // another name all along.
-                if aliased {
-                    aliased_count += 1;
-                    aliased_bytes += m.size;
-                } else {
-                    removed_bytes += m.size;
-                }
-                deleted_paths.push(m.path.clone());
-                disposal.done_label(aliased)
-            }
-            Fate::Changed => {
-                changed_count += 1;
-                "CHANGED"
-            }
-            Fate::Failed => {
-                failed_count += 1;
-                "FAILED"
-            }
-        };
-
-        // Laid out like the grouped run's results table: outcome first as a
-        // column, path last because it is the one field of unbounded width.
-        info!(
-            "\t{:<width$} {}, {}",
-            format!("{},", label),
-            format_size(m.size),
-            m.path,
-            width = export::ACTION_COLUMN
-        );
-    }
-
-    let mut summary = export::disposed_line(disposal, removed_count, removed_bytes);
-    summary.push_str(&export::aliased_line(aliased_count, aliased_bytes));
-    summary.push_str(&export::trouble_lines(failed_count, changed_count, unheld.len()));
-    info!("\n{}", summary);
+    info!("\n{}", tally.lines(disposal));
 
     Ok(deleted_paths)
 }
