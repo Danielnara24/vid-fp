@@ -1732,7 +1732,7 @@ pub(crate) struct Hashed {
 
 /// A sub-rectangle of each frame's own crop that a re-upload is often cut down
 /// to, hashed alongside the whole frame so that copy can still be found.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Reframing {
     /// A portrait frame holding a 16:9 picture in its middle rows: the blurred
     /// or coloured "fill" a vertical re-upload pads a landscape video with.

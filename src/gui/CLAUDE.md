@@ -101,8 +101,14 @@ one differs, it is said below.
   `Kind`, label, tip, hint; `ALL`), defaults read off vid-fp's own parser
   (`options::flag`). **Adding an option**: an `Opt` in `ALL` and a place on the
   page for its widget; a flag the window does not show goes in `BY_HAND` or
-  `NOT_SHOWN` (the test says which is missing). There is no "use a cache"
-  switch: vid-fp always caches.
+  `NOT_SHOWN` (the test says which is missing). *Use a cache* (`USE_CACHE`,
+  img-fp's) passes `--no-cache` when off, with no `--cache` or `--prune-cache`
+  unless the cache is to be emptied; a scan without it is not kept as the
+  last scan. *Include hidden folders* is `--hidden`. The exclude list also
+  takes what is typed (*Or type*, `PathList::with_patterns`,
+  `vid_fp::typed_exclude`, img-fp's): a pattern of names as typed, or a whole
+  or `~/` path, plain or a pattern; anything relative is refused, since the
+  worker has no folder the user chose to resolve it against.
 - Paths persist (`$XDG_CONFIG_HOME/vid-fp/gui.json`), options only where set
   away from their default; clear/prune cache never kept; `recursive` on by
   default. The last scan and its marks are kept in

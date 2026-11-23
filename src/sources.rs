@@ -60,10 +60,12 @@ use anyhow::{Context, Result};
 use log::info;
 use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Read};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+use crate::exclude::Excludes;
 use crate::stats::RunStats;
 use crate::utils::shutdown_requested;
 
@@ -79,6 +81,8 @@ pub struct Sources<'a> {
     pub extensions: &'a [String],
     pub recursive: bool,
     pub follow_symlinks: bool,
+    /// `--hidden`: walk folders whose names start with a dot.
+    pub hidden: bool,
 }
 
 /// One file to fingerprint, plus everything the rest of the run needs to know
@@ -181,9 +185,10 @@ pub struct Library {
     /// under no root the user typed, so `--move-to store` looked safe and the
     /// next run found what the last one had moved.
     walked: Vec<Reached>,
-    /// The `--exclude` paths that resolved, which is what makes the advice in
-    /// the `--move-to` refusal true rather than merely plausible.
-    excluded: Vec<PathBuf>,
+    /// The `--exclude` paths that resolved and the patterns, which is what
+    /// makes the advice in the `--move-to` refusal true rather than merely
+    /// plausible.
+    excluded: Excludes,
 }
 
 impl Library {
@@ -234,10 +239,9 @@ impl Library {
     }
 
     pub fn walk_reaches(&self, dest: &Path) -> Option<&Reached> {
-        if is_excluded(dest, &self.excluded) {
-            return None;
-        }
-        self.walked.iter().find(|r| dest.starts_with(&r.root))
+        self.walked
+            .iter()
+            .find(|r| dest.starts_with(&r.root) && !self.excluded.spares_below(&r.root, dest))
     }
 }
 
@@ -337,7 +341,7 @@ pub fn collect(sources: &Sources, stats: &RunStats) -> Result<Scan> {
             }
         };
 
-        if is_excluded(&resolved, &excludes) {
+        if excludes.covers(&resolved) || excludes.names(&resolved) {
             stats.skipped_excluded.bump();
             log::debug!("Skipping {}: named or under an --exclude path", resolved.display());
             continue;
@@ -577,12 +581,25 @@ impl SetAside {
     }
 }
 
+/// Whether a folder met during a walk is hidden: its name starts with a dot.
+///
+/// **They are passed over unless `--hidden` asks**, as img-fp passes them
+/// over, because what a home folder keeps in them is the programs' own files,
+/// not the user's: caches, browser profiles, build trees, game data. Under
+/// `-x '*'` every one of those files is handed to the decoder, and that is
+/// where most of the failures of a home-directory scan came from. A hidden
+/// folder named as a root is scanned, as a Trash is; a hidden FILE in a
+/// walked folder is a file like any other.
+fn is_hidden(dir: &Path) -> bool {
+    dir.file_name().is_some_and(|n| n.as_bytes().first() == Some(&b'.'))
+}
+
 /// Walk one folder, appending every video in it. Returns false if interrupted.
 fn walk_folder(
     base: &Path,
     sources: &Sources,
     extensions: &Wanted,
-    excludes: &[PathBuf],
+    excludes: &Excludes,
     into: &mut Collecting,
     stats: &RunStats,
 ) -> bool {
@@ -607,10 +624,17 @@ fn walk_folder(
             return false;
         }
         // Without -r a subfolder is never entered, so there is nothing to set aside.
-        if sources.recursive && e.depth() > 0 && e.file_type().is_dir() && set_aside.holds(e.path(), through_links) {
-            log::debug!("Not walking {}: a Trash or recycle bin", e.path().display());
-            stats.skipped_trash.record(e.path().display().to_string());
-            return false;
+        if sources.recursive && e.depth() > 0 && e.file_type().is_dir() {
+            if set_aside.holds(e.path(), through_links) {
+                log::debug!("Not walking {}: a Trash or recycle bin", e.path().display());
+                stats.skipped_trash.record(e.path().display().to_string());
+                return false;
+            }
+            if !sources.hidden && is_hidden(e.path()) {
+                log::debug!("Not walking {}: a hidden folder (--hidden walks it)", e.path().display());
+                stats.skipped_hidden.record(e.path().display().to_string());
+                return false;
+            }
         }
         true
     });
@@ -1015,12 +1039,16 @@ fn normalize_extensions(requested: &[String]) -> Result<Wanted> {
 /// A path that will not resolve excludes NOTHING. That used to be swallowed by
 /// `filter_map(.ok())`, so a typo in `-e` quietly scanned the folder you were
 /// protecting -- and with `--delete` armed, that is how files die.
-fn resolve_excludes(requested: &[String], stats: &RunStats) -> Vec<PathBuf> {
-    let mut excludes: Vec<PathBuf> = Vec::with_capacity(requested.len());
+///
+/// An entry holding a wildcard that names no path is a pattern instead; see
+/// `exclude`.
+fn resolve_excludes(requested: &[String], stats: &RunStats) -> Excludes {
+    let mut excludes = Excludes::default();
 
     for p in requested {
         match std::fs::canonicalize(p) {
-            Ok(resolved) => excludes.push(resolved),
+            Ok(resolved) => excludes.paths.push(resolved),
+            Err(_) if excludes.add_pattern(Path::new(p)) => {}
             Err(e) => {
                 log::error!(
                     target: crate::stats::COUNTED,
@@ -1034,10 +1062,6 @@ fn resolve_excludes(requested: &[String], stats: &RunStats) -> Vec<PathBuf> {
     }
 
     excludes
-}
-
-fn is_excluded(path: &Path, excludes: &[PathBuf]) -> bool {
-    excludes.iter().any(|ex| path.starts_with(ex))
 }
 
 /// Is this path, or the file it actually leads to, under an `--exclude`?
@@ -1062,8 +1086,12 @@ fn is_excluded(path: &Path, excludes: &[PathBuf]) -> bool {
 ///
 /// A path that will not canonicalize is not excluded, and needs no protecting:
 /// it cannot be opened, so it cannot be fingerprinted, moved or deleted.
-fn is_excluded_target(path: &Path, excludes: &[PathBuf], through_links: bool) -> bool {
-    if is_excluded(path, excludes) {
+///
+/// A name pattern is asked of the name the walk met and, through a link, of
+/// the name of what it leads to: `-e '*.part'` protects `real.part` from a
+/// walk that reached it as `link.mkv`.
+fn is_excluded_target(path: &Path, excludes: &Excludes, through_links: bool) -> bool {
+    if excludes.covers(path) || excludes.names(path) {
         return true;
     }
 
@@ -1071,7 +1099,7 @@ fn is_excluded_target(path: &Path, excludes: &[PathBuf], through_links: bool) ->
         return false;
     }
 
-    std::fs::canonicalize(path).is_ok_and(|real| is_excluded(&real, excludes))
+    std::fs::canonicalize(path).is_ok_and(|real| excludes.covers(&real) || excludes.names(&real))
 }
 
 #[cfg(test)]
@@ -1116,6 +1144,7 @@ mod tests {
             extensions,
             recursive: false,
             follow_symlinks: false,
+            hidden: false,
         }
     }
 
@@ -1158,6 +1187,82 @@ mod tests {
         let stats = RunStats::default();
         assert_eq!(collected(&src, &stats).len(), 1, "a Trash named as a root is scanned");
         assert_eq!(stats.skipped_trash.count(), 0);
+    }
+
+    /// A hidden folder met during a walk is passed over unless `--hidden`
+    /// asks, and named as a root it is scanned; a hidden file is a file.
+    #[test]
+    fn test_a_walk_passes_over_hidden_folders_unless_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let kept = touch(dir.path(), "lib/a.mkv");
+        let dotfile = touch(dir.path(), "lib/.b.mkv");
+        let inside = touch(dir.path(), "lib/.cache/c.mkv");
+        let include = vec![dir.path().join("lib").to_string_lossy().to_string()];
+        let mkv = extensions_of(&["mkv"]);
+        let mut src = sources(&include, &[], &mkv);
+        src.recursive = true;
+        let stats = RunStats::default();
+        assert_eq!(collected(&src, &stats), vec![dotfile.clone(), kept.clone()]);
+        assert_eq!(stats.skipped_hidden.count(), 1);
+
+        src.hidden = true;
+        let stats = RunStats::default();
+        assert_eq!(collected(&src, &stats), vec![dotfile, inside.clone(), kept]);
+        assert_eq!(stats.skipped_hidden.count(), 0);
+
+        let named = vec![dir.path().join("lib/.cache").to_string_lossy().to_string()];
+        let mut src = sources(&named, &[], &mkv);
+        src.recursive = true;
+        assert_eq!(collected(&src, &RunStats::default()), vec![inside], "a hidden folder named as a root is scanned");
+    }
+
+    /// A pattern of a name leaves out every file and folder of that name below
+    /// a root, and a pattern of a path what lies under the paths it describes.
+    /// Neither is an unresolved path.
+    #[test]
+    fn test_an_exclude_with_a_wildcard_is_a_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        let kept = touch(dir.path(), "lib/a.mkv");
+        touch(dir.path(), "lib/b.mkv.part");
+        touch(dir.path(), "lib/x/@eaDir/c.mkv");
+        touch(dir.path(), "lib/y/z/proxies/d.mkv");
+        let also = touch(dir.path(), "lib/proxies2/e.mkv");
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let include = vec![root.join("lib").to_string_lossy().to_string()];
+        let exclude = vec![
+            "*.part".to_string(),
+            "@eaDir".to_string(),
+            "@ea[D]ir".to_string(),
+            root.join("lib/**/proxies").to_string_lossy().to_string(),
+        ];
+        let any = vec!["*".to_string()];
+        let mut src = sources(&include, &exclude, &any);
+        src.recursive = true;
+        let stats = RunStats::default();
+        let found = collected(&src, &stats);
+        assert!(found.contains(&kept) && found.contains(&also), "{:?}", found);
+        assert_eq!(found.len(), 2, "{:?}", found);
+        // `@eaDir` holds no wildcard: a path that would not resolve.
+        assert_eq!(stats.unresolved_excludes.count(), 1);
+    }
+
+    /// The `--move-to` loop guard reads a pattern as a walk does: a
+    /// destination the walk would pass over by name is not walked again.
+    #[test]
+    fn test_a_destination_a_name_pattern_leaves_out_is_not_reached() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "lib/a.mkv");
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let include = vec![root.join("lib").to_string_lossy().to_string()];
+        let exclude = vec!["@dupes*".to_string()];
+        let mkv = extensions_of(&["mkv"]);
+        let mut src = sources(&include, &exclude, &mkv);
+        src.recursive = true;
+        let lib = library(&src, &RunStats::default());
+        assert_eq!(reaches(&lib, &root.join("lib/@dupes")), None);
+        assert_eq!(reaches(&lib, &root.join("lib/dupes")), Some(root.join("lib")));
+        // A hidden destination is still reached: one --hidden later it is.
+        assert_eq!(reaches(&lib, &root.join("lib/.dupes")), Some(root.join("lib")));
     }
 
     /// The home Trash is set aside by place, since `Trash` is too ordinary a

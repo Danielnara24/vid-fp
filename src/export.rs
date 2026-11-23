@@ -876,6 +876,10 @@ pub fn output_results(
     // says what happened, and SKIPPED is a target an interrupt or a vanished
     // winner left alone.
     let marked: HashSet<usize> = delete.iter().copied().collect();
+    let rests_on: HashMap<usize, usize> = lost_to
+        .iter()
+        .filter_map(|(&idx, winners)| rests_on(winners, &marked).map(|w| (idx, w)))
+        .collect();
     let action = |idx: usize| -> &'static str {
         match (review.contains(&idx), marked.contains(&idx), disposal.is_some()) {
             (true, _, _) => "REVIEW",
@@ -923,8 +927,13 @@ pub fn output_results(
         }
 
         let name = format!("group_{}", i + 1);
-        let files: Vec<Entry> =
-            group.iter().map(|&idx| Entry::of(idx, group, fingerprints, matches, action(idx))).collect();
+        let files: Vec<Entry> = group
+            .iter()
+            .map(|&idx| {
+                let lost = rests_on.get(&idx).map(|&w| fingerprints[w].path.as_str());
+                Entry::of(idx, group, fingerprints, matches, action(idx), lost)
+            })
+            .collect();
         for body in bodies {
             body.group(&name, &files);
         }
@@ -966,6 +975,22 @@ pub fn output_results(
     }
 
     Ok(deleted_paths)
+}
+
+/// The one file a DELETE's report row names as what it rests on (`lost_to`),
+/// out of every file it lost the ranking to.
+///
+/// A report row has room for one, and `--from-report` acts on the row only
+/// while that file is still there, so the choice is the one most likely to
+/// stay: a winner nothing marks DELETE, the lowest-numbered (the comparison
+/// reads in path order, so a run names the same file every time). Only where
+/// every winner is itself marked -- a chain, see `verdicts` -- is it one of
+/// those, and a replay then holds it to having gone earlier in the same pass,
+/// exactly as the scan holds its own disposal (`output_results`).
+pub(crate) fn rests_on(winners: &[usize], marked: &HashSet<usize>) -> Option<usize> {
+    let mut sorted = winners.to_vec();
+    sorted.sort_unstable();
+    sorted.iter().copied().find(|w| !marked.contains(w)).or_else(|| sorted.first().copied())
 }
 
 /// What a disposal pass did: the counts and bytes both of its callers report.
@@ -1128,10 +1153,20 @@ mod tests {
     use tempfile::NamedTempFile;
     use std::fs;
 
-    const CSV_HEADER: &str = "group;action;full_path;length;length_seconds;resolution;width;\
+    const CSV_HEADER: &str = "group;action;full_path;lost_to;length;length_seconds;resolution;width;\
 height;framerate_fps;codec;size;size_bytes;bitrate;bitrate_bps;quality;\
 quality_bits_per_frame;matched_with;identical;samples;matched_seconds;matched_from;matched_to;\
 matched_from_seconds;matched_to_seconds";
+
+    /// What a DELETE row names as its rest: a winner that stays, before one
+    /// that is itself marked, and the lowest-numbered of either kind.
+    #[test]
+    fn test_a_delete_rests_on_a_winner_that_stays_when_there_is_one() {
+        let marked: HashSet<usize> = [1, 2].into_iter().collect();
+        assert_eq!(rests_on(&[2, 1, 5, 3], &marked), Some(3));
+        assert_eq!(rests_on(&[2, 1], &marked), Some(1), "a chain names a marked winner");
+        assert_eq!(rests_on(&[], &marked), None);
+    }
 
     fn mock_fp() -> VideoFingerprint {
         VideoFingerprint {
@@ -1308,7 +1343,7 @@ matched_from_seconds;matched_to_seconds";
         // A group of one has nobody to be compared against, so every column
         // that describes a link is empty too.
         assert!(contents.contains(
-            "group_1;KEEP;/fake/path/vid.mp4;00:01:00;60.0;1920x1080;1920;1080;30.0;h264;\
+            "group_1;KEEP;/fake/path/vid.mp4;;00:01:00;60.0;1920x1080;1920;1080;30.0;h264;\
 1.0MB;1048576;140kbps;139810;4.7kb/f;4660;;;0;;;;;"
         ), "{}", contents);
 
@@ -1403,7 +1438,7 @@ matched_from_seconds;matched_to_seconds";
 
         assert!(
             csv.contains(
-                "group_1;KEEP;/fake/a.mp4;00:01:40;100.0;1920x1080;1920;1080;30.0;h264;\
+                "group_1;KEEP;/fake/a.mp4;;00:01:40;100.0;1920x1080;1920;1080;30.0;h264;\
 12.5MB;13107200;1.0Mbps;1048576;35.0kb/f;34952;/fake/b.mp4;false;0;80.0;"
             ),
             "{}",
@@ -1495,9 +1530,9 @@ matched_from_seconds;matched_to_seconds";
         let contents = fs::read_to_string(&path_str).unwrap();
         for line in contents.lines().skip(1) {
             let cells: Vec<&str> = line.split(';').collect();
-            let matched: f64 = cells[19].parse().unwrap();
-            let from: f64 = cells[22].parse().unwrap();
-            let to: f64 = cells[23].parse().unwrap();
+            let matched: f64 = cells[20].parse().unwrap();
+            let from: f64 = cells[23].parse().unwrap();
+            let to: f64 = cells[24].parse().unwrap();
             assert!(
                 matched <= to - from + 1e-9,
                 "matched footage must fit inside its own envelope: {}",

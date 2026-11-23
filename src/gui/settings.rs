@@ -236,7 +236,11 @@ impl Settings {
                 flag("--format", f);
             }
         }
-        if !cache.is_empty() {
+        let use_cache = self.on(&o::USE_CACHE);
+        // The named file goes with `--no-cache` too when it is to be cleared:
+        // left out, `--clear-cache` would empty the default cache, not the
+        // one in the field.
+        if !cache.is_empty() && (use_cache || self.on(&o::CLEAR_CACHE)) {
             flag("--cache", cache);
         }
         if self.on(&o::LOG) && !log.is_empty() {
@@ -246,10 +250,13 @@ impl Settings {
             a.push("--exclude".into());
             a.push(e.into());
         }
+        if !use_cache {
+            a.push("--no-cache".into());
+        }
         if self.on(&o::CLEAR_CACHE) {
             a.push("--clear-cache".into());
         }
-        if self.on(&o::PRUNE_CACHE) {
+        if self.on(&o::PRUNE_CACHE) && use_cache {
             a.push("--prune-cache".into());
         }
         a.push("--".into());
@@ -430,6 +437,27 @@ mod tests {
         assert_eq!(given(&a, "format"), Some(vec!["csv".to_string()]));
         assert_eq!(given(&a, "log_file"), Some(vec!["/l.txt".to_string()]));
         assert_eq!(given(&a, "exclude"), Some(vec!["/v/keep".to_string(), "/v/old".to_string()]));
+        assert_eq!(vid_fp::check_args(a), Ok(()));
+    }
+
+    /// Without a cache the scan is told so, and is given no cache file or
+    /// prune to go with it -- unless the file is to be emptied, when it is
+    /// the one named. Every combination is one the command line accepts.
+    #[test]
+    fn a_scan_without_a_cache_is_given_no_cache_file_unless_to_empty_it() {
+        let mut s = Settings { folders: vec!["/v".into()], cache_path: "/c.redb".into(), ..Default::default() };
+        assert!(s.on(&o::USE_CACHE), "a cache by default");
+        s.set(&o::PRUNE_CACHE, Value::On(true));
+        s.set(&o::USE_CACHE, Value::On(false));
+        let a = s.argv();
+        let has = |a: &[OsString], f: &str| a.iter().any(|x| x == f);
+        assert!(has(&a, "--no-cache") && !has(&a, "--prune-cache"));
+        assert_eq!(given(&a, "cache"), None);
+        assert_eq!(vid_fp::check_args(a), Ok(()));
+        s.set(&o::CLEAR_CACHE, Value::On(true));
+        let a = s.argv();
+        assert_eq!(given(&a, "cache"), Some(vec!["/c.redb".to_string()]));
+        assert!(has(&a, "--clear-cache"));
         assert_eq!(vid_fp::check_args(a), Ok(()));
     }
 }

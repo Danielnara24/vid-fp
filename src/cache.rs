@@ -543,6 +543,9 @@ pub(crate) struct CacheUnavailable {
 
 pub(crate) struct Cache {
     db: Database,
+    /// `--no-cache`: an empty database in memory that nothing is written to,
+    /// so every lookup misses and the run keeps nothing. See `Cache::none`.
+    discards: bool,
 }
 
 impl Cache {
@@ -560,7 +563,7 @@ impl Cache {
         let fatal = |reason| CacheUnavailable { locked: false, damaged: false, reason };
 
         match Database::builder().set_cache_size(CACHE_SIZE_BYTES).create(db_path) {
-            Ok(db) => Ok(Self { db }),
+            Ok(db) => Ok(Self { db, discards: false }),
             Err(DatabaseError::DatabaseAlreadyOpen) => Err(CacheUnavailable {
                 locked: true,
                 damaged: false,
@@ -611,10 +614,25 @@ impl Cache {
         }
     }
 
+    /// The cache of a run under `--no-cache`: it holds nothing and keeps
+    /// nothing. Every lookup misses, every write is dropped, so nothing the
+    /// run learns accumulates in memory either -- the fingerprints the run
+    /// needs are held by the run itself. One empty in-memory database rather
+    /// than an `Option` at every call site, so the scan reads the same way
+    /// with or without a cache.
+    pub fn none() -> Result<Self> {
+        let db = Database::builder()
+            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .context("Failed to set up a run without a cache")?;
+        let cache = Self { db, discards: false };
+        cache.prepare()?;
+        Ok(Self { discards: true, ..cache })
+    }
+
     /// A cache in a file nothing else holds, ready to use. For tests.
     #[cfg(test)]
     pub fn create(db_path: &Path) -> Self {
-        let cache = Self { db: Database::create(db_path).unwrap() };
+        let cache = Self { db: Database::create(db_path).unwrap(), discards: false };
         cache.prepare().unwrap();
         cache
     }
@@ -719,7 +737,7 @@ impl Cache {
     /// batched per pass, because there can be a quarter of a million of them
     /// and one fsync each would cost more than re-probing next time.
     pub fn write(&self, writes: &[Write<'_>]) -> Result<()> {
-        if writes.is_empty() {
+        if writes.is_empty() || self.discards {
             return Ok(());
         }
         let txn = self.db.begin_write().context("Failed to start a cache transaction")?;
@@ -1180,7 +1198,7 @@ mod tests {
             txn.commit().unwrap();
         }
 
-        let db = Cache { db: redb::Database::create(&path).unwrap() };
+        let db = Cache { db: redb::Database::create(&path).unwrap(), discards: false };
         let prepared = db.prepare().unwrap();
         assert_eq!(prepared.converted, 4, "three fingerprints and one refusal");
         assert!(!prepared.rebuilt, "nothing is decoded again for it");

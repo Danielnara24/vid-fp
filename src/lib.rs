@@ -4,8 +4,10 @@ mod clustering;
 mod compare;
 mod confirm;
 mod content;
+mod exclude;
 mod export;
 mod fingerprint;
+mod kept;
 pub mod found;
 pub mod progress;
 mod report;
@@ -16,6 +18,7 @@ pub mod utils;
 mod sources;
 pub use sources::desktop_dir;
 pub use cache::default_cache_file;
+pub use exclude::{is_exclude_pattern, typed_exclude};
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
@@ -171,7 +174,7 @@ struct Args {
     /// extension, since --extensions is only a guess about what a FOLDER
     /// contains. Example: `fd -e mkv | vid-fp -`.
     #[arg(
-        required_unless_present_any = ["completions", "man", "from_file", "from_report"],
+        required_unless_present_any = ["completions", "man", "from_file", "from_report", "last"],
         num_args = 1..,
         value_name = "PATH",
         value_hint = clap::ValueHint::AnyPath
@@ -182,7 +185,10 @@ struct Args {
     ///
     /// Matched by whole path components, so -e ~/clips/take does not cover
     /// ~/clips/take.mkv. Resolved through symlinks, so excluding a link or its
-    /// target covers both.
+    /// target covers both. With `*`, `?` or `[...]` it is a pattern: of a name
+    /// anywhere (-e '*.part'), or, holding a `/`, of a path, where `**` spans
+    /// folders (-e '/media/**/proxies'). Quote patterns, or the shell expands
+    /// them first.
     #[arg(short = 'e', long = "exclude", value_name = "PATH",
           value_hint = clap::ValueHint::AnyPath)]
     exclude: Vec<String>,
@@ -214,6 +220,14 @@ struct Args {
     /// link leads to, not on the link.
     #[arg(long = "follow-symlinks")]
     follow_symlinks: bool,
+
+    /// Also walk hidden folders, whose names start with a dot
+    ///
+    /// They are passed over by default: in a home folder they hold programs'
+    /// caches and data rather than videos. A hidden folder named as a path to
+    /// scan is scanned either way, and hidden files are always walked.
+    #[arg(long = "hidden")]
+    hidden: bool,
 
     /// Extensions a FOLDER walk treats as video, comma-separated or repeated
     ///
@@ -331,7 +345,7 @@ struct Args {
         value_name = "FILE",
         value_hint = clap::ValueHint::FilePath,
         conflicts_with_all = [
-            "include", "exclude", "from_file", "null", "recursive", "follow_symlinks",
+            "include", "exclude", "from_file", "null", "recursive", "follow_symlinks", "hidden",
             "extensions", "hamming_distance", "match_percent", "min_duration",
             "kf_interval", "min_kf_samples", "priority", "output", "format",
             "prune_cache", "threads", "against",
@@ -350,11 +364,30 @@ struct Args {
 
     /// With --against, print the paths given these answers to stdout
     ///
-    /// Comma-separated or repeated. One path a line, or NUL-separated with -0.
+    /// Also with --last, after a scan against a library. Comma-separated or
+    /// repeated. One path a line, or NUL-separated with -0.
     /// Nothing else is printed to stdout, so the list can be piped on.
-    #[arg(long = "list", value_name = "ANSWER", value_enum, value_delimiter = ',',
-          requires = "against")]
+    #[arg(long = "list", value_name = "ANSWER", value_enum, value_delimiter = ',')]
     list: Vec<against::Answer>,
+
+    /// Write the last scan's report again, without scanning
+    ///
+    /// In another format with -o or --format, or with another --priority.
+    /// After a scan against a library, its answers, or with --list their
+    /// paths. Never touches a file: act on a report it writes with
+    /// --from-report. The last scan is kept beside the cache it used, so
+    /// --cache picks which; a run with --no-cache keeps none.
+    #[arg(
+        long = "last",
+        conflicts_with_all = [
+            "include", "exclude", "from_file", "recursive", "follow_symlinks", "hidden",
+            "extensions", "hamming_distance", "match_percent", "min_duration",
+            "kf_interval", "min_kf_samples", "delete", "permanent", "move_to",
+            "from_report", "against", "yes", "clear_cache", "prune_cache", "no_cache",
+            "threads",
+        ]
+    )]
+    last: bool,
 
     /// Answer yes to the confirmation shown before any file is touched
     ///
@@ -371,6 +404,14 @@ struct Args {
     #[arg(long = "cache", value_name = "PATH",
           value_hint = clap::ValueHint::FilePath)]
     cache: Option<String>,
+
+    /// Don't read or write the fingerprint cache
+    ///
+    /// Every video is fingerprinted again, and nothing this run learns is
+    /// kept, nor is the scan kept for --last. With --clear-cache, the cache is
+    /// emptied and not used.
+    #[arg(long = "no-cache", conflicts_with = "prune_cache")]
+    no_cache: bool,
 
     /// Delete ALL cache before running
     ///
@@ -855,12 +896,16 @@ fn conclude_without_comparing(
     if let Some(path) = &args.window_result {
         found::Found::empty(found, compared).save(path)?;
     }
+    // Kept too, for the reason the empty report is written: `--last` must not
+    // answer with an earlier scan of a library this one found empty.
+    let elapsed_secs = start_time.elapsed().as_secs();
+    keep_for_last(args, || kept::Kept::of(&[], &[], &[], &[], &[], !args.against.is_empty(), found, elapsed_secs));
     export::output_results(
         &[],
         &[],
         &MatchIndex::new(Vec::new()),
         report_target,
-        start_time.elapsed().as_secs(),
+        elapsed_secs,
         args.priority,
         disposal,
         args.yes,
@@ -868,6 +913,154 @@ fn conclude_without_comparing(
     )?;
 
     Ok(Outcome::Completed)
+}
+
+/// Keep this scan for `--last` (`kept`), beside the cache it used. Not under
+/// `--no-cache`, which asks for nothing to be kept, nor under the window,
+/// which keeps its own. Failing to keep it is said and costs nothing else:
+/// the report this run writes is the one asked for.
+fn keep_for_last(args: &Args, kept: impl FnOnce() -> kept::Kept) {
+    if args.no_cache || args.window_result.is_some() {
+        return;
+    }
+    let path = kept::path_for(&cache::cache_file_for(args.cache.as_deref()));
+    if let Err(e) = kept().save(&path) {
+        log::warn!("{:#}", e);
+    }
+}
+
+/// The paths `--list` prints, refused before anything is written when one
+/// cannot be printed as a line.
+fn listed_paths<'a>(
+    args: &Args,
+    answered: Option<&against::Answered>,
+    fingerprints: &'a [VideoFingerprint],
+) -> Result<Vec<&'a str>> {
+    // `--list` writes paths for a script to act on, so a path that cannot be
+    // written that way stops the run here, before anything is disposed of.
+    let listed: Vec<&str> = match answered {
+        Some(a) => a
+            .answers
+            .iter()
+            .filter(|(_, answer)| args.list.contains(answer))
+            .map(|&(i, _)| fingerprints[i].path.as_str())
+            .collect(),
+        None => Vec::new(),
+    };
+    if !args.null {
+        if let Some(bad) = listed.iter().find(|p| p.contains('\n')) {
+            anyhow::bail!(
+                "{:?} holds a line break, so --list would print it as two paths. Add -0 to \
+                 separate the list with NUL bytes instead.",
+                bad
+            );
+        }
+    }
+    Ok(listed)
+}
+
+fn say_answers(a: &against::Answered) {
+    let count = |want| a.answers.iter().filter(|(_, got)| *got == want).count();
+    info!(
+        "Against the library: {} repeat(s), {} better, {} to review, {} new.",
+        count(against::Answer::Repeat),
+        count(against::Answer::Better),
+        count(against::Answer::Review),
+        count(against::Answer::New)
+    );
+}
+
+fn print_listed(listed: &[&str], null: bool) {
+    if listed.is_empty() {
+        return;
+    }
+    let end = if null { '\0' } else { '\n' };
+    let mut out = std::io::stdout().lock();
+    for path in listed {
+        // A reader closing early is how a pipeline ends (`| head`).
+        if write!(out, "{}{}", path, end).is_err() {
+            break;
+        }
+    }
+    let _ = out.flush();
+}
+
+/// How long ago, in the largest whole unit.
+fn age_of(secs: u64) -> String {
+    match secs {
+        0..=119 => format!("{} s", secs),
+        120..=7199 => format!("{} min", secs / 60),
+        7200..=172_799 => format!("{} h", secs / 3600),
+        _ => format!("{} days", secs / 86_400),
+    }
+}
+
+/// `--last`: the last scan's report written again, from what the scan kept
+/// (`kept`), by the function that wrote it the first time.
+///
+/// Report-only by construction: no `Disposal` is ever made here, so nothing
+/// can be touched. A report it writes is acted on with `--from-report`,
+/// whose checks (each file's size, what each DELETE rests on) are taken
+/// against the disk as it stands then -- which is what makes a report
+/// rewritten from a scan of yesterday safe to act on.
+fn run_last(args: &Args, stats: &RunStats) -> Result<()> {
+    check_ranges(args)?;
+    let path = kept::path_for(&cache::cache_file_for(args.cache.as_deref()));
+    let mut kept = kept::Kept::load(&path)?;
+    if !args.list.is_empty() && !kept.answering {
+        anyhow::bail!("--list needs a scan against a library, and the last scan was not one.");
+    }
+    let report_target = report_target_for(args.output.as_deref(), args.format)?;
+    if !args.list.is_empty() && report_target.as_ref().is_some_and(|t| matches!(t.sink, Sink::Stdout)) {
+        anyhow::bail!("--list prints to stdout, so the report cannot go there too; give -o a file.");
+    }
+    let fingerprints = kept.fingerprints();
+    report_replaces_an_input(report_target.as_ref(), &fingerprints)?;
+
+    let age = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+        .saturating_sub(kept.finished);
+    info!("The last scan, kept {} ago ({} file(s) found).", age_of(age), kept.found);
+    let gone = fingerprints.iter().filter(|f| std::fs::symlink_metadata(&f.path).is_err()).count();
+    if gone > 0 {
+        log::warn!(
+            "{} file(s) it reported are no longer where it found them. The report says what the \
+             scan found; --from-report checks every file again before it acts.",
+            gone
+        );
+    }
+
+    let n = fingerprints.len();
+    let answered =
+        kept.answering.then(|| against::answer(&fingerprints, &kept.matches, &kept.library, args.priority));
+    let mut answered = answered;
+    let groups = match answered.as_mut() {
+        Some(a) => std::mem::take(&mut a.groups),
+        None => std::mem::take(&mut kept.groups),
+    };
+    let listed = listed_paths(args, answered.as_ref(), &fingerprints)?;
+    if let Some(a) = &answered {
+        say_answers(a);
+    }
+    let matches = MatchIndex::new(std::mem::take(&mut kept.matches)).with_identical(n, &kept.identical);
+
+    export::output_results(
+        &groups,
+        &fingerprints,
+        &matches,
+        report_target.as_ref(),
+        kept.elapsed_secs,
+        match answered {
+            Some(a) => export::Ranking::Pinned(a.verdicts),
+            None => export::Ranking::By(args.priority),
+        },
+        None,
+        true,
+        stats,
+    )?;
+    print_listed(&listed, args.null);
+    Ok(())
 }
 
 /// `--from-report`: dispose of what a previous run's report marks DELETE, and
@@ -1124,7 +1317,11 @@ fn refuse_shared_outputs(args: &Args) -> Result<()> {
     let cache = cache::cache_file_for(args.cache.as_deref());
     let output = args.output.as_deref().filter(|o| *o != "-").map(Path::new);
     let log = args.log_file.as_deref().map(Path::new);
-    let mut named: Vec<(&str, &Path)> = vec![("--cache", cache.as_path())];
+    // Under `--no-cache` the file is not opened unless it is to be emptied.
+    let mut named: Vec<(&str, &Path)> = Vec::new();
+    if !args.no_cache || args.clear_cache {
+        named.push(("--cache", cache.as_path()));
+    }
     named.extend(output.map(|p| ("--output", p)));
     named.extend(log.map(|p| ("--log-file", p)));
     for i in 0..named.len() {
@@ -1360,6 +1557,19 @@ Interrupted with Ctrl-C.
     // Installed before any real work so even the directory walk is cancellable.
     install_signal_handler()?;
 
+    // `--last` scans nothing and opens no cache: it needs neither FFmpeg nor
+    // the lock another run may be holding.
+    if args.last {
+        let stats = RunStats::default();
+        let outcome = run_last(&args, &stats);
+        stats.print_summary();
+        outcome?;
+        if stats.had_problems() {
+            std::process::exit(EXIT_WITH_PROBLEMS);
+        }
+        return Ok(());
+    }
+
     // --- Allocator tuning (Linux / glibc) ------------------------------------
     // Each video's frame data is now a single large buffer. We pin glibc's mmap
     // and trim thresholds low and FIXED so those buffers are always served by
@@ -1430,9 +1640,13 @@ Interrupted with Ctrl-C.
     //
     // `--clear-cache` is exempt. Emptying a cache is not bookkeeping -- it is
     // the thing that was asked for, and it cannot be given up quietly.
-    let mut db = match Cache::open(&db_path) {
-        Ok(db) => Some(db),
-        Err(e) if e.locked && args.from_report.is_some() && !args.clear_cache => {
+    // `--no-cache` opens the file only to empty it, under `--clear-cache`.
+    let file_wanted = !args.no_cache || args.clear_cache;
+    let opened = if file_wanted { Some(Cache::open(&db_path)) } else { None };
+    let mut db = match opened {
+        None => None,
+        Some(Ok(db)) => Some(db),
+        Some(Err(e)) if e.locked && args.from_report.is_some() && !args.clear_cache => {
             log::warn!(
                 "The fingerprint cache at {} is in use by another vid-fp run.\n\
                  Continuing without it, since a report replay does not read it -- but the \
@@ -1442,7 +1656,7 @@ Interrupted with Ctrl-C.
             );
             None
         }
-        Err(e) if e.damaged && args.clear_cache => {
+        Some(Err(e)) if e.damaged && args.clear_cache => {
             let aside = cache::set_aside_path(&db_path);
             std::fs::rename(&db_path, &aside).with_context(|| {
                 format!("Could not move the damaged cache {} aside", db_path.display())
@@ -1455,10 +1669,16 @@ Interrupted with Ctrl-C.
             );
             Some(Cache::open(&db_path).map_err(|e| e.reason)?)
         }
-        Err(e) => return Err(e.reason),
+        Some(Err(e)) => return Err(e.reason),
     };
 
-    if let Some(db) = db.as_mut() {
+    if args.no_cache {
+        if let Some(mut file) = db.take() {
+            info!("Clearing all cache...");
+            file.clear()?;
+        }
+        db = Some(Cache::none()?);
+    } else if let Some(db) = db.as_mut() {
         // Handled here rather than inside `run` because compaction needs an
         // exclusive handle on the database, and because this is the only point
         // in the run where compacting is free. A clear drops every table, the
@@ -1665,6 +1885,15 @@ fn check_ranges(args: &Args) -> Result<()> {
              --keyframe-interval to stand on its own)."
         );
     }
+    if !args.list.is_empty() && args.against.is_empty() && !args.last {
+        anyhow::bail!("--list needs --against, or --last after a scan against a library.");
+    }
+    // A cache named beside `--no-cache` is one the run will neither read nor
+    // write, which is a mistake -- unless it is there to say which file
+    // `--clear-cache` empties (img-fp's rule, and the window's need).
+    if args.cache.is_some() && args.no_cache && !args.clear_cache {
+        anyhow::bail!("--cache cannot be used with --no-cache, except with --clear-cache to empty that cache.");
+    }
     Ok(())
 }
 
@@ -1757,6 +1986,7 @@ fn run(
             extensions: &args.extensions,
             recursive: args.recursive,
             follow_symlinks: args.follow_symlinks,
+            hidden: args.hidden,
         },
         stats,
     )? {
@@ -1779,6 +2009,7 @@ fn run(
                 extensions: &args.extensions,
                 recursive: args.recursive,
                 follow_symlinks: args.follow_symlinks,
+                hidden: args.hidden,
             },
             stats,
         )? {
@@ -2032,6 +2263,21 @@ fn run(
             .filter(|set| set.len() > 1)
             .collect()
     };
+    // One figure for both: what the kept scan says it took is what its report
+    // said.
+    let elapsed_secs = start_time.elapsed().as_secs();
+    keep_for_last(args, || {
+        kept::Kept::of(
+            &final_groups,
+            &fingerprints,
+            &matches,
+            &identical,
+            &library_side,
+            answering,
+            total_videos,
+            elapsed_secs,
+        )
+    });
     let matches = MatchIndex::new(matches).with_identical(n, &identical);
 
     if shutdown_requested() {
@@ -2047,34 +2293,9 @@ fn run(
     // then fails to save still leaves the window its groups to show.
     // `--list` writes paths for a script to act on, so a path that cannot be
     // written that way stops the run here, before anything is disposed of.
-    let listed: Vec<&str> = match &answered {
-        Some(a) => a
-            .answers
-            .iter()
-            .filter(|(_, answer)| args.list.contains(answer))
-            .map(|&(i, _)| fingerprints[i].path.as_str())
-            .collect(),
-        None => Vec::new(),
-    };
-    if !args.null {
-        if let Some(bad) = listed.iter().find(|p| p.contains('\n')) {
-            anyhow::bail!(
-                "{:?} holds a line break, so --list would print it as two paths. Add -0 to \
-                 separate the list with NUL bytes instead.",
-                bad
-            );
-        }
-    }
-
+    let listed = listed_paths(args, answered.as_ref(), &fingerprints)?;
     if let Some(a) = &answered {
-        let count = |want| a.answers.iter().filter(|(_, got)| *got == want).count();
-        info!(
-            "Against the library: {} repeat(s), {} better, {} to review, {} new.",
-            count(against::Answer::Repeat),
-            count(against::Answer::Better),
-            count(against::Answer::Review),
-            count(against::Answer::New)
-        );
+        say_answers(a);
     }
 
     if let Some(path) = &args.window_result {
@@ -2086,7 +2307,7 @@ fn run(
         &fingerprints,
         &matches,
         report_target.as_ref(),
-        start_time.elapsed().as_secs(),
+        elapsed_secs,
         match answered {
             Some(a) => export::Ranking::Pinned(a.verdicts),
             None => export::Ranking::By(args.priority),
@@ -2096,17 +2317,7 @@ fn run(
         stats,
     )?;
 
-    if !listed.is_empty() {
-        let end = if args.null { '\0' } else { '\n' };
-        let mut out = std::io::stdout().lock();
-        for path in &listed {
-            // A reader closing early is how a pipeline ends (`| head`).
-            if write!(out, "{}{}", path, end).is_err() {
-                break;
-            }
-        }
-        let _ = out.flush();
-    }
+    print_listed(&listed, args.null);
 
     // Those files are gone for good, so the fingerprints filed under their
     // paths describe nothing at all (see `forgets` for why only for good).

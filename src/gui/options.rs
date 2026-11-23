@@ -158,6 +158,10 @@ pub static RECURSIVE: Opt = Opt {
     ..plain("recursive", Some("recursive"), Kind::Check, l::RECURSIVE)
 };
 pub static SYMLINKS: Opt = plain("follow_symlinks", Some("follow_symlinks"), Kind::Check, l::SYMLINKS);
+pub static HIDDEN: Opt = Opt {
+    tip: Some("Folders whose names start with a dot hold programs' own files, not videos, and are left out unless this is on."),
+    ..plain("hidden", Some("hidden"), Kind::Check, l::HIDDEN)
+};
 
 // The window's own switches: each says whether a path beside it is used, and
 // `Settings::argv` passes the flags they stand for.
@@ -173,6 +177,11 @@ pub static REPORT_FORMAT: Opt = Opt {
         l::REPORT_FORMAT,
     )
 };
+pub static USE_CACHE: Opt = Opt {
+    default: Some("true"),
+    hint: Some("Keeps each video's fingerprint, so a folder scanned again only fingerprints what changed."),
+    ..plain("use_cache", None, Kind::Check, l::USE_CACHE)
+};
 pub static CLEAR_CACHE: Opt = Opt { default: Some("false"), kept: false, ..plain("clear_cache", None, Kind::Check, l::CLEAR_CACHE) };
 pub static PRUNE_CACHE: Opt = Opt { default: Some("false"), kept: false, ..plain("prune_cache", None, Kind::Check, l::PRUNE_CACHE) };
 pub static LOG: Opt = Opt {
@@ -182,9 +191,9 @@ pub static LOG: Opt = Opt {
 };
 
 /// Every option, in the order the command line passes them.
-pub static ALL: [&Opt; 14] = [
-    &TOLERANCE, &MATCH_PERCENT, &MIN_DURATION, &THREADS, &KF_INTERVAL, &MIN_KEYFRAMES, &EXTENSIONS, &RECURSIVE, &SYMLINKS,
-    &REPORT, &REPORT_FORMAT, &CLEAR_CACHE, &PRUNE_CACHE, &LOG,
+pub static ALL: [&Opt; 16] = [
+    &TOLERANCE, &MATCH_PERCENT, &MIN_DURATION, &THREADS, &KF_INTERVAL, &MIN_KEYFRAMES, &EXTENSIONS, &RECURSIVE, &SYMLINKS, &HIDDEN,
+    &REPORT, &REPORT_FORMAT, &USE_CACHE, &CLEAR_CACHE, &PRUNE_CACHE, &LOG,
 ];
 
 impl Opt {
@@ -281,7 +290,7 @@ mod tests {
 
     /// vid-fp's options the window passes by hand (`Settings::argv`): the
     /// paths, and what the switches above stand for.
-    const BY_HAND: [&str; 8] = ["include", "exclude", "output", "format", "cache", "clear_cache", "prune_cache", "log_file"];
+    const BY_HAND: [&str; 9] = ["include", "exclude", "output", "format", "no_cache", "cache", "clear_cache", "prune_cache", "log_file"];
 
     /// vid-fp's options the window never passes: another kind of run, a
     /// disposal the window does itself (the Trash button, with the scan's
@@ -290,8 +299,9 @@ mod tests {
     /// (`found::Verdict`), and the results page's *Rank by* picks one.
     /// `--against` and its `--list` are another kind of run, which `run`
     /// refuses from the window.
-    const NOT_SHOWN: [&str; 11] =
-        ["from_file", "null", "priority", "delete", "permanent", "move_to", "from_report", "yes", "quiet", "against", "list"];
+    /// `--last` is the command line's: the window keeps its own last scan.
+    const NOT_SHOWN: [&str; 12] =
+        ["from_file", "null", "priority", "delete", "permanent", "move_to", "from_report", "yes", "quiet", "against", "list", "last"];
 
     /// Each of vid-fp's options is the window's to show, its to pass by
     /// hand, or not its to pass, and only one of these: an option added to

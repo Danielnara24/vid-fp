@@ -32,10 +32,13 @@ fn hundredths(seconds: f64) -> f64 {
 ///
 /// The columns run in three blocks, each answering one question:
 ///
-///   who        action, full_path -- the row's identity and its fate. Action
-///              sits beside the path because `--from-report` exists to have it
-///              edited, and an action you have to scroll to is one that gets
-///              edited on the wrong row.
+///   who        action, full_path, lost_to -- the row's identity and its fate.
+///              Action sits beside the path because `--from-report` exists to
+///              have it edited, and an action you have to scroll to is one that
+///              gets edited on the wrong row. `lost_to` is what a DELETE rests
+///              on: a file of the group it was measured against and lost the
+///              ranking to, which `--from-report` requires to still be there
+///              before it acts on the row.
 ///   what       length .. quality_bits_per_frame -- the file's own properties,
 ///              in the order the ranking reads them, codec leading the three
 ///              bit-derived figures because it is the reason two rows' figures
@@ -66,6 +69,9 @@ fn hundredths(seconds: f64) -> f64 {
 pub(super) struct Row<'a> {
     action: &'static str,
     full_path: &'a str,
+    /// For a file marked DELETE, the file its DELETE rests on (see
+    /// `export::kept_copy_of`); empty on every other row.
+    lost_to: Option<&'a str>,
     length: String,
     length_seconds: Option<f64>,
     resolution: String,
@@ -137,6 +143,7 @@ impl<'a> Entry<'a> {
         fingerprints: &'a [VideoFingerprint],
         matches: &MatchIndex,
         action: &'static str,
+        lost_to: Option<&'a str>,
     ) -> Self {
         let fp = &fingerprints[idx];
         let links = matches.links_of(idx, group, fingerprints);
@@ -148,6 +155,7 @@ impl<'a> Entry<'a> {
         let row = Row {
             action,
             full_path: &fp.path,
+            lost_to,
             length: if measured { format_duration(fp.duration) } else { "-".to_string() },
             length_seconds: measured.then(|| hundredths(fp.duration)),
             resolution: format!("{}x{}", fp.width, fp.height),

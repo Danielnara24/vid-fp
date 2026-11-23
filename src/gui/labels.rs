@@ -24,6 +24,7 @@ pub const RECURSIVE: &str = "Look _in subfolders";
 pub const EXCLUDE: &str = "_Exclude";
 pub const ADD_EXCLUDE: &str = "Add excl_uded folder…";
 pub const REMOVE_EXCLUDE: &str = "Re_move";
+pub const PATTERN: &str = "Or t_ype";
 pub const TOLERANCE: &str = "Frame _tolerance";
 pub const MATCH_PERCENT: &str = "Min matched _percent";
 pub const MIN_DURATION: &str = "Min s_hared length";
@@ -34,9 +35,11 @@ pub const KF_INTERVAL: &str = "_Keyframe interval";
 pub const MIN_KEYFRAMES: &str = "Mi_n keyframes";
 pub const EXTENSIONS: &str = "Extensi_ons";
 pub const SYMLINKS: &str = "Follow s_ymlinks";
+pub const HIDDEN: &str = "Include h_idden folders";
 pub const REPORT: &str = "Save a _report to";
 pub const REPORT_CHOOSE: &str = "Choos_e…";
 pub const REPORT_FORMAT: &str = "For_mat";
+pub const USE_CACHE: &str = "Use _a cache";
 pub const CACHE_FILE: &str = "_Cache file";
 pub const CACHE_CHOOSE: &str = "C_hoose…";
 pub const CLEAR_CACHE: &str = "Em_pty the cache before scanning";
@@ -111,10 +114,10 @@ mod tests {
     fn no_two_visible_controls_share_a_mnemonic() {
         // CANCEL is left out because it replaces SCAN.
         let page = [SCAN, TAB_GENERAL, TAB_ADVANCED, SCAN_LOG, BACK_TO_RESULTS, DEFAULTS];
-        let general = [FOLDERS, ADD_FOLDER, REMOVE_FOLDER, RECURSIVE, EXCLUDE, ADD_EXCLUDE, REMOVE_EXCLUDE, TOLERANCE, MATCH_PERCENT, MIN_DURATION];
+        let general = [FOLDERS, ADD_FOLDER, REMOVE_FOLDER, RECURSIVE, EXCLUDE, ADD_EXCLUDE, REMOVE_EXCLUDE, PATTERN, TOLERANCE, MATCH_PERCENT, MIN_DURATION];
         let advanced = [
-            THREADS, KF_INTERVAL, MIN_KEYFRAMES, EXTENSIONS, SYMLINKS, REPORT, REPORT_CHOOSE, REPORT_FORMAT, CACHE_FILE, CACHE_CHOOSE, CLEAR_CACHE,
-            PRUNE_CACHE, LOG_FILE, LOG_CHOOSE,
+            THREADS, KF_INTERVAL, MIN_KEYFRAMES, EXTENSIONS, SYMLINKS, HIDDEN, REPORT, REPORT_CHOOSE, REPORT_FORMAT, USE_CACHE, CACHE_FILE,
+            CACHE_CHOOSE, CLEAR_CACHE, PRUNE_CACHE, LOG_FILE, LOG_CHOOSE,
         ];
         distinct("general tab", &[&page[..], &general[..]].concat());
         distinct("advanced tab", &[&page[..], &advanced[..]].concat());

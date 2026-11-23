@@ -20,7 +20,9 @@
 //! against the size the report recorded immediately before it is touched
 //! (`export::dispose_one`), so a report written last week cannot remove a file
 //! that has been replaced since -- the one guarantee that gets *more* valuable
-//! the longer a report sits before it is acted on.
+//! the longer a report sits before it is acted on. A row that names what its
+//! DELETE rests on (`lost_to`) is also held to that file still being there,
+//! as the scan that wrote it would have been; see `apply`.
 //!
 //! Both formats `-o` can write a decision into are read: the CSV, and the JSON
 //! that is the richer of the two. What is deliberately NOT duplicated is the
@@ -75,6 +77,10 @@ struct Marked {
     /// taken against this, so a row without a usable one is not actionable at
     /// all -- see `read`.
     size: u64,
+    /// The file the row's DELETE rests on, when the report names one: a
+    /// report written since `lost_to` was a column names it on every DELETE
+    /// row. See `apply`.
+    lost_to: Option<String>,
 }
 
 /// What one report amounted to.
@@ -84,6 +90,9 @@ struct Report {
     /// Per group, the files the report leaves in place, with the size each was
     /// measured at. A DELETE rests on these; see `apply`.
     holders: std::collections::HashMap<String, Vec<(String, u64)>>,
+    /// Every path a row names with a usable size, at that size: what a named
+    /// `lost_to` is checked against.
+    sizes: std::collections::HashMap<String, u64>,
     /// Data rows seen, however they were labelled.
     rows: usize,
 }
@@ -104,6 +113,9 @@ struct Row<'a> {
     /// Deliberately untrimmed. See `Rows::consider`.
     file: &'a str,
     size: &'a str,
+    /// Untrimmed for the same reason as `file`; empty when the report names
+    /// nothing.
+    lost_to: &'a str,
 }
 
 /// The rows of one report, and the single place that decides what any of them
@@ -116,6 +128,7 @@ struct Row<'a> {
 struct Rows {
     marked: Vec<Marked>,
     holders: std::collections::HashMap<String, Vec<(String, u64)>>,
+    sizes: std::collections::HashMap<String, u64>,
     rows: usize,
     /// One file can only be disposed of once. A report vid-fp wrote never
     /// repeats a path within its own decisions, but one assembled by hand or
@@ -158,6 +171,12 @@ impl Rows {
                 .report_unusable
                 .record(format!("{} {}: action \"{}\"", report, row.at, action));
             return;
+        }
+
+        if let Ok(size) = row.size.trim().parse::<u64>() {
+            if !row.file.trim().is_empty() {
+                self.sizes.entry(row.file.to_string()).or_insert(size);
+            }
         }
 
         if lower != ACT_ON {
@@ -251,11 +270,34 @@ impl Rows {
             }
         };
 
+        // What the row rests on is held to the rule its own path is: a path
+        // that is not canonical names a different file from every directory,
+        // and checking that the WRONG file is still there would vouch for a
+        // deletion nothing stands behind.
+        let lost_to = (!row.lost_to.trim().is_empty()).then(|| row.lost_to.to_string());
+        if let Some(fault) = lost_to.as_deref().and_then(not_canonical) {
+            log::error!(
+                target: crate::stats::COUNTED,
+                "{}: {} is marked DELETE but its lost_to \"{}\" {}. {} was left alone: \
+                 what it rests on cannot be checked.",
+                report,
+                row.at,
+                row.lost_to,
+                fault,
+                row.file
+            );
+            stats
+                .report_unusable
+                .record(format!("{} {}: lost_to {}", report, row.at, fault));
+            return;
+        }
+
         if self.seen.insert(row.file.to_string()) {
             self.marked.push(Marked {
                 groups: row.group.into_iter().collect(),
                 path: row.file.to_string(),
                 size,
+                lost_to,
             });
         } else if let Some(group) = row.group {
             if let Some(m) = self.marked.iter_mut().find(|m| m.path == row.file) {
@@ -268,6 +310,7 @@ impl Rows {
         Report {
             marked: self.marked,
             holders: self.holders,
+            sizes: self.sizes,
             rows: self.rows,
         }
     }
@@ -423,6 +466,9 @@ fn read_csv(path: &str, stats: &RunStats) -> Result<Report> {
     // Optional: a report without it simply has no groups to check a DELETE
     // against, which is how a hand-built one would read.
     let group_col = headers.iter().position(|h| h.trim().eq_ignore_ascii_case("group"));
+    // Optional too: reports written before it was a column replay by the
+    // group rule alone (`apply`).
+    let lost_col = headers.iter().position(|h| h.trim().eq_ignore_ascii_case("lost_to"));
 
     let mut rows = Rows::default();
 
@@ -472,6 +518,7 @@ fn read_csv(path: &str, stats: &RunStats) -> Result<Report> {
                 action: record.get(action_col).unwrap_or(""),
                 file: record.get(path_col).unwrap_or(""),
                 size: record.get(size_col).unwrap_or(""),
+                lost_to: lost_col.and_then(|c| record.get(c)).unwrap_or(""),
             },
             path,
             stats,
@@ -579,6 +626,7 @@ fn read_json(path: &str, stats: &RunStats) -> Result<Report> {
                     action: &file.action,
                     file: &file.full_path,
                     size: &file.size_bytes,
+                    lost_to: &file.lost_to,
                 },
                 path,
                 stats,
@@ -698,6 +746,7 @@ struct JsonRow {
     action: String,
     full_path: String,
     size_bytes: String,
+    lost_to: String,
 }
 
 impl<'de> serde::Deserialize<'de> for JsonRow {
@@ -723,6 +772,7 @@ impl<'de> serde::de::Visitor<'de> for JsonRowVisitor {
                 "action" => row.action = cell(map.next_value()?),
                 "full_path" => row.full_path = cell(map.next_value()?),
                 "size_bytes" => row.size_bytes = cell(map.next_value()?),
+                "lost_to" => row.lost_to = cell(map.next_value()?),
                 // `matches` above all, and it is the reason this is not a
                 // `Value`: one object per measured link, never read, and on a
                 // large report the great majority of the file.
@@ -819,16 +869,25 @@ pub fn apply(
 
     // A row is the user's decision, and a group may be emptied on purpose: a
     // DELETE in a group whose every row is DELETE is taken as written. What is
-    // NOT the user's decision is a copy the report says stays and that has
-    // since gone. When every file the report keeps in the row's groups is gone
+    // NOT the user's decision is the copy the row was written against having
+    // gone since. A report that names it (`lost_to`) is held to that one file,
+    // as the scan holds its own disposal (`export::output_results`): still
+    // there at the size its own row recorded, or removed earlier in this very
+    // pass. One that names none -- a report from before the column, or a row
+    // the user promoted from REVIEW, which rests on nothing -- falls back to
+    // the group: when every file the report keeps in the row's groups is gone
     // or changed, removing this one would remove the last copy the report
-    // knows of -- the premise the row was written on no longer holds -- so it
-    // is left alone, as the window leaves it (`Move::stays`).
-    let (marked, unheld): (Vec<&Marked>, Vec<&Marked>) = report.marked.iter().partition(|m| {
-        let holders: Vec<&(String, u64)> =
-            m.groups.iter().filter_map(|g| report.holders.get(g)).flatten().collect();
-        holders.is_empty()
-            || holders.iter().any(|(path, size)| export::still_holds(path, *size, None))
+    // knows of. Either way the file is left alone, as the window leaves it
+    // (`Move::stays`).
+    let sizes = &report.sizes;
+    let (marked, unheld): (Vec<&Marked>, Vec<&Marked>) = report.marked.iter().partition(|m| match &m.lost_to {
+        Some(rest) => rest != &m.path && rest_holds(rest, sizes),
+        None => {
+            let holders: Vec<&(String, u64)> =
+                m.groups.iter().filter_map(|g| report.holders.get(g)).flatten().collect();
+            holders.is_empty()
+                || holders.iter().any(|(path, size)| export::still_holds(path, *size, None))
+        }
     });
     for m in &unheld {
         export::refuse_unheld(&m.path, stats);
@@ -859,15 +918,36 @@ pub fn apply(
         line("SKIPPED", m);
     }
 
-    // Every row's holders were settled above, before the prompt, so nothing
-    // here is held back on the way.
+    // A row's named rest is asked again as its turn comes, because it may be
+    // another row of this pass: gone by then on the same terms is a chain,
+    // still there is the ordinary case, and anything else -- it changed while
+    // the prompt waited, or its own removal failed -- leaves this one alone.
+    // Rows without one were settled above, before the prompt.
+    let target_of: std::collections::HashMap<&str, usize> =
+        marked.iter().enumerate().map(|(i, m)| (m.path.as_str(), i)).collect();
+    let held = |i: usize, removed: &HashSet<usize>| match &marked[i].lost_to {
+        None => true,
+        Some(rest) => {
+            target_of.get(rest.as_str()).is_some_and(|j| removed.contains(j)) || rest_holds(rest, sizes)
+        }
+    };
     let (mut tally, deleted_paths) =
-        export::dispose_all(&targets, |_, _| true, disposal, stats, |i, label| line(label, marked[i]));
-    tally.unheld = unheld.len();
+        export::dispose_all(&targets, held, disposal, stats, |i, label| line(label, marked[i]));
+    tally.unheld += unheld.len();
 
     info!("\n{}", tally.lines(disposal));
 
     Ok(deleted_paths)
+}
+
+/// Whether the file a DELETE row rests on is still there as the report
+/// measured it: at the size its own row recorded, or, where the report holds
+/// no row for it (a hand-trimmed report), merely there as a regular file.
+fn rest_holds(path: &str, sizes: &std::collections::HashMap<String, u64>) -> bool {
+    match sizes.get(path) {
+        Some(&size) => export::still_holds(path, size, None),
+        None => std::fs::metadata(path).is_ok_and(|m| m.is_file()),
+    }
 }
 
 #[cfg(test)]
@@ -914,7 +994,7 @@ mod tests {
         assert_eq!(column_ends.len(), 1, "every action leaves the next field in one place");
     }
 
-    const HEADER: &str = "group;action;full_path;length;length_seconds;resolution;width;height;\
+    const HEADER: &str = "group;action;full_path;lost_to;length;length_seconds;resolution;width;height;\
 framerate_fps;codec;size;size_bytes;bitrate;bitrate_bps;quality;quality_bits_per_frame;\
 matched_with;identical;samples;matched_seconds;matched_from;matched_to;matched_from_seconds;\
 matched_to_seconds";
@@ -1030,6 +1110,117 @@ shared_to_seconds";
         assert_eq!(removed, vec![held.clone()]);
         assert!(Path::new(&lone).exists(), "the last copy is kept");
         assert_eq!(stats.delete_unheld.count(), 1);
+    }
+
+    /// A row with `lost_to` in it, in the real layout.
+    fn row_resting_on(path: &str, size: u64, action: &str, rest: &str) -> String {
+        let columns: Vec<&str> = HEADER.split(';').collect();
+        let mut fields: Vec<String> = row(path, size, action).split(';').map(String::from).collect();
+        fields[columns.iter().position(|c| *c == "lost_to").unwrap()] = rest.to_string();
+        fields.join(";")
+    }
+
+    /// A report that names what a DELETE rests on holds it to THAT file, as
+    /// the scan does: another KEEP of the group still being there is not
+    /// enough, since it was never shown to be a copy of this one.
+    #[test]
+    fn test_a_delete_whose_named_rest_is_gone_is_left_alone_whatever_else_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("winner.mkv").to_string_lossy().to_string();
+        let other = make_file(&dir, "other.mkv", 100);
+        let doomed = make_file(&dir, "doomed.mkv", 200);
+        let body = format!(
+            "{}\n{}\n{}\n{}\n",
+            HEADER,
+            row(&gone, 300, "KEEP"),
+            row(&other, 100, "KEEP"),
+            row_resting_on(&doomed, 200, "DELETE", &gone)
+        );
+        let path = write_report(&dir, &body);
+
+        let stats = RunStats::default();
+        let removed = apply(&path, &Disposal::Permanent, true, &stats).unwrap();
+
+        assert!(removed.is_empty());
+        assert!(PathBuf::from(&doomed).exists());
+        assert!(stats.had_problems(), "an unheld DELETE is a problem");
+    }
+
+    /// And held to its size: the rest's own row recorded one, and a file of
+    /// another length there now is not the copy the row was written against.
+    #[test]
+    fn test_a_delete_whose_named_rest_changed_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let winner = make_file(&dir, "winner.mkv", 999);
+        let doomed = make_file(&dir, "doomed.mkv", 200);
+        let body = format!(
+            "{}\n{}\n{}\n",
+            HEADER,
+            row(&winner, 300, "KEEP"),
+            row_resting_on(&doomed, 200, "DELETE", &winner)
+        );
+        let path = write_report(&dir, &body);
+
+        let stats = RunStats::default();
+        assert!(apply(&path, &Disposal::Permanent, true, &stats).unwrap().is_empty());
+        assert!(PathBuf::from(&doomed).exists());
+    }
+
+    /// A chain: `b` rests on `a` and `c` on `b`, all but `a` marked. However
+    /// the rows are ordered, both go -- `c` because `b` went in this pass, or
+    /// because `b` was still there when `c`'s turn came.
+    #[test]
+    fn test_a_chain_of_named_rests_is_carried_out_in_either_order() {
+        for reversed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let a = make_file(&dir, "a.mkv", 300);
+            let b = make_file(&dir, "b.mkv", 200);
+            let c = make_file(&dir, "c.mkv", 100);
+            let mut rows = [row_resting_on(&b, 200, "DELETE", &a), row_resting_on(&c, 100, "DELETE", &b)];
+            if reversed {
+                rows.reverse();
+            }
+            let body = format!("{}\n{}\n{}\n", HEADER, row(&a, 300, "KEEP"), rows.join("\n"));
+            let path = write_report(&dir, &body);
+
+            let stats = RunStats::default();
+            let removed = apply(&path, &Disposal::Permanent, true, &stats).unwrap();
+
+            assert_eq!(removed.len(), 2, "reversed: {}", reversed);
+            assert!(PathBuf::from(&a).exists());
+            assert!(!stats.had_problems());
+        }
+    }
+
+    /// What a row rests on is a path like any other, and one that is not
+    /// canonical cannot be checked: the row is refused, not waved through.
+    #[test]
+    fn test_a_named_rest_that_is_not_canonical_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let doomed = make_file(&dir, "doomed.mkv", 200);
+        let body = format!("{}\n{}\n", HEADER, row_resting_on(&doomed, 200, "DELETE", "winner.mkv"));
+        let path = write_report(&dir, &body);
+
+        let stats = RunStats::default();
+        assert!(apply(&path, &Disposal::Permanent, true, &stats).unwrap().is_empty());
+        assert!(PathBuf::from(&doomed).exists());
+        assert!(stats.had_problems());
+    }
+
+    /// The JSON names it under the same key.
+    #[test]
+    fn test_a_json_row_is_held_to_its_named_rest_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = make_file(&dir, "other.mkv", 100);
+        let doomed = make_file(&dir, "doomed.mkv", 200);
+        let gone = dir.path().join("winner.mkv").to_string_lossy().to_string();
+        let mut marked = json_file(&doomed, serde_json::json!(200), "DELETE");
+        marked["lost_to"] = serde_json::json!(gone);
+        let path = json_report(&dir, vec![json_file(&other, serde_json::json!(100), "KEEP"), marked]);
+
+        let stats = RunStats::default();
+        assert!(apply(&path, &Disposal::Permanent, true, &stats).unwrap().is_empty());
+        assert!(PathBuf::from(&doomed).exists());
     }
 
     #[test]

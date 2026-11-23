@@ -30,16 +30,78 @@ const ASK_AGAIN_AFTER: Duration = Duration::from_secs(5);
 const KILL_AFTER: Duration = Duration::from_secs(10);
 
 /// A list of folders with Add and Remove, for the folders to scan and the
-/// ones to leave out.
+/// ones to leave out; the second also takes what is typed (`with_patterns`).
 struct PathList {
     root: gtk::Box,
     list: gtk::ListBox,
     paths: RefCell<Vec<PathBuf>>,
     add: gtk::Button,
+    /// Each row says whether its entry is a pattern rather than a path.
+    patterns: bool,
 }
 
 impl PathList {
     fn new(window: &gtk::ApplicationWindow, add_label: &str, remove_label: &str, empty: &str, height: i32) -> Rc<PathList> {
+        Self::make(window, add_label, remove_label, empty, height, false)
+    }
+
+    /// The list of what to leave out, which also takes what is typed: a
+    /// pattern of names (`*.part`) or a whole path, plain or a pattern, as
+    /// `--exclude` takes them (`vid_fp::typed_exclude`). The chooser can name
+    /// only folders, so the patterns `--exclude` reads could not be given
+    /// from the window at all. img-fp's, as it is there.
+    fn with_patterns(window: &gtk::ApplicationWindow, add_label: &str, remove_label: &str, empty: &str, height: i32) -> Rc<PathList> {
+        let me = Self::make(window, add_label, remove_label, empty, height, true);
+        let entry = gtk::Entry::builder()
+            .placeholder_text("*.part     @eaDi?     ~/Videos/**/proxies")
+            .hexpand(true)
+            .secondary_icon_name("list-add-symbolic")
+            .secondary_icon_tooltip_text("Add it")
+            .tooltip_text(
+                "A name to leave out wherever it is met, with * for any run of characters, ? for one and [...] for one of a set: \
+                 *.part, @eaDi?. Or a whole path, which may hold the same, and ** for any number of folders: ~/Videos/**/proxies. \
+                 Press Enter to add it.",
+            )
+            .build();
+        let label = label_for(l::PATTERN, &entry);
+        let error = gtk::Label::builder().xalign(0.0).wrap(true).visible(false).css_classes(["error", "caption"]).build();
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        row.append(&label);
+        row.append(&entry);
+        me.root.append(&row);
+        me.root.append(&error);
+        let add = {
+            let me = Rc::downgrade(&me);
+            let error = error.clone();
+            move |entry: &gtk::Entry| {
+                let Some(me) = me.upgrade() else { return };
+                let home = std::env::var_os("HOME").map(PathBuf::from);
+                match vid_fp::typed_exclude(&entry.text(), home.as_deref()) {
+                    Ok(Some(p)) => {
+                        me.add_paths(std::iter::once(p));
+                        entry.set_text("");
+                        error.set_visible(false);
+                    }
+                    Ok(None) => error.set_visible(false),
+                    Err(why) => {
+                        error.set_text(why);
+                        error.set_visible(true);
+                    }
+                }
+            }
+        };
+        entry.connect_activate(add.clone());
+        entry.connect_icon_release(move |entry, pos| {
+            if pos == gtk::EntryIconPosition::Secondary {
+                add(entry);
+            }
+        });
+        // A refusal is about what was typed, and goes once it changes.
+        entry.connect_changed(move |_| error.set_visible(false));
+        me
+    }
+
+    fn make(window: &gtk::ApplicationWindow, add_label: &str, remove_label: &str, empty: &str, height: i32, patterns: bool) -> Rc<PathList> {
         let list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::Browse).build();
         list.add_css_class("boxed-list");
         list.set_placeholder(Some(&gtk::Label::builder().label(empty).css_classes(["dim-label"]).margin_top(12).margin_bottom(12).build()));
@@ -60,7 +122,7 @@ impl PathList {
         top.append(&buttons);
         let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
         root.append(&top);
-        let me = Rc::new(PathList { root, list, paths: RefCell::new(Vec::new()), add: add.clone() });
+        let me = Rc::new(PathList { root, list, paths: RefCell::new(Vec::new()), add: add.clone(), patterns });
 
         let window = window.downgrade();
         add.connect_clicked({
@@ -137,6 +199,11 @@ impl PathList {
                 .build();
             let row = gtk::Box::builder().spacing(8).margin_start(8).margin_end(8).margin_top(4).margin_bottom(4).build();
             row.append(&label);
+            // As the walk reads it: a path that is there is that path,
+            // wildcards and all.
+            if self.patterns && vid_fp::is_exclude_pattern(p) && !p.exists() {
+                row.append(&gtk::Label::builder().label("pattern").css_classes(["dim-label", "caption"]).build());
+            }
             self.list.append(&row);
         }
         *self.paths.borrow_mut() = v;
@@ -323,7 +390,7 @@ impl Setup {
 
         // ---- General
         let folders = PathList::new(window, l::ADD_FOLDER, l::REMOVE_FOLDER, "No folders yet. Add one, or drop it here.", 130);
-        let exclude = PathList::new(window, l::ADD_EXCLUDE, l::REMOVE_EXCLUDE, "Nothing left out.", 90);
+        let exclude = PathList::with_patterns(window, l::ADD_EXCLUDE, l::REMOVE_EXCLUDE, "Nothing left out.", 90);
 
         let g = grid();
         let folders_label = label_for(l::FOLDERS, &folders.list);
@@ -375,36 +442,38 @@ impl Setup {
         a.attach(&w(&o::EXTENSIONS), 1, 4, 2, 1);
         a.attach(&hint(hint_of(&o::EXTENSIONS)), 1, 5, 2, 1);
         a.attach(&w(&o::SYMLINKS), 1, 6, 2, 1);
-        a.attach(&section("Report"), 0, 7, 3, 1);
-        a.attach(&w(&o::REPORT), 0, 8, 1, 1);
+        a.attach(&w(&o::HIDDEN), 1, 7, 2, 1);
+        a.attach(&section("Report"), 0, 8, 3, 1);
+        a.attach(&w(&o::REPORT), 0, 9, 1, 1);
         let report_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         report_box.append(&report_path);
         report_box.append(&report_choose);
-        a.attach(&report_box, 1, 8, 2, 1);
-        a.attach(&label_of(&o::REPORT_FORMAT, &w(&o::REPORT_FORMAT)), 0, 9, 1, 1);
+        a.attach(&report_box, 1, 9, 2, 1);
+        a.attach(&label_of(&o::REPORT_FORMAT, &w(&o::REPORT_FORMAT)), 0, 10, 1, 1);
         w(&o::REPORT_FORMAT).set_halign(gtk::Align::Start);
-        a.attach(&w(&o::REPORT_FORMAT), 1, 9, 2, 1);
-        a.attach(&hint("The same report vid-fp writes with --output; its CSV or JSON can be handed back with --from-report."), 1, 10, 2, 1);
-        a.attach(&section("Cache"), 0, 11, 3, 1);
-        a.attach(&hint("Keeps each video's fingerprint, so a folder scanned again only decodes what changed."), 0, 12, 3, 1);
-        a.attach(&label_for(l::CACHE_FILE, &cache_path), 0, 13, 1, 1);
+        a.attach(&w(&o::REPORT_FORMAT), 1, 10, 2, 1);
+        a.attach(&hint("The same report vid-fp writes with --output; its CSV or JSON can be handed back with --from-report."), 1, 11, 2, 1);
+        a.attach(&section("Cache"), 0, 12, 3, 1);
+        a.attach(&w(&o::USE_CACHE), 0, 13, 3, 1);
+        a.attach(&hint(hint_of(&o::USE_CACHE)), 0, 14, 3, 1);
+        a.attach(&label_for(l::CACHE_FILE, &cache_path), 0, 15, 1, 1);
         let cache_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         cache_box.append(&cache_path);
         cache_box.append(&cache_choose);
-        a.attach(&cache_box, 1, 13, 2, 1);
-        a.attach(&w(&o::CLEAR_CACHE), 1, 14, 2, 1);
-        a.attach(&w(&o::PRUNE_CACHE), 1, 15, 2, 1);
-        a.attach(&hint("Both apply to the next scan only."), 1, 16, 2, 1);
-        a.attach(&section("Log"), 0, 17, 3, 1);
-        a.attach(&w(&o::LOG), 0, 18, 1, 1);
+        a.attach(&cache_box, 1, 15, 2, 1);
+        a.attach(&w(&o::CLEAR_CACHE), 1, 16, 2, 1);
+        a.attach(&w(&o::PRUNE_CACHE), 1, 17, 2, 1);
+        a.attach(&hint("Both apply to the next scan only."), 1, 18, 2, 1);
+        a.attach(&section("Log"), 0, 19, 3, 1);
+        a.attach(&w(&o::LOG), 0, 20, 1, 1);
         let log_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         log_box.append(&log_path);
         log_box.append(&log_choose);
-        a.attach(&log_box, 1, 18, 2, 1);
-        a.attach(&hint(hint_of(&o::LOG)), 1, 19, 2, 1);
+        a.attach(&log_box, 1, 20, 2, 1);
+        a.attach(&hint(hint_of(&o::LOG)), 1, 21, 2, 1);
         let version = hint(concat!("vid-fp ", env!("CARGO_PKG_VERSION")));
         version.set_margin_top(18);
-        a.attach(&version, 0, 20, 3, 1);
+        a.attach(&version, 0, 22, 3, 1);
         let advanced = gtk::ScrolledWindow::builder().child(&a).hscrollbar_policy(gtk::PolicyType::Never).vexpand(true).build();
 
         let notebook = gtk::Notebook::new();
@@ -421,7 +490,7 @@ impl Setup {
         scan_button.set_tooltip_text(Some("Start the scan (Ctrl+Enter)"));
         let cancel_button = gtk::Button::with_mnemonic(l::CANCEL);
         cancel_button.add_css_class("destructive-action");
-        cancel_button.set_tooltip_text(Some("Stop now (Escape). Videos fingerprinted so far are kept in the cache."));
+        cancel_button.set_tooltip_text(Some("Stop now (Escape). With a cache, videos fingerprinted so far are kept in it."));
         cancel_button.set_visible(false);
         let back_button = gtk::Button::with_mnemonic(l::BACK_TO_RESULTS);
         back_button.set_visible(false);
@@ -487,6 +556,7 @@ impl Setup {
         // What depends on what.
         for (check, deps) in [
             (me.check(&o::REPORT), vec![me.report_path.clone().upcast::<gtk::Widget>(), report_choose.clone().upcast(), me.control(&o::REPORT_FORMAT).widget()]),
+            (me.check(&o::USE_CACHE), vec![me.cache_path.clone().upcast(), cache_choose.clone().upcast(), me.control(&o::PRUNE_CACHE).widget()]),
             (me.check(&o::LOG), vec![me.log_path.clone().upcast(), log_choose.clone().upcast()]),
         ] {
             let sync = move |c: &gtk::CheckButton| {
@@ -748,6 +818,9 @@ impl Setup {
         // The folders scanned, as the report spells its paths: the tree view
         // starts from them.
         let roots = settings.folders.clone();
+        // Kept for the next window as the command line keeps a scan for
+        // `--last`: not one run without the cache.
+        let use_cache = settings.on(&o::USE_CACHE);
         let me = Rc::downgrade(self);
         glib::spawn_future_local(async move {
             let mut stderr: Vec<String> = Vec::new();
@@ -799,8 +872,9 @@ impl Setup {
                                     let found = scan::read_result(&path);
                                     // Not one that found nothing: a scan of
                                     // an empty folder is not worth the last
-                                    // one, nor its marks.
-                                    let keep = found.as_ref().is_ok_and(|f| f.found > 0);
+                                    // one, nor its marks. Nor one without
+                                    // the cache, which asked to keep nothing.
+                                    let keep = use_cache && found.as_ref().is_ok_and(|f| f.found > 0);
                                     let mut prepared = found.map(results::prepare);
                                     if let Ok(p) = prepared.as_mut() {
                                         p.set_roots(notes.roots.clone());
@@ -892,7 +966,8 @@ impl Setup {
             Some(scan::EXIT_INTERRUPTED) => {
                 drop(scan);
                 self.progress.set_text(Some("Cancelled"));
-                self.idle(&format!("Cancelled after {took}. Videos fingerprinted so far are kept in the cache."));
+                let kept = if self.check(&o::USE_CACHE).is_active() { " Videos fingerprinted so far are kept in the cache." } else { "" };
+                self.idle(&format!("Cancelled after {took}.{kept}"));
             }
             _ => {
                 drop(scan);

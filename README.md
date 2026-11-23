@@ -190,18 +190,22 @@ Screenshots show *Big Buck Bunny* (© Blender Foundation, CC BY 3.0).
 # Report duplicates in a folder and all its subfolders
 vid-fp ~/Videos -r
 
-# Scan several folders, excluding one
-vid-fp ~/Videos ~/Downloads -e ~/Downloads/keep -r
+# Scan several folders, excluding one, and partial downloads anywhere
+vid-fp ~/Videos ~/Downloads -e ~/Downloads/keep -e '*.part' -r
 
 # Write a report you can open later
 vid-fp ~/Videos -r -o results.csv
 
 # Pipe the report to another tool
 vid-fp ~/Videos -r -o - --format csv | grep DELETE
+
+# Write the last scan's report again, as JSON, without scanning
+vid-fp --last -o results.json
 ```
 
 The scan is **not** recursive unless you add `-r`. A Trash or recycle bin inside
-a scanned folder is not walked; name it to scan it. A file reached through
+a scanned folder is not walked, nor is a hidden folder (one whose name starts
+with a dot) unless you add `--hidden`; name either to scan it. A file reached through
 symlinks, hard links or overlapping folders is scanned once.
 
 ### Naming files, and reading a list
@@ -261,10 +265,12 @@ vid-fp --from-report dupes.csv --delete
 ```
 
 `--from-report` disposes of every row whose `action` reads `DELETE` and touches
-nothing else. Change `REVIEW` or `KEEP` to `DELETE` to act on a row, or change a
+nothing else, and only while the file in its `lost_to` column is still there. Change `REVIEW` or `KEEP` to `DELETE` to act on a row, or change a
 `DELETE` to spare one. Columns are found by name, and a CSV re-saved by a
 spreadsheet with `,` or tab separators still works. CSV and JSON reports are
-accepted; `.txt` reports record no sizes and are refused.
+accepted; `.txt` reports record no sizes and are refused. `--last` writes the
+last scan's report again in any format or `-k` ranking, so a scan run without
+`-o` can still be replayed.
 
 ### Checking new files against a library
 
@@ -299,7 +305,8 @@ One line each; `vid-fp --help` and `man vid-fp` have the details.
 | `-0`, `--null` | Paths in the list (and `--list` output) are NUL-separated | off |
 | `-r`, `--recursive` | Include subfolders | off |
 | `--follow-symlinks` | Descend into symlinked folders | off |
-| `-e`, `--exclude <PATH>` | Exclude a folder or a single file; repeatable | |
+| `-e`, `--exclude <PATH>` | Exclude a folder or a single file; repeatable. With `*`, `?` or `[...]` it is a pattern: of a name anywhere (`-e '*.part'`) or, holding a `/`, of a path (`-e '/media/**/proxies'`) | |
+| `--hidden` | Also walk hidden folders, whose names start with a dot | off |
 | `-x`, `--extensions <EXT>` | Extensions a folder walk treats as video. `-x '*'` takes every file; `-x '!flac'` takes every file but those | 38, listed below |
 | `-d`, `--hamming-distance <N>` | Frame-match tolerance; higher finds more. See [Tuning](#tuning) | `6` |
 | `-p`, `--match-percent <F>` | Min % of a video that must match, `0` to `100` | `20` |
@@ -315,11 +322,13 @@ One line each; `vid-fp --help` and `man vid-fp` have the details.
 | `--against <LIBRARY>` | Answer each scanned file against this library instead of grouping | |
 | `--list <ANSWER>` | With `--against`, print the paths with these answers | |
 | `--from-report <FILE>` | Act on a CSV or JSON report instead of scanning | |
+| `--last` | Write the last scan's report again without scanning, in another format or `-k` ranking; after `--against`, its answers or `--list` | |
 | `-y`, `--yes` | Skip the confirmation | off |
 | `-t`, `--threads <N>` | Worker threads; `0` = all cores. More only helps on slow or network storage | `0` |
 | `-q`, `--quiet` | Only print errors | off |
 | `--log-file <PATH>` | Write every log line to this file, whatever `--quiet` says | |
 | `--cache <PATH>` | Use this cache file | `~/.cache/vid-fp/fingerprints.redb` |
+| `--no-cache` | Don't read or write the cache; nothing is kept for `--last` | off |
 | `--clear-cache` | Empty the cache before running | off |
 | `--prune-cache` | Drop cache entries for files not in this scan | off |
 | `--completions <SHELL>` | Print a shell completion script and exit | |
@@ -432,6 +441,7 @@ console's figures it carries:
 
 | Column | Meaning |
 | --- | --- |
+| `lost_to` | On a DELETE row, the member it lost to, which `--from-report` requires to still be there |
 | `matched_with` | The group member the `matched_seconds` figure on this row describes |
 | `identical` | `true` when that member is a byte-identical copy of this file |
 | `samples` | How many frame hashes this file's fingerprint holds |
@@ -456,7 +466,9 @@ fingerprint. An entry is invalidated when the file changes or when
 `--min-duration` never invalidate it, so re-running at another tolerance is
 instant.
 
-A run locks its cache for the whole scan, so two runs at once need a cache each:
+The last scan is kept beside its cache for `--last`. `--no-cache` reads and
+keeps nothing. A run locks its cache for the whole scan, so two runs at once
+need a cache each:
 
 ```bash
 vid-fp -r ~/Videos/film &
@@ -498,13 +510,13 @@ Failures are listed once at the end, up to 10 examples of each kind.
 - **Nothing is acted on blind.** Every file is re-checked against its recorded
   size (and, in a scan, its change time) right before it is touched, and left
   alone if it changed. So is a file whose every better copy has gone or changed
-  since.
+  since, and a report row whose `lost_to` file has.
 - **No double-counting.** Links to the same data are scanned once. A file whose
   data keeps another name outside the scan is reported UNLINKED, with no space
   counted as freed.
 - **Excludes follow links.** An excluded file stays excluded when the scan
   reaches it another way. An exclude path that can't be resolved excludes
-  nothing, so tab-complete it.
+  nothing, so tab-complete it. Quote a pattern, or the shell expands it first.
 - **Reports and logs never land on a video,** the cache, or each other.
 - **`--from-report` hands the judgement to you.** Replaying an edited report
   keeps the prompt and the checks above, but nothing else: a group you mark

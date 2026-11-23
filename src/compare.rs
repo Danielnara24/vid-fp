@@ -607,7 +607,7 @@ impl BlockIndex {
 /// each file -- that is the entire point of reporting it. A two-minute clip cut
 /// from the middle of an episode spans 0..2min of itself and 14min..16min of the
 /// episode.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Span {
     pub start_ms: u32,
     pub end_ms: u32,
@@ -649,7 +649,7 @@ impl Span {
 ///
 /// The spans are directional for the same reason and are never reconciled at
 /// all: "where the shared footage sits" has two different right answers.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Match {
     pub a: usize,
     pub b: usize,
