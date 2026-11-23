@@ -90,6 +90,11 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.45.3" date="2026-11-22">
+      <description>
+        <p>Internal restructuring of how a scan records each file. Results are unchanged.</p>
+      </description>
+    </release>
     <release version="0.45.2" date="2026-11-22">
       <description>
         <p>Reports are written from one shared layout. Numbers in the CSV report are now written the same way as in the JSON report.</p>

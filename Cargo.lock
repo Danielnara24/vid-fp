@@ -1653,7 +1653,7 @@ checksum = "03c2856837ef78f57382f06b2b8563a2f512f7185d732608fd9176cb3b8edf0e"
 
 [[package]]
 name = "vid-fp"
-version = "0.45.2"
+version = "0.45.3"
 dependencies = [
  "anyhow",
  "async-channel",
