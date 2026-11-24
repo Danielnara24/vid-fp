@@ -168,6 +168,15 @@ generates both itself with `vid-fp --completions bash` and `vid-fp --man`.
 Trash. Folders named on its command line are the ones to scan
 (`vid-fp-gui ~/Videos`).
 
+<p>
+<img src="flatpak/screenshots/setup.png" width="49%" alt="The scan settings: a folder to scan, an excluded folder and a typed pattern, and the duplicate thresholds">
+<img src="flatpak/screenshots/advanced.png" width="49%" alt="The advanced settings: which files to scan, hidden folders, the report and the cache">
+</p>
+
+- *Exclude* takes folders, or a name pattern or path typed in (`*.part`,
+  `~/Videos/**/proxies`). Hidden folders are left out unless *Include hidden
+  folders* is on, and with *Use a cache* off nothing is kept between scans.
+
 ![Matched frames between a clip and the film it was cut from](flatpak/screenshots/compare.png)
 
 - Each group lists its videos with a thumbnail, their figures, what they matched
