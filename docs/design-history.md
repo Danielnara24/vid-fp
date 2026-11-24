@@ -452,3 +452,25 @@ Accuracy, static build, `-p 20`, old x86 (libswscale) against new, a cold scan a
 | VIDS2 | 8 | 0.8566 / 0.9092 / 0.8821 | 0.8613 / 0.9103 / 0.8851 | 951 -> 916 |
 
 F1 is higher at every rung on both corpora; recall is higher at every rung. Cold scans (one each): VIDS 167.0 -> 166.5 s, VIDS2 313.0 -> 296.3 s; warm runs level. Warm (compare-only) runs, five interleaved repeats at -d 0/2/6 on both corpora: medians within 1% (VIDS2 -d 2: 70.1 -> 69.7 s) and peak RSS within the run-to-run spread (+0-4 MB median; VIDS2 -d 0 320 -> 342 MB median but 311-356 vs 322-356 range). A single-run 20-25% VIDS2 slowdown seen first was drift: base runs later in the series slowed the same way. The VIDS -d 8 false links are churn, not growth: 82 new, 70 gone, the same kinds (lyric near-miss pair, low-detail dark or flat frames passing the loose threshold). The x86 cache is rebuilt once (`files_ff8_picture` -> `files_ff8_cpath`, no architecture suffix); refusals and identities are carried over, fingerprints are not. Declined earlier and now moot: forcing libswscale's C path by clearing cpu flags around `sws_getContext` (global state, 2-6% of a cold scan); `SWS_BITEXACT | SWS_ACCURATE_RND` (does not reach the fast path).
+
+## Phase 1 routing refit (2026-11-24)
+
+Comparing at `-d 0` and `-d 2` took 2.5-3.5x as long as at `-d 6` on VIDS and VIDS2. Cause: `index_is_cheaper` chose the block index there and the index was the slower route. Decoded fingerprints are read by the wide rule, whose widest main-hash reach is 13-15 bits at `-d 0`-`3` (probe radius 3, 697 keys a block) and 16+ from `-d 4` (radius 4, 2517 keys), so with the old constants the model picked the index for `-d 0`-`3` and the direct scan from `-d 4`. Both routes gave identical reports at `-d 0`, 2, 4, 6 on both corpora (forced-route build).
+
+Two faults, both fixed:
+
+1. **`PROBE_COST` was 4; it is about 48.** Measured phase 1, forced each way (VIDS2: 612 videos, 96,793 hashes): radius 3, index 36.9 s vs direct 12.1 s; radius 4, 122.5 s vs 10.1 s. VIDS (1,188 videos, 73,020 hashes): 25.4 s vs 8.0 s at radius 3, 92.1 s vs 8.4 s at radius 4. Fitted cost per probe: 41, 52, 57 comparisons. A probe is two random reads; a direct comparison streams. The AN-era table that set 4 (index 3x faster at radius 2 on 9k hashes) predates the wide rule and the reframing orientations and could not be re-run. The bin sweep is now sampled from the library's real bin counts (`swept_entries`, 4096 probe hashes) instead of assuming `total_hashes / BINS`; it came to only ~1.25x the even estimate here, so the sampling is insurance for crowded libraries, not what fixed these corpora. `ENTRY_COST` (1) could not be separated from `PROBE_COST` by these timings. Crossover now: the index wins above roughly `400 * masks` hashes (55k at radius 2, 280k at radius 3, 1M at radius 4); not measured, no library that large is at hand.
+2. **The index handed phase 2 pairs the direct route never does.** It checked main hashes against the widest reach only; the direct route also applies the cap and the combined main+detail limit (`any_within`). VIDS2 `-d 0`: 165,718 candidates from the index vs 18,079. The index's list now goes through the same `any_frame`. Forced index at VIDS2 `-d 0`: 54.6 / 54.3 s wall, 360 s CPU with the filter; without it, 362-365 s wall and 2,325 s CPU twice running (other runs of the unfiltered build on the same input measured 440-484 s CPU: phase 2 over those extra pairs is both slow and erratic, cause not found; with the filter those pairs never reach it). VIDS: 27.4 / 25.2 s vs 206.9 / 198.7 s.
+
+A/B, warm cache, 3 interleaved rounds (round 1 discarded: a `cargo test` build ran alongside), medians, reports identical at every rung:
+
+| corpus | `-d` | before: route, candidates, wall / CPU | after |
+|---|---|---|---|
+| VIDS | 0 | index 110,931, 29.9 s / 200 s | direct 38,438, 8.9 s / 56 s |
+| VIDS | 2 | index 357,420, 35.6 s / 236 s | direct 48,200, 9.4 s / 58 s |
+| VIDS | 4-8 | direct | unchanged (within 1 s) |
+| VIDS2 | 0 | index 165,718, 71.5 s / 483 s | direct 18,079, 16.8 s / 111 s |
+| VIDS2 | 2 | index 413,517, 80.2 s / 541 s | direct 28,798, 19.6 s / 131 s |
+| VIDS2 | 4-8 | direct | unchanged (within 1 s) |
+
+Peak RSS unchanged within noise. Tests that pinned the old model by raw counts now build libraries of mock fingerprints; `test_both_routes_agree_when_the_gate_is_switched_off` moved to `-d 0` with 601 files of 20 hashes so it still reaches the index arm; `test_crowded_bins_make_the_index_dearer` is new.

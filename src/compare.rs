@@ -35,13 +35,14 @@ const BINS: usize = 1 << BLOCK_BITS;
 
 /// What one bin probe costs, in units of "one hash comparison".
 ///
-/// A probe loads two offsets, binary-searches past the videos already handled
-/// and builds a slice before it looks at a single hash; a comparison is an XOR,
-/// a popcount and a branch. Four is the ratio the measurements in
-/// `index_is_cheaper` imply, and nothing is sensitive to it being exactly right:
-/// the two routes it chooses between sit within a factor of two of each other on
-/// either side of the crossover.
-const PROBE_COST: usize = 4;
+/// A probe is a random read of the offsets and then of the bin itself, followed
+/// by a binary search past the videos already handled; a comparison in the
+/// direct route is an XOR, a popcount and a branch over two arrays read in
+/// order. The random reads are what a probe costs. Fitted from phase 1 of
+/// both routes on VIDS and VIDS2 (2026-11-24): 41, 52 and 57 comparisons per
+/// probe at radius 3, 3 and 4. It used to be 4, from AN-era timings, which made
+/// the index look 3.5x cheaper at `-d 0` when it ran 3x slower.
+const PROBE_COST: usize = 48;
 
 /// What handing one pair to phase 2 costs before it compares anything: two
 /// `vec![false; _]` allocations and the loop setup, in the same units.
@@ -480,45 +481,84 @@ fn probe_radius(max_hamming_dist: u32) -> u32 {
 /// pair of videos outright.
 ///
 /// The two routes return the same pairs -- the index is exhaustive at every
-/// tolerance and phase 2 measures whatever it is handed -- so this is purely a
-/// question of which is faster, and the answer flips as `-d` rises. Per stored
-/// hash the index examines `BLOCKS * masks` bins holding `total_hashes / BINS`
-/// hashes apiece, where the direct route examines every other hash in the
-/// library. The mask count is what moves: 1, 17, 137, 697, 2517 keys per block
-/// for radius 0 through 4, so the index's side of this grows by roughly 5x per
-/// rung of `-d 4` while the direct side does not move at all.
+/// tolerance, and both end with the same `any_frame` check -- so this is purely a
+/// question of which is faster. The direct route costs half the library's hashes
+/// squared, whatever the tolerance. The index costs a lookup per probe key per
+/// stored hash, plus every bin entry those lookups sweep, and the sweep is the
+/// part that has to be MEASURED: it depends on how the library's hashes fill
+/// the bins, not on how many there are.
 ///
-/// Measured, compare stage only, warm cache, 8 threads -- the local 727-file
-/// corpus (9k hashes) and a 42-file library of full episodes (33k hashes):
+/// The sweep used to be estimated as `total_hashes / BINS` per bin, as if hashes
+/// spread evenly. They don't -- dark, flat and title-card frames share keys --
+/// so it is sampled: `SWEEP_SAMPLE` of the library's own hashes, spread evenly
+/// through it, are run against each block's real bin counts, and the mean is
+/// scaled up. On VIDS and VIDS2 that came to only about 1.25x the even
+/// estimate; what had been badly wrong was `PROBE_COST`. With it at 4, on
+/// VIDS2 (612 videos, 96,793 hashes) the index was called 3.5x cheaper at
+/// `-d 0` (radius 3) and ran phase 1 in 36.9 s against the direct route's
+/// 12.1 s; forced at radius 4 it took 122.5 s against 10.1 s.
 ///
-/// ```text
-///     -d            8      12      16      20      24      32
-///     radius        2       3       4       5       6       8
-///     9k  index   11ms    33ms   106ms   303ms   681ms      --
-///     9k  direct  36ms    35ms    37ms    36ms    45ms      --
-///     33k index  316ms   675ms  1511ms  3375ms  6906ms 17932ms
-///     33k direct 379ms   394ms   416ms   405ms   497ms  1064ms
-/// ```
+/// Where the crossover falls, with `PROBE_COST` at 48: the index wins once the
+/// library holds roughly `400 * masks` hashes -- about 7k at radius 1, 55k at
+/// radius 2, 280k at radius 3 (every `-d` up to 3 on decoded fingerprints, whose
+/// wide rule puts the widest reach at 13-15 bits), 1M at radius 4.
 ///
-/// The direct route is flat because it compares everything whatever the
-/// tolerance says; the index is not, and by `-d 32` it spends eighteen seconds
-/// proposing the same pairs the direct route proposes in one. That is the whole
-/// reason this function exists: an uncapped radius is exhaustive but degenerates
-/// at the loose end, where the probe set has grown wide enough to touch most of
-/// the library and the index has stopped being an index.
-///
-/// The estimate picks the faster route everywhere except the two near-ties at
-/// radius 3, where it keeps the index for the 33k library that would have run
-/// 1.7x quicker directly, and drops it for the 9k one that was already 1.06x
-/// ahead. Being within a factor of two at the crossover is all the accuracy this
-/// needs: what it exists to avoid is the order of magnitude at the right-hand
-/// end of the table, not a coin-flip in the middle.
-fn index_is_cheaper(masks: usize, videos: usize, total_hashes: usize) -> bool {
-    let bin_len = total_hashes / BINS;
-    let index = total_hashes * BLOCKS * masks * (PROBE_COST + bin_len);
+/// The lookups alone are a lower bound on the index's cost and are free to
+/// compute, so when they already lose, nothing is sampled. That also bounds the
+/// sample's cost: it only runs when `masks` is small next to the library.
+fn index_is_cheaper(fingerprints: &[VideoFingerprint], masks: &[u16]) -> bool {
+    let videos = fingerprints.len();
+    let total_hashes: usize = fingerprints.iter().map(|fp| fp.valid_hashes.len()).sum();
     let direct = total_hashes * total_hashes / 2 + videos * videos / 2 * PAIR_COST;
-
+    let lookups = total_hashes * BLOCKS * masks.len() * PROBE_COST;
+    if lookups > direct {
+        return false;
+    }
+    // Only the entries of later videos are read when the pair is probed one way
+    // round, and the direct route halves the same way, hence the halving here.
+    let index = lookups + swept_entries(fingerprints, masks, total_hashes) / 2 * ENTRY_COST;
+    log::debug!(
+        "Phase 1 estimate: index {index} (lookups {lookups}), direct {direct}, {} key(s) per block.",
+        masks.len()
+    );
     index <= direct
+}
+
+/// How many probe hashes `swept_entries` runs through the real bins.
+const SWEEP_SAMPLE: usize = 4096;
+
+/// What one bin entry swept by a probe costs, in units of one hash comparison.
+/// The entries of a bin are read in order once the probe has found it, so they
+/// cost about what the direct route's comparisons do. The timings cannot pull
+/// this apart from `PROBE_COST` (the sweep grew with the probe count on both
+/// corpora); it decides only where bins are crowded, at many millions of hashes
+/// or a library of near-identical frames.
+const ENTRY_COST: usize = 1;
+
+/// How many bin entries the index's probes sweep over all blocks, estimated
+/// from `SWEEP_SAMPLE` of the library's hashes taken at an even stride.
+fn swept_entries(fingerprints: &[VideoFingerprint], masks: &[u16], total_hashes: usize) -> usize {
+    if total_hashes == 0 {
+        return 0;
+    }
+    let stride = total_hashes.div_ceil(SWEEP_SAMPLE).max(1);
+    let all = || fingerprints.iter().flat_map(|fp| fp.valid_hashes.iter().copied());
+    let mut swept = 0usize;
+    let mut sampled = 0usize;
+    for k in 0..BLOCKS {
+        let mut counts = vec![0u32; BINS];
+        for h in all() {
+            counts[block_of(h, k)] += 1;
+        }
+        for h in all().step_by(stride) {
+            let key = block_of(h, k);
+            swept += masks.iter().map(|&m| counts[key ^ m as usize] as usize).sum::<usize>();
+            sampled += 1;
+        }
+    }
+    // `sampled` counts every block's sample, so this is the mean per probe
+    // per block times every probe of every block.
+    (swept as u128 * (total_hashes * BLOCKS) as u128 / sampled as u128) as usize
 }
 
 /// Every bit pattern to XOR a block key with, i.e. every 16-bit value with at
@@ -1051,24 +1091,6 @@ fn candidate_pairs_scanning(
     (row_weights, done): (&[u64], &Counter),
 ) -> Vec<(usize, usize)> {
     let n = fingerprints.len();
-    // A frame can only be admitted inside the rule's own widest reach, which
-    // for a pair read the wide way is the combined distance as well as the
-    // main hash's cap -- so that is what is asked here, of whichever rule the
-    // pair will be measured by.
-    let any_frame = |a: &VideoFingerprint, b: &VideoFingerprint| -> bool {
-        let tol = rules.for_pair(a, b).tol;
-        match tol.cap {
-            None => any_within(&a.valid_hashes, None, &b.valid_hashes, None, tol.loose, tol.loose),
-            Some(cap) => any_within(
-                &a.valid_hashes,
-                Some(&a.detail_hashes),
-                &b.valid_hashes,
-                Some(&b.detail_hashes),
-                cap,
-                tol.loose,
-            ),
-        }
-    };
     (0..n)
         .into_par_iter()
         .flat_map_iter(|q| {
@@ -1080,7 +1102,7 @@ fn candidate_pairs_scanning(
                         && !probe.is_empty()
                         && !shutdown_requested()
                         && wanted(q, t)
-                        && any_frame(&probes[q], &fingerprints[t])
+                        && any_frame(rules, &probes[q], &fingerprints[t])
                 })
                 .map(move |t| (q, t))
                 .collect();
@@ -1088,6 +1110,24 @@ fn candidate_pairs_scanning(
             row
         })
         .collect()
+}
+
+/// Whether any frame of `a` could be admitted against any frame of `b` at all.
+///
+/// A frame can only be admitted inside the rule's own widest reach, which for a
+/// pair read the wide way is the combined distance as well as the main hash's
+/// cap -- so that is what is asked, of whichever rule the pair will be measured
+/// by. Both phase-1 routes end with it: the direct route asks it of every pair,
+/// the index of the pairs it found. The index alone reads main hashes against
+/// the widest distance and nothing else, and on VIDS2 at `-d 0` it handed phase
+/// 2 165,718 pairs where this leaves 18,079; phase 2 then spent 28 s refusing
+/// the difference (7 s from the direct route's list).
+fn any_frame(rules: Rules, a: &VideoFingerprint, b: &VideoFingerprint) -> bool {
+    let tol = rules.for_pair(a, b).tol;
+    match tol.cap {
+        None => any_within(&a.valid_hashes, None, &b.valid_hashes, None, tol.loose, tol.loose),
+        Some(cap) => any_within(&a.valid_hashes, Some(&a.detail_hashes), &b.valid_hashes, Some(&b.detail_hashes), cap, tol.loose),
+    }
 }
 
 /// What each probe file's row of `candidate_pairs_scanning` costs, in hash
@@ -2521,7 +2561,6 @@ fn find_matches_where(
     let wanted_as =
         |o: usize, q: usize, t: usize| wanted(q.min(t), q.max(t)) && orientations[o].fits(&fingerprints[q], &fingerprints[t]);
     let n = fingerprints.len();
-    let total_hashes: usize = fingerprints.iter().map(|fp| fp.valid_hashes.len()).sum();
     // Phase 1 has to be exhaustive at the WIDEST distance phase 2 can admit, not
     // at `-d`: a pair whose only matches are corroborated ones would otherwise
     // never be proposed, and the corroboration rule would be unreachable exactly
@@ -2557,7 +2596,7 @@ fn find_matches_where(
     // so the two routes compare per orientation exactly as they do for one.
     // Phase 1 is counted on the run's bar like any other stage: it is most of
     // a warm scan's comparison, and it used to run with nothing on screen.
-    let pairs: Vec<(usize, usize, usize)> = if index_is_cheaper(masks.len(), n, total_hashes) {
+    let pairs: Vec<(usize, usize, usize)> = if index_is_cheaper(fingerprints, &masks) {
         let probed: u64 = (0..orientations.len())
             .map(|o| side(o).iter().map(|fp| fp.valid_hashes.len() as u64).sum::<u64>())
             .sum();
@@ -2574,7 +2613,12 @@ fn find_matches_where(
                     .map(|(q, t)| (q, t, o)),
             );
         }
-        candidates.retain(|&(q, t, o)| wanted_as(o, q, t));
+        // The same admission check the direct route makes, so both hand phase 2
+        // the same list (see `any_frame`).
+        let candidates: Vec<(usize, usize, usize)> = candidates
+            .into_par_iter()
+            .filter(|&(q, t, o)| wanted_as(o, q, t) && any_frame(rules, &side(o)[q], &fingerprints[t]))
+            .collect();
         info!("Index scan produced {} candidate pair(s) in {:.1?}; verifying...", candidates.len(), route_t.elapsed());
         candidates
     } else {
@@ -3006,23 +3050,43 @@ mod tests {
         assert_eq!(probe_masks(BLOCK_BITS as u32).len(), BINS, "radius 16 is every bin");
     }
 
+    /// `videos` mock files of `per` hashes each, every hash distinct.
+    fn library(videos: u64, per: u64) -> Vec<VideoFingerprint> {
+        (0..videos).map(|v| mock_fp_with_hashes((0..per).map(|j| distinct_hash(v * per + j)).collect(), 1)).collect()
+    }
+
     #[test]
     fn test_the_index_is_abandoned_once_the_probe_outgrows_the_library() {
-        // A library the size of the local corpus: 727 videos, 9k hashes. The
-        // index earns its keep at the tolerances anyone should be using and
-        // stops earning it at the loose end, where the probe set has grown wide
-        // enough to touch most of the library.
-        let (videos, hashes) = (727, 8966);
-        let pays = |d: u32| index_is_cheaper(probe_masks(probe_radius(d)).len(), videos, hashes);
+        // 600 videos, 120k hashes: the index pays for a narrow probe and stops
+        // paying as the probe widens, while the direct route's cost stays put.
+        let fps = library(600, 200);
+        let pays = |d: u32| index_is_cheaper(&fps, &probe_masks(probe_radius(d)));
 
-        assert!(pays(4), "the default tolerance must never pay for the whole triangle");
-        assert!(pays(8));
-        assert!(!pays(16), "radius 4 is 2517 keys a block; the direct route is measured faster");
+        assert!(pays(4), "radius 1 is 17 keys a block");
+        assert!(pays(8), "radius 2 is 137 keys a block");
+        assert!(!pays(12), "radius 3 is 697 keys a block; the direct route is cheaper below ~280k hashes");
         assert!(!pays(32));
+
+        // The same probe is worth it only in a big enough library.
+        assert!(!index_is_cheaper(&library(60, 100), &probe_masks(probe_radius(8))), "6k hashes is too few at radius 2");
 
         // And an empty library keeps the index rather than walking a triangle of
         // pairs that cannot match: there are no hashes to compare.
-        assert!(index_is_cheaper(probe_masks(probe_radius(64)).len(), videos, 0));
+        assert!(index_is_cheaper(&library(727, 0), &probe_masks(probe_radius(64))));
+    }
+
+    #[test]
+    fn test_crowded_bins_make_the_index_dearer() {
+        // The same number of hashes, once spread out and once piled into the
+        // same block keys: only the second sweeps whole bins on every probe.
+        let spread = library(600, 200);
+        let crowded: Vec<VideoFingerprint> = (0..600u64)
+            .map(|v| mock_fp_with_hashes((0..200u64).map(|j| (v * 200 + j) & 0xFF).collect(), 1))
+            .collect();
+        let masks = probe_masks(probe_radius(8));
+        assert!(index_is_cheaper(&spread, &masks));
+        assert!(!index_is_cheaper(&crowded, &masks), "three of the four blocks hold the whole library in one bin");
+        assert!(swept_entries(&crowded, &masks, 120_000) > 100 * swept_entries(&spread, &masks, 120_000));
     }
 
     #[test]
@@ -4138,9 +4202,9 @@ mod tests {
         // 110, with 0.00 matched seconds on all 109 rows it marked DELETE.
         let fps: Vec<VideoFingerprint> =
             (0..4).map(|i| mock_fp_with_hashes(vec![distinct_hash(i)], 1)).collect();
-        let masks = probe_masks(probe_radius(Tolerance::for_distance(4).widest())).len();
+        let masks = probe_masks(probe_radius(Tolerance::for_distance(4).widest()));
         assert!(
-            !index_is_cheaper(masks, fps.len(), fps.len()),
+            !index_is_cheaper(&fps, &masks),
             "this library has to take the direct route for the test to mean anything"
         );
 
@@ -4162,20 +4226,19 @@ mod tests {
         // The routes are chosen on cost alone, so anything they disagree about
         // is decided by a performance heuristic -- and at `-p 0` they disagreed
         // about the whole library. Big enough that `index_is_cheaper` says yes,
-        // which is the arm the small libraries above can never reach.
-        let mut fps: Vec<VideoFingerprint> =
-            (0..600).map(|i| mock_fp_with_hashes(vec![distinct_hash(i)], 1)).collect();
+        // which is the arm the small libraries above can never reach. At `-d 0`,
+        // where the probe is narrowest: 601 files of 20 distinct hashes each.
+        let mut fps = library(600, 20);
         // One genuine pair, so the test cannot pass by finding nothing at all.
         fps.push(mock_fp_with_hashes(vec![distinct_hash(3)], 1));
 
-        let tol = Tolerance::for_distance(4);
-        let hashes: usize = fps.iter().map(|fp| fp.valid_hashes.len()).sum();
+        let tol = Tolerance::for_distance(0);
         assert!(
-            index_is_cheaper(probe_masks(probe_radius(tol.widest())).len(), fps.len(), hashes),
+            index_is_cheaper(&fps, &probe_masks(probe_radius(tol.widest()))),
             "this library has to take the index route for the test to mean anything"
         );
 
-        assert_eq!(pairs(&find_all_matches(&fps, 4, 0.0, 0.0)), vec![(3, 600)]);
+        assert_eq!(pairs(&find_all_matches(&fps, 0, 0.0, 0.0)), vec![(0, 600)]);
     }
 
     #[test]

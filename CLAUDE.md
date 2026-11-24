@@ -47,7 +47,7 @@ Unit tests decode `tests/fixtures/`, so they need a working FFmpeg at runtime.
 3. **Weighing pass** (`fingerprint::weigh_decode`): opens each miss header-only. Prices the decode in keyframe-pixels and settles files that can't decode or fall under `--min-duration`.
 4. **Content pass** (`scan/identify.rs`): BLAKE3 sample (size + three 64 KB stretches) to adopt fingerprints of moved/renamed files; full digests for byte-identical sets, decoded once (`Job::followers`). `--prune-cache` runs after this.
 5. **Decode** (`fingerprint::fingerprint_video`, `fingerprint/keyframes.rs`): keyframes only, scaled to a 128x128 working frame (`SIDE`) by `fingerprint/downscale.rs`, cropped per frame, DCT hashes. Threads are apportioned by decode cost (`scan/budget.rs`).
-6. **Compare** (`compare::find_all_matches`): phase 1 proposes candidate pairs (block index or flat scan); phase 2 measures coverage in milliseconds, in every orientation.
+6. **Compare** (`compare::find_all_matches`): phase 1 proposes candidate pairs (block index or flat scan); phase 2 measures coverage in milliseconds, in every orientation. The two routes must hand phase 2 the same pairs (both end with `any_frame`); `index_is_cheaper` picks between them on cost alone, with `PROBE_COST` fitted to measured phase-1 timings and the bin sweep sampled from the library's real bin counts. Refit `PROBE_COST` from timings of both routes, never from reasoning.
 7. **Group** (`clustering`): greedy star cover; groups overlap and each asserts only "matched the representative".
 8. **Report and dispose** (`export::output_results`): labels resolved once across groups (REVIEW > DELETE > KEEP), confirmation, disposal, report streamed to its sink.
 
