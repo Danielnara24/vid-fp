@@ -63,12 +63,11 @@ use std::path::{Path, PathBuf};
 fn main() {
     println!("cargo:rerun-if-env-changed=FFMPEG_DIR");
 
-    // The suffix on the cache table, whose contents depend on the processor
-    // (`cache::TABLE`): libswscale's fast bilinear scaler rounds
-    // differently in x86 SIMD than in the C code other architectures run.
-    // Empty on x86_64, so the tables every existing cache holds keep their
-    // names; `_<arch>` elsewhere, so a cache shared between an ARM and an x86
-    // machine keeps two sets of fingerprints rather than mixing them.
+    // The suffix the cache's older tables carry (`cache::PREVIOUS_TABLE` and
+    // the legacy layout): while keyframes were scaled by libswscale, whose x86
+    // setup samples other columns than every other processor, each
+    // architecture kept its own fingerprints. Empty on x86_64, `_<arch>`
+    // elsewhere. The current table has no suffix (`fingerprint::downscale`).
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").expect("cargo always sets CARGO_CFG_TARGET_ARCH");
     let suffix = if arch == "x86_64" { String::new() } else { format!("_{arch}") };
     println!("cargo:rustc-env=VID_FP_ARCH_TABLE_SUFFIX={suffix}");

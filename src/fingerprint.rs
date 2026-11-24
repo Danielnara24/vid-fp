@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
+mod downscale;
 mod keyframes;
 pub(crate) use keyframes::{clock_may_restart, decode_stamp, ticks_to_ms, SampleClock};
 use keyframes::{seconds_per_tick, Captured, FrameCapture, KeyframeDecoder, Keyframes, Thinning};
@@ -3028,21 +3029,9 @@ mod tests {
                 dec.send_eof().unwrap();
                 dec.receive_frame(&mut frame).unwrap();
             }
-            let mut scaler = ffmpeg_next::software::scaling::context::Context::get(
-                frame.format(),
-                frame.width(),
-                frame.height(),
-                ffmpeg_next::format::Pixel::GRAY8,
-                SIDE as u32,
-                SIDE as u32,
-                ffmpeg_next::software::scaling::flag::Flags::FAST_BILINEAR,
-            )
-            .unwrap();
-            let mut gray = ffmpeg_next::frame::Video::empty();
-            scaler.run(&frame, &mut gray).unwrap();
-            for y in 0..SIDE {
-                frames.extend_from_slice(&gray.data(0)[y * gray.stride(0)..][..SIDE]);
-            }
+            let mut gray = vec![0u8; FRAME_STRIDE];
+            downscale::Downscaler::default().run(&frame, &mut gray).unwrap();
+            frames.extend_from_slice(&gray);
             times.push(((ts - anchor) as f64 * tb * 1000.0) as u32);
         }
         let (hashes, _) = hash_frames(&frames);

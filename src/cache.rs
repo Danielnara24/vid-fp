@@ -63,7 +63,19 @@ use crate::fingerprint::{self, VideoFingerprint};
 use crate::utils::shutdown_requested;
 
 /// The cache: absolute path -> bincode'd `Entry`.
-const TABLE: TableDefinition<&str, &[u8]> =
+///
+/// No architecture suffix: since `fingerprint::downscale` replaced libswscale
+/// on the fingerprint path, every processor hashes the same pictures, so a
+/// cache shared between an x86 and an aarch64 machine is one table again.
+const TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("files_ff8_cpath");
+
+/// The table before `TABLE`: one per architecture, filled through libswscale,
+/// whose x86 output differed from every other processor's. Its fingerprints
+/// are dropped (they are hashes of differently scaled pictures); its refusals
+/// and identities do not depend on the scaler and are carried over by
+/// `carry_over_all_but_fingerprints`, so a `-x '*'` cache does not re-probe a
+/// home directory to learn what it already knew.
+const PREVIOUS_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new(concat!("files_ff8_picture", env!("VID_FP_ARCH_TABLE_SUFFIX")));
 
 /// Bump when anything a refusal depends on changes; see the module comment.
@@ -660,13 +672,25 @@ impl Cache {
         let mut prepared = Prepared::default();
         {
             let mut table = txn.open_table(TABLE).context("Failed to create the cache table")?;
-            if has(&LEGACY_FINGERPRINTS) {
-                let old = txn.open_table(LEGACY_FINGERPRINTS)?;
-                prepared.converted += migrate_fingerprints(&old, &mut table)?;
+            if has(&PREVIOUS_TABLE) {
+                let old = txn.open_table(PREVIOUS_TABLE)?;
+                prepared.converted += carry_over_all_but_fingerprints(&old, &mut table)?;
             }
+            // The legacy layout's fingerprints were made through libswscale
+            // too, so they are dropped below rather than migrated.
             if has(&LEGACY_REFUSALS) {
+                // A path the legacy layout also held a fingerprint for keeps
+                // neither: the fingerprint was the newer verdict, so the refusal
+                // beside it is stale, and the fingerprint is not carried.
+                let fingerprinted: HashSet<String> = if has(&LEGACY_FINGERPRINTS) {
+                    let fps = txn.open_table(LEGACY_FINGERPRINTS)?;
+                    let keys = fps.iter()?.map(|e| e.map(|(k, _)| k.value().to_string())).collect::<Result<_, _>>()?;
+                    keys
+                } else {
+                    HashSet::new()
+                };
                 let old = txn.open_table(LEGACY_REFUSALS)?;
-                prepared.converted += migrate_refusals(&old, &mut table)?;
+                prepared.converted += migrate_refusals(&old, &mut table, &fingerprinted)?;
             }
             if has(&LEGACY_IDENTITIES) {
                 let old = txn.open_table(LEGACY_IDENTITIES)?;
@@ -679,10 +703,11 @@ impl Cache {
             prepared.reclaimable |= dropped;
             Ok(dropped)
         };
-        for t in [LEGACY_FINGERPRINTS, LEGACY_REFUSALS, LEGACY_IDENTITIES] {
+        for t in [LEGACY_REFUSALS, LEGACY_IDENTITIES] {
             drop_table(t)?;
         }
-        let mut rebuilt = false;
+        let mut rebuilt = drop_table(LEGACY_FINGERPRINTS)?;
+        rebuilt |= drop_table(PREVIOUS_TABLE)?;
         for t in SUPERSEDED_TABLES {
             rebuilt |= drop_table(t)?;
         }
@@ -793,22 +818,34 @@ impl Cache {
 
 // --- The pre-`TABLE` layout ----------------------------------------------------
 
-/// `(Stamp, VideoFingerprint)` per path. Entries with no hashes are not
-/// carried over: only an older build wrote them (an all-featureless file used
-/// to fingerprint to nothing instead of failing), so the file is decoded once
-/// more and fails out loud.
-fn migrate_fingerprints(old: &WriteTable<'_>, table: &mut WriteTable<'_>) -> Result<usize> {
+/// Every record of `PREVIOUS_TABLE` with its fingerprint taken out: the stat,
+/// the identity and a refusal survive, since none of them is a picture. A
+/// record left holding nothing is not written. A path the new table already
+/// has keeps what it has.
+fn carry_over_all_but_fingerprints(old: &WriteTable<'_>, table: &mut WriteTable<'_>) -> Result<usize> {
     let mut carried = 0;
     for entry in old.iter()? {
         let (key, value) = entry?;
-        let Ok((stamp, fp)) = bincode::deserialize::<(Stamp, VideoFingerprint)>(value.value()) else {
-            continue;
-        };
-        if fp.valid_hashes.is_empty() || table.get(key.value())?.is_some() {
+        if table.get(key.value())?.is_some() {
             continue;
         }
-        let verdict = Verdict::Fingerprint { sampling: stamp.sampling(), fp };
-        put(table, key.value(), &Entry { stat: stamp.stat(), identity: None, verdict: Some(verdict) })?;
+        let (stat, identity, verdict) = match bincode::deserialize::<Entry<VideoFingerprint>>(value.value()) {
+            Ok(e) => {
+                let refused = match e.verdict {
+                    Some(v @ Verdict::Refused { .. }) => Some(v),
+                    _ => None,
+                };
+                (e.stat, e.identity, refused)
+            }
+            Err(_) => match bincode::deserialize::<Head>(value.value()) {
+                Ok(h) => (h.stat, h.identity, None),
+                Err(_) => continue,
+            },
+        };
+        if identity.is_none() && verdict.is_none() {
+            continue;
+        }
+        put(table, key.value(), &Entry { stat, identity, verdict })?;
         carried += 1;
     }
     Ok(carried)
@@ -818,10 +855,13 @@ fn migrate_fingerprints(old: &WriteTable<'_>, table: &mut WriteTable<'_>) -> Res
 /// (`refused_ff8_probe6` is `REFUSAL_RULES` 6). A path that already has a
 /// record keeps it: the two tables were kept exclusive, so a clash is a
 /// record this build wrote, which is the newer.
-fn migrate_refusals(old: &WriteTable<'_>, table: &mut WriteTable<'_>) -> Result<usize> {
+fn migrate_refusals(old: &WriteTable<'_>, table: &mut WriteTable<'_>, skip: &HashSet<String>) -> Result<usize> {
     let mut carried = 0;
     for entry in old.iter()? {
         let (key, value) = entry?;
+        if skip.contains(key.value()) {
+            continue;
+        }
         let Ok((stamp, refusal)) = bincode::deserialize::<(Stamp, Refusal)>(value.value()) else {
             continue;
         };
@@ -1161,7 +1201,7 @@ mod tests {
     /// The pre-`TABLE` layout, carried over once and dropped. Each of the three
     /// old tables, and the cases the split allowed that one record cannot hold.
     #[test]
-    fn test_the_three_old_tables_are_carried_over_once() {
+    fn test_the_three_old_tables_are_carried_over_once_without_their_fingerprints() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(CACHE_FILE_NAME);
         let s = stamp(1_700_000_000, 12_345);
@@ -1200,19 +1240,19 @@ mod tests {
 
         let db = Cache { db: redb::Database::create(&path).unwrap(), discards: false };
         let prepared = db.prepare().unwrap();
-        assert_eq!(prepared.converted, 4, "three fingerprints and one refusal");
-        assert!(!prepared.rebuilt, "nothing is decoded again for it");
+        assert_eq!(prepared.converted, 1, "one refusal");
+        assert!(prepared.rebuilt, "the fingerprints were scaled by libswscale, so they are decoded again");
         assert!(prepared.reclaimable);
 
-        assert!(hit(&db, "/v/a.mkv", &s).is_some());
-        assert!(hit(&db, "/v/black.mkv", &s).is_none(), "an empty fingerprint is decoded again, and fails out loud");
+        for p in ["/v/a.mkv", "/v/black.mkv", "/v/stale_id.mkv", "/v/both.mkv"] {
+            assert!(hit(&db, p, &s).is_none(), "{p}: no fingerprint is carried");
+        }
         assert!(refusal(&db, "/v/a.o", &s).is_some());
-        assert!(hit(&db, "/v/both.mkv", &s).is_some(), "one verdict, and the fingerprint is the newer");
+        assert!(refusal(&db, "/v/both.mkv", &s).is_none(), "the refusal beside a fingerprint was stale");
 
         let view = db.view();
-        assert_eq!(view.identity("/v/a.mkv"), Some(identity_of(s, 1)), "joins the record it vouched for");
-        assert_eq!(view.identity("/v/stale_id.mkv"), None, "about other bytes than the fingerprint");
-        assert!(hit(&db, "/v/stale_id.mkv", &s).is_some(), "which still answers by path");
+        assert_eq!(view.identity("/v/a.mkv"), Some(identity_of(s, 1)), "a record of its own");
+        assert_eq!(view.identity("/v/stale_id.mkv"), Some(identity_of(later, 2)), "nothing left to disagree with");
         assert_eq!(view.identity("/v/only_id.mkv"), Some(identity_of(later, 3)), "a record of its own");
         drop(view);
 
@@ -1226,6 +1266,37 @@ mod tests {
             .collect();
         assert_eq!(names, vec![redb::TableHandle::name(&TABLE).to_string()]);
 
+        let again = db.prepare().unwrap();
+        assert_eq!((again.converted, again.rebuilt, again.reclaimable), (0, false, false));
+    }
+
+    /// The libswscale-era table gives up its fingerprints and keeps the rest.
+    #[test]
+    fn test_the_previous_table_keeps_its_refusals_and_identities_and_loses_its_fingerprints() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CACHE_FILE_NAME);
+        let s = stamp(1_700_000_000, 12_345);
+        {
+            let db = redb::Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut old = txn.open_table(PREVIOUS_TABLE).unwrap();
+                let fp = |p: &str| Verdict::Fingerprint { sampling: s.sampling(), fp: mock_fp(p) };
+                put(&mut old, "/v/with_id.mkv", &Entry { stat: s.stat(), identity: Some(held(&identity_of(s, 1))), verdict: Some(fp("/v/with_id.mkv")) }).unwrap();
+                put(&mut old, "/v/bare.mkv", &Entry { stat: s.stat(), identity: None, verdict: Some(fp("/v/bare.mkv")) }).unwrap();
+                let refused: Verdict<VideoFingerprint> = Verdict::Refused { rules: REFUSAL_RULES, sampling: s.sampling(), refusal: not_media() };
+                put(&mut old, "/v/a.o", &Entry { stat: s.stat(), identity: None, verdict: Some(refused) }).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let db = Cache { db: redb::Database::create(&path).unwrap(), discards: false };
+        let prepared = db.prepare().unwrap();
+        assert_eq!(prepared.converted, 2, "the identity's record and the refusal");
+        assert!(prepared.rebuilt);
+        assert!(hit(&db, "/v/with_id.mkv", &s).is_none());
+        assert!(hit(&db, "/v/bare.mkv", &s).is_none());
+        assert!(refusal(&db, "/v/a.o", &s).is_some());
+        assert_eq!(db.view().identity("/v/with_id.mkv"), Some(identity_of(s, 1)));
         let again = db.prepare().unwrap();
         assert_eq!((again.converted, again.rebuilt, again.reclaimable), (0, false, false));
     }

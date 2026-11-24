@@ -95,9 +95,8 @@ chmod +x vid-fp
 sudo install -m 755 vid-fp /usr/local/bin/vid-fp
 ```
 
-On 64-bit ARM, download `vid-fp-aarch64-linux-gnu` instead; it can find slightly
-different matches than x86_64, and a cache shared between the two keeps them
-apart. Without `sudo`, install into `~/.local/bin`. Each release also ships a
+On 64-bit ARM, download `vid-fp-aarch64-linux-gnu` instead; it finds the same
+matches as x86_64 and can share its cache. Without `sudo`, install into `~/.local/bin`. Each release also ships a
 `.sha256` file (`sha256sum -c vid-fp-x86_64-linux-gnu.sha256`).
 
 To update, run the same commands again (`cargo install --force` from source).

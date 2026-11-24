@@ -28,7 +28,7 @@ use ffmpeg_next::codec::packet::Mut as _;
 use ffmpeg_next::format::context::Input;
 use ffmpeg_next::frame::Video as Frame;
 
-use super::{turn_square, Step, FRAME_STRIDE, MAX_DECODE_THREADS, SIDE};
+use super::{turn_square, Step, FRAME_STRIDE, MAX_DECODE_THREADS};
 use crate::utils::shutdown_requested;
 
 /// `FF_THREAD_FRAME` and `FF_THREAD_SLICE` from libavcodec. Spelled out rather
@@ -598,8 +598,7 @@ pub(super) struct FrameCapture {
     turns: u8,
     /// Seconds per tick of the stream, 0 when unknown.
     tb: f64,
-    scaler: Option<ffmpeg_next::software::scaling::context::Context>,
-    scaled: Frame,
+    scaler: super::downscale::Downscaler,
     current: Vec<u8>,
     turn_scratch: Vec<u8>,
     frames: Vec<u8>,
@@ -626,8 +625,7 @@ impl FrameCapture {
         FrameCapture {
             turns,
             tb,
-            scaler: None,
-            scaled: Frame::empty(),
+            scaler: Default::default(),
             current: vec![0u8; FRAME_STRIDE],
             turn_scratch: Vec::with_capacity(if turns == 0 { 0 } else { FRAME_STRIDE }),
             frames: Vec::with_capacity(FRAME_STRIDE * 64),
@@ -647,38 +645,15 @@ impl FrameCapture {
     }
 
     fn scale(&mut self, dec: &Frame) -> Result<(), ffmpeg_next::Error> {
-        // Rebuilt whenever the decoder's output changes shape: a stream may
-        // change resolution or pixel format mid-file (a feed switch, two
-        // encodes joined), and a context refuses any frame not of the shape it
-        // was built for. Built once, it silently dropped the rest of the file.
-        // Asked of the context's own record, so there is no second copy to drift.
-        let rebuild = self.scaler.as_ref().is_none_or(|built| {
-            let input = built.input();
-            input.format != dec.format() || input.width != dec.width() || input.height != dec.height()
-        });
-        if rebuild {
-            self.scaler = Some(ffmpeg_next::software::scaling::context::Context::get(
-                dec.format(),
-                dec.width(),
-                dec.height(),
-                ffmpeg_next::format::Pixel::GRAY8,
-                SIDE as u32,
-                SIDE as u32,
-                ffmpeg_next::software::scaling::flag::Flags::FAST_BILINEAR,
-            )?);
-            // The first frame's geometry is what the report and the ranking
-            // read: a file that rescales has no one true answer, and this is
-            // the one the header would have given.
-            let shown = if self.turns % 2 == 1 { (dec.height(), dec.width()) } else { (dec.width(), dec.height()) };
-            self.dims.get_or_insert(shown);
-        }
-        self.scaler.as_mut().expect("built above").run(dec, &mut self.scaled)?;
-
-        let data = self.scaled.data(0);
-        let stride = self.scaled.stride(0);
-        for y in 0..SIDE {
-            self.current[y * SIDE..(y + 1) * SIDE].copy_from_slice(&data[y * stride..y * stride + SIDE]);
-        }
+        // The scaler re-plans whenever the decoder's output changes shape: a
+        // stream may change resolution or pixel format mid-file (a feed switch,
+        // two encodes joined). See `downscale` for why it is not libswscale.
+        self.scaler.run(dec, &mut self.current)?;
+        // The first frame's geometry is what the report and the ranking read:
+        // a file that rescales has no one true answer, and this is the one the
+        // header would have given.
+        let shown = if self.turns % 2 == 1 { (dec.height(), dec.width()) } else { (dec.width(), dec.height()) };
+        self.dims.get_or_insert(shown);
         turn_square(&mut self.current, self.turns, &mut self.turn_scratch);
 
         let repeat = !self.times.is_empty() && self.frames[self.frames.len() - FRAME_STRIDE..] == self.current[..];

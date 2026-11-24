@@ -82,19 +82,16 @@ jobs:
           cp "$RUNNER_TEMP/av1/a.mkv" "$RUNNER_TEMP/av1/b.mkv"
           ./target/release/vid-fp "$RUNNER_TEMP/av1" -q --cache "$RUNNER_TEMP/av1.redb"
 
-      - name: The fixtures' report is the reviewed aarch64 one
+      - name: The fixtures' report is the reviewed one
         # Every figure in a report of the fixtures (samples, matched seconds,
         # coverage, the groups and labels) comes out of the decoded and scaled
         # pictures, so a checksum of it says whether this build still
-        # fingerprints as it did when its report was reviewed. It is its own
-        # sum, not x86_64's: libswscale's fast bilinear scaler rounds
-        # differently in x86 SIMD than in the C code ARM runs, which moves one
-        # figure here (test_video_capture.ts matched 29.00 s of
-        # test_video_rescaled.ts, 27.00 s on x86_64) and about one link in
-        # eight on a real library, at the same accuracy. That is why the two
-        # keep separate cache tables (lib.rs, CACHE_TABLE). x86_64's sum,
-        # 6e4bffd36885bb30, is checked in release.yml. Refresh both when the
-        # fixtures or the report layout change.
+        # fingerprints as it did when its report was reviewed. It is the same
+        # sum release.yml holds x86_64 to: fingerprint::downscale scales every
+        # keyframe with this crate's own port of libswscale's C path, so the
+        # two architectures agree byte for byte (before it, x86's SIMD setup
+        # sampled other columns and x86 had a sum of its own). Refresh both
+        # when the fixtures or the report layout change.
         #
         # Exit 2 is expected: one fixture is featureless on purpose and cannot
         # be fingerprinted.
@@ -105,11 +102,11 @@ jobs:
           if [ "$rc" -gt 2 ]; then echo "::error::vid-fp exited $rc"; exit 1; fi
           GOT="$(sed "s|$PWD/||g" "$RUNNER_TEMP/fx.csv" | sha256sum | cut -c1-16)"
           if [ "$GOT" != "cd9de982d6dcc870" ]; then
-            echo "::error::the fixtures' report is $GOT, not the reviewed aarch64 cd9de982d6dcc870"
+            echo "::error::the fixtures' report is $GOT, not the reviewed cd9de982d6dcc870"
             cat "$RUNNER_TEMP/fx.csv"
             exit 1
           fi
-          echo "matches the reviewed aarch64 report: $GOT"
+          echo "matches the reviewed report: $GOT"
 
       - name: Package
         # The same names as the x86_64 files, with the architecture in place

@@ -138,18 +138,19 @@ jobs:
       - name: The fixtures' report is the reviewed x86_64 one
         # A checksum of a report of the fixtures, which every fingerprint
         # figure feeds: a change here is a change in what the release
-        # fingerprints, and needs a CACHE_TABLE rename. aarch64.yml holds the
-        # ARM build to its own sum (the scaler rounds differently there).
-        # Refresh both when the fixtures or the report layout change. Exit 2
-        # is expected: one fixture is featureless on purpose.
+        # fingerprints, and needs a cache::TABLE rename. It is the same sum
+        # aarch64.yml checks: since fingerprint::downscale replaced libswscale,
+        # both architectures scale every keyframe identically. Refresh both
+        # when the fixtures or the report layout change. Exit 2 is expected:
+        # one fixture is featureless on purpose.
         run: |
           rc=0
           ./target/release/vid-fp "$PWD/tests/fixtures" -d 10 -q \
             --cache "$RUNNER_TEMP/fx.redb" -o "$RUNNER_TEMP/fx.csv" || rc=$?
           if [ "$rc" -gt 2 ]; then echo "::error::vid-fp exited $rc"; exit 1; fi
           GOT="$(sed "s|$PWD/||g" "$RUNNER_TEMP/fx.csv" | sha256sum | cut -c1-16)"
-          if [ "$GOT" != "e18237e7d039f096" ]; then
-            echo "::error::the fixtures' report is $GOT, not the reviewed e18237e7d039f096"
+          if [ "$GOT" != "cd9de982d6dcc870" ]; then
+            echo "::error::the fixtures' report is $GOT, not the reviewed cd9de982d6dcc870"
             cat "$RUNNER_TEMP/fx.csv"
             exit 1
           fi
