@@ -118,6 +118,9 @@ Pictures are turned by the display matrix before hashing. Matroska runtimes come
 - Frames live in one contiguous allocation per video; `main` pins `mallopt` thresholds. Don't use `Vec<Vec<u8>>`.
 - Phase 2's aligned-match list is banded past `MAX_ALIGNED_MATCHES` with no change in verdict.
 - `-t` is clamped to `MAX_THREAD_OVERSUBSCRIPTION` x cores (minimum 16) in `main_with`; memory, not CPU, is what it really controls.
+- Every quadratic hash loop (`any_within`, `for_each_frame_match`) is compiled a second time with POPCNT and that copy taken at runtime; baseline x86-64 `count_ones` made phase 2 about 6x slower per comparison. A new one needs the same.
+- After corroboration, `admit` reads its anchors, rescue and credit passes from one held sweep (`Near`), and sweeps again only past `MAX_ALIGNED_MATCHES`.
+- Per-frame hashing speedups must keep every bit (otherwise it is a `cache::TABLE` rename): the row pass is shared by rectangles spanning the same rows (`Hasher::band_rows`), `hash_of` selects its median, and the inset search's column test is SSE2 (`edge_columns`, held to `edge_columns_scalar`).
 
 ## Output and logging
 

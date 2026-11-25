@@ -476,3 +476,36 @@ A/B, warm cache, 3 interleaved rounds (round 1 discarded: the old build re-decod
 | VIDS2 | 4-8 | direct | unchanged (within 1 s) |
 
 Peak RSS unchanged within noise. Tests that pinned the old model by raw counts now build libraries of mock fingerprints; `test_both_routes_agree_when_the_gate_is_switched_off` moved to `-d 0` with 601 files of 20 hashes so it still reaches the index arm; `test_crowded_bins_make_the_index_dearer` is new.
+
+## Wall-time pass (2026-11-25)
+
+Stage timings first, static build, `-d 6 -p 20`: a warm VIDS scan was 8.0 s (phase 1 4.5 s, phase 2 2.2 s), a warm VIDS2 scan 21.5 s (phase 1 5.7 s, **phase 2 15.2 s**). Cold, the decode stage is 92% of the wall at 98-99% CPU; ahead of it, the whole-file BLAKE3 pass took 6.2 s on VIDS and ~17 s on VIDS2 at 23-50% CPU (disk-bound: VIDS2 reads 24 GB of same-size candidates, a 10 GB film and its copy among them; one sequential stream reads at ~860 MB/s on this NVMe, two at ~1.4 GB/s). Per-file timers put our own frame hashing at ~8% of decode-thread time on VIDS2.
+
+**Phase 2 was compiled without POPCNT.** `for_each_frame_match` ran at 6-7 ns per frame comparison where phase 1's `any_within`, which already had a POPCNT copy, runs at ~1 ns. The heaviest VIDS2 pairs (films against their re-encodes, ~2,900 x 1,940 samples) took 110-147 ms each, about 35 ms per sweep, and a matched pair sweeps four times: corroboration, anchors, rescue, credit. Two changes, both report-identical:
+
+1. `for_each_frame_match` gets the same runtime-selected POPCNT copy.
+2. `Near`: one sweep at the union of the rule's tolerance and the rescue's reach, held, and the three passes after corroboration filter it (main hash re-checked against each pass's cap, distance against its loose bound) in the sweep's own order. Over `MAX_ALIGNED_MATCHES` entries it is not held and each pass sweeps as before. `test_held_frame_matches_are_what_a_sweep_would_hand_each_pass` checks both arms against a sweep.
+
+Warm, single runs on a warm machine, base -> both, reports byte-identical at every rung, peak RSS level:
+
+| corpus | `-d 0` | `-d 2` | `-d 4` | `-d 6` | `-d 8` | `-d 12` |
+|---|---|---|---|---|---|---|
+| VIDS | 8.6 -> 8.2 s | 9.9 -> 8.6 s | 10.3 -> 8.8 s | 9.9 -> 9.6 s | 13.4 -> 10.3 s | 32.8 -> 18.4 s |
+| VIDS2 | 13.2 -> 11.2 s | 19.9 -> 13.0 s | 23.8 -> 14.0 s | 28.4 -> 15.6 s | 49.3 -> 20.0 s | 117.0 -> 51.2 s |
+
+POPCNT alone, two interleaved rounds at `-d 6`: VIDS2 22.0 -> 13.3 s, VIDS 8.0 -> 7.4 s. Final build against base at `-d 6`, ABBA, three runs each, medians: VIDS2 27.95 -> 16.33 s (user 196.7 -> 107.0 s), VIDS 10.42 -> 9.28 s (user 65.2 -> 58.9 s).
+
+**Phase 1 is at its kernel.** Per orientation (VIDS, 34 orientations): 29e9 hash comparisons, 36% from Zoom and 28% from the 26 strip orientations, at ~1.1 ns each per thread, so the time is comparison count. Refused: an 8-wide branch-free run test in `any_within` (1.45 ns vs 0.96 ns per comparison in isolation). An AVX2 popcount would not pay on this Zen+ (256-bit ops split in two) and AVX-512 is absent.
+
+**Frame hashing, bit-identical.** Best-of-7 microbench on 300 synthetic 128x128 frames, landscape / portrait / 4:3: 738 / 266 / 611 us a frame before, ~344 / 160 / 352 after. Three changes:
+
+- The box filter's row pass depends only on the rectangle's rows, and the whole crop, Cut43 and all 13 strips span the same rows, so it is cached per row range for the frame (`Hasher::band_rows`, reset by `next_frame`); a landscape frame runs 3 row passes of each size instead of ~17.
+- `inset_rect_64` took 136 us a frame: ~1,100 row pairs, each testing 63 columns with an f64 multiply, then walking right edges down from the widest with `continue` past every one over `INSET_MAX_AREA`. Now the share test is an integer table (`ceil(INSET_COVER * len)`, exact for whole counts), the column test is eight SSE2 compares into a bitmask (`edge_columns`; SSE2 is baseline on x86-64, other processors run `edge_columns_scalar`, which a test holds it to), and the walk starts at the widest edge under the area cap (the skipped ones can never end the walk: they are wider than `THUMB` and larger than any area `best` holds). 58 us on busy frames, 29 us against 115 us on 20,000 synthetic frames with insets, identical rectangles on all of them.
+- `hash_of` takes the two middle values with `select_nth_unstable_by` and a max below it, under the same `total_cmp`, instead of a full sort.
+
+Refused: an AVX2 copy of the whole hashing loop (no gain on Zen+); interleaving the detail hash's 64 coefficient sums (no gain). Checked end to end: the fixtures-style checksum over every hash, flag, share and reframing of the microbench frames is unchanged, and fresh-cache cold scans of VIDS and VIDS2 give byte-identical reports to the base build's. Cold, three folders of VIDS (7.2 GB, `--no-cache`), ABBA x3 with the opening cool run dropped, medians: 30.9 -> 29.4 s wall, 202.8 -> 194.5 s user.
+
+**Not done, measured:**
+
+- The BLAKE3 pass blocks the decode while it reads candidates whole (6 s VIDS, ~17 s VIDS2, at the drive's speed). Running it under the CPU-bound decode would hide it, but it means deciding followers and cache adoptions after the leader starts decoding, which is the identical-copy logic disposal rests on.
+- `video_stream_bytes` on every matched file costs 0.69 s of a warm VIDS scan and 0.84 s of VIDS2. Caching it was refused above (a fingerprint field re-decodes every library, and the cache is one table).

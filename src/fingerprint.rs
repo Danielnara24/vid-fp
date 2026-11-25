@@ -386,18 +386,13 @@ fn dct_basis() -> [[f32; THUMB]; KEEP] {
     basis
 }
 
-/// Box-filter the cropped region of a working frame down to `THUMB` x `THUMB`.
-///
-/// Separable: rows first into `band` (THUMB rows still 64 wide), then columns.
-/// Both scratch buffers belong to the caller so a whole video's worth of frames
+/// Box-filter the cropped region of a working frame down to a thumbnail,
+/// separably: rows first into a band still `SIDE` wide (this), then columns
+/// (`resample_cols`). The band depends on the rows' taps alone, so every
+/// rectangle of one frame spanning the same rows can share it (`Hasher`).
+/// Scratch buffers belong to the caller so a whole video's worth of frames
 /// runs without allocating.
-fn resample(
-    frame: &[u8],
-    rows: &[Vec<(usize, f32)>],
-    cols: &[Vec<(usize, f32)>],
-    band: &mut [f32],
-    out: &mut [f32],
-) {
+fn resample_rows(frame: &[u8], rows: &[Vec<(usize, f32)>], band: &mut [f32]) {
     for (oy, taps) in rows.iter().enumerate() {
         let dst = &mut band[oy * SIDE..oy * SIDE + SIDE];
         dst.fill(0.0);
@@ -408,15 +403,19 @@ fn resample(
             }
         }
     }
+}
 
-    for oy in 0..THUMB {
+/// The column half of the box filter (`resample_rows`), over every row of `band`.
+fn resample_cols(band: &[f32], cols: &[Vec<(usize, f32)>], out: &mut [f32]) {
+    let n = cols.len();
+    for (oy, dst) in out.chunks_exact_mut(n).enumerate().take(band.len() / SIDE) {
         let src = &band[oy * SIDE..oy * SIDE + SIDE];
         for (ox, taps) in cols.iter().enumerate() {
             let mut acc = 0.0;
             for &(sx, w) in taps {
                 acc += src[sx] * w;
             }
-            out[oy * THUMB + ox] = acc;
+            dst[ox] = acc;
         }
     }
 }
@@ -473,10 +472,15 @@ fn is_featureless(coefficients: &[f32; KEEP * KEEP]) -> bool {
 /// of places, so `--hamming-distance 5` accepts exactly what 4 does. Odd values
 /// are not wrong, just indistinguishable from the even one below them.
 fn hash_of(coefficients: &[f32; KEEP * KEEP]) -> u64 {
+    // The two middle values of the block in `total_cmp` order: the upper one
+    // selected in place, the lower one the largest below it. The same two
+    // values a full sort puts there, for a fraction of the work; this runs
+    // four times for every rectangle of every frame.
     let mut sorted = *coefficients;
-    sorted.sort_unstable_by(|a, b| a.total_cmp(b));
     let n = KEEP * KEEP;
-    let median = (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0;
+    let (below, &mut upper, _) = sorted.select_nth_unstable_by(n / 2, |a, b| a.total_cmp(b));
+    let lower = below.iter().copied().max_by(|a, b| a.total_cmp(b)).unwrap_or(upper);
+    let median = (lower + upper) / 2.0;
 
     let mut hash = 0u64;
     for (i, &c) in coefficients.iter().enumerate() {
@@ -1830,9 +1834,11 @@ fn inset_rect(full: &[u8]) -> Option<(usize, usize, usize, usize)> {
 fn inset_rect_64(frame: &[u8]) -> Option<(usize, usize, usize, usize)> {
     let px = |y: usize, x: usize| frame[y * 64 + x] as i32;
     // hp[y][x]: edges along the boundary above row y, over columns 0..x.
-    // vp[x][y]: edges along the boundary left of column x, over rows 0..y.
+    // vt[y][x]: edges along the boundary left of column x, over rows 0..y --
+    // stored row by row, so the scan below over every column for one pair of
+    // rows reads two contiguous lines.
     let mut hp = [[0u16; 65]; 64];
-    let mut vp = [[0u16; 65]; 64];
+    let mut vt = [[0u16; 64]; 65];
     for (y, line) in hp.iter_mut().enumerate().skip(1) {
         let mut edges = 0;
         for (x, cell) in line.iter_mut().skip(1).enumerate() {
@@ -1840,14 +1846,17 @@ fn inset_rect_64(frame: &[u8]) -> Option<(usize, usize, usize, usize)> {
             *cell = edges;
         }
     }
-    for (x, line) in vp.iter_mut().enumerate().skip(1) {
-        let mut edges = 0;
-        for (y, cell) in line.iter_mut().skip(1).enumerate() {
-            edges += ((px(y, x) - px(y, x - 1)).abs() >= INSET_STEP) as u16;
-            *cell = edges;
+    for y in 0..64 {
+        let (done, rest) = vt.split_at_mut(y + 1);
+        for (x, (cell, &above)) in rest[0].iter_mut().zip(&done[y]).enumerate().skip(1) {
+            *cell = above + ((px(y, x) - px(y, x - 1)).abs() >= INSET_STEP) as u16;
         }
     }
-    let covers = |n: u16, len: usize| n as f64 >= INSET_COVER * len as f64;
+    // `n` edges cover a side `len` long when at least `INSET_COVER` of it has
+    // one; for a whole count that is `n >= need[len]`, the share rounded up.
+    let need: [u16; 65] = std::array::from_fn(|len| (INSET_COVER * len as f64).ceil() as u16);
+    // The largest area `INSET_MAX_AREA` allows, rounded down the same way.
+    let max_area = (INSET_MAX_AREA * 4096.0).floor() as usize;
     let mut best = 0usize;
     let mut found = None;
     let mut cols = [0usize; 64];
@@ -1857,25 +1866,32 @@ fn inset_rect_64(frame: &[u8]) -> Option<(usize, usize, usize, usize)> {
             if h * 63 <= best {
                 continue;
             }
+            let mut sides = edge_columns(&vt[y1], &vt[y2], need[h]);
             let mut n = 0;
-            for (x, line) in vp.iter().enumerate().skip(1) {
-                if covers(line[y2] - line[y1], h) {
-                    cols[n] = x;
-                    n += 1;
-                }
+            while sides != 0 {
+                cols[n] = sides.trailing_zeros() as usize;
+                n += 1;
+                sides &= sides - 1;
             }
+            // Right edges far enough out to make the inset larger than
+            // `INSET_MAX_AREA` are never taken, and never end the walk either
+            // (they are wider than `THUMB`, and larger than any area `best`
+            // can hold), so the walk starts at the widest one inside the cap.
+            // `hi` only moves right, as `x1` does.
+            let widest = max_area / h;
+            let mut hi = 0;
             for p in 0..n {
                 let x1 = cols[p];
-                for q in (p + 1..n).rev() {
+                while hi < n && cols[hi] - x1 <= widest {
+                    hi += 1;
+                }
+                for q in (p + 1..hi).rev() {
                     let x2 = cols[q];
                     let w = x2 - x1;
                     if w < THUMB || w * h <= best {
                         break;
                     }
-                    if (w * h) as f64 > INSET_MAX_AREA * 4096.0 {
-                        continue;
-                    }
-                    if !covers(hp[y1][x2] - hp[y1][x1], w) || !covers(hp[y2][x2] - hp[y2][x1], w) {
+                    if hp[y1][x2] - hp[y1][x1] < need[w] || hp[y2][x2] - hp[y2][x1] < need[w] {
                         continue;
                     }
                     best = w * h;
@@ -1886,6 +1902,46 @@ fn inset_rect_64(frame: &[u8]) -> Option<(usize, usize, usize, usize)> {
         }
     }
     found
+}
+
+/// The columns `x` whose edge runs at least `at_least` of the rows between
+/// `top` and `bottom` (`bottom[x] - top[x]`, prefix counts), as bits of a mask.
+/// Column 0 has no edge to its left and is never set.
+///
+/// Asked about a thousand times a frame, so on x86-64 it is eight SSE2
+/// compares rather than 63 scalar ones; SSE2 is part of the baseline there.
+fn edge_columns(top: &[u16; 64], bottom: &[u16; 64], at_least: u16) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::*;
+        // Prefix counts are at most 64 and `at_least` at most 65 for these
+        // heights, so 16-bit signed arithmetic is exact.
+        // SAFETY: SSE2 is in every x86-64 processor, and each load reads 8
+        // u16s inside a 64-long array.
+        unsafe {
+            let floor = _mm_set1_epi16(at_least.min(i16::MAX as u16) as i16 - 1);
+            let mut mask = 0u64;
+            for k in 0..4 {
+                let at = |o: usize, line: &[u16; 64]| _mm_loadu_si128(line.as_ptr().add(o) as *const __m128i);
+                let lo = _mm_cmpgt_epi16(_mm_sub_epi16(at(16 * k, bottom), at(16 * k, top)), floor);
+                let hi = _mm_cmpgt_epi16(_mm_sub_epi16(at(16 * k + 8, bottom), at(16 * k + 8, top)), floor);
+                let bits = _mm_movemask_epi8(_mm_packs_epi16(lo, hi)) as u32 as u64;
+                mask |= bits << (16 * k);
+            }
+            mask & !1
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        edge_columns_scalar(top, bottom, at_least)
+    }
+}
+
+/// `edge_columns` one column at a time: what other processors run, and what
+/// the SSE2 version is held to.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+fn edge_columns_scalar(top: &[u16; 64], bottom: &[u16; 64], at_least: u16) -> u64 {
+    (1..64).fold(0u64, |mask, x| mask | (((bottom[x] - top[x] >= at_least) as u64) << x))
 }
 
 const ZOOM: f64 = 1.12;
@@ -1992,6 +2048,14 @@ struct Hasher {
     band: [f32; SIDE * THUMB],
     dthumb: Vec<f32>,
     dband: Vec<f32>,
+    /// The rows (`y1`, `y2`) `band` and `dband` hold the row pass of, for the
+    /// frame being hashed; `None` once `next_frame` says the frame changed.
+    /// The whole crop, Cut43 and every strip span the same rows, so a
+    /// landscape frame runs three row passes of each size rather than about
+    /// seventeen. The column pass and the transform read the band exactly as
+    /// they would a fresh one, so the hashes are the same bits.
+    band_rows: Option<(usize, usize)>,
+    dband_rows: Option<(usize, usize)>,
 }
 
 impl Hasher {
@@ -2017,7 +2081,15 @@ impl Hasher {
             band: [0.0; SIDE * THUMB],
             dthumb: vec![0.0; DETAIL_THUMB * DETAIL_THUMB],
             dband: vec![0.0; SIDE * DETAIL_THUMB],
+            band_rows: None,
+            dband_rows: None,
         }
+    }
+
+    /// The next calls are about another frame: no row pass is shared across it.
+    fn next_frame(&mut self) {
+        self.band_rows = None;
+        self.dband_rows = None;
     }
 
     /// The low-frequency block of `frame` inside `rect`.
@@ -2027,7 +2099,11 @@ impl Hasher {
             .weights
             .entry(rect)
             .or_insert_with(|| (box_weights(y1, y2 - y1 + 1), box_weights(x1, x2 - x1 + 1)));
-        resample(frame, rows, cols, &mut self.band, &mut self.thumb);
+        if self.band_rows != Some((y1, y2)) {
+            resample_rows(frame, rows, &mut self.band);
+            self.band_rows = Some((y1, y2));
+        }
+        resample_cols(&self.band, cols, &mut self.thumb);
         low_frequency_block(&self.thumb, &self.basis)
     }
 
@@ -2038,25 +2114,11 @@ impl Hasher {
             (box_weights_to(y1, y2 - y1 + 1, DETAIL_THUMB), box_weights_to(x1, x2 - x1 + 1, DETAIL_THUMB))
         });
         let n = DETAIL_THUMB;
-        for (oy, taps) in rows.iter().enumerate() {
-            let dst = &mut self.dband[oy * SIDE..oy * SIDE + SIDE];
-            dst.fill(0.0);
-            for &(sy, w) in taps {
-                for (d, &p) in dst.iter_mut().zip(&frame[sy * SIDE..sy * SIDE + SIDE]) {
-                    *d += p as f32 * w;
-                }
-            }
+        if self.dband_rows != Some((y1, y2)) {
+            resample_rows(frame, rows, &mut self.dband);
+            self.dband_rows = Some((y1, y2));
         }
-        for oy in 0..n {
-            let src = &self.dband[oy * SIDE..oy * SIDE + SIDE];
-            for (ox, taps) in cols.iter().enumerate() {
-                let mut acc = 0.0;
-                for &(sx, w) in taps {
-                    acc += src[sx] * w;
-                }
-                self.dthumb[oy * n + ox] = acc;
-            }
-        }
+        resample_cols(&self.dband, cols, &mut self.dthumb);
         // rows of the transform first, for every k any picked coefficient needs
         let mut partial = [[0.0f32; DETAIL_THUMB]; DETAIL_KEEP];
         for (k, prow) in partial.iter_mut().enumerate() {
@@ -2187,6 +2249,7 @@ pub(crate) fn hash_frames_fully(u_frames: &[u8], dims: (u32, u32), on_frame: &dy
         if i > 0 {
             on_frame(i);
         }
+        hasher.next_frame();
         let (rect, tiny) = frame_crop_or_tiny(frame);
         let (y1, y2, x1, x2) = rect;
         out.picture.push(((y2 - y1 + 1) * (x2 - x1 + 1)) as f32 / FRAME_STRIDE as f32);
@@ -2553,6 +2616,29 @@ mod tests {
             }
         }
         assert_eq!(hash_frames_on(&[], (0, 0), 8, &|_| {}).hashes, Vec::<u64>::new());
+    }
+
+    /// The SSE2 column test of the inset search answers what the scalar one
+    /// does, at every threshold, on prefix counts of every shape.
+    #[test]
+    fn test_edge_columns_agrees_with_the_scalar_test() {
+        let mut x = 0x9E37_79B9u32;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        for _ in 0..2000 {
+            let (mut top, mut bottom) = ([0u16; 64], [0u16; 64]);
+            for c in 0..64 {
+                top[c] = (next() % 33) as u16;
+                bottom[c] = top[c] + (next() % 33) as u16;
+            }
+            for at_least in [0, 1, 13, 20, 32, 51, 65] {
+                assert_eq!(edge_columns(&top, &bottom, at_least), edge_columns_scalar(&top, &bottom, at_least));
+            }
+        }
     }
 
     #[test]

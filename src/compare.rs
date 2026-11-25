@@ -1417,9 +1417,9 @@ fn admit<M: FnMut(u32, u32, u32)>(
     // so the anchors do, and so does everything rescued from them. The same
     // sweep names the strict matches, which `for_each_frame_match` flagged
     // without saying which pair they were.
+    let near = Near::of(fp_a, fp_b, tol);
     let mut anchors: Vec<Aligned> = Vec::new();
-    let (mut scratch_a, mut scratch_b) = (matched_a.to_vec(), matched_b.to_vec());
-    for_each_frame_match(fp_a, fp_b, tol, &mut scratch_a, &mut scratch_b, |entry| {
+    near.each(fp_a, fp_b, tol, |entry| {
         if entry.3 <= tol.strict {
             on_mark(entry.1, entry.2, entry.3);
         }
@@ -1427,14 +1427,13 @@ fn admit<M: FnMut(u32, u32, u32)>(
             anchors.push(entry);
         }
     });
-    rescue_along_alignments(fp_a, fp_b, tol, anchors, matched_a, matched_b, on_mark);
+    rescue_along_alignments(fp_a, fp_b, &near, anchors, matched_a, matched_b, on_mark);
     // What is credited is read the way the anchors are, after the rescue: every
     // frame match within the rule's reach between two samples both matched. A
     // set that only grows with `-d`, where the marks reported along the way
     // need not (corroboration skips a row already settled).
     let mut settled: Vec<(u32, u32)> = Vec::new();
-    let (mut scratch_a, mut scratch_b) = (matched_a.to_vec(), matched_b.to_vec());
-    for_each_frame_match(fp_a, fp_b, tol, &mut scratch_a, &mut scratch_b, |(_, i, j, _)| {
+    near.each(fp_a, fp_b, tol, |(_, i, j, _)| {
         if matched_a[i as usize] && matched_b[j as usize] {
             settled.push((i, j));
         }
@@ -1513,11 +1512,90 @@ fn credit_matched_spans(
     }
 }
 
-/// The rescue step of `admit`. `accepted` is its anchors.
+/// How far the rescue reaches past `tol`: one more `CORROBORATION_SLACK_SIGMA`
+/// step than the corroborated side, with the main hash held to half of it.
+fn rescue_reach(tol: Tolerance) -> Tolerance {
+    let width = if tol.cap.is_some() { WIDE_BITS } else { HASH_BITS };
+    let slack = (CORROBORATION_SLACK_SIGMA * sigma_of(width)).round() as u32;
+    let reach = tol.loose.saturating_add(slack).min(width);
+    Tolerance { strict: reach, loose: reach, cap: tol.cap.map(|_| (reach / 2).min(HASH_BITS)) }
+}
+
+/// The frame matches of one pair out to the rescue's reach, swept once and
+/// held, so `admit`'s three passes after corroboration (anchors, rescue,
+/// credit) read a list instead of each sweeping the pair again. The list is
+/// in the sweep's own order, and each pass takes from it exactly the entries
+/// its own sweep would have handed it, so the passes cannot tell the
+/// difference. A pair with more than `MAX_ALIGNED_MATCHES` of them is not
+/// held, and every pass sweeps it as before.
+///
+/// The sweeps were most of phase 2 on VIDS2, where long films matched against
+/// their re-encodes do all four.
+struct Near {
+    /// The rule's own tolerance; the rescue reaches `rescue_reach` of it.
+    tol: Tolerance,
+    /// `None` when the pair had too many to hold.
+    held: Option<Vec<Aligned>>,
+}
+
+impl Near {
+    fn of(fp_a: &VideoFingerprint, fp_b: &VideoFingerprint, tol: Tolerance) -> Near {
+        Near::holding(fp_a, fp_b, tol, MAX_ALIGNED_MATCHES)
+    }
+
+    /// `of`, holding at most `cap` entries.
+    fn holding(fp_a: &VideoFingerprint, fp_b: &VideoFingerprint, tol: Tolerance, cap: usize) -> Near {
+        let wider = rescue_reach(tol);
+        // Wide enough for both: everything `tol` or `wider` admits.
+        let hold = Tolerance {
+            strict: 0,
+            loose: tol.loose.max(wider.loose),
+            cap: tol.cap.map(|c| wider.cap.map_or(c, |w| c.max(w))),
+        };
+        let (mut scratch_a, mut scratch_b) = (vec![false; fp_a.valid_hashes.len()], vec![false; fp_b.valid_hashes.len()]);
+        let mut held: Vec<Aligned> = Vec::new();
+        let mut total = 0usize;
+        for_each_frame_match(fp_a, fp_b, hold, &mut scratch_a, &mut scratch_b, |entry| {
+            total += 1;
+            if total <= cap {
+                held.push(entry);
+            }
+        });
+        Near { tol, held: (total <= cap).then_some(held) }
+    }
+
+    /// Every frame match within `tol`, in sweep order: what
+    /// `for_each_frame_match` hands `keep` for it.
+    fn each<F: FnMut(Aligned)>(&self, fp_a: &VideoFingerprint, fp_b: &VideoFingerprint, tol: Tolerance, mut keep: F) {
+        match &self.held {
+            Some(held) => {
+                for &entry in held {
+                    let (_, i, j, distance) = entry;
+                    if let Some(cap) = tol.cap {
+                        if (fp_a.valid_hashes[i as usize] ^ fp_b.valid_hashes[j as usize]).count_ones() > cap {
+                            continue;
+                        }
+                    }
+                    if distance <= tol.loose {
+                        keep(entry);
+                    }
+                }
+            }
+            None => {
+                let (mut scratch_a, mut scratch_b) =
+                    (vec![false; fp_a.valid_hashes.len()], vec![false; fp_b.valid_hashes.len()]);
+                for_each_frame_match(fp_a, fp_b, tol, &mut scratch_a, &mut scratch_b, keep);
+            }
+        }
+    }
+}
+
+/// The rescue step of `admit`. `accepted` is its anchors, `near` the pair's
+/// frame matches under the rule's tolerance.
 fn rescue_along_alignments<M: FnMut(u32, u32, u32)>(
     fp_a: &VideoFingerprint,
     fp_b: &VideoFingerprint,
-    tol: Tolerance,
+    near: &Near,
     mut accepted: Vec<Aligned>,
     matched_a: &mut [bool],
     matched_b: &mut [bool],
@@ -1553,12 +1631,7 @@ fn rescue_along_alignments<M: FnMut(u32, u32, u32)>(
     if chains.is_empty() {
         return;
     }
-    let width = if tol.cap.is_some() { WIDE_BITS } else { HASH_BITS };
-    let slack = (CORROBORATION_SLACK_SIGMA * sigma_of(width)).round() as u32;
-    let reach = tol.loose.saturating_add(slack).min(width);
-    let wider = Tolerance { strict: reach, loose: reach, cap: tol.cap.map(|_| (reach / 2).min(HASH_BITS)) };
-    let (mut scratch_a, mut scratch_b) = (vec![false; matched_a.len()], vec![false; matched_b.len()]);
-    for_each_frame_match(fp_a, fp_b, wider, &mut scratch_a, &mut scratch_b, |(off, i, j, d)| {
+    near.each(fp_a, fp_b, rescue_reach(near.tol), |(off, i, j, d)| {
         let (ta, tb) = (fp_a.valid_t_start[i as usize], fp_b.valid_t_start[j as usize]);
         let inside = chains.iter().any(|&((olo, ohi), (alo, ahi), (blo, bhi))| {
             off >= olo && off <= ohi && ta >= alo && ta <= ahi && tb >= blo && tb <= bhi
@@ -1584,6 +1657,10 @@ fn rescue_along_alignments<M: FnMut(u32, u32, u32)>(
 /// are the strongest witnesses there are, and leaving them out would make a
 /// loose match's fate depend on whether its corroborator happened to be close
 /// enough to stand alone.
+///
+/// Compiled a second time with the POPCNT instruction and that copy taken when
+/// the processor has it, as `any_within` is: on the baseline x86-64 target
+/// `count_ones` is a dozen instructions, and this loop is most of phase 2.
 #[inline]
 fn for_each_frame_match<F: FnMut(Aligned)>(
     fp_a: &VideoFingerprint,
@@ -1593,28 +1670,59 @@ fn for_each_frame_match<F: FnMut(Aligned)>(
     matched_b: &mut [bool],
     mut keep: F,
 ) {
-    for (i, &h_a) in fp_a.valid_hashes.iter().enumerate() {
-        for (j, &h_b) in fp_b.valid_hashes.iter().enumerate() {
-            let main = (h_a ^ h_b).count_ones();
-            let distance = match tol.cap {
-                None => main,
-                Some(cap) => {
-                    if main > cap {
-                        continue;
+    #[inline(always)]
+    fn body<F: FnMut(Aligned)>(
+        fp_a: &VideoFingerprint,
+        fp_b: &VideoFingerprint,
+        tol: Tolerance,
+        matched_a: &mut [bool],
+        matched_b: &mut [bool],
+        keep: &mut F,
+    ) {
+        for (i, &h_a) in fp_a.valid_hashes.iter().enumerate() {
+            for (j, &h_b) in fp_b.valid_hashes.iter().enumerate() {
+                let main = (h_a ^ h_b).count_ones();
+                let distance = match tol.cap {
+                    None => main,
+                    Some(cap) => {
+                        if main > cap {
+                            continue;
+                        }
+                        main + (fp_a.detail_hashes[i] ^ fp_b.detail_hashes[j]).count_ones()
                     }
-                    main + (fp_a.detail_hashes[i] ^ fp_b.detail_hashes[j]).count_ones()
+                };
+                if distance <= tol.strict {
+                    matched_a[i] = true;
+                    matched_b[j] = true;
                 }
-            };
-            if distance <= tol.strict {
-                matched_a[i] = true;
-                matched_b[j] = true;
-            }
-            if distance <= tol.loose {
-                let offset = fp_a.valid_t_start[i] as i64 - fp_b.valid_t_start[j] as i64;
-                keep((offset, i as u32, j as u32, distance));
+                if distance <= tol.loose {
+                    let offset = fp_a.valid_t_start[i] as i64 - fp_b.valid_t_start[j] as i64;
+                    keep((offset, i as u32, j as u32, distance));
+                }
             }
         }
     }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // `unsafe` rather than a safe `#[target_feature]` fn, which needs Rust
+        // 1.86 and the declared MSRV is 1.85.
+        #[target_feature(enable = "popcnt")]
+        unsafe fn with_popcnt<F: FnMut(Aligned)>(
+            fp_a: &VideoFingerprint,
+            fp_b: &VideoFingerprint,
+            tol: Tolerance,
+            matched_a: &mut [bool],
+            matched_b: &mut [bool],
+            keep: &mut F,
+        ) {
+            body(fp_a, fp_b, tol, matched_a, matched_b, keep)
+        }
+        if std::arch::is_x86_feature_detected!("popcnt") {
+            // SAFETY: the feature was detected on this processor just above.
+            return unsafe { with_popcnt(fp_a, fp_b, tol, matched_a, matched_b, &mut keep) };
+        }
+    }
+    body(fp_a, fp_b, tol, matched_a, matched_b, &mut keep)
 }
 
 /// Run the corroboration rule over one pair, holding at most `cap` matches at a
@@ -2910,6 +3018,45 @@ mod tests {
             reframed: Vec::new(),
             picture: 0.0,
             measured: None,
+        }
+    }
+
+    /// A held list hands each of `admit`'s passes exactly what a sweep of the
+    /// pair would, in the same order, under the rule's tolerance and under the
+    /// rescue's wider one; so does a pair too big to hold, which sweeps.
+    #[test]
+    fn test_held_frame_matches_are_what_a_sweep_would_hand_each_pass() {
+        let mut x = 0x2545F4914F6CDD1Du64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        // Pairs of hashes a few bits apart, so every distance band is populated.
+        let base: Vec<(u64, u64)> = (0..40).map(|_| (next(), next())).collect();
+        let near = |h: u64, n: &mut dyn FnMut() -> u64| h ^ (n() & n() & n() & n());
+        let mut a = mock_fp_with_hashes(base.iter().map(|b| b.0).collect(), 40);
+        a.detail_hashes = base.iter().map(|b| b.1).collect();
+        let mut b = mock_fp_with_hashes(base.iter().map(|p| near(p.0, &mut next)).collect(), 40);
+        b.detail_hashes = base.iter().map(|p| near(p.1, &mut next)).collect();
+        b.valid_hashes.extend(base.iter().take(10).map(|p| near(p.0, &mut next)));
+        b.detail_hashes.extend(base.iter().take(10).map(|p| near(p.1, &mut next)));
+        b.valid_t_start = (0..50).map(|t| t * 7).collect();
+        b.valid_t_end = (1..=50).map(|t| t * 7).collect();
+        for d in [0, 4, 6, 10, 16] {
+            let tol = Tolerance::wide(d);
+            for t in [tol, rescue_reach(tol)] {
+                let mut swept = Vec::new();
+                let (mut sa, mut sb) = (vec![false; 40], vec![false; 50]);
+                for_each_frame_match(&a, &b, t, &mut sa, &mut sb, |e| swept.push(e));
+                for cap in [usize::MAX, 0] {
+                    let mut read = Vec::new();
+                    Near::holding(&a, &b, tol, cap).each(&a, &b, t, |e| read.push(e));
+                    assert_eq!(read, swept, "-d {d}, cap {cap}");
+                }
+                assert!(d < 4 || !swept.is_empty(), "-d {d} should find something");
+            }
         }
     }
 
