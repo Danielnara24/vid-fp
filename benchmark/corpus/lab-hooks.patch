@@ -1,0 +1,343 @@
+diff --git a/src/compare.rs b/src/compare.rs
+index d16326c..6bc1128 100644
+--- a/src/compare.rs
++++ b/src/compare.rs
+@@ -316,6 +316,26 @@ impl Tolerance {
+     fn widest(&self) -> u32 {
+         self.cap.unwrap_or(self.loose)
+     }
++
++    /// This tolerance held to the same chance when it is one of `tries`
++    /// alternative ways a pair is measured: each distance moves in to the
++    /// largest one whose chance tail is `tries` times smaller, so the
++    /// alternatives together admit a chance match as rarely as one comparison
++    /// does at the uncorrected distance.
++    fn corrected(self, width: u32, tries: u32) -> Self {
++        if tries <= 1 || std::env::var("VIDFP_CORR").is_ok_and(|v| v == "off") {
++            return self;
++        }
++        let extra = (tries as f64).log10();
++        let pull = |d: u32| {
++            let need = chance_orders_of_magnitude_of(width, d) + extra;
++            (0..=d).rev().find(|&t| chance_orders_of_magnitude_of(width, t) >= need).unwrap_or(0)
++        };
++        let loose_only = std::env::var("VIDFP_CORR").is_ok_and(|v| v == "loose"); // LAB
++        let strict = if loose_only { self.strict } else { pull(self.strict) };
++        let loose = pull(self.loose).max(strict);
++        Tolerance { strict, loose, cap: self.cap.map(|_| (loose / 2).min(HASH_BITS)) }
++    }
+ }
+ 
+ /// What one pair is judged by: the two tolerances `-d` implies and how many
+@@ -349,6 +369,14 @@ impl<'a> Rules<'a> {
+     fn widest(&self) -> u32 {
+         self.narrow.tol.widest().max(self.wide.tol.widest())
+     }
++
++    /// Both rules held to one comparison's chance across `tries` alternatives.
++    fn corrected(&self, tries: u32) -> Rules<'a> {
++        Rules {
++            narrow: Rule { tol: self.narrow.tol.corrected(HASH_BITS, tries), ..self.narrow },
++            wide: Rule { tol: self.wide.tol.corrected(WIDE_BITS, tries), ..self.wide },
++        }
++    }
+ }
+ 
+ fn has_detail(fp: &VideoFingerprint) -> bool {
+@@ -2206,10 +2234,20 @@ pub struct Evidence {
+     /// order, touching samples merged.
+     pub stretches_a: Vec<(u32, u32)>,
+     pub stretches_b: Vec<(u32, u32)>,
++    /// LAB: every admitted frame match, `(t_a_ms, t_b_ms, distance)`.
++    pub all: Vec<(u32, u32, u32)>,
+ }
+ 
+ /// `Evidence` for `fp_a` against `fp_b` at `-d max_hamming_dist`.
+ pub fn evidence(fp_a: &VideoFingerprint, fp_b: &VideoFingerprint, max_hamming_dist: u32) -> Evidence {
++    let (ta, tb);
++    let (fp_a, fp_b) = if thin_on() {
++        ta = thinned(fp_a);
++        tb = thinned(fp_b);
++        (&ta, &tb)
++    } else {
++        (fp_a, fp_b)
++    };
+     // The pair was measured every way round and kept the orientation that
+     // covered more (`better_orientation`), so the frames shown are taken the
+     // same way: each orientation of `a` against `b`, and each one-sided
+@@ -2220,18 +2258,19 @@ pub fn evidence(fp_a: &VideoFingerprint, fp_b: &VideoFingerprint, max_hamming_di
+         let pct = |ms: u64, total: u32| if total > 0 { ms as f64 / total as f64 } else { 0.0 };
+         pct(ms(&e.stretches_a), fp_a.total_ms).max(pct(ms(&e.stretches_b), fp_b.total_ms))
+     };
+-    let mut chosen = evidence_as(fp_a, fp_b, max_hamming_dist);
++    let mut chosen = evidence_as(fp_a, fp_b, max_hamming_dist, 1);
+     for o in &Orientation::all()[1..] {
+         let mut candidates = Vec::new();
+         if o.fits(fp_a, fp_b) {
+-            candidates.push(evidence_as(&o.apply(fp_a), fp_b, max_hamming_dist));
++            candidates.push(evidence_as(&o.apply(fp_a), fp_b, max_hamming_dist, o.tries(fp_a, fp_b)));
+         }
+         if !o.symmetric() && o.fits(fp_b, fp_a) {
+-            let e = evidence_as(&o.apply(fp_b), fp_a, max_hamming_dist);
++            let e = evidence_as(&o.apply(fp_b), fp_a, max_hamming_dist, o.tries(fp_a, fp_b));
+             candidates.push(Evidence {
+                 pairs: e.pairs.iter().map(|&(tb, ta, d)| (ta, tb, d)).collect(),
+                 stretches_a: e.stretches_b,
+                 stretches_b: e.stretches_a,
++                all: e.all.iter().map(|&(tb, ta, d)| (ta, tb, d)).collect(),
+             });
+         }
+         for e in candidates {
+@@ -2245,19 +2284,22 @@ pub fn evidence(fp_a: &VideoFingerprint, fp_b: &VideoFingerprint, max_hamming_di
+     Evidence { pairs, ..chosen }
+ }
+ 
+-fn evidence_as(fp_a: &VideoFingerprint, fp_b: &VideoFingerprint, max_hamming_dist: u32) -> Evidence {
++fn evidence_as(fp_a: &VideoFingerprint, fp_b: &VideoFingerprint, max_hamming_dist: u32, tries: u32) -> Evidence {
+     let narrow_schedule = witness_schedule();
+     let wide_schedule = witness_schedule_of(WIDE_BITS);
+     let rules = Rules {
+         narrow: Rule { tol: Tolerance::for_distance(max_hamming_dist), schedule: &narrow_schedule },
+         wide: Rule { tol: Tolerance::wide(max_hamming_dist), schedule: &wide_schedule },
+-    };
++    }
++    .corrected(tries);
+     let rule = rules.for_pair(fp_a, fp_b);
+     let mut matched_a = vec![false; fp_a.valid_hashes.len()];
+     let mut matched_b = vec![false; fp_b.valid_hashes.len()];
+     // The closest partner of each sample of `a`, of the matches admitted.
+     let mut best: Vec<Option<(u32, u32)>> = vec![None; fp_a.valid_hashes.len()];
+-    let note = |best: &mut Vec<Option<(u32, u32)>>, i: u32, j: u32, d: u32| {
++    let mut all: Vec<(u32, u32, u32)> = Vec::new();
++    let note = |best: &mut Vec<Option<(u32, u32)>>, all: &mut Vec<(u32, u32, u32)>, i: u32, j: u32, d: u32| {
++        all.push((fp_a.valid_t_start[i as usize], fp_b.valid_t_start[j as usize], d));
+         let slot = &mut best[i as usize];
+         if slot.is_none_or(|(_, bd)| d < bd) {
+             *slot = Some((j, d));
+@@ -2265,14 +2307,16 @@ fn evidence_as(fp_a: &VideoFingerprint, fp_b: &VideoFingerprint, max_hamming_dis
+     };
+     let mut witnesses = Witnesses::new();
+     admit(fp_a, fp_b, rule, &mut matched_a, &mut matched_b, &mut witnesses, &mut |i, j, d| {
+-        note(&mut best, i, j, d)
++        note(&mut best, &mut all, i, j, d)
+     });
++    all.sort_unstable();
++    all.dedup();
+     let pairs = best
+         .iter()
+         .enumerate()
+         .filter_map(|(i, b)| b.map(|(j, d)| (fp_a.valid_t_start[i], fp_b.valid_t_start[j as usize], d)))
+         .collect();
+-    Evidence { pairs, stretches_a: stretches(&matched_a, fp_a), stretches_b: stretches(&matched_b, fp_b) }
++    Evidence { pairs, stretches_a: stretches(&matched_a, fp_a), stretches_b: stretches(&matched_b, fp_b), all }
+ }
+ 
+ /// The flagged samples of `fp` as stretches of footage: each sample stands for
+@@ -2330,6 +2374,13 @@ fn find_matches_where(
+     min_match_percent: f32,
+     min_duration: f64,
+ ) -> Vec<Match> {
++    let thin_store: Vec<VideoFingerprint>;
++    let fingerprints: &[VideoFingerprint] = if thin_on() {
++        thin_store = fingerprints.iter().map(thinned).collect();
++        &thin_store
++    } else {
++        fingerprints
++    };
+     let wanted = |a: usize, b: usize| sides.is_none_or(|s| s[a] != s[b]);
+     let orientations = Orientation::all();
+     let wanted_as =
+@@ -2361,6 +2412,11 @@ fn find_matches_where(
+     // One orientation of one pair, `q` read that way round against `t` as it
+     // is, reported with the lower index as `a`.
+     let measure = |(q, t, o): (usize, usize, usize), witnesses: &mut Witnesses| -> Option<Match> {
++        let rules = if o == 0 {
++            rules
++        } else {
++            rules.corrected(orientations[o].tries(&fingerprints[q], &fingerprints[t]))
++        };
+         let m = measure_pair(&side(o)[q], &fingerprints[t], (q, t), rules, min_match_percent, min_duration, witnesses)?;
+         let m = Match { mirrored: orientations[o].mirrored, reframed: orientations[o].reframed, ..m };
+         Some(if q < t { m } else { m.swapped() })
+@@ -2460,6 +2516,27 @@ impl Orientation {
+         out
+     }
+ 
++    /// How many ways round other than the plain one a pair is measured: each
++    /// symmetric orientation once, each one-sided one in every direction it
++    /// fits. The number every alternative's tolerance is corrected for.
++    fn alternatives(a: &VideoFingerprint, b: &VideoFingerprint) -> u32 {
++        Orientation::all()[1..]
++            .iter()
++            .map(|o| if o.symmetric() { 1 } else { o.fits(a, b) as u32 + o.fits(b, a) as u32 })
++            .sum()
++    }
++
++    /// How many tries this orientation's tolerance is corrected for (LAB switch).
++    fn tries(&self, a: &VideoFingerprint, b: &VideoFingerprint) -> u32 {
++        match std::env::var("VIDFP_CORR").as_deref() {
++            Ok("strip") => match self.reframed {
++                Some(Reframing::Strip(_)) => 2 * crate::fingerprint::STRIPS as u32,
++                _ => 1,
++            },
++            _ => Orientation::alternatives(a, b),
++        }
++    }
++
+     /// Whether measuring `a` this way round against `b` is the same question
+     /// as measuring `b` this way round against `a`. Mirroring is its own
+     /// inverse, so a mirrored `a` against `b` is a mirrored `b` against `a`; a
+@@ -4211,3 +4288,117 @@ mod tests {
+         assert_eq!(span_b, None);
+     }
+ }
++
++/// LAB (not for commit): per file, each sample's nearest look-alike inside its
++/// own video at least `sep` ms away, for several separations, as combined
++/// main + detail distance. Plus the wide tolerance at `d`.
++pub fn lab_self_dump(fps: &[VideoFingerprint], d: u32, path: &str) -> std::io::Result<()> {
++    use rayon::prelude::*;
++    let tol = Tolerance::wide(d);
++    let seps: [u32; 4] = [0, 10_000, 30_000, 120_000];
++    let lines: Vec<String> = fps
++        .par_iter()
++        .map(|fp| {
++            let n = fp.valid_hashes.len();
++            let has_detail = fp.detail_hashes.len() == n;
++            let span = {
++                let mut s: Vec<u32> = (0..n).map(|i| fp.valid_t_end[i] - fp.valid_t_start[i]).collect();
++                s.sort_unstable();
++                s.get(n / 2).copied().unwrap_or(0).max(ALIGNMENT_TOLERANCE_MS as u32)
++            };
++            let mut mins: Vec<[u32; 4]> = vec![[u32::MAX; 4]; n];
++            for i in 0..n {
++                for j in 0..n {
++                    if i == j {
++                        continue;
++                    }
++                    let dt = fp.valid_t_start[i].abs_diff(fp.valid_t_start[j]);
++                    let mut dist = (fp.valid_hashes[i] ^ fp.valid_hashes[j]).count_ones();
++                    if has_detail {
++                        dist += (fp.detail_hashes[i] ^ fp.detail_hashes[j]).count_ones();
++                    }
++                    for (k, &s) in seps.iter().enumerate() {
++                        let s = if k == 0 { span } else { s };
++                        if dt > s && dist < mins[i][k] {
++                            mins[i][k] = dist;
++                        }
++                    }
++                }
++            }
++            serde_json::json!({"path": fp.path, "t": fp.valid_t_start, "span": span, "min": mins}).to_string()
++        })
++        .collect();
++    let head = serde_json::json!({"strict": tol.strict, "loose": tol.loose}).to_string();
++    std::fs::write(path, format!("{head}\n{}", lines.join("\n")))
++}
++
++/// `fp` with its samples thinned to at most one per `ALIGNMENT_TOLERANCE_MS`:
++/// a sample that starts sooner than that after the last one kept is folded into
++/// it, its span added to the kept one's. The matcher cannot place a match more
++/// finely than that window, so samples denser than it add no timing, only more
++/// draws of each picture's hash noise -- more chances to land near some frame
++/// of an unrelated file. (LAB switch VIDFP_THIN.)
++pub(crate) fn thinned(fp: &VideoFingerprint) -> VideoFingerprint {
++    let n = fp.valid_hashes.len();
++    let step = ALIGNMENT_TOLERANCE_MS as u32;
++    let mut keep: Vec<u32> = Vec::with_capacity(n); // new index of each old sample, or u32::MAX
++    let mut new_of = vec![u32::MAX; n];
++    let mut out = VideoFingerprint {
++        valid_hashes: Vec::new(),
++        valid_t_start: Vec::new(),
++        valid_t_end: Vec::new(),
++        mirrored_hashes: Vec::new(),
++        detail_hashes: Vec::new(),
++        mirrored_detail_hashes: Vec::new(),
++        reframed: Vec::new(),
++        path: fp.path.clone(),
++        codec: fp.codec.clone(),
++        ..*fp
++    };
++    let has = |v: &Vec<u64>| v.len() == n;
++    for i in 0..n {
++        let s = fp.valid_t_start[i];
++        if let Some(&last) = keep.last() {
++            if s < fp.valid_t_start[last as usize] + step {
++                let k = out.valid_t_end.len() - 1;
++                out.valid_t_end[k] = out.valid_t_end[k].max(fp.valid_t_end[i]);
++                continue;
++            }
++        }
++        new_of[i] = out.valid_hashes.len() as u32;
++        keep.push(i as u32);
++        out.valid_hashes.push(fp.valid_hashes[i]);
++        out.valid_t_start.push(s);
++        out.valid_t_end.push(fp.valid_t_end[i]);
++        if has(&fp.mirrored_hashes) {
++            out.mirrored_hashes.push(fp.mirrored_hashes[i]);
++        }
++        if has(&fp.detail_hashes) {
++            out.detail_hashes.push(fp.detail_hashes[i]);
++        }
++        if has(&fp.mirrored_detail_hashes) {
++            out.mirrored_detail_hashes.push(fp.mirrored_detail_hashes[i]);
++        }
++    }
++    out.reframed = fp
++        .reframed
++        .iter()
++        .map(|r| {
++            let mut o = crate::fingerprint::Reframed::default();
++            for (&s, h) in r.samples.iter().zip(&r.hashes) {
++                if let Some(&ni) = new_of.get(s as usize) {
++                    if ni != u32::MAX {
++                        o.samples.push(ni);
++                        o.hashes.push(*h);
++                    }
++                }
++            }
++            o
++        })
++        .collect();
++    out
++}
++
++fn thin_on() -> bool {
++    std::env::var_os("VIDFP_THIN").is_some()
++}
+diff --git a/src/lib.rs b/src/lib.rs
+index c7d7df3..1d6d9d7 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -4529,6 +4529,31 @@ fn run(
+         find_all_matches(&fingerprints, max_hamming, min_match_pct, min_duration)
+     };
+ 
++    // LAB HOOK (not for commit): the admitted frame matches of every link.
++    if let Ok(dump) = std::env::var("VIDFP_SELFDUMP") {
++        compare::lab_self_dump(&fingerprints, max_hamming, &dump)?;
++    }
++    if let Ok(dump) = std::env::var("VIDFP_LINKDUMP") {
++        use rayon::prelude::*;
++        let lines: Vec<String> = matches
++            .par_iter()
++            .map(|m| {
++                let (fa, fb) = (&fingerprints[m.a], &fingerprints[m.b]);
++                let e = compare::evidence(fa, fb, max_hamming);
++                serde_json::json!({
++                    "a": fa.path, "b": fb.path,
++                    "na": fa.valid_hashes.len(), "nb": fb.valid_hashes.len(),
++                    "ta": fa.total_ms, "tb": fb.total_ms,
++                    "ca": m.coverage_a, "cb": m.coverage_b,
++                    "mir": m.mirrored, "ref": m.reframed.is_some(), "rtype": format!("{:?}", m.reframed),
++                    "pairs": e.pairs, "all": if std::env::var_os("VIDFP_LINKDUMP_ALL").is_some() { e.all } else { Vec::new() },
++                })
++                .to_string()
++            })
++            .collect();
++        std::fs::write(&dump, lines.join("\n"))?;
++    }
++
+     if shutdown_requested() {
+         return Ok(Outcome::Interrupted);
+     }

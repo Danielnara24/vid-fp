@@ -1,0 +1,258 @@
+diff --git a/src/compare.rs b/src/compare.rs
+index e17c3d1..040fd71 100644
+--- a/src/compare.rs
++++ b/src/compare.rs
+@@ -980,13 +980,26 @@ fn match_overlap(
+     // static shot is worth ten seconds of agreement; one covering half a second
+     // of cuts is worth half a second. Two encodes of the same footage sample it
+     // at completely different rates and still measure the same overlap.
++    // EXPERIMENT (keyframe runs): consecutive hashes sharing one end are one
++    // sample (a keyframe and its run); it counts once if any of them matched,
++    // over the span from its first hash to that end. Without runs every end is
++    // distinct and this is the sum it always was.
+     let covered_ms = |matched: &[bool], fp: &VideoFingerprint| -> u64 {
+-        matched
+-            .iter()
+-            .enumerate()
+-            .filter(|(_, &m)| m)
+-            .map(|(i, _)| (fp.valid_t_end[i].saturating_sub(fp.valid_t_start[i])) as u64)
+-            .sum()
++        let mut total = 0u64;
++        let mut i = 0;
++        while i < matched.len() {
++            let mut j = i;
++            let mut any = false;
++            while j < matched.len() && fp.valid_t_end[j] == fp.valid_t_end[i] {
++                any |= matched[j];
++                j += 1;
++            }
++            if any {
++                total += fp.valid_t_end[i].saturating_sub(fp.valid_t_start[i]) as u64;
++            }
++            i = j;
++        }
++        total
+     };
+ 
+     let pct = |ms: u64, total: u32| -> f32 {
+diff --git a/src/fingerprint.rs b/src/fingerprint.rs
+index 52a1ab4..48a583b 100644
+--- a/src/fingerprint.rs
++++ b/src/fingerprint.rs
+@@ -1471,11 +1471,21 @@ fn send_and_take(
+ /// The crop is found from all of the frames together, so this is asked of a
+ /// whole video at once.
+ fn hash_frames(u_frames: &[u8]) -> (Vec<u64>, Vec<bool>) {
++    hash_frames_cropped_by(u_frames, None)
++}
++
++/// EXPERIMENT (keyframe runs): the crop is measured over the frames `crop_from`
++/// marks (the keyframes), so adding run frames does not move it.
++fn hash_frames_cropped_by(u_frames: &[u8], crop_from: Option<&[bool]>) -> (Vec<u64>, Vec<bool>) {
+     let n_unique = u_frames.len() / FRAME_STRIDE;
+-    let n_f32 = n_unique as f32;
++    let use_mask = crop_from.is_some_and(|m| m.iter().any(|&k| k));
++    let n_f32 = if use_mask { crop_from.unwrap().iter().filter(|&&k| k).count() as f32 } else { n_unique as f32 };
+     let mut sum = vec![0u64; FRAME_STRIDE];
+     let mut sum_sq = vec![0u64; FRAME_STRIDE];
+-    for frame in u_frames.chunks_exact(FRAME_STRIDE) {
++    for (fi, frame) in u_frames.chunks_exact(FRAME_STRIDE).enumerate() {
++        if use_mask && !crop_from.unwrap()[fi] {
++            continue;
++        }
+         for (i, &val) in frame.iter().enumerate() {
+             let v = val as u64;
+             sum[i] += v;
+@@ -1655,6 +1665,13 @@ pub fn fingerprint_video(
+ 
+     let decode_threads = decode_threads.clamp(1, MAX_DECODE_THREADS);
+ 
++    // EXPERIMENT (keyframe runs): decode VIDFP_RUN packets after every kept
++    // keyframe as well, so two encodes whose keyframes sit at different moments
++    // still share decoded moments. VIDFP_NOREF=1 lets the decoder skip
++    // non-reference frames inside a run (more reach for the same cost).
++    let run_len: u32 = std::env::var("VIDFP_RUN").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
++    let run_noref = std::env::var("VIDFP_NOREF").is_ok_and(|v| v == "1");
++
+     unsafe {
+         let ctx = context_decoder.as_mut_ptr();
+         (*ctx).thread_count = decode_threads as i32;
+@@ -1678,7 +1695,13 @@ pub fn fingerprint_video(
+         } else {
+             (*ctx).flags |= ffmpeg_next::ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
+         }
+-        (*ctx).skip_frame = ffmpeg_next::ffi::AVDiscard::AVDISCARD_NONKEY;
++        (*ctx).skip_frame = if run_len == 0 {
++            ffmpeg_next::ffi::AVDiscard::AVDISCARD_NONKEY
++        } else if run_noref {
++            ffmpeg_next::ffi::AVDiscard::AVDISCARD_NONREF
++        } else {
++            ffmpeg_next::ffi::AVDiscard::AVDISCARD_DEFAULT
++        };
+     }
+ 
+     let mut decoder = context_decoder.decoder().video()
+@@ -1721,6 +1744,10 @@ pub fn fingerprint_video(
+     // container gave no timestamp for; a video with any of those falls back to
+     // spacing its samples evenly (see `sample_times`).
+     let mut unique_frame_times: Vec<Option<u32>> = Vec::new();
++    // EXPERIMENT (keyframe runs): whether each kept frame is a keyframe, and the
++    // sample time of every keyframe fed (the starts of the runs).
++    let mut unique_frame_key: Vec<bool> = Vec::new();
++    let mut kf_times_ms: Vec<u32> = Vec::new();
+ 
+     // Seconds per unit of the video stream's timestamps. Zero when the header
+     // never said, which makes every frame time unknown.
+@@ -1819,6 +1846,7 @@ pub fn fingerprint_video(
+             // FFmpeg 6.1 on 17 of the local corpus's 19 HEVC files, and never
+             // with the vendored FFmpeg 8. See
+             // `test_a_sample_is_the_picture_of_the_keyframe_it_is_timed_at`.
++            unique_frame_key.push(dec.is_key());
+             unique_frame_times.push(match dec.pts() {
+                 Some(pts) if stream_time_base > 0.0 && pts >= 0 => {
+                     Some((pts as f64 * stream_time_base * 1000.0) as u32)
+@@ -1849,7 +1877,9 @@ pub fn fingerprint_video(
+         let fmt_ctx = ictx.as_mut_ptr();
+         for i in 0..(*fmt_ctx).nb_streams as usize {
+             let stream_ptr = *(*fmt_ctx).streams.add(i);
+-            (*stream_ptr).discard = if i == video_stream_index {
++            (*stream_ptr).discard = if i == video_stream_index && run_len > 0 {
++                ffmpeg_next::ffi::AVDiscard::AVDISCARD_DEFAULT
++            } else if i == video_stream_index {
+                 ffmpeg_next::ffi::AVDiscard::AVDISCARD_NONKEY
+             } else {
+                 ffmpeg_next::ffi::AVDiscard::AVDISCARD_ALL
+@@ -1963,6 +1993,10 @@ pub fn fingerprint_video(
+     // and the runtime this file reports (see below), which was measured from
+     // the same broken arithmetic.
+     let mut clock_restarted = false;
++    // EXPERIMENT (keyframe runs): packets of the current run still to feed, and
++    // the keyframe's (sample clock, raw pts) the run is timed against.
++    let mut run_left: u32 = 0;
++    let mut run_anchor: Option<(i64, i64)> = None;
+ 
+     loop {
+         if shutdown_requested() {
+@@ -2054,12 +2088,56 @@ pub fn fingerprint_video(
+             // The discard hint was ignored. Note it: from the next keyframe on
+             // we jump rather than read.
+             demuxer_ignores_discard = true;
++            if run_left > 0 {
++                run_left -= 1;
++                let raw = packet.pts().or_else(|| packet.dts());
++                let at = match (raw, run_anchor) {
++                    (Some(r), Some((kf_elapsed, kf_raw))) => Some(kf_elapsed + (r - kf_raw)),
++                    _ => None,
++                };
++                // A leading picture (shown before its keyframe) refers to
++                // frames this run never decoded; and a frame with no time
++                // would put the whole file on the even-spacing fallback.
++                if let Some(at) = at.filter(|&a| run_anchor.is_some_and(|(k, _)| a >= k)) {
++                    packet.set_pts(Some(at));
++                    if let Err(e) = feed_keyframe(
++                        &mut decoder,
++                        &packet,
++                        &mut decoded,
++                        &mut sample_frame,
++                        &mut lost_pictures,
++                    ) {
++                        refused.get_or_insert(e);
++                    }
++                }
++                if run_left == 0 && !seeking_broken {
++                    match packet.dts().or_else(|| packet.pts()) {
++                        None => seeking_broken = true,
++                        Some(ts) => {
++                            let ok = unsafe {
++                                ffmpeg_next::ffi::av_seek_frame(
++                                    ictx.as_mut_ptr(),
++                                    video_stream_index as i32,
++                                    ts.saturating_add(1),
++                                    0,
++                                ) >= 0
++                            };
++                            if ok {
++                                after_seek = true;
++                            } else {
++                                seeking_broken = true;
++                            }
++                        }
++                    }
++                }
++            }
+             continue;
+         }
+ 
+         // The timestamp the container's index is keyed on, which is what a seek
+         // target is measured against.
+         let index_ts = packet.dts().or_else(|| packet.pts());
++        let raw_pts = packet.pts().or(index_ts);
+ 
+         // A seek may land on or before a keyframe already decoded. Skip those
+         // rather than hashing the same frame twice.
+@@ -2172,6 +2250,18 @@ pub fn fingerprint_video(
+             // If PTS/DTS is missing we fall through and keep the frame (safe default).
+         }
+ 
++        if kept && run_len > 0 {
++            run_left = run_len;
++            run_anchor = sample_ts.zip(raw_pts);
++            if let Some(ts) = sample_ts {
++                if stream_time_base > 0.0 && ts >= 0 {
++                    kf_times_ms.push((ts as f64 * stream_time_base * 1000.0) as u32);
++                }
++            }
++        } else if run_len > 0 {
++            run_left = 0;
++        }
++
+         if kept {
+             if let Err(e) = feed_keyframe(
+                 &mut decoder,
+@@ -2189,7 +2279,7 @@ pub fn fingerprint_video(
+         }
+ 
+         // --- Jump to the next keyframe we actually want ----------------------
+-        if demuxer_ignores_discard && !seeking_broken {
++        if run_len == 0 && demuxer_ignores_discard && !seeking_broken {
+             match index_ts {
+                 // No clock to seek by. Reading forward is the only option left.
+                 None => seeking_broken = true,
+@@ -2317,7 +2407,11 @@ pub fn fingerprint_video(
+     // u_frames holds n_unique * FRAME_STRIDE bytes; the frame count is the time list.
+     let n_unique = unique_frame_times.len();
+ 
+-    let (hashes, flat) = hash_frames(&u_frames);
++    let (hashes, flat) = if run_len > 0 {
++        hash_frames_cropped_by(&u_frames, Some(&unique_frame_key))
++    } else {
++        hash_frames(&u_frames)
++    };
+ 
+     // Frame pixels are no longer needed; release the large buffer (munmap) now
+     // rather than at end of scope, trimming the peak during the cheap tail work.
+@@ -2363,9 +2457,10 @@ pub fn fingerprint_video(
+         let h = hashes[i];
+         let valid = !flat[i];
+ 
++        let group = |t: u32| kf_times_ms.partition_point(|&k| k <= t);
+         let should_push = k == 0 || {
+             let prev = order[k - 1];
+-            h != hashes[prev] || valid != !flat[prev]
++            h != hashes[prev] || valid != !flat[prev] || (run_len > 0 && group(times[i]) != group(times[prev]))
+         };
+ 
+         if should_push {
+@@ -2384,7 +2479,11 @@ pub fn fingerprint_video(
+             final_hashes.push(changes_hashes[i]);
+             final_t_start.push(changes_t_start[i]);
+ 
+-            if i + 1 < changes_hashes.len() {
++            if run_len > 0 {
++                // Every hash of a run stands for the keyframe's whole span.
++                let g = kf_times_ms.partition_point(|&k| k <= changes_t_start[i]);
++                final_t_end.push(kf_times_ms.get(g).copied().unwrap_or(total_ms).max(changes_t_start[i] + 1));
++            } else if i + 1 < changes_hashes.len() {
+                 final_t_end.push(changes_t_start[i + 1]);
+             } else {
+                 final_t_end.push(total_ms);
