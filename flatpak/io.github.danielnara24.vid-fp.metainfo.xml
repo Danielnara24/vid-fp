@@ -90,6 +90,11 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.48.1" date="2026-11-25">
+      <description>
+        <p>Comparing is faster, most of all on long videos and at looser tolerances, and fingerprinting is slightly faster. Results are unchanged, and the cache is kept.</p>
+      </description>
+    </release>
     <release version="0.48.0" date="2026-11-24">
       <description>
         <p>Scans find the same matches on every processor, and more of them: fingerprints on Intel and AMD now match those on ARM. The first scan after updating fingerprints the library again on Intel and AMD. Comparing at the strictest tolerances is several times faster.</p>
